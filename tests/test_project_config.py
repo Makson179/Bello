@@ -27,7 +27,12 @@ from supervisor.project_config import (
     save_project_config,
     sync_runtime_config_fields,
 )
-from supervisor.schemas import SentinelConfig
+from supervisor.review_limits import (
+    EXPLICIT_REVIEW_LIMIT_FORMAT,
+    REVIEW_LIMIT_FORMAT_FIELD,
+    UNLIMITED_REVIEW_LIMIT,
+)
+from supervisor.schemas import BelloConfig
 from supervisor.state import CONFIG, PROGRESS, StateStore
 
 
@@ -43,15 +48,22 @@ def test_first_load_creates_default_project_config(tmp_path: Path) -> None:
     assert config.completion_intelligence == DEFAULT_INTELLIGENCE
     assert config.adversary_intelligence == DEFAULT_INTELLIGENCE
     assert config.start_over is True
-    assert config.adversary is True
+    assert config.completion_review is False
+    assert config.adversary is False
     assert config.adversary_runs == 1
-    assert config.completion_returns_per_generation == 10
+    assert config.completion_returns_before_adversary == 1
+    assert config.completion_returns_after_adversary == 0
+    assert config.cheap_runtime is True
     assert config.clean is False
     assert config.task is None
     assert config.protected_path == ()
     assert project_config_path(tmp_path).exists()
     assert project_config_path(tmp_path) == tmp_path.resolve() / ".supervisor" / "config.json"
-    assert not (tmp_path / ".sentinel").exists()
+    assert not (tmp_path / ".bello").exists()
+
+    reloaded = load_project_config(tmp_path, create=False)
+    assert reloaded.completion_review is False
+    assert reloaded.adversary is False
 
 
 def test_gpt_56_sol_is_default_and_reasoning_choices_are_model_specific() -> None:
@@ -75,6 +87,8 @@ def test_project_config_missing_fields_are_defaulted(tmp_path: Path) -> None:
     assert config.completion_mod == DEFAULT_MODEL
     assert config.adversary_mod == DEFAULT_MODEL
     assert config.start_over is True
+    assert config.completion_returns_before_adversary == 4
+    assert config.completion_returns_after_adversary == 2
 
 
 def test_project_config_invalid_json_reports_path(tmp_path: Path) -> None:
@@ -82,7 +96,7 @@ def test_project_config_invalid_json_reports_path(tmp_path: Path) -> None:
     path.parent.mkdir()
     path.write_text("{", encoding="utf-8")
 
-    with pytest.raises(ProjectConfigError, match="invalid Sentinel config JSON"):
+    with pytest.raises(ProjectConfigError, match="invalid Bello config JSON"):
         load_project_config(tmp_path)
 
 
@@ -100,7 +114,10 @@ def test_project_config_save_shape(tmp_path: Path) -> None:
     assert payload["speed"] == "fast"
     assert payload["fast"] is True
     assert payload["clean"] is True
-    assert payload["max_completion_returns_per_generation"] == 10
+    assert payload[REVIEW_LIMIT_FORMAT_FIELD] == EXPLICIT_REVIEW_LIMIT_FORMAT
+    assert payload["max_completion_returns_before_adversary"] == 1
+    assert payload["max_completion_returns_after_adversary"] == 0
+    assert payload["cheap_runtime"] is True
     assert payload["runtime_mod"] == DEFAULT_MODEL
     assert payload["completion_mod"] == DEFAULT_MODEL
     assert payload["adversary_mod"] == DEFAULT_MODEL
@@ -110,7 +127,7 @@ def test_project_config_loads_runtime_config_shape(tmp_path: Path) -> None:
     store = StateStore(tmp_path)
     store.write_json_locked(
         CONFIG,
-        SentinelConfig(
+        BelloConfig(
             project_root=str(tmp_path),
             task_path="TASK.md",
             coder_model="gpt-coder",
@@ -123,7 +140,9 @@ def test_project_config_loads_runtime_config_shape(tmp_path: Path) -> None:
             protected_paths=["hidden"],
             adversary=False,
             max_adversary_runs=0,
-            max_completion_returns_per_generation=4,
+            max_completion_returns_before_adversary=4,
+            max_completion_returns_after_adversary=1,
+            cheap_runtime=False,
         ),
     )
 
@@ -144,7 +163,39 @@ def test_project_config_loads_runtime_config_shape(tmp_path: Path) -> None:
     assert config.protected_path == ("hidden",)
     assert config.adversary is False
     assert config.adversary_runs == 0
-    assert config.completion_returns_per_generation == 4
+    assert config.completion_returns_before_adversary == 4
+    assert config.completion_returns_after_adversary == 1
+    assert config.cheap_runtime is False
+
+
+@pytest.mark.parametrize(
+    "before_field",
+    ["max_completion_returns_before_adversary", "max_completion_returns_per_generation"],
+)
+def test_state_store_migrates_legacy_zero_review_limits_on_update(
+    tmp_path: Path,
+    before_field: str,
+) -> None:
+    store = StateStore(tmp_path)
+    store.write_json_locked(
+        CONFIG,
+        {
+            "project_root": str(tmp_path),
+            "task_path": "TASK.md",
+            before_field: 0,
+            "max_completion_returns_after_adversary": 0,
+        },
+    )
+
+    config = store.get_bello_config()
+    assert config.max_completion_returns_before_adversary == UNLIMITED_REVIEW_LIMIT
+    assert config.max_completion_returns_after_adversary == UNLIMITED_REVIEW_LIMIT
+
+    store.update_bello_config(lambda current: current)
+    payload = json.loads(store.path(CONFIG).read_text(encoding="utf-8"))
+    assert payload[REVIEW_LIMIT_FORMAT_FIELD] == EXPLICIT_REVIEW_LIMIT_FORMAT
+    assert payload["max_completion_returns_before_adversary"] == UNLIMITED_REVIEW_LIMIT
+    assert payload["max_completion_returns_after_adversary"] == UNLIMITED_REVIEW_LIMIT
 
 
 def test_project_config_loads_independent_role_models_and_efforts(tmp_path: Path) -> None:
@@ -184,18 +235,21 @@ def test_config_initializes_supervisor_state_when_missing(tmp_path: Path) -> Non
     store = StateStore(tmp_path)
     assert store.path(CONFIG).exists()
     assert store.path(PROGRESS).exists()
-    runtime_config = store.get_sentinel_config()
+    runtime_config = store.get_bello_config()
     assert runtime_config.project_root == str(tmp_path.resolve())
     assert runtime_config.task_path == ""
     assert runtime_config.fast is True
     assert runtime_config.adversary is False
     assert runtime_config.max_adversary_runs == 0
-    assert runtime_config.max_completion_returns_per_generation == 10
+    assert runtime_config.review_limit_format == EXPLICIT_REVIEW_LIMIT_FORMAT
+    assert runtime_config.max_completion_returns_before_adversary == 1
+    assert runtime_config.max_completion_returns_after_adversary == 0
+    assert runtime_config.cheap_runtime is True
 
 
 def test_config_does_not_touch_existing_supervisor_state_by_default(tmp_path: Path) -> None:
     store = StateStore(tmp_path)
-    existing = SentinelConfig(
+    existing = BelloConfig(
         project_root=str(tmp_path),
         task_path="TASK.md",
         generation=3,
@@ -206,7 +260,7 @@ def test_config_does_not_touch_existing_supervisor_state_by_default(tmp_path: Pa
 
     ensure_runtime_state_initialized(tmp_path, ProjectConfig(coder_mod="config-coder"))
 
-    runtime_config = store.get_sentinel_config()
+    runtime_config = store.get_bello_config()
     assert runtime_config.generation == 3
     assert runtime_config.coder_thread_id == "thread"
     assert runtime_config.coder_model == "runtime-coder"
@@ -216,7 +270,7 @@ def test_config_change_patches_only_changed_runtime_fields(tmp_path: Path) -> No
     store = StateStore(tmp_path)
     store.write_json_locked(
         CONFIG,
-        SentinelConfig(
+        BelloConfig(
             project_root=str(tmp_path),
             task_path="TASK.md",
             generation=4,
@@ -234,7 +288,7 @@ def test_config_change_patches_only_changed_runtime_fields(tmp_path: Path) -> No
         ("speed",),
     )
 
-    runtime_config = store.get_sentinel_config()
+    runtime_config = store.get_bello_config()
     assert runtime_config.generation == 4
     assert runtime_config.coder_thread_id == "thread"
     assert runtime_config.coder_model == "runtime-coder"
@@ -248,6 +302,13 @@ def test_changed_project_config_fields_tracks_actual_changes() -> None:
     after = ProjectConfig(speed="fast", clean=False)
 
     assert changed_project_config_fields(before, after) == ("speed",)
+
+
+def test_changed_project_config_fields_tracks_cheap_runtime() -> None:
+    before = ProjectConfig(cheap_runtime=True)
+    after = ProjectConfig(cheap_runtime=False)
+
+    assert changed_project_config_fields(before, after) == ("cheap_runtime",)
 
 
 def test_config_editor_state_expands_selects_and_advances() -> None:
@@ -307,8 +368,21 @@ def test_config_editor_choice_can_update_boolean() -> None:
     assert state.parameter_index == clean_index + 1
 
 
-def test_config_editor_inline_adversary_runs_updates_boolean() -> None:
-    config = ProjectConfig(adversary=False)
+def test_config_editor_can_disable_cheap_runtime() -> None:
+    config = ProjectConfig(cheap_runtime=True)
+    params = parameter_defs(config)
+    runtime_index = [param.key for param in params].index("cheap_runtime")
+    state = EditorState(parameter_index=runtime_index, expanded_index=runtime_index, option_index=1)
+
+    config, state, action = select_current(config, state)
+
+    assert action is None
+    assert config.cheap_runtime is False
+    assert state.parameter_index == runtime_index + 1
+
+
+def test_config_editor_inline_adversary_runs_updates_value() -> None:
+    config = ProjectConfig(completion_review=True, adversary=True)
     params = parameter_defs(config)
     runs_index = [param.key for param in params].index("adversary_runs")
     state = EditorState(parameter_index=runs_index)
@@ -316,7 +390,7 @@ def test_config_editor_inline_adversary_runs_updates_boolean() -> None:
     config, state, action = select_current(config, state)
     assert action is None
     assert state.editing is True
-    assert state.edit_value == "0"
+    assert state.edit_value == "1"
 
     state = replace(state, edit_value="3")
     config, state, action = select_current(config, state)
@@ -326,8 +400,63 @@ def test_config_editor_inline_adversary_runs_updates_boolean() -> None:
     assert config.adversary_runs == 3
 
 
+def test_config_editor_disabling_completion_review_hides_and_skips_dependencies() -> None:
+    config = ProjectConfig(completion_review=True, adversary=True)
+    params = parameter_defs(config)
+    review_index = [param.key for param in params].index("completion_review")
+    state = EditorState(parameter_index=review_index, expanded_index=review_index, option_index=1)
+
+    config, state, action = select_current(config, state)
+
+    assert action is None
+    assert config.completion_review is False
+    updated_params = parameter_defs(config)
+    updated_keys = {parameter.key for parameter in updated_params}
+    assert "completion_mod" not in updated_keys
+    assert "adversary" not in updated_keys
+    assert "adversary_runs" not in updated_keys
+    assert "completion_returns_before_adversary" not in updated_keys
+    assert updated_params[state.parameter_index].key == "clean"
+
+
+def test_config_editor_disabling_adversary_hides_and_skips_its_dependencies() -> None:
+    config = ProjectConfig(completion_review=True, adversary=True)
+    params = parameter_defs(config)
+    adversary_index = [param.key for param in params].index("adversary")
+    state = EditorState(parameter_index=adversary_index, expanded_index=adversary_index, option_index=1)
+
+    config, state, action = select_current(config, state)
+
+    assert action is None
+    assert config.adversary is False
+    updated_params = parameter_defs(config)
+    updated_keys = {parameter.key for parameter in updated_params}
+    assert "adversary_mod" not in updated_keys
+    assert "adversary_runs" not in updated_keys
+    assert "completion_returns_after_adversary" not in updated_keys
+    assert "completion_returns_before_adversary" in updated_keys
+    assert updated_params[state.parameter_index].key == "completion_returns_before_adversary"
+
+
+def test_config_editor_enabling_adversary_restores_a_runnable_pass_count() -> None:
+    config = ProjectConfig(completion_review=True, adversary=True, adversary_runs=0)
+    params = parameter_defs(config)
+    adversary_index = [param.key for param in params].index("adversary")
+    assert params[adversary_index].value == "false"
+    state = EditorState(parameter_index=adversary_index, expanded_index=adversary_index, option_index=0)
+
+    config, state, action = select_current(config, state)
+
+    assert action is None
+    assert config.adversary is True
+    assert config.adversary_runs == 1
+    updated_params = parameter_defs(config)
+    assert "adversary_runs" in {parameter.key for parameter in updated_params}
+    assert updated_params[state.parameter_index].key == "completion_returns_before_adversary"
+
+
 def test_config_editor_inline_adversary_runs_zero_disables_adversary() -> None:
-    config = ProjectConfig(adversary=True, adversary_runs=2)
+    config = ProjectConfig(completion_review=True, adversary=True, adversary_runs=2)
     params = parameter_defs(config)
     runs_index = [param.key for param in params].index("adversary_runs")
     state = EditorState(parameter_index=runs_index)
@@ -339,12 +468,15 @@ def test_config_editor_inline_adversary_runs_zero_disables_adversary() -> None:
     assert action is None
     assert config.adversary is False
     assert config.adversary_runs == 0
+    updated_params = parameter_defs(config)
+    assert "adversary_runs" not in {parameter.key for parameter in updated_params}
+    assert updated_params[state.parameter_index].key == "completion_returns_before_adversary"
 
 
-def test_config_editor_inline_completion_return_limit_updates_config() -> None:
-    config = ProjectConfig()
+def test_config_editor_inline_completion_return_limits_update_config() -> None:
+    config = ProjectConfig(completion_review=True, adversary=True)
     params = parameter_defs(config)
-    limit_index = [param.key for param in params].index("completion_returns_per_generation")
+    limit_index = [param.key for param in params].index("completion_returns_before_adversary")
     state = EditorState(parameter_index=limit_index)
 
     config, state, action = select_current(config, state)
@@ -352,13 +484,52 @@ def test_config_editor_inline_completion_return_limit_updates_config() -> None:
     config, state, action = select_current(config, state)
 
     assert action is None
-    assert config.completion_returns_per_generation == 4
+    assert config.completion_returns_before_adversary == 4
+
+    params = parameter_defs(config)
+    limit_index = [param.key for param in params].index("completion_returns_after_adversary")
+    state = EditorState(parameter_index=limit_index)
+    config, state, action = select_current(config, state)
+    state = replace(state, edit_value="1")
+    config, state, action = select_current(config, state)
+
+    assert action is None
+    assert config.completion_returns_after_adversary == 1
+
+
+def test_config_editor_review_limits_support_zero_and_unlimited() -> None:
+    config = ProjectConfig(completion_review=True, adversary=True)
+    params = parameter_defs(config)
+    before_index = [param.key for param in params].index("completion_returns_before_adversary")
+    state = EditorState(parameter_index=before_index)
+
+    config, state, action = select_current(config, state)
+    assert action is None
+    assert state.edit_kind == "review_limit"
+    assert state.edit_value == "1"
+
+    state = replace(state, edit_value="Unlimited")
+    config, state, action = select_current(config, state)
+    assert action is None
+    assert config.completion_returns_before_adversary == UNLIMITED_REVIEW_LIMIT
+
+    params = parameter_defs(config)
+    before = next(param for param in params if param.key == "completion_returns_before_adversary")
+    assert before.value == "Unlimited"
+
+    after_index = [param.key for param in params].index("completion_returns_after_adversary")
+    state = EditorState(parameter_index=after_index)
+    config, state, action = select_current(config, state)
+    state = replace(state, edit_value="0")
+    config, state, action = select_current(config, state)
+    assert action is None
+    assert config.completion_returns_after_adversary == 0
 
 
 def test_config_editor_inline_number_rejects_invalid_input() -> None:
-    config = ProjectConfig()
+    config = ProjectConfig(completion_review=True, adversary=True)
     params = parameter_defs(config)
-    limit_index = [param.key for param in params].index("completion_returns_per_generation")
+    limit_index = [param.key for param in params].index("completion_returns_before_adversary")
     state = EditorState(parameter_index=limit_index)
 
     config, state, action = select_current(config, state)
@@ -366,13 +537,13 @@ def test_config_editor_inline_number_rejects_invalid_input() -> None:
     config, state, action = select_current(config, state)
 
     assert action is None
-    assert config.completion_returns_per_generation == 10
+    assert config.completion_returns_before_adversary == 1
     assert state.editing is True
-    assert state.edit_error == "enter a non-negative integer"
+    assert state.edit_error == "enter 0 or a positive integer, or Unlimited"
 
 
 def test_config_editor_groups_gpt_56_variants_and_filters_older_models() -> None:
-    config = ProjectConfig()
+    config = ProjectConfig(completion_review=True, adversary=True)
     params = parameter_defs(
         config,
         model_choices=(
@@ -483,11 +654,12 @@ def test_config_command_invokes_editor(monkeypatch: pytest.MonkeyPatch, tmp_path
     result = CliRunner().invoke(cli, ["config"])
 
     assert result.exit_code == 0
-    assert "Saved Sentinel config:" in result.output
+    assert "Saved Bello config:" in result.output
     assert "coder-mod: gpt-coder" in result.output
     assert f"runtime-mod: {DEFAULT_MODEL}" in result.output
     assert f"completion-mod: {DEFAULT_MODEL}" in result.output
     assert f"adversary-mod: {DEFAULT_MODEL}" in result.output
+    assert "cheap-runtime: true" in result.output
 
 
 def _write_config_payload(tmp_path: Path, payload: str) -> None:
@@ -503,8 +675,15 @@ def test_max_adversary_runs_parsed_from_payload(tmp_path) -> None:
     assert config.adversary_runs == 3
 
 
-def test_max_adversary_runs_zero_disables_adversary(tmp_path) -> None:
-    _write_config_payload(tmp_path, '{"max_adversary_runs": 0}')
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"max_adversary_runs": 0}',
+        '{"adversary": true, "max_adversary_runs": 0}',
+    ],
+)
+def test_max_adversary_runs_zero_disables_adversary(tmp_path, payload: str) -> None:
+    _write_config_payload(tmp_path, payload)
     config = load_project_config(tmp_path, create=False)
     assert config.adversary is False
     assert config.adversary_runs == 0
@@ -522,34 +701,136 @@ def test_to_json_data_round_trips_adversary_runs(tmp_path) -> None:
     assert data["max_adversary_runs"] == 2
 
 
-def test_max_completion_returns_per_generation_parsed_from_payload(tmp_path) -> None:
+def test_completion_return_budgets_parsed_from_payload(tmp_path) -> None:
+    _write_config_payload(
+        tmp_path,
+        '{"max_completion_returns_before_adversary": 3, "max_completion_returns_after_adversary": 1}',
+    )
+    config = load_project_config(tmp_path, create=False)
+    assert config.completion_returns_before_adversary == 3
+    assert config.completion_returns_after_adversary == 1
+
+
+def test_explicit_zero_completion_return_budgets_mean_none(tmp_path) -> None:
+    _write_config_payload(
+        tmp_path,
+        json.dumps(
+            {
+                REVIEW_LIMIT_FORMAT_FIELD: EXPLICIT_REVIEW_LIMIT_FORMAT,
+                "max_completion_returns_before_adversary": 0,
+                "max_completion_returns_after_adversary": 0,
+            }
+        ),
+    )
+
+    config = load_project_config(tmp_path, create=False)
+
+    assert config.completion_returns_before_adversary == 0
+    assert config.completion_returns_after_adversary == 0
+
+
+def test_legacy_zero_completion_return_budgets_remain_unlimited(tmp_path) -> None:
+    _write_config_payload(
+        tmp_path,
+        '{"max_completion_returns_before_adversary": 0, "max_completion_returns_after_adversary": 0}',
+    )
+
+    config = load_project_config(tmp_path, create=False)
+
+    assert config.completion_returns_before_adversary == UNLIMITED_REVIEW_LIMIT
+    assert config.completion_returns_after_adversary == UNLIMITED_REVIEW_LIMIT
+
+
+def test_completion_return_budgets_accept_unlimited(tmp_path) -> None:
+    _write_config_payload(
+        tmp_path,
+        json.dumps(
+            {
+                REVIEW_LIMIT_FORMAT_FIELD: EXPLICIT_REVIEW_LIMIT_FORMAT,
+                "max_completion_returns_before_adversary": "Unlimited",
+                "max_completion_returns_after_adversary": "unlimited",
+            }
+        ),
+    )
+
+    config = load_project_config(tmp_path, create=False)
+
+    assert config.completion_returns_before_adversary == UNLIMITED_REVIEW_LIMIT
+    assert config.completion_returns_after_adversary == UNLIMITED_REVIEW_LIMIT
+
+
+def test_legacy_completion_return_budget_is_supported(tmp_path) -> None:
     _write_config_payload(tmp_path, '{"max_completion_returns_per_generation": 3}')
     config = load_project_config(tmp_path, create=False)
-    assert config.completion_returns_per_generation == 3
+    assert config.completion_returns_before_adversary == 3
 
 
-def test_max_completion_returns_per_generation_rejects_invalid_values(tmp_path) -> None:
-    _write_config_payload(tmp_path, '{"max_completion_returns_per_generation": -1}')
+def test_legacy_zero_completion_return_budget_remains_unlimited(tmp_path) -> None:
+    _write_config_payload(tmp_path, '{"max_completion_returns_per_generation": 0}')
+
+    config = load_project_config(tmp_path, create=False)
+
+    assert config.completion_returns_before_adversary == UNLIMITED_REVIEW_LIMIT
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"max_completion_returns_before_adversary": -1}',
+        '{"max_completion_returns_after_adversary": -1}',
+        json.dumps(
+            {
+                REVIEW_LIMIT_FORMAT_FIELD: EXPLICIT_REVIEW_LIMIT_FORMAT,
+                "max_completion_returns_before_adversary": "forever",
+            }
+        ),
+        '{"max_completion_returns_before_adversary": false}',
+    ],
+)
+def test_completion_return_budgets_reject_invalid_values(tmp_path, payload: str) -> None:
+    _write_config_payload(tmp_path, payload)
     with pytest.raises(ProjectConfigError):
         load_project_config(tmp_path, create=False)
 
 
 def test_to_json_data_round_trips_completion_return_limit(tmp_path) -> None:
-    config = ProjectConfig(completion_returns_per_generation=4)
+    config = ProjectConfig(
+        completion_returns_before_adversary=UNLIMITED_REVIEW_LIMIT,
+        completion_returns_after_adversary=0,
+    )
     data = config.to_json_data()
-    assert data["max_completion_returns_per_generation"] == 4
+    assert data[REVIEW_LIMIT_FORMAT_FIELD] == EXPLICIT_REVIEW_LIMIT_FORMAT
+    assert data["max_completion_returns_before_adversary"] == UNLIMITED_REVIEW_LIMIT
+    assert data["max_completion_returns_after_adversary"] == 0
+    assert "max_completion_returns_per_generation" not in data
 
 
-def test_completion_review_defaults_to_enabled(tmp_path) -> None:
+def test_invalid_review_limit_format_is_rejected(tmp_path) -> None:
+    _write_config_payload(
+        tmp_path,
+        json.dumps({REVIEW_LIMIT_FORMAT_FIELD: "ambiguous"}),
+    )
+
+    with pytest.raises(ProjectConfigError, match=REVIEW_LIMIT_FORMAT_FIELD):
+        load_project_config(tmp_path, create=False)
+
+
+def test_completion_review_defaults_to_disabled(tmp_path) -> None:
     _write_config_payload(tmp_path, "{}")
     config = load_project_config(tmp_path, create=False)
-    assert config.completion_review is True
+    assert config.completion_review is False
 
 
 def test_completion_review_parsed_from_payload(tmp_path) -> None:
     _write_config_payload(tmp_path, '{"completion_review": false}')
     config = load_project_config(tmp_path, create=False)
     assert config.completion_review is False
+
+
+def test_completion_review_parsed_from_runtime_state_key(tmp_path) -> None:
+    _write_config_payload(tmp_path, '{"completion_review_enabled": true}')
+    config = load_project_config(tmp_path, create=False)
+    assert config.completion_review is True
 
 
 def test_completion_review_rejects_invalid_values(tmp_path) -> None:
@@ -566,17 +847,44 @@ def test_to_json_data_round_trips_completion_review(tmp_path) -> None:
 
 def test_completion_review_syncs_to_runtime_config(tmp_path) -> None:
     from supervisor.state import StateStore
-    from supervisor.schemas import SentinelConfig
+    from supervisor.schemas import BelloConfig
 
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
         overwrite=True,
     )
-    assert store.get_sentinel_config().completion_review_enabled is True
+    assert store.get_bello_config().completion_review_enabled is True
 
     sync_runtime_config_fields(tmp_path, ProjectConfig(completion_review=False), ("completion_review",))
 
-    assert store.get_sentinel_config().completion_review_enabled is False
+    assert store.get_bello_config().completion_review_enabled is False
+
+
+def test_cheap_runtime_parsed_from_payload(tmp_path: Path) -> None:
+    _write_config_payload(tmp_path, '{"cheap_runtime": false}')
+
+    assert load_project_config(tmp_path, create=False).cheap_runtime is False
+
+
+def test_cheap_runtime_rejects_invalid_values(tmp_path: Path) -> None:
+    _write_config_payload(tmp_path, '{"cheap_runtime": "sometimes"}')
+
+    with pytest.raises(ProjectConfigError, match="cheap_runtime"):
+        load_project_config(tmp_path, create=False)
+
+
+def test_cheap_runtime_syncs_to_runtime_config(tmp_path: Path) -> None:
+    store = StateStore(tmp_path)
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path="TASK.md", coder_thread_id="thread"),
+        overwrite=True,
+    )
+
+    sync_runtime_config_fields(tmp_path, ProjectConfig(cheap_runtime=False), ("cheap_runtime",))
+
+    runtime_config = store.get_bello_config()
+    assert runtime_config.cheap_runtime is False
+    assert runtime_config.coder_thread_id == "thread"

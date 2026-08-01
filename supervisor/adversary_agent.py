@@ -18,10 +18,14 @@ from supervisor.prompts import build_adversary_prompt
 from supervisor.schemas import SupervisorWakePacket
 
 
-DEFAULT_ADVERSARY_TIMEOUT_SECONDS = 1800.0
+DEFAULT_ADVERSARY_TIMEOUT_SECONDS = 4000.0
 
 
 class AdversaryAgentError(RuntimeError):
+    pass
+
+
+class AdversaryAttemptError(AdversaryAgentError):
     pass
 
 
@@ -89,9 +93,9 @@ class AdversaryAgent:
                     attempt_prompt = prompt + "\n\n" + _denied_probes_retry_note(denied)
             try:
                 return await self._run_once(attempt_prompt)
-            except AdversaryAgentError as exc:
+            except AdversaryAttemptError as exc:
                 last_error = str(exc)
-                if "did not produce an agent message" not in last_error or attempt == 1:
+                if attempt == 1:
                     raise
         raise AdversaryAgentError(last_error or "adversary run failed")
 
@@ -124,7 +128,10 @@ class AdversaryAgent:
             if not isinstance(turn_id_value, str):
                 raise AdversaryAgentError("adversary turn/start did not return turn id")
             turn_id = turn_id_value
-            if turn.get("status") != "completed":
+            status = turn.get("status")
+            if status in {"failed", "interrupted"}:
+                raise AdversaryAttemptError(_turn_failure_message(turn, thread_id=thread_id, turn_id=turn_id))
+            if status != "completed":
                 try:
                     completed = await self.client.wait_for_notification(
                         lambda message: message.method == "turn/completed"
@@ -139,6 +146,8 @@ class AdversaryAgent:
                         f"thread_id={thread_id} turn_id={turn_id}"
                     ) from exc
                 turn = completed.params.get("turn", {})
+            if turn.get("status") != "completed":
+                raise AdversaryAttemptError(_turn_failure_message(turn, thread_id=thread_id, turn_id=turn_id))
 
             text = last_agent_message_text(turn)
             if text is None:
@@ -154,8 +163,9 @@ class AdversaryAgent:
                 )
                 text = _agent_message_text_from_turns(turns.get("data", []), turn_id=turn_id)
             if text is None or not text.strip():
-                raise AdversaryAgentError("adversary did not produce an agent message")
+                raise AdversaryAttemptError("adversary did not produce an agent message")
             report_text = text.strip()
+            _validate_adversary_report(report_text)
             return AdversaryRunResult(
                 report_text=report_text,
                 thread_id=thread_id,
@@ -237,6 +247,47 @@ def _agent_message_text_from_turns(data: Any, *, turn_id: str | None) -> str | N
         if text:
             return text
     return None
+
+
+def _turn_failure_message(turn: Any, *, thread_id: str, turn_id: str) -> str:
+    status = turn.get("status") if isinstance(turn, dict) else None
+    error = turn.get("error") if isinstance(turn, dict) else None
+    details: list[str] = []
+    if isinstance(error, dict):
+        message = error.get("message")
+        if isinstance(message, str) and message.strip():
+            details.append(message.strip())
+        codex_error_info = error.get("codexErrorInfo")
+        if codex_error_info is not None:
+            details.append(f"codexErrorInfo={codex_error_info!r}")
+        additional = error.get("additionalDetails")
+        if isinstance(additional, str) and additional.strip():
+            details.append(additional.strip())
+    detail_text = f": {'; '.join(details)}" if details else ""
+    return (
+        f"adversary turn ended with status={status!r} "
+        f"thread_id={thread_id} turn_id={turn_id}{detail_text}"
+    )
+
+
+def _validate_adversary_report(report_text: str) -> None:
+    lines = [line.strip() for line in report_text.splitlines() if line.strip()]
+    if not lines or lines[0].lower() not in {"candidate_finding: true", "candidate_finding: false"}:
+        raise AdversaryAttemptError(
+            "adversary did not produce a complete report: missing the initial candidate_finding routing line"
+        )
+
+    sections: set[str] = set()
+    for line in lines[1:]:
+        normalized = line.lower().lstrip("#*- ")
+        for section in ("attacked", "findings", "overall"):
+            if normalized.startswith(f"{section}:"):
+                sections.add(section)
+    missing = sorted({"attacked", "findings", "overall"} - sections)
+    if missing:
+        raise AdversaryAttemptError(
+            "adversary did not produce a complete report: missing sections " + ", ".join(missing)
+        )
 
 
 def _report_has_candidate_finding(report_text: str) -> bool:

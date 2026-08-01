@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
-from supervisor.adversary_agent import AdversaryAgent, _report_has_candidate_finding
+import pytest
+
+from supervisor.adversary_agent import AdversaryAgent, AdversaryAgentError, _report_has_candidate_finding
 from supervisor.schemas import SupervisorWakePacket, ValidationRun
 
 
@@ -54,7 +57,10 @@ async def test_adversary_agent_uses_fresh_workspace_write_threads(tmp_path: Path
                     "items": [
                         {
                             "type": "agentMessage",
-                            "text": f"attacked: stack args\nfindings: none\noverall: held {turn_number}",
+                            "text": (
+                                "candidate_finding: false\n"
+                                f"attacked: stack args\nfindings: none\noverall: held {turn_number}"
+                            ),
                         }
                     ],
                 }
@@ -129,7 +135,10 @@ async def test_adversary_agent_reads_completed_report_from_turns_list(tmp_path: 
                         "items": [
                             {
                                 "type": "agentMessage",
-                                "text": "attacked: ephemeral-regression\nfindings: none\noverall: held",
+                                "text": (
+                                    "candidate_finding: false\n"
+                                    "attacked: ephemeral-regression\nfindings: none\noverall: held"
+                                ),
                             }
                         ],
                     }
@@ -169,7 +178,12 @@ async def test_adversary_agent_retries_once_after_no_message(tmp_path: Path) -> 
                 "turn": {
                     "id": "adv-turn-2",
                     "status": "completed",
-                    "items": [{"type": "agentMessage", "text": "attacked: retry\nfindings: none\noverall: held"}],
+                    "items": [
+                        {
+                            "type": "agentMessage",
+                            "text": "candidate_finding: false\nattacked: retry\nfindings: none\noverall: held",
+                        }
+                    ],
                 }
             }
 
@@ -210,7 +224,12 @@ async def test_adversary_agent_retry_carries_denied_probes_note(tmp_path: Path) 
                 "turn": {
                     "id": "adv-turn-2",
                     "status": "completed",
-                    "items": [{"type": "agentMessage", "text": "attacked: retry\nfindings: none\noverall: held"}],
+                    "items": [
+                        {
+                            "type": "agentMessage",
+                            "text": "candidate_finding: false\nattacked: retry\nfindings: none\noverall: held",
+                        }
+                    ],
                 }
             }
 
@@ -233,6 +252,147 @@ async def test_adversary_agent_retry_carries_denied_probes_note(tmp_path: Path) 
     assert "Retry note" not in client.prompts[0]
     assert "some-host-binary --flag file.html" in client.prompts[1]
     assert "record them under not_reached" in client.prompts[1]
+
+
+async def test_adversary_agent_retries_failed_turn_instead_of_accepting_progress_message(tmp_path: Path) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.thread_ids: list[str] = []
+            self.archived: list[str] = []
+
+        async def thread_start(self, params, *, timeout):
+            thread_id = f"adv-thread-{len(self.thread_ids) + 1}"
+            self.thread_ids.append(thread_id)
+            return {"thread": {"id": thread_id}}
+
+        async def turn_start(self, params, *, timeout):
+            if params["threadId"] == "adv-thread-1":
+                return {"turn": {"id": "adv-turn-1", "status": "inProgress", "items": []}}
+            return {
+                "turn": {
+                    "id": "adv-turn-2",
+                    "status": "completed",
+                    "items": [
+                        {
+                            "type": "agentMessage",
+                            "text": "candidate_finding: false\nattacked: retry\nfindings: none\noverall: held",
+                        }
+                    ],
+                }
+            }
+
+        async def wait_for_notification(self, predicate, *, timeout):
+            notification = SimpleNamespace(
+                method="turn/completed",
+                params={
+                    "threadId": "adv-thread-1",
+                    "turn": {
+                        "id": "adv-turn-1",
+                        "status": "failed",
+                        "error": {
+                            "message": "upstream response failed",
+                            "codexErrorInfo": "internalServerError",
+                        },
+                        "items": [
+                            {
+                                "type": "agentMessage",
+                                "text": "I am replaying the previous findings before probing new behavior.",
+                            }
+                        ],
+                    },
+                },
+            )
+            assert predicate(notification)
+            return notification
+
+        async def thread_archive(self, thread_id, *, timeout):
+            self.archived.append(thread_id)
+            return {}
+
+    client = FakeClient()
+    result = await AdversaryAgent(client, tmp_path, timeout_seconds=1).run(_packet(tmp_path))  # type: ignore[arg-type]
+
+    assert result.thread_id == "adv-thread-2"
+    assert result.candidate_finding is False
+    assert client.thread_ids == ["adv-thread-1", "adv-thread-2"]
+    assert client.archived == ["adv-thread-1", "adv-thread-2"]
+
+
+async def test_adversary_agent_retries_incomplete_completed_report(tmp_path: Path) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.thread_ids: list[str] = []
+
+        async def thread_start(self, params, *, timeout):
+            thread_id = f"adv-thread-{len(self.thread_ids) + 1}"
+            self.thread_ids.append(thread_id)
+            return {"thread": {"id": thread_id}}
+
+        async def turn_start(self, params, *, timeout):
+            if params["threadId"] == "adv-thread-1":
+                return {
+                    "turn": {
+                        "id": "adv-turn-1",
+                        "status": "completed",
+                        "items": [
+                            {
+                                "type": "agentMessage",
+                                "text": "I am replaying the previous findings before probing new behavior.",
+                            }
+                        ],
+                    }
+                }
+            return {
+                "turn": {
+                    "id": "adv-turn-2",
+                    "status": "completed",
+                    "items": [
+                        {
+                            "type": "agentMessage",
+                            "text": "candidate_finding: true\nattacked: parser\nfindings: malformed input accepted\noverall: defects remain",
+                        }
+                    ],
+                }
+            }
+
+        async def thread_archive(self, thread_id, *, timeout):
+            return {}
+
+    result = await AdversaryAgent(FakeClient(), tmp_path, timeout_seconds=1).run(  # type: ignore[arg-type]
+        _packet(tmp_path)
+    )
+
+    assert result.thread_id == "adv-thread-2"
+    assert result.candidate_finding is True
+
+
+async def test_adversary_agent_surfaces_failed_turn_after_bounded_retry(tmp_path: Path) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.thread_count = 0
+
+        async def thread_start(self, params, *, timeout):
+            self.thread_count += 1
+            return {"thread": {"id": f"adv-thread-{self.thread_count}"}}
+
+        async def turn_start(self, params, *, timeout):
+            return {
+                "turn": {
+                    "id": f"adv-turn-{self.thread_count}",
+                    "status": "failed",
+                    "error": {"message": "provider overloaded", "codexErrorInfo": "serverOverloaded"},
+                    "items": [{"type": "agentMessage", "text": "Starting the audit now."}],
+                }
+            }
+
+        async def thread_archive(self, thread_id, *, timeout):
+            return {}
+
+    client = FakeClient()
+    with pytest.raises(AdversaryAgentError, match="status='failed'.*provider overloaded"):
+        await AdversaryAgent(client, tmp_path, timeout_seconds=1).run(_packet(tmp_path))  # type: ignore[arg-type]
+
+    assert client.thread_count == 2
 
 
 def test_adversary_candidate_finding_parser_handles_multiline_findings() -> None:

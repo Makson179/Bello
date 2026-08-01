@@ -41,6 +41,47 @@ def test_clean_workspace_preserves_nested_task_parents(tmp_path: Path) -> None:
     ]
 
 
+def test_clean_workspace_preserves_declared_protected_paths(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    protected_file = tmp_path / "grading" / "golden.json"
+    protected_file.parent.mkdir()
+    protected_file.write_text("{}", encoding="utf-8")
+    protected_dir = tmp_path / "hidden-tests"
+    protected_dir.mkdir()
+    (protected_dir / "test_hidden.py").write_text("def test_hidden(): pass", encoding="utf-8")
+    (tmp_path / "grading" / "remove.txt").write_text("remove", encoding="utf-8")
+    (tmp_path / "src.py").write_text("remove", encoding="utf-8")
+
+    clean_workspace_except_task(
+        tmp_path,
+        task,
+        protected_paths=("grading/golden.json", protected_dir),
+    )
+
+    assert task.exists()
+    assert protected_file.exists()
+    assert (protected_dir / "test_hidden.py").exists()
+    assert not (tmp_path / "grading" / "remove.txt").exists()
+    assert not (tmp_path / "src.py").exists()
+
+
+def test_clean_workspace_ignores_protected_paths_outside_project(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    task = workspace / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    removable = workspace / "remove.txt"
+    removable.write_text("remove", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep", encoding="utf-8")
+
+    clean_workspace_except_task(workspace, task, protected_paths=(outside,))
+
+    assert not removable.exists()
+    assert outside.exists()
+
+
 def test_clean_workspace_rejects_task_outside_root(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     outside = tmp_path / "outside"

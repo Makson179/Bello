@@ -23,6 +23,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           path-to-signatures: '.github/cla-signatures.json'
-          path-to-document: 'https://github.com/Makson179/Sentinel/blob/main/CLA.md'
+          path-to-document: 'https://github.com/Makson179/Bello/blob/main/CLA.md'
           branch: 'main'
           allowlist: 'Makson179,AlexeyKulaev,dependabot[bot]'

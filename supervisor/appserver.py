@@ -81,7 +81,7 @@ APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS = 30.0
 APP_SERVER_PREFLIGHT_RPC_TIMEOUT_SECONDS = 30.0
 APP_SERVER_RESPOND_TIMEOUT_SECONDS = 15.0
 APP_SERVER_CLEANUP_RPC_TIMEOUT_SECONDS = 10.0
-APP_SERVER_CODER_RPC_TIMEOUT_SECONDS = 1800.0
+APP_SERVER_CODER_RPC_TIMEOUT_SECONDS = 3600.0
 
 
 class AppServerClient:
@@ -188,7 +188,7 @@ class AppServerClient:
         result = await self.request(
             "initialize",
             {
-                "clientInfo": {"name": "sentinel", "title": "Sentinel", "version": "0.2.0"},
+                "clientInfo": {"name": "bello", "title": "Bello", "version": "0.3.0"},
                 "capabilities": {"experimentalApi": True, "requestAttestation": False},
             },
             timeout=timeout,
@@ -486,7 +486,7 @@ def _codex_home_from_environment(environ: Mapping[str, str]) -> Path:
 
 def _create_isolated_codex_home(source: Path) -> Path:
     source = source.resolve(strict=True)
-    isolated = Path(tempfile.mkdtemp(prefix="sentinel-codex-home-")).resolve()
+    isolated = Path(tempfile.mkdtemp(prefix="bello-codex-home-")).resolve()
     try:
         for child in source.iterdir():
             if child.name == "rules":

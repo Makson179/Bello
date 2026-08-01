@@ -16,7 +16,7 @@ from supervisor.prompts import build_coder_prompt, build_restart_prompt
 from supervisor.state import StateStore
 
 
-CODER_SANDBOX_ENV = "SENTINEL_CODER_SANDBOX"
+CODER_SANDBOX_ENV = "BELLO_CODER_SANDBOX"
 CODER_SANDBOX_READ_ONLY = "read-only"
 CODER_SANDBOX_WORKSPACE_WRITE = "workspace-write"
 CODER_SANDBOX_DANGER_FULL_ACCESS = "danger-full-access"
@@ -133,7 +133,7 @@ class CoderSession:
         if not isinstance(thread_id, str):
             raise RuntimeError("app-server thread/start did not return a thread id")
         self.thread_id = thread_id
-        self.store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"coder_thread_id": thread_id}))
+        self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"coder_thread_id": thread_id}))
         return thread_id
 
     async def start_initial_turn(self) -> str:
@@ -160,7 +160,7 @@ class CoderSession:
         if not isinstance(turn_id, str):
             raise RuntimeError("app-server turn/start did not return a turn id")
         self.active_turn_id = turn_id
-        self.store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"active_coder_turn_id": turn_id}))
+        self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"active_coder_turn_id": turn_id}))
         return turn_id
 
     async def steer_or_start(self, message: str) -> str | None:
@@ -177,7 +177,7 @@ class CoderSession:
                 raise
             except Exception:
                 self.active_turn_id = None
-                self.store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"active_coder_turn_id": None}))
+                self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"active_coder_turn_id": None}))
         if self.thread_id:
             return await self.start_turn(message)
         return None
@@ -194,4 +194,4 @@ class CoderSession:
     def mark_turn_completed(self, turn_id: str) -> None:
         if self.active_turn_id == turn_id:
             self.active_turn_id = None
-            self.store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"active_coder_turn_id": None}))
+            self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"active_coder_turn_id": None}))

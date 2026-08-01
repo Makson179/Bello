@@ -12,7 +12,7 @@ import click
 
 from supervisor.config_editor import run_config_editor
 from supervisor import doctor, update_check
-from supervisor.controller import SentinelController
+from supervisor.controller import BelloController
 from supervisor.project_config import (
     INTELLIGENCE_CHOICES,
     ProjectConfig,
@@ -21,22 +21,22 @@ from supervisor.project_config import (
     load_project_config,
     project_config_path,
 )
-from supervisor.schemas import SentinelStatus
+from supervisor.schemas import BelloStatus
 from supervisor.task_select import TaskSelectionError
 
 
 OPTIONAL_BOOL_FLAGS = {"--fast", "--start-over", "--clean", "--adversary", "--completion-review"}
 
 
-class SentinelClickGroup(click.Group):
+class BelloClickGroup(click.Group):
     def main(self, args: list[str] | tuple[str, ...] | None = None, **extra: Any) -> Any:
         normalized_args = _normalize_optional_bool_args(list(args) if args is not None else sys.argv[1:])
         return super().main(args=normalized_args, **extra)
 
 
 @click.group(
-    name="sentinel",
-    cls=SentinelClickGroup,
+    name="bello",
+    cls=BelloClickGroup,
     invoke_without_command=True,
     no_args_is_help=False,
     subcommand_metavar="[COMMAND] [ARGS]...",
@@ -113,7 +113,7 @@ class SentinelClickGroup(click.Group):
     default=None,
     type=click.BOOL,
     metavar="[true|false]",
-    help="Delete everything in the current folder except the selected task file before starting.",
+    help="Delete everything except the selected task file and protected paths before starting.",
 )
 @click.option(
     "--completion-review",
@@ -196,7 +196,7 @@ def cli(
             adversary=adversary,
             adversary_runs=adversary_runs,
         )
-        _run_async_cleanly(_run_sentinel(run_settings))
+        _run_async_cleanly(_run_bello(run_settings))
     except ProjectConfigError as exc:
         raise click.ClickException(str(exc)) from exc
     except TaskSelectionError as exc:
@@ -219,9 +219,9 @@ def update_command(check_only: bool, json_output: bool) -> None:
         return
 
     if status.state == update_check.UpdateState.UNKNOWN:
-        raise click.ClickException(status.warning or "Could not check for Sentinel updates")
+        raise click.ClickException(status.warning or "Could not check for Bello updates")
     if status.state == update_check.UpdateState.CURRENT:
-        click.echo("Sentinel is up to date.")
+        click.echo("Bello is up to date.")
         click.echo(f"Installed: {info.version}")
         return
 
@@ -231,7 +231,7 @@ def update_command(check_only: bool, json_output: bool) -> None:
         update_check.run_update(info)
     except update_check.UpdateCheckError as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo("Sentinel updated.")
+    click.echo("Bello updated.")
     click.echo(f"Previous: {old_version}")
     click.echo(f"Current:  {status.latest_version}")
 
@@ -251,7 +251,7 @@ def _update_status_payload(status: update_check.UpdateStatus) -> dict[str, Any]:
 
 def _format_update_check_report(status: update_check.UpdateStatus) -> str:
     info = status.install_info
-    lines = [f"Sentinel {info.version}"]
+    lines = [f"Bello {info.version}"]
     if status.state == update_check.UpdateState.CURRENT:
         lines.append("status: up to date")
         lines.append(f"latest: {status.latest_version or info.version}")
@@ -261,7 +261,7 @@ def _format_update_check_report(status: update_check.UpdateStatus) -> str:
         lines.append(f"latest:    {status.latest_version}")
     else:
         lines.append("status: unknown")
-        lines.append(f"warning: Could not check for Sentinel updates: {status.warning or 'unknown error'}")
+        lines.append(f"warning: Could not check for Bello updates: {status.warning or 'unknown error'}")
     return "\n".join(lines)
 
 
@@ -276,11 +276,12 @@ def config_command() -> None:
         config = run_config_editor(Path.cwd())
     except (ProjectConfigError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"Saved Sentinel config: {project_config_path(Path.cwd())}")
+    click.echo(f"Saved Bello config: {project_config_path(Path.cwd())}")
     click.echo(f"coder-mod: {config.coder_mod}")
     click.echo(f"runtime-mod: {config.runtime_mod}")
     click.echo(f"completion-mod: {config.completion_mod}")
     click.echo(f"adversary-mod: {config.adversary_mod}")
+    click.echo(f"cheap-runtime: {str(config.cheap_runtime).lower()}")
 
 
 def _version_callback(ctx: click.Context, value: bool) -> None:
@@ -293,7 +294,7 @@ def _version_callback(ctx: click.Context, value: bool) -> None:
 def _format_version_report() -> str:
     status = update_check.check_for_update()
     info = status.install_info
-    lines = [f"Sentinel {info.version}"]
+    lines = [f"Bello {info.version}"]
     if status.state == update_check.UpdateState.CURRENT:
         lines.append(f"latest: {status.latest_version or info.version}")
         lines.append("status: up to date")
@@ -301,10 +302,10 @@ def _format_version_report() -> str:
         lines.append(f"installed: {info.version}")
         lines.append(f"latest:    {status.latest_version}")
         lines.append("status: update available")
-        lines.extend(["", "Run:", "  sentinel update"])
+        lines.extend(["", "Run:", "  bello update"])
     else:
         lines.append("status: unknown")
-        lines.append(f"warning: Could not check for Sentinel updates: {status.warning or 'unknown error'}")
+        lines.append(f"warning: Could not check for Bello updates: {status.warning or 'unknown error'}")
     return "\n".join(lines)
 
 
@@ -314,7 +315,7 @@ def _startup_update_gate() -> None:
     status = update_check.check_for_update()
     if status.state == update_check.UpdateState.UNKNOWN:
         click.echo(
-            f"Warning: Could not check for Sentinel updates: {status.warning or 'unknown error'}",
+            f"Warning: Could not check for Bello updates: {status.warning or 'unknown error'}",
             err=True,
         )
         return
@@ -324,7 +325,7 @@ def _startup_update_gate() -> None:
     if not sys.stdin.isatty():
         click.echo(_format_update_available_message(status), err=True)
         click.echo(
-            f"Sentinel is not running from a TTY; continuing without prompting. "
+            f"Bello is not running from a TTY; continuing without prompting. "
             f"Set {update_check.SKIP_UPDATE_CHECK_ENV}=1 to bypass this check.",
             err=True,
         )
@@ -347,7 +348,7 @@ def _format_update_available_message(status: update_check.UpdateStatus) -> str:
     info = status.install_info
     return "\n".join(
         [
-            "A newer Sentinel version is available.",
+            "A newer Bello version is available.",
             "",
             f"Installed: {info.version}",
             f"Latest:    {status.latest_version}",
@@ -390,8 +391,8 @@ def _run_async_cleanly(coro: Coroutine[Any, Any, Any]) -> None:
     sys.exit(exit_code)
 
 
-async def _run_sentinel(settings: RunSettings) -> int:
-    controller = SentinelController(
+async def _run_bello(settings: RunSettings) -> int:
+    controller = BelloController(
         Path.cwd(),
         task_path=settings.task_path,
         coder_model=settings.coder_model,
@@ -412,8 +413,8 @@ async def _run_sentinel(settings: RunSettings) -> int:
         project_config=load_project_config(Path.cwd(), create=False),
     )
     await controller.run()
-    status = controller.store.get_sentinel_config().status
-    if status == SentinelStatus.PROVIDER_FAILURE:
+    status = controller.store.get_bello_config().status
+    if status == BelloStatus.PROVIDER_FAILURE:
         return 2
     return 0
 

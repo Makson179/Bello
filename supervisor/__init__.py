@@ -9,7 +9,7 @@ from pathlib import Path as _Path
 
 def _read_version() -> str:
     try:
-        return _metadata.version("sentinel-supervisor")
+        return _metadata.version("bello")
     except _metadata.PackageNotFoundError:
         pyproject = _Path(__file__).resolve().parents[1] / "pyproject.toml"
         try:

@@ -19,8 +19,8 @@ from packaging.version import InvalidVersion, Version
 from supervisor import __version__
 
 
-DISTRIBUTION_NAME = "sentinel-supervisor"
-SKIP_UPDATE_CHECK_ENV = "SENTINEL_SKIP_UPDATE_CHECK"
+DISTRIBUTION_NAME = "bello"
+SKIP_UPDATE_CHECK_ENV = "BELLO_SKIP_UPDATE_CHECK"
 REMOTE_CHECK_TIMEOUT_SECONDS = 8.0
 UPDATE_COMMAND_TIMEOUT_SECONDS = 300.0
 NONINTERACTIVE_UPDATE_EXIT_CODE = 17
@@ -158,12 +158,12 @@ def run_update(info: InstallInfo) -> subprocess.CompletedProcess[str]:
     except FileNotFoundError as exc:
         raise UpdateCheckError(str(exc)) from exc
     except subprocess.TimeoutExpired as exc:
-        raise UpdateCheckError("Sentinel update command timed out") from exc
+        raise UpdateCheckError("Bello update command timed out") from exc
 
     if completed.returncode != 0:
         output = (completed.stdout + completed.stderr).strip()
         detail = f"\n\n{output}" if output else ""
-        raise UpdateCheckError(f"Sentinel update command failed.{detail}")
+        raise UpdateCheckError(f"Bello update command failed.{detail}")
     return completed
 
 
@@ -178,7 +178,7 @@ def update_command(info: InstallInfo) -> list[str]:
 def manual_update_message(info: InstallInfo) -> str:
     return "\n".join(
         [
-            "Could not update Sentinel automatically.",
+            "Could not update Bello automatically.",
             "",
             "Try:",
             f"  pipx upgrade {info.package_name}",

@@ -11,7 +11,8 @@ from typing import Any, Callable, Iterator, Literal, TypeVar
 import fcntl
 from pydantic import BaseModel
 
-from supervisor.schemas import AppEvent, FinalReport, HealthState, SentinelConfig
+from supervisor.schemas import AppEvent, FinalReport, HealthState, BelloConfig
+from supervisor.review_limits import normalize_review_limit_payload
 
 T = TypeVar("T")
 
@@ -154,9 +155,9 @@ class StateStore:
     def write_handoff(self, content: str) -> None:
         self.write_text_locked(HANDOFF, content)
 
-    def initialize_sentinel(
+    def initialize_bello(
         self,
-        config: SentinelConfig,
+        config: BelloConfig,
         overwrite: bool = False,
         *,
         mode: INITIALIZATION_MODES | None = None,
@@ -167,7 +168,7 @@ class StateStore:
         elif mode == "resume":
             self._clear_state_dir(preserve={EVENTS, LOG, PREVIOUS_RUNS, RECOVERY})
         else:
-            raise ValueError(f"unknown sentinel initialization mode: {mode}")
+            raise ValueError(f"unknown bello initialization mode: {mode}")
 
         files = self._initial_state_files(config)
         for name, value in files.items():
@@ -180,7 +181,7 @@ class StateStore:
                 self.atomic_write_text(path, value)
         self.ensure_previous_runs_dir()
 
-    def _initial_state_files(self, config: SentinelConfig) -> dict[str, Any]:
+    def _initial_state_files(self, config: BelloConfig) -> dict[str, Any]:
         return {
             CONFIG: config,
             HEALTH: HealthState(generation=config.generation, restart_count=config.restart_count),
@@ -247,12 +248,12 @@ class StateStore:
                 max_run = max(max_run, int(suffix))
         return previous_runs / f"run{max_run + 1}"
 
-    def get_sentinel_config(self) -> SentinelConfig:
-        return SentinelConfig.model_validate(self.read_json(CONFIG, {}))
+    def get_bello_config(self) -> BelloConfig:
+        return BelloConfig.model_validate(normalize_review_limit_payload(self.read_json(CONFIG, {})))
 
-    def update_sentinel_config(self, patcher: Callable[[SentinelConfig], SentinelConfig]) -> SentinelConfig:
+    def update_bello_config(self, patcher: Callable[[BelloConfig], BelloConfig]) -> BelloConfig:
         with self.locked(CONFIG):
-            config = self.get_sentinel_config()
+            config = self.get_bello_config()
             updated = patcher(config)
             self.atomic_write_json(self.path(CONFIG), updated)
             return updated

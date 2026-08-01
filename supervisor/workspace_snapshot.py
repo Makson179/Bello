@@ -165,7 +165,7 @@ def create_workspace_snapshot(
     task_path: Path,
     *,
     declared_grading_roots: Iterable[str | Path] = (),
-    prefix: str = "sentinel-coder-",
+    prefix: str = "bello-coder-",
 ) -> WorkspaceSnapshot:
     if shutil.which("git") is None:
         raise WorkspaceSnapshotError("git executable is required for workspace snapshots")
@@ -185,7 +185,7 @@ def create_workspace_snapshot(
     )
     if reserved_task_part is not None:
         raise WorkspaceSnapshotError(
-            f"task path cannot be inside Sentinel runtime, cache, or dependency directory: {reserved_task_part}"
+            f"task path cannot be inside Bello runtime, cache, or dependency directory: {reserved_task_part}"
         )
 
     try:
@@ -421,7 +421,7 @@ def _apply_patch_to_original(
     patch: bytes,
 ) -> None:
     original_root = snapshot.original_root
-    with tempfile.TemporaryDirectory(prefix="sentinel-patch-backup-") as raw_backup:
+    with tempfile.TemporaryDirectory(prefix="bello-patch-backup-") as raw_backup:
         backup_root = Path(raw_backup)
         normalized_symlink_paths = _rewritten_symlink_paths_for_changes(snapshot, changed_paths)
         backup_paths = tuple(dict.fromkeys((*changed_paths, *normalized_symlink_paths)))
@@ -475,9 +475,9 @@ def _rewritten_symlink_paths_for_changes(
 def _init_snapshot_git(snapshot_root: Path) -> str:
     identity = [
         "-c",
-        "user.email=sentinel@localhost",
+        "user.email=bello@localhost",
         "-c",
-        "user.name=Sentinel Snapshot",
+        "user.name=Bello Snapshot",
         "-c",
         "commit.gpgsign=false",
     ]
@@ -486,15 +486,15 @@ def _init_snapshot_git(snapshot_root: Path) -> str:
     _run_git(snapshot_root, ["config", "--local", "core.hooksPath", os.devnull])
     _run_git(snapshot_root, ["config", "--local", "commit.gpgsign", "false"])
     _run_git(snapshot_root, ["config", "--local", "tag.gpgsign", "false"])
-    _run_git(snapshot_root, ["config", "--local", "user.email", "sentinel@localhost"])
-    _run_git(snapshot_root, ["config", "--local", "user.name", "Sentinel Snapshot"])
+    _run_git(snapshot_root, ["config", "--local", "user.email", "bello@localhost"])
+    _run_git(snapshot_root, ["config", "--local", "user.name", "Bello Snapshot"])
     _run_git(snapshot_root, ["add", "-f", "-A", "--"])
     _run_git(
         snapshot_root,
-        [*identity, "commit", "-q", "--no-verify", "--allow-empty", "-m", "sentinel coder snapshot baseline"],
+        [*identity, "commit", "-q", "--no-verify", "--allow-empty", "-m", "bello coder snapshot baseline"],
     )
     baseline_commit = str(_run_git(snapshot_root, ["rev-parse", "HEAD"])).strip()
-    _run_git(snapshot_root, ["update-ref", "refs/sentinel/baseline", baseline_commit])
+    _run_git(snapshot_root, ["update-ref", "refs/bello/baseline", baseline_commit])
     return baseline_commit
 
 

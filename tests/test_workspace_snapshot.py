@@ -554,7 +554,7 @@ def test_snapshot_git_plumbing_ignores_user_filters(tmp_path: Path, monkeypatch:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
     attributes = tmp_path / ".gitattributes"
-    attributes.write_text("*.dat filter=sentinel-test-filter\n", encoding="utf-8")
+    attributes.write_text("*.dat filter=bello-test-filter\n", encoding="utf-8")
     data = tmp_path / "value.dat"
     data.write_text("baseline\n", encoding="utf-8")
     _init_repo(tmp_path)
@@ -562,7 +562,7 @@ def test_snapshot_git_plumbing_ignores_user_filters(tmp_path: Path, monkeypatch:
     marker = tmp_path / "filter-ran"
     global_config = tmp_path / "malicious-git-config"
     global_config.write_text(
-        "[filter \"sentinel-test-filter\"]\n"
+        "[filter \"bello-test-filter\"]\n"
         f"\tclean = sh -c 'touch {marker}; cat'\n"
         "\trequired = true\n",
         encoding="utf-8",

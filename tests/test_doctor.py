@@ -17,7 +17,7 @@ def test_doctor_result_format_is_readable() -> None:
 
 def test_doctor_collects_required_checks_with_update_warning(monkeypatch: pytest.MonkeyPatch) -> None:
     info = update_check.InstallInfo(
-        package_name="sentinel-supervisor",
+        package_name="bello",
         version="0.1.0",
         install_mode="pipx",
     )
@@ -49,9 +49,9 @@ def test_doctor_collects_required_checks_with_update_warning(monkeypatch: pytest
     assert "Codex app-server supported" in messages
     assert "app-server schema generation OK" in messages
     assert "Codex auth OK" in messages
-    assert "Sentinel package: sentinel-supervisor 0.1.0" in messages
-    assert "Sentinel executable: /usr/bin/sentinel" in messages
-    assert "Sentinel install mode: pipx" in messages
+    assert "Bello package: bello 0.1.0" in messages
+    assert "Bello executable: /usr/bin/bello" in messages
+    assert "Bello install mode: pipx" in messages
     assert "Update available: 0.1.1" in messages
 
 
@@ -71,7 +71,7 @@ def test_probe_result_fails_on_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_doctor_reports_dependent_codex_checks_when_codex_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     info = update_check.InstallInfo(
-        package_name="sentinel-supervisor",
+        package_name="bello",
         version="0.1.0",
         install_mode="system",
         metadata_available=False,
@@ -85,7 +85,7 @@ def test_doctor_reports_dependent_codex_checks_when_codex_missing(monkeypatch: p
         lambda install_info: update_check.UpdateStatus(
             update_check.UpdateState.UNKNOWN,
             install_info,
-            warning="package 'sentinel-supervisor' was not found on PyPI",
+            warning="package 'bello' was not found on PyPI",
         ),
     )
 
@@ -97,7 +97,7 @@ def test_doctor_reports_dependent_codex_checks_when_codex_missing(monkeypatch: p
     assert by_message["Codex app-server support not checked"].level == "fail"
     assert by_message["app-server schema generation not checked"].level == "fail"
     assert by_message["Codex auth check failed"].level == "fail"
-    assert by_message["Sentinel package metadata could not be read"].level == "fail"
+    assert by_message["Bello package metadata could not be read"].level == "fail"
 
 
 def test_doctor_returns_zero_when_update_check_is_unavailable(
@@ -105,7 +105,7 @@ def test_doctor_returns_zero_when_update_check_is_unavailable(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     info = update_check.InstallInfo(
-        package_name="sentinel-supervisor",
+        package_name="bello",
         version="0.1.0",
         install_mode="pipx",
     )
@@ -130,5 +130,5 @@ def test_doctor_returns_zero_when_update_check_is_unavailable(
 
     assert doctor.run_doctor() == 0
     output = capsys.readouterr().out
-    assert "[WARN] Could not check for Sentinel updates" in output
+    assert "[WARN] Could not check for Bello updates" in output
     assert "could not reach PyPI" in output

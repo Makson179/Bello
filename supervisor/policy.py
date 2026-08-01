@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Iterable
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from supervisor.schemas import PolicyDecision
 
@@ -81,29 +81,11 @@ READ_ONLY_COMMANDS = {
 }
 READ_FILE_COMMANDS = {"cat", "head", "sed", "tail", "wc"}
 VERSION_FLAGS = {"--version", "-V", "version"}
-CHEAP_REVIEW_READ_ONLY_COMMANDS = {
-    "cat",
-    "find",
-    "git",
-    "grep",
-    "head",
-    "ls",
-    "pwd",
-    "rg",
-    "sed",
-    "sort",
-    "tail",
-    "uniq",
-    "wc",
-}
 VERSION_REPORT_COMMANDS = {"node", "npm", "pytest", "python", "python3"}
-# Bounded filesystem-write commands recognized for cheap review. Their path args are
-# resolved, so writing/reading outside the workspace still raises workspace_escape and
-# touching a grading root still raises GRADING_PATH_RISK_TAG (both hard-blocked). They
-# only tag filesystem_write, which cheap review allows (see CHEAP_REVIEW_BLOCK_TAGS).
-CHEAP_REVIEW_WRITE_COMMANDS = {"mkdir", "touch", "cp", "mv", "ln"}
-SUPPORTED_CHEAP_COMPOSITION_OPERATORS = {"|", "&&"}
-FORBIDDEN_CHEAP_RISK_TAGS = {
+# Bounded filesystem-write commands whose path arguments can be resolved reliably.
+BOUNDED_FILESYSTEM_WRITE_COMMANDS = {"mkdir", "touch", "cp", "mv", "ln"}
+SUPPORTED_COMPOSITION_OPERATORS = {"|", "&&"}
+READ_ONLY_BLOCK_RISK_TAGS = {
     "network",
     "shell_redirection",
     "command_substitution",
@@ -125,14 +107,7 @@ FORBIDDEN_CHEAP_RISK_TAGS = {
     "ambiguous_parse",
     GRADING_PATH_RISK_TAG,
 }
-# Tags that block a command from cheap (spark) approval review entirely.
-# Relaxes FORBIDDEN_CHEAP_RISK_TAGS by allowing in-workspace filesystem writes
-# (cp/mv/mkdir/touch/sed -i): writing outside the workspace still raises workspace_escape
-# and reading a grading path still raises GRADING_PATH_RISK_TAG, so both stay blocked.
-# interpreter_execution stays blocked on purpose: running an arbitrary script/binary could
-# read hidden grading material at runtime, bypassing static path analysis (integrity hole).
-CHEAP_REVIEW_BLOCK_TAGS = FORBIDDEN_CHEAP_RISK_TAGS - {"filesystem_write"}
-AUTO_ALLOW_BLOCK_RISK_TAGS = FORBIDDEN_CHEAP_RISK_TAGS - {"interpreter_execution"}
+AUTO_ALLOW_BLOCK_RISK_TAGS = READ_ONLY_BLOCK_RISK_TAGS - {"interpreter_execution"}
 SHELL_PUNCTUATION = "|&;()<>"
 SHELL_OPERATORS = {"|", "&&", "||", ";", "&"}
 SHELL_REDIRECT_OPERATORS = {">", ">>", "<", "<<", "<<<", "<>", ">|", "&>", "2>", "2>>"}
@@ -167,12 +142,23 @@ class CommandAnalysis(BaseModel):
     resolved_paths: list[str] = Field(default_factory=list)
     risk_tags: set[str] = Field(default_factory=set)
     parse_error: str | None = None
-    cheap_review_candidate: bool = False
 
     def policy_payload(self) -> dict[str, Any]:
         data = self.model_dump(mode="json")
         data["risk_tags"] = sorted(self.risk_tags)
         return data
+
+
+def command_analysis_from_policy_decision(evaluation: PolicyDecision) -> CommandAnalysis | None:
+    raw = evaluation.payload.get("command_analysis")
+    if isinstance(raw, CommandAnalysis):
+        return raw
+    if isinstance(raw, dict):
+        try:
+            return CommandAnalysis.model_validate(raw)
+        except ValidationError:
+            return None
+    return None
 
 
 def _parts_lower(path: Path) -> list[str]:
@@ -246,7 +232,7 @@ def _declared_grading_path_hit(raw: str | os.PathLike[str], *, cwd: Path, roots:
 
 
 def _declared_roots_from_env() -> tuple[Path, ...]:
-    raw = os.environ.get("SENTINEL_DECLARED_GRADING_PATHS", "")
+    raw = os.environ.get("BELLO_DECLARED_GRADING_PATHS", "")
     if not raw:
         return ()
     roots: list[Path] = []
@@ -358,7 +344,7 @@ def _split_command_segments(tokens: list[str]) -> tuple[list[list[str]], list[st
             if token == "&":
                 tags.add("background_execution")
                 parse_error = parse_error or "background execution requires supervisor judgment"
-            elif token not in SUPPORTED_CHEAP_COMPOSITION_OPERATORS:
+            elif token not in SUPPORTED_COMPOSITION_OPERATORS:
                 tags.add("ambiguous_parse")
                 parse_error = parse_error or "unsupported shell composition requires supervisor judgment"
             if current:
@@ -562,10 +548,9 @@ def _classify_segment(
             read_only = True
         else:
             tags.add("ambiguous_parse")
-    elif executable in CHEAP_REVIEW_WRITE_COMMANDS:
-        # Bounded in-workspace write (mkdir/touch/cp/mv/ln). Resolve all path args so
-        # workspace_escape / GRADING_PATH_RISK_TAG are raised for any path that leaves the
-        # workspace or touches grading material; those tags hard-block cheap review.
+    elif executable in BOUNDED_FILESYSTEM_WRITE_COMMANDS:
+        # Resolve all path args so workspace_escape / GRADING_PATH_RISK_TAG are raised
+        # for any path that leaves the workspace or touches grading material.
         raw_paths = _plain_path_args(args)
         tags.add("filesystem_write")
         if not raw_paths:
@@ -590,7 +575,7 @@ def _classify_segment(
             tokens=list(segment_tokens),
             raw_paths=list(raw_paths),
             resolved_paths=resolved_paths,
-            read_only=read_only and not (tags & FORBIDDEN_CHEAP_RISK_TAGS),
+            read_only=read_only and not (tags & READ_ONLY_BLOCK_RISK_TAGS),
         ),
         tags,
     )
@@ -616,7 +601,6 @@ def analyze_command(workspace: Path, command: str, cwd: str | None = None) -> Co
             resolved_paths=[],
             risk_tags=risk_tags,
             parse_error=parse_error,
-            cheap_review_candidate=False,
         )
 
     raw_segments, operators, split_tags, split_problem = _split_command_segments(tokens)
@@ -635,14 +619,6 @@ def analyze_command(workspace: Path, command: str, cwd: str | None = None) -> Co
     resolved_paths: list[str] = []
     for segment in segments:
         resolved_paths.extend(segment.resolved_paths)
-    cheap_review_candidate = (
-        parse_error is None
-        and bool(segments)
-        and all(segment.read_only for segment in segments)
-        and all(segment.executable in CHEAP_REVIEW_READ_ONLY_COMMANDS or segment.executable in VERSION_REPORT_COMMANDS for segment in segments)
-        and all(operator in SUPPORTED_CHEAP_COMPOSITION_OPERATORS for operator in operators)
-        and not (risk_tags & FORBIDDEN_CHEAP_RISK_TAGS)
-    )
     return CommandAnalysis(
         command=command,
         cwd=cwd,
@@ -652,7 +628,6 @@ def analyze_command(workspace: Path, command: str, cwd: str | None = None) -> Co
         resolved_paths=resolved_paths,
         risk_tags=risk_tags,
         parse_error=parse_error,
-        cheap_review_candidate=cheap_review_candidate,
     )
 
 
@@ -981,7 +956,7 @@ def _isolated_git_query_environment() -> dict[str, str]:
     return env
 
 
-SENTINEL_CLI_NAMES = {"sentinel", "supervisor"}
+BELLO_CLI_NAMES = {"bello", "supervisor"}
 
 
 def _executable_basename(executable: str) -> str:
@@ -996,28 +971,28 @@ def _is_env_assignment_token(token: str) -> bool:
     return bool(sep and name and (name[0].isalpha() or name[0] == "_") and all(ch.isalnum() or ch == "_" for ch in name))
 
 
-def _tokens_invoke_sentinel_cli(tokens: list[str]) -> bool:
+def _tokens_invoke_bello_cli(tokens: list[str]) -> bool:
     index = 0
     if tokens and _executable_basename(tokens[0]) == "env":
         index = 1
     while index < len(tokens) and _is_env_assignment_token(tokens[index]):
         index += 1
-    return index < len(tokens) and _executable_basename(tokens[index]) in SENTINEL_CLI_NAMES
+    return index < len(tokens) and _executable_basename(tokens[index]) in BELLO_CLI_NAMES
 
 
-def _token_segments_invoke_sentinel_cli(tokens: list[str]) -> bool:
+def _token_segments_invoke_bello_cli(tokens: list[str]) -> bool:
     raw_segments, _operators, _tags, _problem = _split_command_segments(tokens)
-    return any(_tokens_invoke_sentinel_cli(segment) for segment in raw_segments)
+    return any(_tokens_invoke_bello_cli(segment) for segment in raw_segments)
 
 
-def command_invokes_sentinel_cli(analysis: CommandAnalysis) -> bool:
-    if any(_tokens_invoke_sentinel_cli(segment.tokens) for segment in analysis.segments):
+def command_invokes_bello_cli(analysis: CommandAnalysis) -> bool:
+    if any(_tokens_invoke_bello_cli(segment.tokens) for segment in analysis.segments):
         return True
     shell_payload = _shell_payload_from_tokens(analysis.tokens)
     if shell_payload is None:
         return False
     tokens, _problem = parse_command(shell_payload)
-    return bool(tokens and _token_segments_invoke_sentinel_cli(tokens))
+    return bool(tokens and _token_segments_invoke_bello_cli(tokens))
 
 
 def command_mentions_supervisor(command: str) -> bool:
@@ -1207,7 +1182,6 @@ class PolicyEngine:
             "risk_tags": analysis_payload["risk_tags"],
             "parsed_commands": analysis_payload["segments"],
             "resolved_paths": analysis_payload["resolved_paths"],
-            "cheap_review_candidate": analysis.cheap_review_candidate,
         }
         grading_hit = self._command_declared_grading_hit(command, analysis, cwd=cwd)
         if grading_hit is not None:
@@ -1217,8 +1191,8 @@ class PolicyEngine:
         immutable_hit = self._command_immutable_hit(analysis, cwd=cwd)
         if immutable_hit is not None:
             return PolicyDecision.deny(f"immutable path access escalation denied: {immutable_hit}", **payload)
-        if command_invokes_sentinel_cli(analysis):
-            return PolicyDecision.deny("commands invoking Sentinel are denied", **payload)
+        if command_invokes_bello_cli(analysis):
+            return PolicyDecision.deny("commands invoking Bello are denied", **payload)
         if command_mentions_supervisor(command):
             return PolicyDecision.deny("commands containing supervisor are denied", **payload)
         if self._command_targets_supervisor_runtime(analysis, cwd=cwd):

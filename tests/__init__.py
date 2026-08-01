@@ -1,1 +1,1 @@
-"""Test package for Sentinel."""
+"""Test package for Bello."""

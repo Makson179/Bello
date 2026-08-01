@@ -34,7 +34,7 @@ class DoctorResult:
 
 def run_doctor() -> int:
     results = collect_doctor_results()
-    print("Sentinel doctor")
+    print("Bello doctor")
     print()
     for result in results:
         print(format_result(result))
@@ -73,30 +73,30 @@ def collect_doctor_results() -> list[DoctorResult]:
 
     info = update_check.read_install_info()
     if not info.metadata_available:
-        results.append(DoctorResult("fail", "Sentinel package metadata could not be read", info.warning))
+        results.append(DoctorResult("fail", "Bello package metadata could not be read", info.warning))
     else:
-        results.append(DoctorResult("ok", f"Sentinel package: {info.package_name} {info.version}"))
+        results.append(DoctorResult("ok", f"Bello package: {info.package_name} {info.version}"))
 
-    executable = shutil.which("sentinel")
+    executable = shutil.which("bello")
     if executable:
-        results.append(DoctorResult("ok", f"Sentinel executable: {executable}"))
+        results.append(DoctorResult("ok", f"Bello executable: {executable}"))
     else:
-        results.append(DoctorResult("warn", "sentinel command not found on PATH"))
-    results.append(DoctorResult("ok", f"Sentinel install mode: {info.install_mode}"))
+        results.append(DoctorResult("warn", "bello command not found on PATH"))
+    results.append(DoctorResult("ok", f"Bello install mode: {info.install_mode}"))
 
     status = update_check.check_for_update(info)
     if status.state == update_check.UpdateState.CURRENT:
-        results.append(DoctorResult("ok", "Sentinel is up to date"))
+        results.append(DoctorResult("ok", "Bello is up to date"))
     elif status.state == update_check.UpdateState.OUTDATED:
         results.append(
             DoctorResult(
                 "warn",
                 f"Update available: {status.latest_version}",
-                "Run: sentinel update",
+                "Run: bello update",
             )
         )
     else:
-        results.append(DoctorResult("warn", "Could not check for Sentinel updates", status.warning))
+        results.append(DoctorResult("warn", "Could not check for Bello updates", status.warning))
 
     return results
 
@@ -128,7 +128,7 @@ def _probe_result(args: list[str], ok_message: str, fail_message: str, *, timeou
 
 
 def _schema_generation_result() -> DoctorResult:
-    with tempfile.TemporaryDirectory(prefix="sentinel-doctor-schema-") as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix="bello-doctor-schema-") as tmp_dir:
         out_dir = Path(tmp_dir)
         try:
             completed = subprocess.run(

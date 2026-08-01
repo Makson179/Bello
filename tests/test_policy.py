@@ -6,8 +6,7 @@ from pathlib import Path
 import pytest
 
 import supervisor.policy as policy_module
-from supervisor.approval_triage import command_analysis_from_policy_decision
-from supervisor.policy import PolicyEngine
+from supervisor.policy import PolicyEngine, command_analysis_from_policy_decision
 from supervisor.schemas import PolicyDecisionKind
 
 
@@ -215,26 +214,26 @@ def test_c_compiler_output_into_supervisor_runtime_is_not_auto_allowed(workspace
     assert decision.kind != PolicyDecisionKind.ALLOW
 
 
-def test_commands_invoking_sentinel_cli_deny(workspace: Path) -> None:
+def test_commands_invoking_bello_cli_deny(workspace: Path) -> None:
     engine = PolicyEngine(workspace)
 
     commands = [
-        "sentinel --task TASK.md",
-        "./sentinel",
-        "/bin/bash -lc ./sentinel",
-        "/bin/bash -lc './sentinel --task TASK.md'",
-        "bash -lc 'cd . && ./sentinel --task TASK.md'",
-        "bash -lc 'SENTINEL_SKIP_UPDATE_CHECK=1 sentinel --task TASK.md'",
-        "env SENTINEL_SKIP_UPDATE_CHECK=1 sentinel --task TASK.md",
-        "/opt/sentinel-venv/bin/sentinel --task TASK.md",
-        "'.venv\\Scripts\\sentinel.exe' --task TASK.md",
+        "bello --task TASK.md",
+        "./bello",
+        "/bin/bash -lc ./bello",
+        "/bin/bash -lc './bello --task TASK.md'",
+        "bash -lc 'cd . && ./bello --task TASK.md'",
+        "bash -lc 'BELLO_SKIP_UPDATE_CHECK=1 bello --task TASK.md'",
+        "env BELLO_SKIP_UPDATE_CHECK=1 bello --task TASK.md",
+        "/opt/bello-venv/bin/bello --task TASK.md",
+        "'.venv\\Scripts\\bello.exe' --task TASK.md",
         "supervisor --task TASK.md",
     ]
 
     for command in commands:
         decision = engine.evaluate({"command": command})
         assert decision.kind == PolicyDecisionKind.DENY
-        assert decision.reason == "commands invoking Sentinel are denied"
+        assert decision.reason == "commands invoking Bello are denied"
 
 
 def test_commands_containing_supervisor_deny(workspace: Path) -> None:
@@ -268,7 +267,7 @@ def test_dangerous_commands_deny(workspace: Path) -> None:
         "cat pyproject.toml | head -n 80",
     ],
 )
-def test_composed_read_only_commands_are_cheap_review_candidates(workspace: Path, command: str) -> None:
+def test_composed_read_only_commands_are_classified_without_risk(workspace: Path, command: str) -> None:
     (workspace / "src").mkdir()
     (workspace / "tests").mkdir()
     (workspace / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
@@ -277,7 +276,7 @@ def test_composed_read_only_commands_are_cheap_review_candidates(workspace: Path
 
     assert decision.kind == PolicyDecisionKind.ROUTE_LLM
     assert analysis is not None
-    assert analysis.cheap_review_candidate is True
+    assert all(segment.read_only for segment in analysis.segments)
     assert analysis.risk_tags == set()
 
 
@@ -308,7 +307,7 @@ def test_composed_read_only_commands_are_cheap_review_candidates(workspace: Path
         ("unknown-program --flag", "unknown_executable"),
     ],
 )
-def test_unsafe_or_ambiguous_commands_are_not_cheap_review_candidates(
+def test_unsafe_or_ambiguous_commands_carry_risk_tags(
     workspace: Path,
     command: str,
     expected_tag: str,
@@ -317,7 +316,6 @@ def test_unsafe_or_ambiguous_commands_are_not_cheap_review_candidates(
     analysis = command_analysis_from_policy_decision(decision)
 
     assert analysis is not None
-    assert analysis.cheap_review_candidate is False
     assert expected_tag in analysis.risk_tags
 
 
@@ -420,11 +418,11 @@ def test_one_unsafe_segment_makes_pipeline_ineligible(workspace: Path) -> None:
     analysis = command_analysis_from_policy_decision(decision)
 
     assert analysis is not None
-    assert analysis.cheap_review_candidate is False
+    assert not all(segment.read_only for segment in analysis.segments)
     assert "unknown_executable" in analysis.risk_tags
 
 
-def test_symlink_escape_command_path_is_not_cheap_candidate(workspace: Path) -> None:
+def test_symlink_escape_command_path_is_tagged(workspace: Path) -> None:
     outside = workspace.parent / f"outside-{workspace.name}.txt"
     outside.write_text("no", encoding="utf-8")
     link = workspace / "linked-secret.txt"
@@ -434,7 +432,6 @@ def test_symlink_escape_command_path_is_not_cheap_candidate(workspace: Path) -> 
     analysis = command_analysis_from_policy_decision(decision)
 
     assert analysis is not None
-    assert analysis.cheap_review_candidate is False
     assert "workspace_escape" in analysis.risk_tags
 
 
@@ -447,8 +444,8 @@ def test_read_only_git_is_distinguished_from_git_mutation(workspace: Path) -> No
 
     assert read_analysis is not None
     assert mutation_analysis is not None
-    assert read_analysis.cheap_review_candidate is True
-    assert mutation_analysis.cheap_review_candidate is False
+    assert all(segment.read_only for segment in read_analysis.segments)
+    assert not all(segment.read_only for segment in mutation_analysis.segments)
     assert "git_mutation" in mutation_analysis.risk_tags
 
 
@@ -462,6 +459,6 @@ def test_bounded_workspace_find_is_distinguished_from_unbounded_find(workspace: 
 
     assert bounded_analysis is not None
     assert unbounded_analysis is not None
-    assert bounded_analysis.cheap_review_candidate is True
-    assert unbounded_analysis.cheap_review_candidate is False
+    assert all(segment.read_only for segment in bounded_analysis.segments)
+    assert not all(segment.read_only for segment in unbounded_analysis.segments)
     assert "ambiguous_parse" in unbounded_analysis.risk_tags

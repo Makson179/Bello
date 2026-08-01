@@ -35,7 +35,7 @@ def test_read_install_info_uses_distribution_metadata(monkeypatch: pytest.Monkey
 
     info = update_check.read_install_info()
 
-    assert info.package_name == "sentinel-supervisor"
+    assert info.package_name == "bello"
     assert info.version == "0.1.2"
     assert info.install_mode == "pipx"
     assert info.metadata_available is True
@@ -51,7 +51,7 @@ def test_read_install_info_reports_missing_metadata(monkeypatch: pytest.MonkeyPa
 
     info = update_check.read_install_info()
 
-    assert info.package_name == "sentinel-supervisor"
+    assert info.package_name == "bello"
     assert info.version
     assert info.install_mode == "system"
     assert info.metadata_available is False
@@ -67,8 +67,8 @@ def test_latest_pypi_version_reads_json_api(monkeypatch: pytest.MonkeyPatch) -> 
 
     monkeypatch.setattr(update_check.urllib.request, "urlopen", fake_urlopen)
 
-    assert update_check.latest_pypi_version("sentinel-supervisor") == "0.2.0"
-    assert calls == ["https://pypi.org/pypi/sentinel-supervisor/json"]
+    assert update_check.latest_pypi_version("bello") == "0.2.0"
+    assert calls == ["https://pypi.org/pypi/bello/json"]
 
 
 def test_latest_pypi_version_reports_404(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -78,7 +78,7 @@ def test_latest_pypi_version_reports_404(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(update_check.urllib.request, "urlopen", fake_urlopen)
 
     with pytest.raises(update_check.UpdateCheckError, match="not found on PyPI"):
-        update_check.latest_pypi_version("sentinel-supervisor")
+        update_check.latest_pypi_version("bello")
 
 
 def test_latest_pypi_version_reports_network_errors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -88,7 +88,7 @@ def test_latest_pypi_version_reports_network_errors(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(update_check.urllib.request, "urlopen", fake_urlopen)
 
     with pytest.raises(update_check.UpdateCheckError, match="could not reach PyPI"):
-        update_check.latest_pypi_version("sentinel-supervisor")
+        update_check.latest_pypi_version("bello")
 
 
 def test_latest_pypi_version_reports_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -98,7 +98,7 @@ def test_latest_pypi_version_reports_timeout(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(update_check.urllib.request, "urlopen", fake_urlopen)
 
     with pytest.raises(update_check.UpdateCheckError, match="timed out"):
-        update_check.latest_pypi_version("sentinel-supervisor")
+        update_check.latest_pypi_version("bello")
 
 
 def test_latest_pypi_version_reports_invalid_json(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -112,12 +112,12 @@ def test_latest_pypi_version_reports_invalid_json(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(update_check.urllib.request, "urlopen", fake_urlopen)
 
     with pytest.raises(update_check.UpdateCheckError, match="invalid JSON"):
-        update_check.latest_pypi_version("sentinel-supervisor")
+        update_check.latest_pypi_version("bello")
 
 
 def test_check_for_update_compares_pep440_versions(monkeypatch: pytest.MonkeyPatch) -> None:
     info = update_check.InstallInfo(
-        package_name="sentinel-supervisor",
+        package_name="bello",
         version="0.1.9",
         install_mode="pipx",
     )
@@ -131,7 +131,7 @@ def test_check_for_update_compares_pep440_versions(monkeypatch: pytest.MonkeyPat
 
 def test_check_for_update_treats_newer_local_version_as_current(monkeypatch: pytest.MonkeyPatch) -> None:
     info = update_check.InstallInfo(
-        package_name="sentinel-supervisor",
+        package_name="bello",
         version="0.2.0",
         install_mode="pipx",
     )
@@ -145,7 +145,7 @@ def test_check_for_update_treats_newer_local_version_as_current(monkeypatch: pyt
 
 def test_check_for_update_reports_invalid_versions(monkeypatch: pytest.MonkeyPatch) -> None:
     info = update_check.InstallInfo(
-        package_name="sentinel-supervisor",
+        package_name="bello",
         version="not-a-version",
         install_mode="pipx",
     )
@@ -159,7 +159,7 @@ def test_check_for_update_reports_invalid_versions(monkeypatch: pytest.MonkeyPat
 
 def test_check_for_update_converts_pypi_errors_to_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
     info = update_check.InstallInfo(
-        package_name="sentinel-supervisor",
+        package_name="bello",
         version="0.1.0",
         install_mode="pipx",
     )
@@ -177,18 +177,18 @@ def test_check_for_update_converts_pypi_errors_to_unknown(monkeypatch: pytest.Mo
 
 def test_update_command_uses_pipx_upgrade_for_pipx_installs(monkeypatch: pytest.MonkeyPatch) -> None:
     info = update_check.InstallInfo(
-        package_name="sentinel-supervisor",
+        package_name="bello",
         version="0.1.0",
         install_mode="pipx",
     )
     monkeypatch.setattr(update_check.shutil, "which", lambda name: "/usr/bin/pipx" if name == "pipx" else None)
 
-    assert update_check.update_command(info) == ["pipx", "upgrade", "sentinel-supervisor"]
+    assert update_check.update_command(info) == ["pipx", "upgrade", "bello"]
 
 
 def test_update_command_uses_pip_inside_venv(monkeypatch: pytest.MonkeyPatch) -> None:
     info = update_check.InstallInfo(
-        package_name="sentinel-supervisor",
+        package_name="bello",
         version="0.1.0",
         install_mode="venv",
     )
@@ -200,7 +200,7 @@ def test_update_command_uses_pip_inside_venv(monkeypatch: pytest.MonkeyPatch) ->
         "pip",
         "install",
         "--upgrade",
-        "sentinel-supervisor",
+        "bello",
     ]
 
 
@@ -208,7 +208,7 @@ def test_detect_install_mode_recognizes_custom_pipx_home(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    venv = tmp_path / "custom-home" / "venvs" / "sentinel-supervisor"
+    venv = tmp_path / "custom-home" / "venvs" / "bello"
     venv.mkdir(parents=True)
     (venv / "pipx_metadata.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(update_check.sys, "prefix", str(venv))

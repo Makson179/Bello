@@ -2,19 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import re
-import time
 from pathlib import Path
 from typing import Any, Protocol
 
-from pydantic import ValidationError
-
-from supervisor.approval_triage import (
-    CheapApprovalAttempt,
-    cheap_approval_fingerprint,
-    cheap_review_attempt_metadata,
-    is_cheap_review_candidate,
-    validate_cheap_approval,
-)
 from supervisor.appserver import AppServerMessage
 from supervisor.policy import (
     PolicyEngine,
@@ -26,7 +16,6 @@ from supervisor.schemas import (
     ApprovalContext,
     ApprovalRequestType,
     ApprovalResolution,
-    CheapApprovalDecision,
     NetworkApprovalContext,
     PolicyDecision,
     PolicyDecisionKind,
@@ -74,11 +63,6 @@ MCP_ELICITATION_METHOD = "mcpServer/elicitation/request"
 
 class SupervisorApprovalReviewer(Protocol):
     async def decide_approval(self, context: ApprovalContext, reason: str) -> SupervisorDecision:
-        ...
-
-
-class CheapApprovalReviewerProtocol(Protocol):
-    async def review(self, context: ApprovalContext, evaluation: PolicyDecision) -> CheapApprovalDecision:
         ...
 
 
@@ -149,11 +133,9 @@ class ApprovalManager:
         workspace: Path,
         *,
         supervisor: SupervisorApprovalReviewer | None = None,
-        cheap_reviewer: CheapApprovalReviewerProtocol | None = None,
         declared_grading_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
         immutable_paths: list[str | Path] | tuple[str | Path, ...] | None = None,
-        timeout_seconds: float = 180.0,
-        cheap_review_timeout_seconds: float = 20.0,
+        timeout_seconds: float = 360.0,
         adversary_mode: bool = False,
     ):
         self.workspace = workspace.resolve()
@@ -164,14 +146,10 @@ class ApprovalManager:
             immutable_paths=self.immutable_paths,
         )
         self.supervisor = supervisor
-        self.cheap_reviewer = cheap_reviewer
         self.timeout_seconds = timeout_seconds
-        self.cheap_review_timeout_seconds = cheap_review_timeout_seconds
         self.adversary_mode = adversary_mode
-        self.last_cheap_review_attempt: CheapApprovalAttempt | None = None
 
     async def decide(self, context: ApprovalContext) -> ApprovalResolution:
-        self.last_cheap_review_attempt = None
         if context.request_type in {
             ApprovalRequestType.TOOL_USER_INPUT,
             ApprovalRequestType.DYNAMIC_TOOL_CALL,
@@ -203,7 +181,7 @@ class ApprovalManager:
             return self._allow(context, policy_decision.reason)
         if self.adversary_mode:
             return await self._adversary_containment_decision(context)
-        return await self._route_review_chain_or_full_supervisor(context, policy_decision)
+        return await self._route_full_supervisor_or_deny(context, policy_decision.reason)
 
     async def _adversary_containment_decision(self, context: ApprovalContext) -> ApprovalResolution:
         """Adversary gray zone: contained escalations auto-approve, the rest is situational.
@@ -248,94 +226,6 @@ class ApprovalManager:
             return {"action": action, "content": None, "_meta": None}
         return {"decision": resolution.decision}
 
-    async def _route_review_chain_or_full_supervisor(self, context: ApprovalContext, evaluation: PolicyDecision) -> ApprovalResolution:
-        original_reason = evaluation.reason
-        eligible = self.cheap_reviewer is not None and is_cheap_review_candidate(context, evaluation, self.workspace)
-        if not eligible:
-            self.last_cheap_review_attempt = cheap_review_attempt_metadata(
-                eligible=False,
-                attempted=False,
-                outcome="not_eligible",
-                model=getattr(self.cheap_reviewer, "model", None),
-                full_supervisor_fallback=True,
-            )
-            return await self._route_full_supervisor_or_deny(context, original_reason)
-
-        started_at = time.monotonic()
-        expected_fingerprint = cheap_approval_fingerprint(context, evaluation, self.workspace)
-        try:
-            assert self.cheap_reviewer is not None
-            raw_decision = await asyncio.wait_for(
-                self.cheap_reviewer.review(context, evaluation),
-                timeout=self.cheap_review_timeout_seconds,
-            )
-            cheap_decision = (
-                raw_decision
-                if isinstance(raw_decision, CheapApprovalDecision)
-                else CheapApprovalDecision.model_validate(raw_decision)
-            )
-        except asyncio.TimeoutError:
-            self.last_cheap_review_attempt = cheap_review_attempt_metadata(
-                eligible=True,
-                attempted=True,
-                outcome="timeout",
-                started_at=started_at,
-                model=getattr(self.cheap_reviewer, "model", None),
-                full_supervisor_fallback=True,
-            )
-            return await self._route_full_supervisor_or_deny(context, original_reason)
-        except (ValidationError, ValueError, TypeError):
-            self.last_cheap_review_attempt = cheap_review_attempt_metadata(
-                eligible=True,
-                attempted=True,
-                outcome="invalid",
-                started_at=started_at,
-                model=getattr(self.cheap_reviewer, "model", None),
-                full_supervisor_fallback=True,
-            )
-            return await self._route_full_supervisor_or_deny(context, original_reason)
-        except Exception:
-            self.last_cheap_review_attempt = cheap_review_attempt_metadata(
-                eligible=True,
-                attempted=True,
-                outcome="unavailable",
-                started_at=started_at,
-                model=getattr(self.cheap_reviewer, "model", None),
-                full_supervisor_fallback=True,
-            )
-            return await self._route_full_supervisor_or_deny(context, original_reason)
-
-        resolution = validate_cheap_approval(
-            context=context,
-            evaluation=evaluation,
-            cheap_decision=cheap_decision,
-            workspace=self.workspace,
-            expected_fingerprint=expected_fingerprint,
-        )
-        if resolution is not None:
-            self.last_cheap_review_attempt = cheap_review_attempt_metadata(
-                eligible=True,
-                attempted=True,
-                outcome="approved",
-                started_at=started_at,
-                reason_code=cheap_decision.reason_code,
-                model=getattr(self.cheap_reviewer, "model", None),
-                full_supervisor_fallback=False,
-            )
-            return resolution
-
-        outcome = "escalated" if cheap_decision.decision == "escalate" else "rejected"
-        self.last_cheap_review_attempt = cheap_review_attempt_metadata(
-            eligible=True,
-            attempted=True,
-            outcome=outcome,
-            started_at=started_at,
-            reason_code=cheap_decision.reason_code,
-            model=getattr(self.cheap_reviewer, "model", None),
-            full_supervisor_fallback=True,
-        )
-        return await self._route_full_supervisor_or_deny(context, original_reason)
-
     async def _route_full_supervisor_or_deny(self, context: ApprovalContext, reason: str) -> ApprovalResolution:
         if self.supervisor is None:
             return self._deny(context, reason)
@@ -353,8 +243,7 @@ class ApprovalManager:
                     "acceptWithExecpolicyAmendment": {"execpolicy_amendment": decision.execpolicy_amendment}
                 }
                 if (
-                    approval == "accept"
-                    and context.request_type == ApprovalRequestType.COMMAND
+                    context.request_type == ApprovalRequestType.COMMAND
                     and self._is_exact_execpolicy_amendment_allowed(context, decision.execpolicy_amendment)
                 ):
                     return ApprovalResolution(

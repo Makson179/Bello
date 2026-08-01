@@ -6,7 +6,7 @@ import json
 import pytest
 from click.testing import CliRunner
 
-from supervisor.controller import DEFAULT_MODEL, SentinelController
+from supervisor.controller import DEFAULT_MODEL, BelloController
 from supervisor.main import _resolve_run_settings, cli
 from supervisor.project_config import (
     MODEL_GPT_5_5,
@@ -59,14 +59,14 @@ def test_cli_passes_independent_role_models_and_efforts_to_runner(monkeypatch: p
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("supervisor.main._startup_update_gate", lambda: None)
 
-    async def fake_run_sentinel(settings):
+    async def fake_run_bello(settings):
         captured.append(settings)
         return 0
 
     def fake_run_async_cleanly(coro):
         assert asyncio.run(coro) == 0
 
-    monkeypatch.setattr("supervisor.main._run_sentinel", fake_run_sentinel)
+    monkeypatch.setattr("supervisor.main._run_bello", fake_run_bello)
     monkeypatch.setattr("supervisor.main._run_async_cleanly", fake_run_async_cleanly)
 
     result = CliRunner().invoke(
@@ -244,7 +244,7 @@ def test_run_settings_cli_values_override_each_role_for_current_run(tmp_path) ->
 def test_controller_records_four_role_models_and_efforts(tmp_path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
-    controller = SentinelController(
+    controller = BelloController(
         tmp_path,
         task_path=task,
         coder_model="gpt-coder",
@@ -259,7 +259,7 @@ def test_controller_records_four_role_models_and_efforts(tmp_path) -> None:
 
     controller.initialize_state()
 
-    config = controller.store.get_sentinel_config()
+    config = controller.store.get_bello_config()
     assert config.model is None
     assert config.coder_model == "gpt-coder"
     assert config.runtime_model == "gpt-runtime"
@@ -276,18 +276,22 @@ def test_controller_records_four_role_models_and_efforts(tmp_path) -> None:
 def test_controller_records_fast_mode(tmp_path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
-    controller = SentinelController(tmp_path, task_path=task, fast=True)
+    controller = BelloController(tmp_path, task_path=task, fast=True)
 
     controller.initialize_state()
 
-    assert controller.store.get_sentinel_config().fast is True
+    assert controller.store.get_bello_config().fast is True
 
 
 def test_controller_records_runtime_config_flags(tmp_path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
     protected_path = tmp_path / "hidden"
-    controller = SentinelController(
+    protected_path.mkdir()
+    (protected_path / "test_hidden.py").write_text("def test_hidden(): pass\n", encoding="utf-8")
+    removable = tmp_path / "remove.txt"
+    removable.write_text("remove\n", encoding="utf-8")
+    controller = BelloController(
         tmp_path,
         task_path=task,
         clean_workspace=True,
@@ -298,18 +302,20 @@ def test_controller_records_runtime_config_flags(tmp_path) -> None:
 
     controller.initialize_state()
 
-    config = controller.store.get_sentinel_config()
+    config = controller.store.get_bello_config()
     assert config.start_over is False
     assert config.clean is True
     assert config.protected_paths == ["hidden"]
     assert config.adversary is False
     assert config.max_adversary_runs == 0
+    assert (protected_path / "test_hidden.py").exists()
+    assert not removable.exists()
 
 
 def test_controller_runtime_settings_summary_uses_all_effective_role_values(tmp_path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
-    controller = SentinelController(
+    controller = BelloController(
         tmp_path,
         task_path=task,
         coder_model="cli-coder",
@@ -337,6 +343,7 @@ def test_controller_runtime_settings_summary_uses_all_effective_role_values(tmp_
         "completion-intelligence=ultra "
         "adversary-intelligence=ultra "
         "speed=fast "
+        "cheap-runtime=true "
         "start-over=false "
         "clean=false "
         "completion-review=true "
@@ -364,7 +371,7 @@ def test_controller_runtime_overrides_do_not_rewrite_project_config_fields(tmp_p
         clean=True,
         protected_path=("hidden",),
     )
-    controller = SentinelController(
+    controller = BelloController(
         tmp_path,
         task_path=task,
         coder_model="cli-coder",
@@ -399,7 +406,7 @@ def test_fast_true_override_does_not_rewrite_saved_fast_field(tmp_path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
     project_config = ProjectConfig(speed="usual")
-    controller = SentinelController(tmp_path, task_path=task, fast=True, project_config=project_config)
+    controller = BelloController(tmp_path, task_path=task, fast=True, project_config=project_config)
 
     controller.initialize_state()
 
@@ -413,9 +420,31 @@ def _resolve(project_config: ProjectConfig, **overrides):
     return _resolve_run_settings(project_config=project_config, **overrides)
 
 
+def test_fresh_project_uses_everyday_defaults() -> None:
+    settings = _resolve(ProjectConfig())
+
+    assert settings.coder_model == MODEL_GPT_5_6_SOL
+    assert settings.runtime_model == MODEL_GPT_5_6_SOL
+    assert settings.coder_intelligence == "xhigh"
+    assert settings.runtime_intelligence == "xhigh"
+    assert settings.completion_review is False
+    assert settings.adversary is False
+
+
+def test_deep_work_cli_flags_enable_review_and_adversary() -> None:
+    config = ProjectConfig()
+    settings = _resolve(config, completion_review=True, adversary=True)
+
+    assert settings.completion_review is True
+    assert settings.adversary is True
+    assert settings.adversary_runs == 1
+    assert config.completion_returns_before_adversary == 1
+    assert config.completion_returns_after_adversary == 0
+
+
 def test_adversary_runs_defaults_to_project_config() -> None:
     settings = _resolve(ProjectConfig())
-    assert settings.adversary is True
+    assert settings.adversary is False
     assert settings.adversary_runs == 1
 
 

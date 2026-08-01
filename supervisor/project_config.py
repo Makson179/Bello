@@ -5,6 +5,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from supervisor.review_limits import (
+    EXPLICIT_REVIEW_LIMIT_FORMAT,
+    REVIEW_LIMIT_FORMAT_FIELD,
+    ReviewLimit,
+    normalize_review_limit,
+    normalize_review_limit_payload,
+)
+
 
 MODEL_GPT_5_6_SOL = "gpt-5.6-sol"
 MODEL_GPT_5_6_TERRA = "gpt-5.6-terra"
@@ -32,11 +40,13 @@ RUNTIME_SYNC_FIELDS = (
     "completion_intelligence",
     "adversary_intelligence",
     "speed",
+    "cheap_runtime",
     "start_over",
     "completion_review",
     "adversary",
     "adversary_runs",
-    "completion_returns_per_generation",
+    "completion_returns_before_adversary",
+    "completion_returns_after_adversary",
     "clean",
     "protected_path",
 )
@@ -58,11 +68,13 @@ class ProjectConfig:
     completion_intelligence: str = DEFAULT_INTELLIGENCE
     adversary_intelligence: str = DEFAULT_INTELLIGENCE
     speed: str = "usual"
+    cheap_runtime: bool = True
     start_over: bool = True
-    completion_review: bool = True
-    adversary: bool = True
+    completion_review: bool = False
+    adversary: bool = False
     adversary_runs: int = 1
-    completion_returns_per_generation: int = 10
+    completion_returns_before_adversary: ReviewLimit = 1
+    completion_returns_after_adversary: ReviewLimit = 0
     clean: bool = False
     protected_path: tuple[str, ...] = ()
 
@@ -72,6 +84,7 @@ class ProjectConfig:
 
     def to_json_data(self) -> dict[str, Any]:
         return {
+            REVIEW_LIMIT_FORMAT_FIELD: EXPLICIT_REVIEW_LIMIT_FORMAT,
             "task": self.task,
             "coder_mod": self.coder_mod,
             "runtime_mod": self.runtime_mod,
@@ -82,11 +95,13 @@ class ProjectConfig:
             "completion_intelligence": self.completion_intelligence,
             "adversary_intelligence": self.adversary_intelligence,
             "speed": self.speed,
+            "cheap_runtime": self.cheap_runtime,
             "start_over": self.start_over,
             "completion_review": self.completion_review,
             "adversary": self.adversary,
             "max_adversary_runs": self.adversary_runs,
-            "max_completion_returns_per_generation": self.completion_returns_per_generation,
+            "max_completion_returns_before_adversary": self.completion_returns_before_adversary,
+            "max_completion_returns_after_adversary": self.completion_returns_after_adversary,
             "clean": self.clean,
             "protected_path": list(self.protected_path),
         }
@@ -123,12 +138,18 @@ def load_project_config(project_root: Path, *, create: bool = True) -> ProjectCo
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise ProjectConfigError(f"invalid Sentinel config JSON at {path}: {exc}") from exc
+        raise ProjectConfigError(f"invalid Bello config JSON at {path}: {exc}") from exc
     except OSError as exc:
-        raise ProjectConfigError(f"could not read Sentinel config at {path}: {exc}") from exc
+        raise ProjectConfigError(f"could not read Bello config at {path}: {exc}") from exc
     if not isinstance(payload, dict):
-        raise ProjectConfigError(f"invalid Sentinel config at {path}: expected a JSON object")
-    return _config_from_payload(payload, path=path)
+        raise ProjectConfigError(f"invalid Bello config at {path}: expected a JSON object")
+    normalized_payload = normalize_review_limit_payload(payload)
+    if normalized_payload.get(REVIEW_LIMIT_FORMAT_FIELD) != EXPLICIT_REVIEW_LIMIT_FORMAT:
+        raise ProjectConfigError(
+            f"invalid Bello config at {path}: {REVIEW_LIMIT_FORMAT_FIELD} must be "
+            f"'{EXPLICIT_REVIEW_LIMIT_FORMAT}'"
+        )
+    return _config_from_payload(normalized_payload, path=path)
 
 
 def save_project_config(project_root: Path, config: ProjectConfig) -> None:
@@ -146,7 +167,7 @@ def ensure_runtime_state_initialized(project_root: Path, config: ProjectConfig) 
             StateStore(project_root).write_json_locked(CONFIG, _runtime_config_from_project_config(project_root, config))
         return
     store = StateStore(project_root)
-    store.initialize_sentinel(_runtime_config_from_project_config(project_root, config), mode="fresh")
+    store.initialize_bello(_runtime_config_from_project_config(project_root, config), mode="fresh")
 
 
 def sync_runtime_config_fields(project_root: Path, config: ProjectConfig, fields: Iterable[str]) -> None:
@@ -156,7 +177,7 @@ def sync_runtime_config_fields(project_root: Path, config: ProjectConfig, fields
 
     from pydantic import ValidationError
 
-    from supervisor.schemas import SentinelConfig
+    from supervisor.schemas import BelloConfig
     from supervisor.state import CONFIG, StateStore
 
     store = StateStore(project_root)
@@ -166,10 +187,10 @@ def sync_runtime_config_fields(project_root: Path, config: ProjectConfig, fields
     except (OSError, json.JSONDecodeError):
         raw_config = {}
 
-    runtime_config: SentinelConfig
+    runtime_config: BelloConfig
     if isinstance(raw_config, dict) and raw_config:
         try:
-            runtime_config = SentinelConfig.model_validate(raw_config)
+            runtime_config = BelloConfig.model_validate(normalize_review_limit_payload(raw_config))
         except ValidationError:
             runtime_config = _runtime_config_from_project_config(project_root, config)
     else:
@@ -253,15 +274,38 @@ def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfi
             path=path,
         ),
         speed=_speed_from_payload(payload, default.speed, path=path),
+        cheap_runtime=_bool(
+            _first_present(payload, ("cheap_runtime", "cheap_runtime_enabled"), default.cheap_runtime),
+            "cheap_runtime",
+            path=path,
+        ),
         start_over=_bool(payload.get("start_over", default.start_over), "start_over", path=path),
         completion_review=_bool(
-            payload.get("completion_review", default.completion_review), "completion_review", path=path
+            _first_present(
+                payload,
+                ("completion_review", "completion_review_enabled"),
+                default.completion_review,
+            ),
+            "completion_review",
+            path=path,
         ),
         adversary=_adversary_from_payload(payload, default.adversary, path=path),
         adversary_runs=_adversary_runs_from_payload(payload, default.adversary_runs, path=path),
-        completion_returns_per_generation=_non_negative_int(
-            payload.get("max_completion_returns_per_generation", default.completion_returns_per_generation),
-            "max_completion_returns_per_generation",
+        completion_returns_before_adversary=_review_limit(
+            _first_present(
+                payload,
+                ("max_completion_returns_before_adversary", "max_completion_returns_per_generation"),
+                default.completion_returns_before_adversary,
+            ),
+            "max_completion_returns_before_adversary",
+            path=path,
+        ),
+        completion_returns_after_adversary=_review_limit(
+            payload.get(
+                "max_completion_returns_after_adversary",
+                default.completion_returns_after_adversary,
+            ),
+            "max_completion_returns_after_adversary",
             path=path,
         ),
         clean=_bool(payload.get("clean", default.clean), "clean", path=path),
@@ -288,13 +332,13 @@ def _optional_string(value: Any, field: str, *, path: Path) -> str | None:
     if isinstance(value, str):
         stripped = value.strip()
         return stripped or None
-    raise ProjectConfigError(f"invalid Sentinel config at {path}: {field} must be a string or null")
+    raise ProjectConfigError(f"invalid Bello config at {path}: {field} must be a string or null")
 
 
 def _required_string(value: Any, field: str, *, path: Path) -> str:
     if isinstance(value, str) and value.strip():
         return value.strip()
-    raise ProjectConfigError(f"invalid Sentinel config at {path}: {field} must be a non-empty string")
+    raise ProjectConfigError(f"invalid Bello config at {path}: {field} must be a non-empty string")
 
 
 def _choice(value: Any, field: str, choices: tuple[str, ...], *, path: Path) -> str:
@@ -303,7 +347,7 @@ def _choice(value: Any, field: str, choices: tuple[str, ...], *, path: Path) -> 
         if normalized in choices:
             return normalized
     expected = ", ".join(choices)
-    raise ProjectConfigError(f"invalid Sentinel config at {path}: {field} must be one of: {expected}")
+    raise ProjectConfigError(f"invalid Bello config at {path}: {field} must be one of: {expected}")
 
 
 def _speed_from_payload(payload: dict[str, Any], default: str, *, path: Path) -> str:
@@ -315,6 +359,8 @@ def _speed_from_payload(payload: dict[str, Any], default: str, *, path: Path) ->
 
 
 def _adversary_from_payload(payload: dict[str, Any], default: bool, *, path: Path) -> bool:
+    if "max_adversary_runs" in payload and _adversary_runs_value(payload["max_adversary_runs"], path=path) == 0:
+        return False
     if "adversary" in payload:
         return _bool(payload["adversary"], "adversary", path=path)
     if "max_adversary_runs" in payload:
@@ -332,25 +378,32 @@ def _adversary_runs_value(value: Any, *, path: Path) -> int:
     return _non_negative_int(value, "max_adversary_runs", path=path)
 
 
+def _review_limit(value: Any, field: str, *, path: Path) -> ReviewLimit:
+    try:
+        return normalize_review_limit(value)
+    except ValueError as exc:
+        raise ProjectConfigError(f"invalid Bello config at {path}: {field} {exc}") from exc
+
+
 def _non_negative_int(value: Any, field: str, *, path: Path) -> int:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
-    raise ProjectConfigError(f"invalid Sentinel config at {path}: {field} must be a non-negative integer")
+    raise ProjectConfigError(f"invalid Bello config at {path}: {field} must be a non-negative integer")
 
 
 def _bool(value: Any, field: str, *, path: Path) -> bool:
     if isinstance(value, bool):
         return value
-    raise ProjectConfigError(f"invalid Sentinel config at {path}: {field} must be true or false")
+    raise ProjectConfigError(f"invalid Bello config at {path}: {field} must be true or false")
 
 
 def _string_list(value: Any, field: str, *, path: Path) -> list[str]:
     if not isinstance(value, list | tuple):
-        raise ProjectConfigError(f"invalid Sentinel config at {path}: {field} must be a list of strings")
+        raise ProjectConfigError(f"invalid Bello config at {path}: {field} must be a list of strings")
     result: list[str] = []
     for item in value:
         if not isinstance(item, str):
-            raise ProjectConfigError(f"invalid Sentinel config at {path}: {field} must be a list of strings")
+            raise ProjectConfigError(f"invalid Bello config at {path}: {field} must be a list of strings")
         stripped = item.strip()
         if stripped:
             result.append(stripped)
@@ -358,9 +411,9 @@ def _string_list(value: Any, field: str, *, path: Path) -> list[str]:
 
 
 def _runtime_config_from_project_config(project_root: Path, config: ProjectConfig):
-    from supervisor.schemas import SentinelConfig
+    from supervisor.schemas import BelloConfig
 
-    return SentinelConfig(
+    return BelloConfig(
         project_root=str(project_root.resolve()),
         **_runtime_updates_for_fields(config, RUNTIME_SYNC_FIELDS),
     )
@@ -403,6 +456,8 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
     if "speed" in selected:
         updates["speed"] = config.speed
         updates["fast"] = config.fast
+    if "cheap_runtime" in selected:
+        updates["cheap_runtime"] = config.cheap_runtime
     if "start_over" in selected:
         updates["start_over"] = config.start_over
     if "clean" in selected:
@@ -415,6 +470,8 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
     if selected.intersection({"adversary", "adversary_runs"}):
         updates["adversary"] = config.adversary
         updates["max_adversary_runs"] = config.adversary_runs if config.adversary else 0
-    if "completion_returns_per_generation" in selected:
-        updates["max_completion_returns_per_generation"] = config.completion_returns_per_generation
+    if "completion_returns_before_adversary" in selected:
+        updates["max_completion_returns_before_adversary"] = config.completion_returns_before_adversary
+    if "completion_returns_after_adversary" in selected:
+        updates["max_completion_returns_after_adversary"] = config.completion_returns_after_adversary
     return updates

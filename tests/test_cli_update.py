@@ -20,7 +20,7 @@ VERSION_B = "0.1.1"
 
 def _info(version: str = VERSION_A) -> update_check.InstallInfo:
     return update_check.InstallInfo(
-        package_name="sentinel-supervisor",
+        package_name="bello",
         version=version,
         install_mode="pipx",
     )
@@ -49,10 +49,10 @@ def test_version_report_shows_update_available(monkeypatch: pytest.MonkeyPatch) 
 
     report = _format_version_report()
 
-    assert "Sentinel 0.1.0" in report
+    assert "Bello 0.1.0" in report
     assert "installed: 0.1.0" in report
     assert "latest:    0.1.1" in report
-    assert "sentinel update" in report
+    assert "bello update" in report
 
 
 def test_startup_gate_warns_and_continues_when_outdated_without_tty(
@@ -65,9 +65,9 @@ def test_startup_gate_warns_and_continues_when_outdated_without_tty(
     _startup_update_gate()
 
     captured = capsys.readouterr()
-    assert "A newer Sentinel version is available." in captured.err
+    assert "A newer Bello version is available." in captured.err
     assert "continuing without prompting" in captured.err
-    assert "Set SENTINEL_SKIP_UPDATE_CHECK=1" in captured.err
+    assert "Set BELLO_SKIP_UPDATE_CHECK=1" in captured.err
 
 
 def test_startup_gate_warns_and_continues_when_update_check_is_unknown(
@@ -87,7 +87,7 @@ def test_startup_gate_warns_and_continues_when_update_check_is_unknown(
     _startup_update_gate()
 
     captured = capsys.readouterr()
-    assert "Could not check for Sentinel updates" in captured.err
+    assert "Could not check for Bello updates" in captured.err
     assert "could not reach PyPI" in captured.err
 
 
@@ -147,9 +147,9 @@ def test_startup_gate_update_choice_updates_and_reexecs(monkeypatch: pytest.Monk
 @pytest.mark.parametrize(
     "argv",
     [
-        ["sentinel", "--task", "TASK.md"],
-        ["/Users/alex/.local/bin/sentinel", "--task", "TASK.md"],
-        [r"C:\Users\alex\.local\bin\sentinel.exe", "--task", "TASK.md"],
+        ["bello", "--task", "TASK.md"],
+        ["/Users/alex/.local/bin/bello", "--task", "TASK.md"],
+        [r"C:\Users\alex\.local\bin\bello.exe", "--task", "TASK.md"],
     ],
 )
 def test_update_reexec_preserves_original_launcher_and_task_args(
@@ -185,7 +185,7 @@ def test_update_command_reports_current(monkeypatch: pytest.MonkeyPatch) -> None
     result = CliRunner().invoke(cli, ["update"])
 
     assert result.exit_code == 0
-    assert "Sentinel is up to date." in result.output
+    assert "Bello is up to date." in result.output
     assert "Installed: 0.1.0" in result.output
 
 
@@ -223,7 +223,7 @@ def test_update_check_json_reports_unknown_without_failing(monkeypatch: pytest.M
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload == {
-        "package": "sentinel-supervisor",
+        "package": "bello",
         "installed_version": "0.1.0",
         "latest_version": None,
         "state": "unknown",
@@ -261,7 +261,7 @@ def test_version_option_bypasses_startup_gate(monkeypatch: pytest.MonkeyPatch) -
     result = CliRunner().invoke(cli, ["--version"])
 
     assert result.exit_code == 0
-    assert "Sentinel 0.1.0" in result.output
+    assert "Bello 0.1.0" in result.output
 
 
 def test_version_option_reports_unknown_update_status_without_failing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -278,7 +278,7 @@ def test_version_option_reports_unknown_update_status_without_failing(monkeypatc
     result = CliRunner().invoke(cli, ["--version"])
 
     assert result.exit_code == 0
-    assert "Sentinel 0.1.0" in result.output
+    assert "Bello 0.1.0" in result.output
     assert "status: unknown" in result.output
     assert "could not reach PyPI" in result.output
 
@@ -298,7 +298,7 @@ def test_cli_update_continue_runs_original_task_on_supported_platforms(
     monkeypatch.setattr("builtins.input", lambda prompt: "c")
     monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, VERSION_B))
 
-    async def fake_run_sentinel(settings):
+    async def fake_run_bello(settings):
         calls.append(
             (
                 settings.task_path,
@@ -323,12 +323,12 @@ def test_cli_update_continue_runs_original_task_on_supported_platforms(
         assert asyncio.run(coro) == 0
         calls.append(("runtime-started",))
 
-    monkeypatch.setattr("supervisor.main._run_sentinel", fake_run_sentinel)
+    monkeypatch.setattr("supervisor.main._run_bello", fake_run_bello)
     monkeypatch.setattr("supervisor.main._run_async_cleanly", fake_run_async_cleanly)
 
     result = cli.main(
         args=["--task", str(task), "--start-over"],
-        prog_name="sentinel",
+        prog_name="bello",
         standalone_mode=False,
     )
 
@@ -348,7 +348,7 @@ def test_cli_update_continue_runs_original_task_on_supported_platforms(
             True,
             (),
             False,
-            True,
+            False,
         ),
         ("runtime-started",),
     ]
@@ -361,7 +361,7 @@ def test_cli_fast_flag_reaches_runner(monkeypatch: pytest.MonkeyPatch, tmp_path)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("supervisor.main._startup_update_gate", lambda: None)
 
-    async def fake_run_sentinel(settings):
+    async def fake_run_bello(settings):
         calls.append(
             (
                 settings.task_path,
@@ -385,12 +385,12 @@ def test_cli_fast_flag_reaches_runner(monkeypatch: pytest.MonkeyPatch, tmp_path)
     def fake_run_async_cleanly(coro):
         assert asyncio.run(coro) == 0
 
-    monkeypatch.setattr("supervisor.main._run_sentinel", fake_run_sentinel)
+    monkeypatch.setattr("supervisor.main._run_bello", fake_run_bello)
     monkeypatch.setattr("supervisor.main._run_async_cleanly", fake_run_async_cleanly)
 
     result = cli.main(
         args=["--task", str(task), "--fast"],
-        prog_name="sentinel",
+        prog_name="bello",
         standalone_mode=False,
     )
 
@@ -410,7 +410,7 @@ def test_cli_fast_flag_reaches_runner(monkeypatch: pytest.MonkeyPatch, tmp_path)
             True,
             (),
             False,
-            True,
+            False,
         )
     ]
 
@@ -422,19 +422,19 @@ def test_cli_boolean_false_overrides_project_config(monkeypatch: pytest.MonkeyPa
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("supervisor.main._startup_update_gate", lambda: None)
 
-    async def fake_run_sentinel(settings):
+    async def fake_run_bello(settings):
         calls.append((settings.fast, settings.start_over, settings.clean, settings.adversary))
         return 0
 
     def fake_run_async_cleanly(coro):
         assert asyncio.run(coro) == 0
 
-    monkeypatch.setattr("supervisor.main._run_sentinel", fake_run_sentinel)
+    monkeypatch.setattr("supervisor.main._run_bello", fake_run_bello)
     monkeypatch.setattr("supervisor.main._run_async_cleanly", fake_run_async_cleanly)
 
     result = cli.main(
         args=["--task", str(task), "--start-over=false", "--adversary=false", "--clean=false", "--fast=false"],
-        prog_name="sentinel",
+        prog_name="bello",
         standalone_mode=False,
     )
 
@@ -449,19 +449,19 @@ def test_cli_completion_review_flag_reaches_runner(monkeypatch: pytest.MonkeyPat
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("supervisor.main._startup_update_gate", lambda: None)
 
-    async def fake_run_sentinel(settings):
+    async def fake_run_bello(settings):
         calls.append(settings.completion_review)
         return 0
 
     def fake_run_async_cleanly(coro):
         assert asyncio.run(coro) == 0
 
-    monkeypatch.setattr("supervisor.main._run_sentinel", fake_run_sentinel)
+    monkeypatch.setattr("supervisor.main._run_bello", fake_run_bello)
     monkeypatch.setattr("supervisor.main._run_async_cleanly", fake_run_async_cleanly)
 
     result = cli.main(
         args=["--task", str(task), "--completion-review=false"],
-        prog_name="sentinel",
+        prog_name="bello",
         standalone_mode=False,
     )
 
@@ -470,10 +470,10 @@ def test_cli_completion_review_flag_reaches_runner(monkeypatch: pytest.MonkeyPat
 
     result = cli.main(
         args=["--task", str(task)],
-        prog_name="sentinel",
+        prog_name="bello",
         standalone_mode=False,
     )
 
     assert result is None
-    # No flag: the project-config default (enabled) flows through.
-    assert calls == [False, True]
+    # No flag: the Everyday project-config default flows through.
+    assert calls == [False, False]

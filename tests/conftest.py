@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from supervisor.schemas import SentinelConfig
+from supervisor.schemas import BelloConfig
 from supervisor.state import StateStore
 
 
@@ -16,7 +16,7 @@ def workspace(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def store(workspace: Path) -> StateStore:
-    config = SentinelConfig(project_root=str(workspace), task_path=str(workspace / "TASK.md"))
+    config = BelloConfig(project_root=str(workspace), task_path=str(workspace / "TASK.md"))
     state = StateStore(workspace)
-    state.initialize_sentinel(config, overwrite=True)
+    state.initialize_bello(config, overwrite=True)
     return state

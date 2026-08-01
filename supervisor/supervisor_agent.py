@@ -40,14 +40,14 @@ from supervisor.schemas.models import (
     openai_strict_json_schema_for_completion_review_decision,
     openai_strict_json_schema_for_supervisor_decision,
 )
-from supervisor.state import DECISIONS, HANDOFF, PROGRESS, StateStore
+from supervisor.state import DECISIONS, HANDOFF, PROGRESS, STATE_DIR_NAME, StateStore
 
 
-DEFAULT_SUPERVISOR_TIMEOUT_SECONDS = 180.0
+DEFAULT_SUPERVISOR_TIMEOUT_SECONDS = 360.0
 # Completion review reads the whole (growing) workspace at high effort; late-round reviews on
 # large tasks were observed needing >900s (a 711k-token read died at the old cap and killed a
 # 4.5h run). Keep this above the coder RPC budget, not below it.
-DEFAULT_COMPLETION_REVIEW_TIMEOUT_SECONDS = 2400.0
+DEFAULT_COMPLETION_REVIEW_TIMEOUT_SECONDS = 4800.0
 # Prompt-size budgets (characters). Compaction triggers above the target so the
 # assembled wake packet never approaches the model context window (~4 chars/token).
 # Both runtime and completion wakes go through a budget; runtime is kept small so it
@@ -56,6 +56,13 @@ COMPLETION_PROMPT_TARGET_CHARS = 500_000
 COMPLETION_PROMPT_ULTRA_TARGET_CHARS = 380_000
 RUNTIME_PROMPT_TARGET_CHARS = 120_000
 RUNTIME_PROMPT_ULTRA_TARGET_CHARS = 80_000
+RUNTIME_PROGRESS_ENTRY_LIMIT = 30
+RUNTIME_PROGRESS_CHAR_LIMIT = 12_000
+RUNTIME_DECISIONS_ENTRY_LIMIT = 20
+RUNTIME_DECISIONS_CHAR_LIMIT = 10_000
+RUNTIME_VALIDATION_LIMIT = 12
+RUNTIME_INSPECTION_LIMIT = 8
+RUNTIME_INTERVENTION_LIMIT = 10
 
 
 class SupervisorAgentError(RuntimeError):
@@ -90,6 +97,7 @@ class StatelessSupervisorAgent:
         self.completion_thread_id: str | None = None
 
     async def decide(self, packet: SupervisorWakePacket) -> SupervisorDecision:
+        packet = _prepare_runtime_packet(packet)
         prompt_packet, prompt = _stateless_prompt_with_budget(packet)
         return await self._decide(
             prompt_packet,
@@ -435,7 +443,7 @@ class StatelessSupervisorAgent:
 
     async def decide_approval(self, context: ApprovalContext, reason: str) -> SupervisorDecision:
         packet = self.build_packet(
-            wake_sequence=self.store.get_sentinel_config().last_event_sequence + 1,
+            wake_sequence=self.store.get_bello_config().last_event_sequence + 1,
             current_summary=f"Approval request needs judgment: {reason}",
             triggering_server_request_id=context.server_request_id,
             approval_context=_approval_wake_context(context, reason),
@@ -485,7 +493,7 @@ class StatelessSupervisorAgent:
         behavior_surface: list[BehaviorSurfaceItem] | None = None,
         prior_uncovered_edge_candidates: list[str] | None = None,
     ) -> SupervisorWakePacket:
-        cfg = self.store.get_sentinel_config()
+        cfg = self.store.get_bello_config()
         health = self.store.get_health()
         prior_interventions = prior_interventions or []
         health_payload = health.model_dump(mode="json")
@@ -868,6 +876,226 @@ def _slim_completion_packet(packet: SupervisorWakePacket) -> SupervisorWakePacke
             "diff_summary": None,
         }
     )
+
+
+def _prepare_runtime_packet(packet: SupervisorWakePacket) -> SupervisorWakePacket:
+    progress, progress_total, progress_included = _markdown_tail_excerpt(
+        packet.progress,
+        entry_limit=RUNTIME_PROGRESS_ENTRY_LIMIT,
+        char_limit=RUNTIME_PROGRESS_CHAR_LIMIT,
+    )
+    decisions, decisions_total, decisions_included = _markdown_tail_excerpt(
+        packet.decisions,
+        entry_limit=RUNTIME_DECISIONS_ENTRY_LIMIT,
+        char_limit=RUNTIME_DECISIONS_CHAR_LIMIT,
+    )
+    return packet.model_copy(
+        update={
+            "progress": progress,
+            "progress_path": f"{STATE_DIR_NAME}/{PROGRESS}",
+            "progress_total_entries": progress_total,
+            "progress_omitted_entries": max(0, progress_total - progress_included),
+            "decisions": decisions,
+            "decisions_path": f"{STATE_DIR_NAME}/{DECISIONS}",
+            "decisions_total_entries": decisions_total,
+            "decisions_omitted_entries": max(0, decisions_total - decisions_included),
+            "validations": _select_runtime_validations(
+                packet.validations,
+                triggering_action=packet.triggering_action,
+            ),
+            "inspections": _select_runtime_inspections(
+                packet.inspections,
+                triggering_action=packet.triggering_action,
+            ),
+            "prior_interventions": [
+                _compact_runtime_intervention(value)
+                for value in packet.prior_interventions[-RUNTIME_INTERVENTION_LIMIT:]
+            ],
+        }
+    )
+
+
+def _markdown_tail_excerpt(
+    text: str,
+    *,
+    entry_limit: int,
+    char_limit: int,
+) -> tuple[str, int, int]:
+    lines = text.splitlines()
+    heading = next((line for line in lines if line.startswith("#")), "")
+    entries: list[str] = []
+    current: list[str] = []
+    for line in lines:
+        if line.startswith("- "):
+            if current:
+                entries.append("\n".join(current))
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        entries.append("\n".join(current))
+    if not entries:
+        return _bounded_text(text, limit=char_limit), 0, 0
+
+    selected = entries[-entry_limit:]
+
+    def render(values: list[str]) -> str:
+        body = "\n".join(values)
+        return f"{heading}\n\n{body}".strip() if heading else body
+
+    while len(selected) > 1 and len(render(selected)) > char_limit:
+        selected.pop(0)
+    excerpt = render(selected)
+    if len(excerpt) > char_limit:
+        excerpt = _bounded_text(excerpt, limit=char_limit)
+    return excerpt, len(entries), len(selected)
+
+
+def _select_runtime_validations(
+    validations: list[ValidationRun],
+    *,
+    triggering_action: TriggeringAction | None,
+) -> list[ValidationRun]:
+    if not validations:
+        return []
+    selected: list[ValidationRun] = []
+    selected_keys: set[tuple[str, int]] = set()
+
+    def add(value: ValidationRun) -> None:
+        key = (value.validation_id, value.sequence)
+        if key in selected_keys or len(selected) >= RUNTIME_VALIDATION_LIMIT:
+            return
+        selected_keys.add(key)
+        selected.append(value)
+
+    command_key = _normalized_command_key(triggering_action.command if triggering_action else None)
+    if command_key:
+        matching = [
+            value
+            for value in reversed(validations)
+            if _normalized_command_key(value.normalized_command or value.command) == command_key
+        ]
+        for value in matching[:4]:
+            add(value)
+
+    for predicate in (
+        lambda value: value.trusted_validation_outcome == "masked_or_unknown",
+        lambda value: value.trusted_validation_outcome == "failed",
+        lambda value: value.type in {"behavioral", "behavior_demo"}
+        and value.trusted_validation_outcome == "passed",
+    ):
+        match = next((value for value in reversed(validations) if predicate(value)), None)
+        if match is not None:
+            add(match)
+
+    for value in reversed(validations[-5:]):
+        add(value)
+    for value in reversed(validations):
+        add(value)
+        if len(selected) >= RUNTIME_VALIDATION_LIMIT:
+            break
+    return [
+        _compact_runtime_validation(value)
+        for value in sorted(selected, key=lambda item: item.sequence)
+    ]
+
+
+def _select_runtime_inspections(
+    inspections: list[InspectionRun],
+    *,
+    triggering_action: TriggeringAction | None,
+) -> list[InspectionRun]:
+    if not inspections:
+        return []
+    selected: list[InspectionRun] = []
+    selected_keys: set[tuple[str, int]] = set()
+
+    def add(value: InspectionRun) -> None:
+        key = (value.inspection_id, value.sequence)
+        if key in selected_keys or len(selected) >= RUNTIME_INSPECTION_LIMIT:
+            return
+        selected_keys.add(key)
+        selected.append(value)
+
+    command_key = _normalized_command_key(triggering_action.command if triggering_action else None)
+    if command_key:
+        matching = [
+            value
+            for value in reversed(inspections)
+            if _normalized_command_key(value.normalized_command or value.command) == command_key
+        ]
+        for value in matching[:3]:
+            add(value)
+
+    seen_commands: set[str] = set()
+    for value in reversed(inspections):
+        key = _normalized_command_key(value.normalized_command or value.command)
+        if key in seen_commands:
+            continue
+        seen_commands.add(key)
+        add(value)
+        if len(selected) >= RUNTIME_INSPECTION_LIMIT:
+            break
+    return [
+        _compact_runtime_inspection(value)
+        for value in sorted(selected, key=lambda item: item.sequence)
+    ]
+
+
+def _compact_runtime_validation(value: ValidationRun) -> ValidationRun:
+    had_output = bool(value.captured_output.strip())
+    return value.model_copy(
+        update={
+            "command": _slim_command(value.command, limit=300),
+            "raw_command": None,
+            "normalized_command": None,
+            "cwd": None,
+            "summary": _bounded_text(value.summary, limit=800),
+            "captured_output": "",
+            "captured_output_truncated": value.captured_output_truncated or had_output,
+            "raw_selector": _bounded_text(value.raw_selector, limit=300) if value.raw_selector else None,
+            "executed_test_names": _bounded_string_list(value.executed_test_names),
+            "executed_test_files": _bounded_string_list(value.executed_test_files),
+            "target_files_or_test_files": _bounded_string_list(value.target_files_or_test_files),
+        }
+    )
+
+
+def _compact_runtime_inspection(value: InspectionRun) -> InspectionRun:
+    had_output = bool(value.captured_output.strip())
+    return value.model_copy(
+        update={
+            "command": _slim_command(value.command, limit=300),
+            "raw_command": None,
+            "normalized_command": None,
+            "cwd": None,
+            "summary": _bounded_text(value.summary, limit=600),
+            "captured_output": "",
+            "captured_output_truncated": value.captured_output_truncated or had_output,
+            "inspected_paths": _bounded_string_list(value.inspected_paths),
+        }
+    )
+
+
+def _compact_runtime_intervention(value: PriorIntervention) -> PriorIntervention:
+    return value.model_copy(
+        update={
+            "reason": _bounded_text(value.reason, limit=400),
+            "message_to_coder": _bounded_text(value.message_to_coder, limit=1000),
+        }
+    )
+
+
+def _bounded_string_list(values: list[str], *, limit: int = 20, item_limit: int = 240) -> list[str]:
+    bounded = [_bounded_text(value, limit=item_limit) for value in values[:limit]]
+    omitted = len(values) - len(bounded)
+    if omitted > 0:
+        bounded.append(f"...<{omitted} more>")
+    return bounded
+
+
+def _normalized_command_key(command: str | None) -> str:
+    return " ".join((command or "").strip().split())
 
 
 class _PromptCompactionLevel:

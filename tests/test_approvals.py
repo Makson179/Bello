@@ -1,54 +1,17 @@
 from __future__ import annotations
 
-import asyncio
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from supervisor.approval_triage import (
-    DEFAULT_TRIAGE_MODEL,
-    CheapApprovalReviewer,
-    cheap_approval_triage_config_from_env,
-)
 from supervisor.appserver import AppServerMessage
 from supervisor.approvals import ApprovalManager, normalize_approval_request
-from supervisor.schemas import ApprovalDecisionKind, CheapApprovalDecision, SupervisorDecision, SupervisorDecisionKind
+from supervisor.schemas import ApprovalDecisionKind, SupervisorDecision, SupervisorDecisionKind
 
 
 def message(method: str, request_id: int, params: dict) -> AppServerMessage:
     return AppServerMessage({"id": request_id, "method": method, "params": params})
-
-
-def test_cheap_approval_triage_config_defaults_disabled_with_default_model(monkeypatch) -> None:
-    # Cheap approval stays opt-in; deterministic gates cover the obvious cases.
-    monkeypatch.delenv("SENTINEL_APPROVAL_TRIAGE_ENABLED", raising=False)
-    monkeypatch.delenv("SENTINEL_APPROVAL_TRIAGE_MODEL", raising=False)
-    monkeypatch.setenv("SENTINEL_APPROVAL_TRIAGE_TIMEOUT", "3.5")
-
-    config = cheap_approval_triage_config_from_env()
-
-    assert config.enabled is False
-    assert config.model == DEFAULT_TRIAGE_MODEL
-    assert config.timeout_seconds == 3.5
-
-
-def test_cheap_approval_triage_can_be_enabled_by_env(monkeypatch) -> None:
-    monkeypatch.setenv("SENTINEL_APPROVAL_TRIAGE_ENABLED", "true")
-    monkeypatch.delenv("SENTINEL_APPROVAL_TRIAGE_MODEL", raising=False)
-
-    config = cheap_approval_triage_config_from_env()
-
-    assert config.enabled is True
-
-
-def test_cheap_approval_reviewer_uses_configured_model(tmp_path: Path) -> None:
-    reviewer = CheapApprovalReviewer(object(), tmp_path, model="cheap-model", timeout_seconds=7)  # type: ignore[arg-type]
-
-    params = reviewer._thread_params()
-
-    assert params["model"] == "cheap-model"
-    assert params["cwd"] == str(tmp_path)
 
 
 def command_context(tmp_path: Path, command: str, *, available=None):
@@ -66,25 +29,6 @@ def command_context(tmp_path: Path, command: str, *, available=None):
             },
         )
     )
-
-
-class FakeCheapReviewer:
-    model = "cheap-test"
-
-    def __init__(self, result=None, exc: BaseException | None = None) -> None:
-        self.result = result or CheapApprovalDecision(decision="approve_low_impact", reason_code="bounded_read_only")
-        self.exc = exc
-        self.calls = 0
-        self.contexts = []
-        self.evaluations = []
-
-    async def review(self, context, evaluation):
-        self.calls += 1
-        self.contexts.append(context)
-        self.evaluations.append(evaluation)
-        if self.exc is not None:
-            raise self.exc
-        return self.result
 
 
 class FakeFullSupervisor:
@@ -186,6 +130,79 @@ async def test_accept_with_execpolicy_amendment_only_for_command(tmp_path: Path)
 
     assert isinstance(decision.decision, dict)
     assert "acceptWithExecpolicyAmendment" in decision.decision
+
+
+@pytest.mark.asyncio
+async def test_accept_for_session_with_exact_execpolicy_amendment_uses_offered_protocol_decision(
+    tmp_path: Path,
+) -> None:
+    amendment = ["./compile.sh"]
+
+    class Reviewer:
+        async def decide_approval(self, context, reason):
+            return SupervisorDecision(
+                decision=SupervisorDecisionKind.APPROVE,
+                approval_decision=ApprovalDecisionKind.ACCEPT_FOR_SESSION,
+                execpolicy_amendment=amendment,
+                reason="approve the exact repeated build",
+            )
+
+    offered_decision = {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": amendment}}
+    ctx = normalize_approval_request(
+        message(
+            "item/commandExecution/requestApproval",
+            13,
+            {
+                "threadId": "thread",
+                "turnId": "turn",
+                "itemId": "build",
+                "command": "/bin/bash -lc ./compile.sh",
+                "cwd": str(tmp_path),
+                "proposedExecpolicyAmendment": amendment,
+                "availableDecisions": ["accept", offered_decision, "cancel"],
+            },
+        )
+    )
+
+    decision = await ApprovalManager(tmp_path, supervisor=Reviewer()).decide(ctx)
+
+    assert decision.decision == offered_decision
+    assert decision.from_supervisor is True
+
+
+@pytest.mark.asyncio
+async def test_accept_for_session_cannot_substitute_unoffered_execpolicy_amendment(tmp_path: Path) -> None:
+    offered_amendment = ["./compile.sh"]
+
+    class Reviewer:
+        async def decide_approval(self, context, reason):
+            return SupervisorDecision(
+                decision=SupervisorDecisionKind.APPROVE,
+                approval_decision=ApprovalDecisionKind.ACCEPT_FOR_SESSION,
+                execpolicy_amendment=["./other-command"],
+                reason="approve a different command",
+            )
+
+    ctx = normalize_approval_request(
+        message(
+            "item/commandExecution/requestApproval",
+            14,
+            {
+                "command": "/bin/bash -lc ./compile.sh",
+                "cwd": str(tmp_path),
+                "proposedExecpolicyAmendment": offered_amendment,
+                "availableDecisions": [
+                    "accept",
+                    {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": offered_amendment}},
+                    "cancel",
+                ],
+            },
+        )
+    )
+
+    decision = await ApprovalManager(tmp_path, supervisor=Reviewer()).decide(ctx)
+
+    assert decision.decision == "cancel"
 
 
 @pytest.mark.asyncio
@@ -500,15 +517,13 @@ async def test_recursive_delete_of_tracked_path_is_denied(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_deterministic_allow_bypasses_cheap_and_full_review(tmp_path: Path) -> None:
-    cheap = FakeCheapReviewer()
+async def test_deterministic_allow_bypasses_full_review(tmp_path: Path) -> None:
     full = FakeFullSupervisor()
     ctx = command_context(tmp_path, "ls")
 
-    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
+    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
 
     assert decision.decision == "accept"
-    assert cheap.calls == 0
     assert full.calls == 0
 
 
@@ -524,210 +539,76 @@ async def test_deterministic_allow_bypasses_cheap_and_full_review(tmp_path: Path
 )
 @pytest.mark.asyncio
 async def test_project_execution_commands_use_full_supervisor_review(tmp_path: Path, command: str) -> None:
-    cheap = FakeCheapReviewer()
     full = FakeFullSupervisor()
     ctx = command_context(tmp_path, command.format(workspace=tmp_path))
 
-    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
+    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
 
     assert decision.decision == "accept"
-    assert cheap.calls == 0
     assert full.calls == 1
 
 
 @pytest.mark.asyncio
 async def test_shell_heredoc_task_command_still_uses_full_supervisor(tmp_path: Path) -> None:
-    cheap = FakeCheapReviewer()
     full = FakeFullSupervisor()
     ctx = command_context(
         tmp_path,
         "bash -lc 'cat > /tmp/input.c <<EOF\nint main(void){return 0;}\nEOF'",
     )
 
-    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
+    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
 
     assert decision.decision == "accept"
-    assert cheap.calls == 0
     assert full.calls == 1
 
 
 @pytest.mark.asyncio
 async def test_private_c_compiler_input_still_uses_full_supervisor(tmp_path: Path) -> None:
-    cheap = FakeCheapReviewer()
     full = FakeFullSupervisor()
     ctx = command_context(tmp_path, "./c_compiler /tmp/private/input.c -o /tmp/out")
 
-    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
+    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
 
     assert decision.decision == "accept"
-    assert cheap.calls == 0
     assert full.calls == 1
 
 
 @pytest.mark.asyncio
-async def test_deterministic_denial_bypasses_and_cannot_be_overridden_by_cheap_review(tmp_path: Path) -> None:
-    cheap = FakeCheapReviewer()
+async def test_deterministic_denial_bypasses_full_review(tmp_path: Path) -> None:
     full = FakeFullSupervisor()
-    ctx = command_context(tmp_path, "sentinel --task TASK.md")
+    ctx = command_context(tmp_path, "bello --task TASK.md")
 
-    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
+    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
 
     assert decision.decision in {"decline", "cancel"}
-    assert "Sentinel" in decision.reason
-    assert cheap.calls == 0
+    assert "Bello" in decision.reason
     assert full.calls == 0
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git status --short && git diff --stat",
+        "mkdir build",
+        "cp parser.c /tmp/leak.c",
+        "python -c \"print('x')\"",
+    ],
+)
 @pytest.mark.asyncio
-async def test_eligible_command_can_be_plain_accepted_by_cheap_review(tmp_path: Path) -> None:
-    cheap = FakeCheapReviewer(
-        CheapApprovalDecision(decision="approve_low_impact", reason_code="bounded_read_only")
-    )
+async def test_commands_requiring_judgment_go_directly_to_full_supervisor(tmp_path: Path, command: str) -> None:
     full = FakeFullSupervisor()
-    ctx = command_context(tmp_path, "git status --short && git diff --stat")
+    ctx = command_context(tmp_path, command)
 
-    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
-
-    assert decision.decision == "accept"
-    assert decision.reason == "low-impact command approved by cheap review (bounded_read_only)"
-    assert decision.persistent_decision is None
-    assert decision.from_supervisor is False
-    assert cheap.calls == 1
-    assert full.calls == 0
-
-
-@pytest.mark.asyncio
-async def test_workspace_local_write_is_eligible_for_cheap_approval(tmp_path: Path) -> None:
-    # Expanded eligibility: a bounded in-workspace write (not read-only) may be cheap-approved.
-    cheap = FakeCheapReviewer(
-        CheapApprovalDecision(decision="approve_low_impact", reason_code="workspace_local_safe")
-    )
-    full = FakeFullSupervisor()
-    ctx = command_context(tmp_path, "mkdir build")
-
-    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
-
-    assert decision.decision == "accept"
-    assert decision.reason == "low-impact command approved by cheap review (workspace_local_safe)"
-    assert decision.from_supervisor is False
-    assert cheap.calls == 1
-    assert full.calls == 0
-
-
-@pytest.mark.asyncio
-async def test_workspace_escaping_write_bypasses_cheap_review(tmp_path: Path) -> None:
-    # A write that leaves the workspace stays hard-blocked from cheap review (integrity/safety).
-    cheap = FakeCheapReviewer(
-        CheapApprovalDecision(decision="approve_low_impact", reason_code="workspace_local_safe")
-    )
-    full = FakeFullSupervisor()
-    ctx = command_context(tmp_path, "cp parser.c /tmp/leak.c")
-
-    await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
-
-    assert cheap.calls == 0
-    assert full.calls == 1
-
-
-@pytest.mark.asyncio
-async def test_cheap_review_escalation_calls_full_supervisor_once_with_original_reason(tmp_path: Path) -> None:
-    cheap = FakeCheapReviewer(CheapApprovalDecision(decision="escalate", reason_code="needs_task_judgment"))
-    full = FakeFullSupervisor()
-    ctx = command_context(tmp_path, "git status --short && git diff --stat")
-
-    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
+    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
 
     assert decision.decision == "accept"
     assert decision.reason == "full supervisor approved"
-    assert cheap.calls == 1
-    assert full.calls == 1
-    assert full.contexts == [ctx]
-    assert full.reasons == ["shell metacharacters require LLM review"]
-
-
-@pytest.mark.asyncio
-async def test_cheap_review_exception_calls_full_supervisor_without_leaking_marker(tmp_path: Path) -> None:
-    marker = "CHEAP_REVIEW_PRIVATE_MARKER_71F2"
-    cheap = FakeCheapReviewer(exc=RuntimeError(marker))
-    full = FakeFullSupervisor()
-    ctx = command_context(tmp_path, "git status --short && git diff --stat")
-
-    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
-
-    assert decision.decision == "accept"
-    assert cheap.calls == 1
-    assert full.calls == 1
-    assert marker not in full.reasons[0]
-    assert marker not in full.contexts[0].model_dump_json()
-
-
-@pytest.mark.asyncio
-async def test_cheap_review_timeout_calls_full_supervisor(tmp_path: Path) -> None:
-    class SlowCheapReviewer(FakeCheapReviewer):
-        async def review(self, context, evaluation):
-            self.calls += 1
-            await asyncio.sleep(1)
-            return self.result
-
-    cheap = SlowCheapReviewer()
-    full = FakeFullSupervisor()
-    ctx = command_context(tmp_path, "git status --short && git diff --stat")
-
-    decision = await ApprovalManager(
-        tmp_path,
-        supervisor=full,
-        cheap_reviewer=cheap,
-        cheap_review_timeout_seconds=0.01,
-    ).decide(ctx)
-
-    assert decision.decision == "accept"
-    assert cheap.calls == 1
+    assert decision.from_supervisor is True
     assert full.calls == 1
 
 
 @pytest.mark.asyncio
-async def test_cheap_review_invalid_shape_calls_full_supervisor(tmp_path: Path) -> None:
-    cheap = FakeCheapReviewer({"decision": "approve_low_impact", "reason_code": "bounded_read_only", "extra": "no"})
-    full = FakeFullSupervisor()
-    ctx = command_context(tmp_path, "git status --short && git diff --stat")
-
-    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
-
-    assert decision.decision == "accept"
-    assert cheap.calls == 1
-    assert full.calls == 1
-    assert full.reasons == ["shell metacharacters require LLM review"]
-
-
-@pytest.mark.asyncio
-async def test_cheap_review_unavailable_calls_full_supervisor(tmp_path: Path) -> None:
-    cheap = FakeCheapReviewer(exc=RuntimeError("model unavailable"))
-    full = FakeFullSupervisor()
-    ctx = command_context(tmp_path, "git status --short && git diff --stat")
-
-    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
-
-    assert decision.decision == "accept"
-    assert cheap.calls == 1
-    assert full.calls == 1
-
-
-@pytest.mark.asyncio
-async def test_noncandidate_command_bypasses_cheap_and_calls_full_supervisor(tmp_path: Path) -> None:
-    cheap = FakeCheapReviewer()
-    full = FakeFullSupervisor()
-    ctx = command_context(tmp_path, "python -c \"print('x')\"")
-
-    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
-
-    assert decision.decision == "accept"
-    assert cheap.calls == 0
-    assert full.calls == 1
-
-
-@pytest.mark.asyncio
-async def test_accept_not_offered_rejects_cheap_approval_and_uses_full_supervisor(tmp_path: Path) -> None:
-    cheap = FakeCheapReviewer()
+async def test_accept_not_offered_uses_full_supervisor_denial(tmp_path: Path) -> None:
     full = FakeFullSupervisor(
         SupervisorDecision(
             decision=SupervisorDecisionKind.DENY,
@@ -737,30 +618,26 @@ async def test_accept_not_offered_rejects_cheap_approval_and_uses_full_superviso
     )
     ctx = command_context(tmp_path, "git status --short && git diff --stat", available=["decline", "cancel"])
 
-    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
+    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
 
     assert decision.decision in {"decline", "cancel"}
-    assert cheap.calls == 0
     assert full.calls == 1
 
 
 @pytest.mark.asyncio
-async def test_full_supervisor_failure_after_cheap_escalation_fails_closed(tmp_path: Path) -> None:
-    cheap = FakeCheapReviewer(CheapApprovalDecision(decision="escalate", reason_code="needs_task_judgment"))
+async def test_full_supervisor_failure_fails_closed(tmp_path: Path) -> None:
     full = FakeFullSupervisor(exc=RuntimeError("full failed"))
     ctx = command_context(tmp_path, "git status --short && git diff --stat")
 
-    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
+    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
 
     assert decision.decision in {"decline", "cancel"}
     assert "supervisor approval fallback failed" in decision.reason
-    assert cheap.calls == 1
     assert full.calls == 1
 
 
 @pytest.mark.asyncio
-async def test_full_supervisor_invalid_output_after_fallback_fails_closed(tmp_path: Path) -> None:
-    cheap = FakeCheapReviewer(CheapApprovalDecision(decision="escalate", reason_code="needs_task_judgment"))
+async def test_full_supervisor_invalid_output_fails_closed(tmp_path: Path) -> None:
     full = FakeFullSupervisor(
         SupervisorDecision(
             decision=SupervisorDecisionKind.NOOP,
@@ -770,62 +647,77 @@ async def test_full_supervisor_invalid_output_after_fallback_fails_closed(tmp_pa
     )
     ctx = command_context(tmp_path, "git status --short && git diff --stat")
 
-    decision = await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
+    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
 
     assert decision.decision in {"decline", "cancel"}
     assert "not an approval" in decision.reason
-    assert cheap.calls == 1
     assert full.calls == 1
 
 
 @pytest.mark.parametrize(
-    ("method", "params"),
+    "method",
     [
-        (
-            "item/commandExecution/requestApproval",
-            {
-                "command": "curl https://example.com",
-                "networkApprovalContext": {"host": "example.com", "protocol": "https"},
-                "availableDecisions": ["accept", "decline"],
-            },
-        ),
-        ("item/fileChange/requestApproval", {"grantRoot": "x", "availableDecisions": ["accept", "decline"]}),
-        ("item/permissions/requestApproval", {"availableDecisions": ["accept", "decline"]}),
-        ("item/tool/call", {"availableDecisions": ["accept", "decline"]}),
-        ("item/tool/requestUserInput", {"availableDecisions": ["accept", "decline"]}),
-        ("mcpServer/elicitation/request", {"availableDecisions": ["accept", "decline"]}),
-        ("unknown/request", {"availableDecisions": ["accept", "decline"]}),
+        "item/permissions/requestApproval",
+        "item/tool/call",
+        "item/tool/requestUserInput",
+        "mcpServer/elicitation/request",
+        "unknown/request",
     ],
 )
 @pytest.mark.asyncio
-async def test_non_command_request_boundaries_never_use_cheap_review(tmp_path: Path, method: str, params: dict) -> None:
-    cheap = FakeCheapReviewer()
+async def test_unsupported_request_types_are_denied_without_full_supervisor(tmp_path: Path, method: str) -> None:
     full = FakeFullSupervisor()
-    params = {"threadId": "t", "turnId": "u", "itemId": "i", **params}
-    if method == "item/fileChange/requestApproval":
-        params["grantRoot"] = str(tmp_path)
+    params = {
+        "threadId": "t",
+        "turnId": "u",
+        "itemId": "i",
+        "availableDecisions": ["accept", "decline"],
+    }
     ctx = normalize_approval_request(message(method, 200, params))
 
-    await ApprovalManager(tmp_path, supervisor=full, cheap_reviewer=cheap).decide(ctx)
+    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
 
-    assert cheap.calls == 0
+    assert decision.decision in {"decline", "cancel"}
+    assert full.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_network_approval_goes_directly_to_full_supervisor(tmp_path: Path) -> None:
+    full = FakeFullSupervisor()
+    ctx = normalize_approval_request(
+        message(
+            "item/commandExecution/requestApproval",
+            201,
+            {
+                "command": "curl https://example.com",
+                "cwd": str(tmp_path),
+                "networkApprovalContext": {"host": "example.com", "protocol": "https"},
+                "availableDecisions": ["accept", "decline"],
+            },
+        )
+    )
+
+    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
+
+    assert decision.decision == "accept"
+    assert full.calls == 1
 
 
 def test_runtime_triage_config_defaults_enabled_with_default_model(monkeypatch) -> None:
     from supervisor.approval_triage import DEFAULT_TRIAGE_MODEL, runtime_triage_config_from_env
 
-    monkeypatch.delenv("SENTINEL_RUNTIME_TRIAGE_ENABLED", raising=False)
-    monkeypatch.delenv("SENTINEL_RUNTIME_TRIAGE_MODEL", raising=False)
+    monkeypatch.setenv("BELLO_RUNTIME_TRIAGE_ENABLED", "false")
+    monkeypatch.delenv("BELLO_RUNTIME_TRIAGE_MODEL", raising=False)
     config = runtime_triage_config_from_env()
     assert config.enabled is True
     assert config.model == DEFAULT_TRIAGE_MODEL
 
 
-def test_runtime_triage_config_can_be_disabled(monkeypatch) -> None:
+def test_runtime_triage_config_uses_project_enabled_value(monkeypatch) -> None:
     from supervisor.approval_triage import runtime_triage_config_from_env
 
-    monkeypatch.setenv("SENTINEL_RUNTIME_TRIAGE_ENABLED", "false")
-    assert runtime_triage_config_from_env().enabled is False
+    monkeypatch.setenv("BELLO_RUNTIME_TRIAGE_ENABLED", "true")
+    assert runtime_triage_config_from_env(enabled=False).enabled is False
 
 
 def test_cheap_runtime_decision_validator() -> None:
@@ -862,6 +754,231 @@ def test_cheap_runtime_packet_is_slim(tmp_path: Path) -> None:
     assert "X" * 1000 not in prompt  # task body not present
     assert len(prompt) < 8000  # genuinely slim
     assert json.loads(prompt)["instructions"]  # carries the classifier instructions
+
+
+def test_cheap_runtime_packet_does_not_present_stale_masked_validation_as_current(tmp_path: Path) -> None:
+    import json
+
+    from supervisor.approval_triage import cheap_runtime_packet
+    from supervisor.schemas import SupervisorWakePacket, TriggeringAction, ValidationRun
+
+    stale = ValidationRun(
+        validation_id="stale",
+        command="./compile.sh",
+        exit_code=0,
+        passed=False,
+        trusted_validation_outcome="masked_or_unknown",
+        masking_reason="behavior_demo_missing_output",
+        summary="old masked compile",
+        sequence=10,
+    )
+    packet = SupervisorWakePacket(
+        wake_sequence=21,
+        latest_event_sequence=20,
+        generation=0,
+        restart_count=0,
+        task_path=str(tmp_path / "TASK.md"),
+        task_contents="task",
+        current_summary="Runtime trigger (nonzero_exit): diff exited 1",
+        triggering_action=TriggeringAction(
+            kind="commandExecution",
+            command="diff -u expected actual",
+            exit_code=1,
+            status="completed",
+            summary="diff exited 1",
+        ),
+        validations=[stale],
+    )
+
+    slim = cheap_runtime_packet(packet)
+
+    assert slim["triggering_validation"] is None
+    assert slim["followup_validations"] == []
+    assert "old masked compile" not in json.dumps(slim)
+
+
+def test_cheap_runtime_packet_keeps_current_validation_and_later_followup(tmp_path: Path) -> None:
+    import json
+
+    from supervisor.approval_triage import cheap_runtime_packet
+    from supervisor.schemas import SupervisorWakePacket, TriggeringAction, ValidationRun
+
+    stale = ValidationRun(
+        validation_id="stale",
+        command="./old-check",
+        exit_code=0,
+        passed=False,
+        trusted_validation_outcome="masked_or_unknown",
+        masking_reason="behavior_demo_missing_output",
+        summary="old masked validation",
+        sequence=5,
+    )
+    current = ValidationRun(
+        validation_id="current",
+        command="./compile.sh | head",
+        exit_code=0,
+        passed=False,
+        trusted_validation_outcome="masked_or_unknown",
+        masking_reason="pipeline_without_pipefail",
+        summary="current masked validation",
+        sequence=20,
+    )
+    followup = ValidationRun(
+        validation_id="followup",
+        command="./trusted-compare",
+        exit_code=0,
+        passed=True,
+        trusted_validation_outcome="passed",
+        summary="trusted comparison passed",
+        sequence=21,
+    )
+    packet = SupervisorWakePacket(
+        wake_sequence=22,
+        latest_event_sequence=21,
+        generation=0,
+        restart_count=0,
+        task_path=str(tmp_path / "TASK.md"),
+        task_contents="task",
+        current_summary="Runtime trigger (masked_validation): compile pipeline completed",
+        triggering_action=TriggeringAction(
+            kind="commandExecution",
+            command="./compile.sh | head",
+            exit_code=0,
+            status="completed",
+            summary="compile pipeline completed",
+        ),
+        validations=[stale, current, followup],
+    )
+
+    slim = cheap_runtime_packet(packet)
+    serialized = json.dumps(slim)
+
+    assert slim["triggering_validation"]["validation_id"] == "current"
+    assert [entry["validation_id"] for entry in slim["followup_validations"]] == ["followup"]
+    assert "old masked validation" not in serialized
+
+
+def test_cheap_runtime_packet_reconstructs_legacy_action_and_keeps_binding_context(tmp_path: Path) -> None:
+    from supervisor.approval_triage import cheap_runtime_packet
+    from supervisor.schemas import PriorIntervention, SupervisorWakePacket, ValidationRun
+
+    current = ValidationRun(
+        validation_id="audit",
+        command="python3 /tmp/audit.py",
+        exit_code=1,
+        passed=False,
+        trusted_validation_outcome="failed",
+        summary="audit mismatch output was truncated",
+        captured_output_truncated=True,
+        sequence=20,
+    )
+    packet = SupervisorWakePacket(
+        wake_sequence=21,
+        latest_event_sequence=20,
+        generation=0,
+        restart_count=1,
+        task_path=str(tmp_path / "TASK.md"),
+        task_contents="task",
+        current_summary=(
+            "Runtime trigger (repeated_same_failing_validation, nonzero_exit): "
+            "command completed: python3 /tmp/audit.py exit=1"
+        ),
+        triggering_item_id="cmd-20",
+        validations=[current],
+        prior_interventions=[
+            PriorIntervention(
+                sequence=18,
+                reason="The broad audit output is truncated before the actionable mismatch.",
+                message_to_coder="Expose the complete first mismatch before rerunning the audit.",
+            )
+        ],
+        latest_relevant_change_sequence=19,
+    )
+
+    slim = cheap_runtime_packet(packet)
+
+    assert slim["triggering_action"]["command"] == "python3 /tmp/audit.py"
+    assert slim["triggering_action"]["sequence"] == 20
+    assert slim["triggering_validation"]["validation_id"] == "audit"
+    assert slim["prior_interventions"][0]["sequence"] == 18
+    assert slim["validation_state"]["trusted_behavioral_validation_is_fresh"] is False
+    assert slim["latest_validation_request"]["sequence"] == 18
+    assert slim["routing_signals"]["failed_after_validation_request"] is True
+
+
+def test_cheap_runtime_packet_exposes_stale_edit_after_stop_and_validate(tmp_path: Path) -> None:
+    from supervisor.approval_triage import cheap_runtime_packet
+    from supervisor.schemas import ChangedFile, PriorIntervention, SupervisorWakePacket, TriggeringAction
+
+    packet = SupervisorWakePacket(
+        wake_sequence=31,
+        latest_event_sequence=30,
+        generation=0,
+        restart_count=0,
+        task_path=str(tmp_path / "TASK.md"),
+        task_contents="task",
+        current_summary="Runtime trigger (large_diff): file change completed: 1 changes",
+        triggering_action=TriggeringAction(
+            item_id="edit-30",
+            kind="fileChange",
+            paths=["src/parser.py"],
+            status="completed",
+            summary="file change completed: 1 changes",
+        ),
+        recent_events=[{"item_id": "edit-30", "sequence": 30}],
+        changed_files=[ChangedFile(path="src/parser.py", status="M", sequence=30)],
+        prior_interventions=[
+            PriorIntervention(
+                sequence=25,
+                reason="The affected behavioral comparison is stale.",
+                message_to_coder="Stop editing and run the asserting comparison before any further edit.",
+            )
+        ],
+        latest_relevant_change_sequence=30,
+    )
+
+    slim = cheap_runtime_packet(packet)
+
+    assert slim["routing_signals"]["stale_edit_after_stop_and_validate"] is True
+    assert slim["latest_validation_request"]["sequence"] == 25
+
+
+def test_cheap_runtime_packet_flags_masked_nonzero_after_validation_request(tmp_path: Path) -> None:
+    from supervisor.approval_triage import cheap_runtime_packet
+    from supervisor.schemas import PriorIntervention, SupervisorWakePacket, TriggeringAction
+
+    packet = SupervisorWakePacket(
+        wake_sequence=41,
+        latest_event_sequence=40,
+        generation=0,
+        restart_count=1,
+        task_path=str(tmp_path / "TASK.md"),
+        task_contents="task",
+        current_summary=(
+            "Runtime trigger (masked_validation, nonzero_exit): "
+            "command completed: python3 /tmp/comparator.py exit=1"
+        ),
+        triggering_action=TriggeringAction(
+            kind="commandExecution",
+            command="python3 /tmp/comparator.py",
+            exit_code=1,
+            status="failed",
+            summary="comparator failed",
+        ),
+        prior_interventions=[
+            PriorIntervention(
+                sequence=35,
+                reason="The affected behavior still lacks trusted evidence.",
+                message_to_coder="Run the asserting comparator before continuing.",
+            )
+        ],
+        latest_relevant_change_sequence=30,
+    )
+
+    slim = cheap_runtime_packet(packet)
+
+    assert slim["triggering_validation"] is None
+    assert slim["routing_signals"]["masked_nonzero_after_validation_request"] is True
 
 
 @pytest.mark.asyncio

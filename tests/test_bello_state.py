@@ -17,15 +17,17 @@ from supervisor.controller import (
     NO_MARKER_IDLE_NUDGE,
     POST_RESTART_CONTINUE_NUDGE,
     ControllerEvent,
-    SentinelController,
+    BelloController,
     _ensure_internal_runtime_git_excluded,
     _has_malformed_readiness_marker,
     _has_passing_behavioral_validation,
     _has_readiness_marker,
+    _git_status_entries_from_porcelain_v1_z,
     _inspection_from_action,
     _hash_file,
     _path_from_git_status_line,
     _read_workspace_file,
+    _runtime_restart_issue,
     _sandbox_matches_mode,
     _evidence_provenance_summary,
     _file_kind,
@@ -51,8 +53,8 @@ from supervisor.schemas import (
     FinalReport,
     PriorIntervention,
     RestartHandoff,
-    SentinelConfig,
-    SentinelStatus,
+    BelloConfig,
+    BelloStatus,
     SupervisorDecision,
     SupervisorDecisionKind,
     SupervisorWakePacket,
@@ -78,15 +80,15 @@ from supervisor.supervisor_agent import StatelessSupervisorAgent, SupervisorAgen
 from supervisor.workspace_snapshot import create_workspace_snapshot
 
 
-def test_sentinel_state_initializes_required_files(tmp_path: Path) -> None:
+def test_bello_state_initializes_required_files(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
     assert store.path(EVENTS).exists()
     assert store.path(FINAL_REPORT).exists()
-    assert store.get_sentinel_config().task_path == str(task)
+    assert store.get_bello_config().task_path == str(task)
 
 
 def test_internal_supervisor_dir_is_added_to_git_info_exclude(tmp_path: Path) -> None:
@@ -120,7 +122,7 @@ async def test_git_init_log_is_filtered_from_changed_files_source(tmp_path: Path
     (tmp_path / ".git-init.log").write_text("initial\nmore git init output\n", encoding="utf-8")
     (tmp_path / "src.c").write_text("int value(void) { return 2; }\n", encoding="utf-8")
 
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller.use_git_diff = True
@@ -157,7 +159,7 @@ async def test_generated_cache_artifacts_are_filtered_from_changed_files_source(
     script.write_text("#!/usr/bin/env bash\nprintf 'demo\\n'\n", encoding="utf-8")
     script.chmod(0o755)
 
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller.use_git_diff = True
@@ -194,8 +196,64 @@ async def test_generated_cache_artifacts_are_filtered_from_changed_files_source(
     assert observed_paths == {"src/app.c", "src/app.o", "compiler"}
 
 
+async def test_greenfield_untracked_files_keep_sequences_for_validation_freshness(tmp_path: Path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    task = tmp_path / "TASK.md"
+    task.write_text("# Build a Python CLI", encoding="utf-8")
+    subprocess.run(["git", "add", "TASK.md"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "init"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    source = tmp_path / "src" / "new module.py"
+    test_file = tmp_path / "tests" / "test_cli.py"
+    source.parent.mkdir()
+    test_file.parent.mkdir()
+    source.write_text("def main():\n    return 0\n", encoding="utf-8")
+    test_file.write_text("def test_main():\n    assert True\n", encoding="utf-8")
+
+    store = StateStore(tmp_path)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    controller = BelloController.__new__(BelloController)
+    controller.project_root = tmp_path
+    controller.task_path = task
+    controller.store = store
+    controller.use_git_diff = True
+    controller.observed_changed_files = {
+        "src/new module.py": ChangedFile(path="src/new module.py", status="modified", sequence=7),
+        "tests/test_cli.py": ChangedFile(path="tests/test_cli.py", status="modified", sequence=8),
+        "src/no-longer-changed.py": ChangedFile(path="src/no-longer-changed.py", status="modified", sequence=99),
+    }
+
+    changed = await controller.changed_files()
+    by_path = {file.path: file for file in changed}
+
+    assert set(by_path) == {"src/new module.py", "tests/test_cli.py"}
+    assert by_path["src/new module.py"].status == "??"
+    assert by_path["src/new module.py"].sequence == 7
+    assert by_path["tests/test_cli.py"].status == "??"
+    assert by_path["tests/test_cli.py"].sequence == 8
+
+    controller.validations = [
+        ValidationRun(command="pytest", exit_code=0, passed=True, summary="2 passed", sequence=9)
+    ]
+    assert await controller._done_without_fresh_behavioral_validation() is None
+    assert store.get_bello_config().last_relevant_edit_sequence == 8
+
+    controller.validations = [
+        ValidationRun(command="pytest", exit_code=0, passed=True, summary="2 passed", sequence=8)
+    ]
+    stale_reason = await controller._done_without_fresh_behavioral_validation()
+    assert stale_reason is not None
+    assert "relevant edit sequence 8" in stale_reason
+
+
 def test_coder_sandbox_defaults_to_workspace_write(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.delenv("SENTINEL_CODER_SANDBOX", raising=False)
+    monkeypatch.delenv("BELLO_CODER_SANDBOX", raising=False)
 
     assert coder_thread_params(tmp_path)["sandbox"] == "workspace-write"
     assert coder_turn_params("thread", "work", tmp_path)["sandboxPolicy"] == {
@@ -208,7 +266,7 @@ def test_coder_sandbox_defaults_to_workspace_write(tmp_path: Path, monkeypatch) 
 def test_snapshot_mode_protects_entire_original_workspace_from_approval_commands(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller._coder_snapshot = SimpleNamespace(original_root=tmp_path)
@@ -237,7 +295,7 @@ def test_workspace_write_preflight_rejects_network_or_extra_writable_roots(tmp_p
 
 
 def test_coder_sandbox_can_use_read_only(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("SENTINEL_CODER_SANDBOX", "read-only")
+    monkeypatch.setenv("BELLO_CODER_SANDBOX", "read-only")
 
     assert coder_thread_params(tmp_path)["sandbox"] == "read-only"
     assert coder_turn_params("thread", "work", tmp_path)["sandboxPolicy"] == {
@@ -263,13 +321,22 @@ def test_git_status_path_parser_handles_missing_second_status_column() -> None:
     assert _path_from_git_status_line("M public/language/en-GB/admin/manage/users.json") == "public/language/en-GB/admin/manage/users.json"
 
 
+def test_git_porcelain_z_parser_preserves_exact_paths_and_rename_destination() -> None:
+    output = "R  src/new name.py\0src/old name.py\0?? new dir/file one.py\0"
+
+    assert _git_status_entries_from_porcelain_v1_z(output) == [
+        ("src/new name.py", "R"),
+        ("new dir/file one.py", "??"),
+    ]
+
+
 async def test_changed_files_and_diff_summary_filter_internal_runtime_paths(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
@@ -284,6 +351,8 @@ async def test_changed_files_and_diff_summary_filter_internal_runtime_paths(tmp_
         return True
 
     async def git_output(command):
+        if command == ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"]:
+            return " M .supervisor/CONFIG.json\0 M TASK.md\0 M src/app.py\0"
         if command == ["git", "status", "--short"]:
             return " M .supervisor/CONFIG.json\n M TASK.md\n M src/app.py"
         if command == ["git", "diff", "--numstat", "HEAD", "--"]:
@@ -313,17 +382,17 @@ def test_file_kind_classifies_common_test_roots_before_source_extensions() -> No
 
 
 def test_coder_sandbox_can_use_danger_full_access(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("SENTINEL_CODER_SANDBOX", "danger-full-access")
+    monkeypatch.setenv("BELLO_CODER_SANDBOX", "danger-full-access")
 
     assert coder_thread_params(tmp_path)["sandbox"] == "danger-full-access"
     assert coder_turn_params("thread", "work", tmp_path)["sandboxPolicy"] == {"type": "dangerFullAccess"}
 
 
-def test_sentinel_events_are_append_only_jsonl(tmp_path: Path) -> None:
+def test_bello_events_are_append_only_jsonl(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
     store.append_event(AppEvent(sequence=1, source=AppEventSource.SYSTEM, event_type="test"))
 
@@ -336,7 +405,7 @@ def test_fresh_initialization_creates_empty_previous_runs_without_run_slot(tmp_p
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), mode="fresh")
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), mode="fresh")
     previous_runs = store.path(PREVIOUS_RUNS)
 
     assert previous_runs.is_dir()
@@ -351,7 +420,7 @@ def test_fresh_initialization_creates_empty_previous_runs_without_run_slot(tmp_p
     (recovery / "run9" / "workspace" / "app.py").write_text("recovery", encoding="utf-8")
     (store.state_dir / "scratch.txt").write_text("scratch", encoding="utf-8")
 
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), mode="fresh")
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), mode="fresh")
 
     assert store.path(EVENTS).read_text(encoding="utf-8") == ""
     assert store.path(LOG).read_text(encoding="utf-8") == ""
@@ -366,8 +435,8 @@ def test_resume_initialization_preserves_history_and_resets_runtime_files(tmp_pa
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    config = SentinelConfig(project_root=str(tmp_path), task_path=str(task))
-    store.initialize_sentinel(config, mode="fresh")
+    config = BelloConfig(project_root=str(tmp_path), task_path=str(task))
+    store.initialize_bello(config, mode="fresh")
     previous_runs = store.path(PREVIOUS_RUNS)
     run1 = previous_runs / "run1"
     run1.mkdir()
@@ -387,7 +456,7 @@ def test_resume_initialization_preserves_history_and_resets_runtime_files(tmp_pa
     (store.state_dir / "scratch.txt").write_text("scratch", encoding="utf-8")
     (store.state_dir / "scratch_dir").mkdir()
 
-    store.initialize_sentinel(config, mode="resume")
+    store.initialize_bello(config, mode="resume")
 
     assert store.path(EVENTS).read_text(encoding="utf-8") == '{"sequence": 42}\n'
     assert store.path(LOG).read_text(encoding="utf-8") == "old log\n"
@@ -408,7 +477,7 @@ def test_archive_completed_run_copies_task_and_report_after_completion(tmp_path:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), mode="fresh")
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), mode="fresh")
 
     store.write_final_report("first report\n")
     run1 = store.archive_completed_run(task)
@@ -426,7 +495,7 @@ def test_controller_event_sequence_starts_at_one_when_events_are_empty(tmp_path:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
 
-    controller = SentinelController(tmp_path, task_path=task)
+    controller = BelloController(tmp_path, task_path=task)
     controller.initialize_state()
 
     assert controller._sequence == 0
@@ -435,18 +504,18 @@ def test_controller_event_sequence_starts_at_one_when_events_are_empty(tmp_path:
 
     lines = controller.store.path(EVENTS).read_text(encoding="utf-8").splitlines()
     assert json.loads(lines[-1])["sequence"] == 1
-    assert controller.store.get_sentinel_config().last_event_sequence == 1
+    assert controller.store.get_bello_config().last_event_sequence == 1
 
 
 def test_controller_event_sequence_continues_existing_events(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
     store.append_event(AppEvent(sequence=7, source=AppEventSource.SYSTEM, event_type="old"))
     store.append_event(AppEvent(sequence=42, source=AppEventSource.SYSTEM, event_type="newer"))
 
-    controller = SentinelController(tmp_path, task_path=task)
+    controller = BelloController(tmp_path, task_path=task)
     controller.initialize_state()
 
     assert controller._sequence == 42
@@ -455,14 +524,14 @@ def test_controller_event_sequence_continues_existing_events(tmp_path: Path) -> 
 
     lines = controller.store.path(EVENTS).read_text(encoding="utf-8").splitlines()
     assert json.loads(lines[-1])["sequence"] == 43
-    assert controller.store.get_sentinel_config().last_event_sequence == 43
+    assert controller.store.get_bello_config().last_event_sequence == 43
 
 
 def test_final_report_rendering(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
     store.write_final_report(FinalReport(task_path=str(task), status="complete", result="done", files_changed=["a.py"]))
 
@@ -475,9 +544,9 @@ async def test_final_report_non_git_omits_git_usage_and_includes_validations(tmp
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
@@ -520,11 +589,11 @@ async def test_finalize_applies_accepted_snapshot_patch_to_real_workspace(tmp_pa
     controller.workspace_task_path = snapshot.task_path
     (snapshot.snapshot_root / "app.py").write_text("value = 2\n", encoding="utf-8")
 
-    await controller.finalize("task complete", status=SentinelStatus.COMPLETE, completion_review_accepted=True)
+    await controller.finalize("task complete", status=BelloStatus.COMPLETE, completion_review_accepted=True)
 
     assert source.read_text(encoding="utf-8") == "value = 2\n"
     assert not snapshot.temp_root.exists()
-    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
     assert "- app.py" in store.path(FINAL_REPORT).read_text(encoding="utf-8")
 
 
@@ -538,7 +607,7 @@ async def test_finalize_preserves_snapshot_and_escalates_when_patch_back_is_reje
     controller.workspace_task_path = snapshot.task_path
     (snapshot.snapshot_root / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
 
-    await controller.finalize("task complete", status=SentinelStatus.COMPLETE, completion_review_accepted=True)
+    await controller.finalize("task complete", status=BelloStatus.COMPLETE, completion_review_accepted=True)
 
     assert not (tmp_path / ".env").exists()
     assert not snapshot.temp_root.exists()
@@ -549,7 +618,7 @@ async def test_finalize_preserves_snapshot_and_escalates_when_patch_back_is_reje
     assert not (recovery_workspace / ".supervisor").exists()
     assert not (recovery_workspace / "TASK.md").is_symlink()
     assert (recovery_workspace / "TASK.md").read_text(encoding="utf-8") == "# Task"
-    assert store.get_sentinel_config().status == SentinelStatus.ESCALATED
+    assert store.get_bello_config().status == BelloStatus.ESCALATED
     report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
     assert "accepted snapshot could not be applied" in report
     assert "snapshot preserved" in report
@@ -567,14 +636,14 @@ async def test_noncomplete_run_preserves_workspace_without_applying_it(tmp_path:
     controller.workspace_task_path = snapshot.task_path
     (snapshot.snapshot_root / "app.py").write_text("value = 2\n", encoding="utf-8")
 
-    await controller.finalize("exited by user", status=SentinelStatus.EXITED)
+    await controller.finalize("exited by user", status=BelloStatus.EXITED)
 
     recovery_workspace = tmp_path / ".supervisor" / "recovery" / "run1" / "workspace"
     assert source.read_text(encoding="utf-8") == "value = 1\n"
     assert (recovery_workspace / "app.py").read_text(encoding="utf-8") == "value = 2\n"
     assert not (recovery_workspace / ".git").exists()
     assert not (recovery_workspace / ".supervisor").exists()
-    assert store.get_sentinel_config().status == SentinelStatus.EXITED
+    assert store.get_bello_config().status == BelloStatus.EXITED
     assert str(recovery_workspace) in store.path(FINAL_REPORT).read_text(encoding="utf-8")
 
 
@@ -587,11 +656,11 @@ async def test_preflight_failure_cleans_unused_snapshot_without_recovery(tmp_pat
     controller.workspace_root = snapshot.snapshot_root
     controller.workspace_task_path = snapshot.task_path
 
-    await controller.finalize("preflight failed", status=SentinelStatus.PROVIDER_FAILURE)
+    await controller.finalize("preflight failed", status=BelloStatus.PROVIDER_FAILURE)
 
     assert not snapshot.temp_root.exists()
     assert not (store.state_dir / "recovery").exists()
-    assert store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE
+    assert store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE
 
 
 def test_task_integrity_detects_replaced_snapshot_link(tmp_path: Path) -> None:
@@ -991,20 +1060,20 @@ async def test_command_aggregated_output_is_attached_to_validation_ledger(tmp_pa
 
 
 def test_readiness_marker_detection_requires_own_exact_line() -> None:
-    assert _has_readiness_marker("Summary\n  SENTINEL_READY_FOR_REVIEW  \n")
-    assert not _has_readiness_marker("Summary SENTINEL_READY_FOR_REVIEW")
-    assert not _has_readiness_marker("sentinel_ready_for_review")
-    assert _has_malformed_readiness_marker("sentinel_ready_for_review")
-    assert _has_malformed_readiness_marker("SENTINEL READY FOR REVIEW")
-    assert not _has_malformed_readiness_marker("I am not emitting `SENTINEL_READY_FOR_REVIEW`.")
+    assert _has_readiness_marker("Summary\n  BELLO_READY_FOR_REVIEW  \n")
+    assert not _has_readiness_marker("Summary BELLO_READY_FOR_REVIEW")
+    assert not _has_readiness_marker("bello_ready_for_review")
+    assert _has_malformed_readiness_marker("bello_ready_for_review")
+    assert _has_malformed_readiness_marker("BELLO READY FOR REVIEW")
+    assert not _has_malformed_readiness_marker("I am not emitting `BELLO_READY_FOR_REVIEW`.")
 
 
 async def test_exact_marker_triggers_completion_review_accept(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
         overwrite=True,
     )
 
@@ -1064,14 +1133,14 @@ async def test_exact_marker_triggers_completion_review_accept(tmp_path: Path) ->
             )
 
     fake = CompletionSupervisor()
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
     controller.supervisor = fake
     controller.pending_approvals = {}
     controller.last_coder_message = CoderMessage(
-        text="Summary: done\nValidation: pytest\nSENTINEL_READY_FOR_REVIEW",
+        text="Summary: done\nValidation: pytest\nBELLO_READY_FOR_REVIEW",
         sequence=1,
     )
     controller.validations = [
@@ -1100,8 +1169,8 @@ async def test_exact_marker_triggers_completion_review_accept(tmp_path: Path) ->
     await controller._supervisor_task
 
     assert len(fake.completion_packets) == 1
-    assert fake.completion_packets[0].last_coder_message.text.endswith("SENTINEL_READY_FOR_REVIEW")
-    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert fake.completion_packets[0].last_coder_message.text.endswith("BELLO_READY_FOR_REVIEW")
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
     assert "accepted by completion_review" in store.path(FINAL_REPORT).read_text(encoding="utf-8")
 
 
@@ -1109,7 +1178,7 @@ async def test_summary_done_without_marker_steers_for_exact_marker_not_completio
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"), overwrite=True)
 
     class FakeCoder:
         def __init__(self) -> None:
@@ -1119,7 +1188,7 @@ async def test_summary_done_without_marker_steers_for_exact_marker_not_completio
             self.messages.append(message)
             return "turn"
 
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
@@ -1145,14 +1214,14 @@ async def test_summary_done_without_marker_steers_for_exact_marker_not_completio
     await controller._handle_coder_turn_completed(item_id="message-item")
 
     assert controller.coder.messages == [NO_MARKER_IDLE_NUDGE]
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert store.get_bello_config().status == BelloStatus.STARTING
 
 
 async def test_material_limitation_without_marker_escalates_instead_of_marker_nudge(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"), overwrite=True)
 
     class FakeCoder:
         def __init__(self) -> None:
@@ -1166,7 +1235,7 @@ async def test_material_limitation_without_marker_escalates_instead_of_marker_nu
         async def interrupt(self):
             self.interrupted = True
 
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
@@ -1180,7 +1249,7 @@ async def test_material_limitation_without_marker_escalates_instead_of_marker_nu
             "Material limitation: Independent behavioral evidence is still missing. "
             "Current instructions prohibit adding a temporary behavior test, so there is "
             "no compliant next validation step. Therefore I am not emitting "
-            "`SENTINEL_READY_FOR_REVIEW`."
+            "`BELLO_READY_FOR_REVIEW`."
         ),
         sequence=7,
     )
@@ -1205,7 +1274,7 @@ async def test_material_limitation_without_marker_escalates_instead_of_marker_nu
 
     await controller._handle_coder_turn_completed(item_id="message-item")
 
-    assert store.get_sentinel_config().status == SentinelStatus.ESCALATED
+    assert store.get_bello_config().status == BelloStatus.ESCALATED
     assert controller.coder.messages == []
     assert controller.coder.interrupted is True
     assert "Coder reported material limitation" in store.path(PROGRESS).read_text(encoding="utf-8")
@@ -1214,7 +1283,7 @@ async def test_material_limitation_without_marker_escalates_instead_of_marker_nu
 
 async def test_no_marker_idle_forces_completion_review_once(tmp_path: Path) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
-    store.update_sentinel_config(
+    store.update_bello_config(
         lambda cfg: cfg.model_copy(update={"active_coder_turn_id": None, "last_event_sequence": 17})
     )
 
@@ -1232,9 +1301,9 @@ async def test_no_marker_idle_forces_completion_review_once(tmp_path: Path) -> N
 
 async def test_marker_with_completion_review_disabled_finalizes_without_review(tmp_path: Path) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
-    store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"completion_review_enabled": False}))
+    store.update_bello_config(lambda cfg: cfg.model_copy(update={"completion_review_enabled": False}))
     controller.last_coder_message = CoderMessage(
-        text="Summary: done\nValidation: pytest\nSENTINEL_READY_FOR_REVIEW",
+        text="Summary: done\nValidation: pytest\nBELLO_READY_FOR_REVIEW",
         sequence=1,
     )
     controller.validations = [
@@ -1243,7 +1312,7 @@ async def test_marker_with_completion_review_disabled_finalizes_without_review(t
 
     await controller._handle_coder_turn_completed(item_id="message-item")
 
-    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
     assert fake.completion_packets == []
     report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
     assert "completion review disabled by config" in report
@@ -1261,7 +1330,7 @@ async def test_completion_review_cli_override_beats_persisted_config(tmp_path: P
     assert controller._effective_completion_review() is False
 
     controller.completion_review = True
-    store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"completion_review_enabled": False}))
+    store.update_bello_config(lambda cfg: cfg.model_copy(update={"completion_review_enabled": False}))
     assert controller._effective_completion_review() is True
 
     controller.completion_review = None
@@ -1272,7 +1341,7 @@ async def test_completion_review_disabled_suppresses_adversary(tmp_path: Path) -
     controller, store, _ = _runtime_controller(tmp_path)
     controller.adversary_enabled = True
     controller.adversary_runs = None
-    store.update_sentinel_config(
+    store.update_bello_config(
         lambda cfg: cfg.model_copy(update={"max_adversary_runs": 2, "completion_review_enabled": False})
     )
 
@@ -1282,7 +1351,7 @@ async def test_completion_review_disabled_suppresses_adversary(tmp_path: Path) -
 
 async def test_no_marker_idle_nudges_coder_when_completion_review_disabled(tmp_path: Path) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
-    store.update_sentinel_config(
+    store.update_bello_config(
         lambda cfg: cfg.model_copy(
             update={"active_coder_turn_id": None, "last_event_sequence": 17, "completion_review_enabled": False}
         )
@@ -1407,14 +1476,414 @@ async def test_runtime_restart_budget_wakes_supervisor(tmp_path: Path) -> None:
     assert "restart_budget" in trace["trigger_reasons"]
 
 
-async def test_protected_runtime_wake_bypasses_cheap_runtime_noop(tmp_path: Path) -> None:
+def _runtime_failure_validation(
+    *,
+    sequence: int,
+    output: str,
+    validation_id: str = "validation-repeat",
+    trusted_outcome: str = "failed",
+    masking_reason: str | None = None,
+    command: str = "pytest tests/test_parser.py",
+) -> ValidationRun:
+    passed = trusted_outcome == "passed"
+    return ValidationRun(
+        validation_id=validation_id,
+        command=command,
+        normalized_command=command,
+        exit_code=0 if passed else 1,
+        shell_exit_code=0 if passed else 1,
+        outcome="pass" if passed else "fail",
+        passed=passed,
+        trusted_validation_outcome=trusted_outcome,
+        masking_reason=masking_reason,
+        summary=output,
+        captured_output=output,
+        sequence=sequence,
+        executed_test_names=["tests/test_parser.py::test_parse"],
+        executed_test_files=["tests/test_parser.py"],
+        failed_count=0 if passed else 1,
+    )
+
+
+def _runtime_validation_packet(
+    validation: ValidationRun,
+    *,
+    wake_sequence: int,
+    reason: str = "repeated_same_failing_validation",
+) -> SupervisorWakePacket:
+    return SupervisorWakePacket(
+        wake_sequence=wake_sequence,
+        latest_event_sequence=wake_sequence,
+        generation=0,
+        restart_count=0,
+        task_path="TASK.md",
+        task_contents="# Task",
+        current_summary=f"Runtime trigger ({reason}): validation requires review",
+        coder_thread_id="thread",
+        triggering_action=TriggeringAction(
+            kind="commandExecution",
+            command=validation.command,
+            exit_code=validation.exit_code,
+            status="completed",
+            summary=validation.summary,
+        ),
+        validations=[validation],
+    )
+
+
+def _runtime_unresolved_validation(
+    *,
+    sequence: int,
+    command: str,
+    validation_id: str,
+) -> ValidationRun:
+    return ValidationRun(
+        validation_id=validation_id,
+        command=command,
+        normalized_command=command,
+        exit_code=None,
+        shell_exit_code=None,
+        outcome="fail",
+        passed=False,
+        trusted_validation_outcome="failed",
+        summary=f"command completed: {command} exit=None",
+        sequence=sequence,
+    )
+
+
+def test_runtime_restart_issue_distinguishes_failures_but_groups_same_masking_reason() -> None:
+    first = _runtime_failure_validation(sequence=1, output="AssertionError: expected 1, got 2")
+    different = _runtime_failure_validation(sequence=2, output="ValueError: malformed header")
+
+    first_issue = _runtime_restart_issue(_runtime_validation_packet(first, wake_sequence=1))
+    different_issue = _runtime_restart_issue(_runtime_validation_packet(different, wake_sequence=2))
+
+    assert first_issue is not None
+    assert different_issue is not None
+    assert first_issue.key != different_issue.key
+
+    masked_a = _runtime_failure_validation(
+        sequence=3,
+        output="pipeline exit was masked",
+        validation_id="validation-a",
+        trusted_outcome="masked_or_unknown",
+        masking_reason="shell_pipeline_masks_failure",
+        command="bash strict-a.sh | tail",
+    )
+    masked_b = _runtime_failure_validation(
+        sequence=4,
+        output="different command masked the same way",
+        validation_id="validation-b",
+        trusted_outcome="masked_or_unknown",
+        masking_reason="shell_pipeline_masks_failure",
+        command="bash strict-b.sh | head",
+    )
+
+    masked_a_issue = _runtime_restart_issue(
+        _runtime_validation_packet(masked_a, wake_sequence=3, reason="masked_validation")
+    )
+    masked_b_issue = _runtime_restart_issue(
+        _runtime_validation_packet(masked_b, wake_sequence=4, reason="masked_validation")
+    )
+
+    assert masked_a_issue is not None
+    assert masked_b_issue is not None
+    assert masked_a_issue.key == masked_b_issue.key
+
+
+def test_runtime_restart_issue_groups_nested_shells_for_same_unresolved_command() -> None:
+    direct = _runtime_unresolved_validation(
+        sequence=1,
+        command="/bin/bash -lc ./compile.sh",
+        validation_id="validation-direct",
+    )
+    nested = _runtime_unresolved_validation(
+        sequence=2,
+        command="/bin/bash -c '/bin/bash -lc ./compile.sh'",
+        validation_id="validation-nested",
+    )
+    different = _runtime_unresolved_validation(
+        sequence=3,
+        command="/bin/bash -lc ./test.sh",
+        validation_id="validation-different",
+    )
+
+    direct_issue = _runtime_restart_issue(_runtime_validation_packet(direct, wake_sequence=1))
+    nested_issue = _runtime_restart_issue(_runtime_validation_packet(nested, wake_sequence=2))
+    different_issue = _runtime_restart_issue(
+        _runtime_validation_packet(different, wake_sequence=3)
+    )
+
+    assert direct_issue is not None
+    assert nested_issue is not None
+    assert different_issue is not None
+    assert direct_issue.key == nested_issue.key
+    assert direct_issue.key != different_issue.key
+
+
+def test_runtime_restart_issue_carries_active_failure_across_turn_completion() -> None:
+    first = _runtime_unresolved_validation(
+        sequence=10,
+        command="/bin/bash -lc ./compile.sh",
+        validation_id="validation-direct",
+    )
+    repeated = _runtime_unresolved_validation(
+        sequence=12,
+        command="/bin/bash -lc '/bin/bash -lc ./compile.sh'",
+        validation_id="validation-nested",
+    )
+    active = _runtime_restart_issue(_runtime_validation_packet(first, wake_sequence=11))
+    assert active is not None
+    packet = SupervisorWakePacket(
+        wake_sequence=13,
+        latest_event_sequence=13,
+        generation=0,
+        restart_count=0,
+        task_path="TASK.md",
+        task_contents="# Task",
+        current_summary="Coder turn completed",
+        coder_thread_id="thread",
+        validations=[first, repeated],
+    )
+
+    carried = _runtime_restart_issue(
+        packet,
+        active_issue_key=active.key,
+        active_issue_last_sequence=first.sequence,
+    )
+    stale = _runtime_restart_issue(
+        packet,
+        active_issue_key=active.key,
+        active_issue_last_sequence=repeated.sequence,
+    )
+    different = _runtime_unresolved_validation(
+        sequence=14,
+        command="/bin/bash -lc ./test.sh",
+        validation_id="validation-different",
+    )
+    superseded = _runtime_restart_issue(
+        packet.model_copy(update={"validations": [first, repeated, different]}),
+        active_issue_key=active.key,
+        active_issue_last_sequence=first.sequence,
+    )
+    unrelated_wake = _runtime_restart_issue(
+        packet.model_copy(
+            update={"current_summary": "Runtime integrity trigger: runtime links restored."}
+        ),
+        active_issue_key=active.key,
+        active_issue_last_sequence=first.sequence,
+    )
+
+    assert carried is not None
+    assert carried.key == active.key
+    assert carried.sequence == repeated.sequence
+    assert stale is None
+    assert superseded is None
+    assert unrelated_wake is None
+
+
+def test_runtime_event_issue_ignores_optional_file_change_action_metadata() -> None:
+    base = SupervisorWakePacket(
+        wake_sequence=20,
+        latest_event_sequence=21,
+        generation=0,
+        restart_count=0,
+        task_path="TASK.md",
+        task_contents="# Task",
+        current_summary="Runtime trigger (large_diff): file change completed: 1 changes",
+        coder_thread_id="thread",
+        changed_files=[ChangedFile(path="src/parser.py", status="M", sequence=19)],
+    )
+    with_action = base.model_copy(
+        update={
+            "wake_sequence": 22,
+            "latest_event_sequence": 23,
+            "triggering_action": TriggeringAction(
+                kind="fileChange",
+                paths=["/tmp/coder/workspace/src/parser.py"],
+                status="completed",
+                summary="file change completed: 1 changes",
+            ),
+        }
+    )
+    different_path = with_action.model_copy(
+        update={"changed_files": [ChangedFile(path="src/lexer.py", status="M", sequence=24)]}
+    )
+
+    base_issue = _runtime_restart_issue(base)
+    action_issue = _runtime_restart_issue(with_action)
+    different_issue = _runtime_restart_issue(different_path)
+
+    assert base_issue is not None
+    assert action_issue is not None
+    assert different_issue is not None
+    assert base_issue.key == action_issue.key
+    assert base_issue.key != different_issue.key
+
+
+async def test_runtime_restart_gate_counts_rejected_restart_as_steering_and_ignores_progress_update(
+    tmp_path: Path,
+) -> None:
+    controller, store, _fake = _runtime_controller(tmp_path)
+
+    class FakeCoder:
+        def __init__(self) -> None:
+            self.steers: list[str] = []
+
+        async def steer_or_start(self, message: str) -> None:
+            self.steers.append(message)
+
+    coder = FakeCoder()
+    controller.coder = coder
+    restarts: list[tuple[str, RestartHandoff | None]] = []
+
+    async def capture_restart(reason: str, *, handoff: RestartHandoff | None = None) -> None:
+        restarts.append((reason, handoff))
+
+    controller.restart = capture_restart  # type: ignore[method-assign]
+    handoff = RestartHandoff(
+        objective="finish task",
+        restart_reason="same failure repeated after steering",
+        bad_pattern="rerunning the same failing validation",
+        known_evidence="the same assertion failed repeatedly",
+        next_step="inspect the assertion before editing",
+        recovery_signal="the validation failure changes or passes",
+    )
+
+    for sequence in (1, 2, 3):
+        event_sequence = sequence * 2 - 1
+        wake_sequence = event_sequence + 1
+        store.update_bello_config(
+            lambda cfg: cfg.model_copy(update={"last_event_sequence": event_sequence})
+        )
+        validation = _runtime_failure_validation(
+            sequence=event_sequence,
+            output="AssertionError: expected 1, got 2",
+        )
+        packet = _runtime_validation_packet(validation, wake_sequence=wake_sequence)
+        if sequence == 1:
+            decision = SupervisorDecision(
+                decision=SupervisorDecisionKind.INTERVENE,
+                reason="the same failure needs a controlled diagnostic",
+                message_to_coder="Inspect the failing assertion before another edit.",
+                progress_update="Recorded the first steering for this validation failure.",
+                wake_sequence=wake_sequence,
+                generation=0,
+            )
+        else:
+            decision = SupervisorDecision(
+                decision=SupervisorDecisionKind.RESTART,
+                reason="coder repeated the same failure after steering",
+                progress_update="Restart requested for the repeated validation failure.",
+                handoff=handoff,
+                wake_sequence=wake_sequence,
+                generation=0,
+            )
+        await controller.apply_supervisor_decision(
+            decision,
+            packet_thread_id="thread",
+            packet=packet,
+        )
+
+    assert len(coder.steers) == 2
+    assert coder.steers[0] == "Inspect the failing assertion before another edit."
+    assert "rerunning the same failing validation" in coder.steers[1]
+    assert len(restarts) == 1
+    assert restarts[0][0] == "coder repeated the same failure after steering"
+    health = store.get_health()
+    assert health.restart_issue_interventions == 2
+    assert health.last_progress_sequence == 1
+    progress = store.path(PROGRESS).read_text(encoding="utf-8")
+    assert progress.count("Restart requested for the repeated validation failure.") == 1
+
+
+def test_trusted_pass_clears_only_matching_runtime_restart_issue(tmp_path: Path) -> None:
+    controller, store, _fake = _runtime_controller(tmp_path)
+    failed = _runtime_failure_validation(sequence=1, output="AssertionError: expected 1, got 2")
+    issue = _runtime_restart_issue(_runtime_validation_packet(failed, wake_sequence=1))
+    assert issue is not None
+    controller._record_runtime_intervention(
+        reason="first steering",
+        message="inspect the failure",
+        sequence=1,
+        generation=0,
+        issue=issue,
+    )
+
+    unrelated_pass = _runtime_failure_validation(
+        sequence=2,
+        output="1 passed",
+        validation_id="validation-other",
+        trusted_outcome="passed",
+    )
+    controller._record_validation_runtime_state(unrelated_pass)
+    assert store.get_health().restart_issue_key == issue.key
+
+    matching_pass = unrelated_pass.model_copy(
+        update={"validation_id": failed.validation_id, "sequence": 3}
+    )
+    controller._record_validation_runtime_state(matching_pass)
+    assert store.get_health().restart_issue_key is None
+
+
+def test_trusted_pass_clears_unresolved_issue_through_equivalent_shell_wrapper(
+    tmp_path: Path,
+) -> None:
+    controller, store, _fake = _runtime_controller(tmp_path)
+    unresolved = _runtime_unresolved_validation(
+        sequence=1,
+        command="/bin/bash -lc '/bin/bash -lc ./compile.sh'",
+        validation_id="validation-nested",
+    )
+    issue = _runtime_restart_issue(_runtime_validation_packet(unresolved, wake_sequence=1))
+    assert issue is not None
+    controller._record_runtime_intervention(
+        reason="build did not execute",
+        message="run the build once through the normal approval path",
+        sequence=1,
+        generation=0,
+        issue=issue,
+    )
+
+    passed = unresolved.model_copy(
+        update={
+            "validation_id": "validation-direct",
+            "command": "/bin/bash -lc ./compile.sh",
+            "normalized_command": "/bin/bash -lc ./compile.sh",
+            "exit_code": 0,
+            "shell_exit_code": 0,
+            "outcome": "pass",
+            "passed": True,
+            "trusted_validation_outcome": "passed",
+            "summary": "command completed: /bin/bash -lc ./compile.sh exit=0",
+            "sequence": 2,
+        }
+    )
+    controller._record_validation_runtime_state(passed)
+
+    assert store.get_health().restart_issue_key is None
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "masked_validation",
+        "validation_regression",
+        "repeated_same_failing_validation",
+        "timeout",
+        "suspicious_file_touched",
+        "restart_budget",
+        "unknown_signal",
+    ],
+)
+async def test_quality_runtime_wake_can_be_filtered_by_cheap_runtime(tmp_path: Path, reason: str) -> None:
     controller, _store, fake = _runtime_controller(tmp_path)
     cheap = _CheapRuntimeNoopReviewer()
     controller.runtime_triage_reviewer = cheap
     controller.runtime_triage_config = SimpleNamespace(model=cheap.model)
 
     await controller._run_supervisor_check(
-        "Runtime trigger (suspicious_file_touched): command completed: sed -n '1,120p' app.test.js exit=0",
+        f"Runtime trigger ({reason}): command completed: sed -n '1,120p' app.test.js exit=0",
         triggering_item_id="cmd-1",
         triggering_action=TriggeringAction(
             kind="commandExecution",
@@ -1428,9 +1897,45 @@ async def test_protected_runtime_wake_bypasses_cheap_runtime_noop(tmp_path: Path
         completion_review=False,
     )
 
+    assert len(cheap.calls) == 1
+    assert cheap.calls[0].current_summary.startswith(f"Runtime trigger ({reason})")
+    assert fake.runtime_packets == []
+
+
+def test_cheap_runtime_switch_reads_persisted_runtime_config(tmp_path: Path) -> None:
+    controller, store, _fake = _runtime_controller(tmp_path)
+    assert controller._cheap_runtime_enabled() is True
+
+    store.update_bello_config(lambda cfg: cfg.model_copy(update={"cheap_runtime": False}))
+
+    assert controller._cheap_runtime_enabled() is False
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        "Runtime trigger (done_without_fresh_validation): readiness claim lacks trusted validation",
+        "Runtime trigger (runtime_control_replacement): coder workspace runtime links were restored",
+        "Runtime integrity trigger: coder workspace runtime links were replaced and restored.",
+    ],
+)
+async def test_mandatory_runtime_wake_bypasses_cheap_runtime_noop(tmp_path: Path, summary: str) -> None:
+    controller, _store, fake = _runtime_controller(tmp_path)
+    cheap = _CheapRuntimeNoopReviewer()
+    controller.runtime_triage_reviewer = cheap
+    controller.runtime_triage_config = SimpleNamespace(model=cheap.model)
+
+    await controller._run_supervisor_check(
+        summary,
+        triggering_item_id="message-1",
+        triggering_action=None,
+        human_message=None,
+        patch_summary=None,
+        completion_review=False,
+    )
+
     assert cheap.calls == []
     assert len(fake.runtime_packets) == 1
-    assert fake.runtime_packets[0].current_summary.startswith("Runtime trigger (suspicious_file_touched)")
 
 
 def test_read_only_large_diff_trigger_is_suppressed_but_real_diff_change_wakes(tmp_path: Path) -> None:
@@ -1480,6 +1985,86 @@ def test_read_only_large_diff_trigger_is_suppressed_but_real_diff_change_wakes(t
     assert repeated_execution.reasons == ()
     assert changed_signature.should_wake is True
     assert changed_signature.reasons == ("large_diff",)
+
+
+def test_suspicious_file_trigger_wakes_once_per_file_state(tmp_path: Path) -> None:
+    controller, _store, _fake = _runtime_controller(tmp_path)
+    test_path = tmp_path / "tests" / "test_parser.py"
+    test_path.parent.mkdir()
+    test_path.write_text("assert parse('a') == 1\n", encoding="utf-8")
+    action = TriggeringAction(
+        kind="commandExecution",
+        command="python3 -c 'print(1)'",
+        exit_code=0,
+        status="completed",
+        summary="command completed",
+    )
+    changed_files = [
+        ChangedFile(path="tests/test_parser.py", status="M", additions=1, deletions=1, sequence=2)
+    ]
+
+    first = controller.should_wake_runtime_supervisor(
+        action=action,
+        validation=None,
+        changed_files=changed_files,
+    )
+    unchanged = controller.should_wake_runtime_supervisor(
+        action=action,
+        validation=None,
+        changed_files=changed_files,
+    )
+    test_path.write_text("assert parse('b') == 2\n", encoding="utf-8")
+    edited_again = controller.should_wake_runtime_supervisor(
+        action=action,
+        validation=None,
+        changed_files=changed_files,
+    )
+    cleaned = controller.should_wake_runtime_supervisor(
+        action=action,
+        validation=None,
+        changed_files=[],
+    )
+    changed_after_clean = controller.should_wake_runtime_supervisor(
+        action=action,
+        validation=None,
+        changed_files=changed_files,
+    )
+
+    assert first.reasons == ("suspicious_file_touched",)
+    assert unchanged.should_wake is False
+    assert edited_again.reasons == ("suspicious_file_touched",)
+    assert cleaned.should_wake is False
+    assert changed_after_clean.reasons == ("suspicious_file_touched",)
+
+
+def test_unchanged_suspicious_file_does_not_hide_another_runtime_reason(tmp_path: Path) -> None:
+    controller, _store, _fake = _runtime_controller(tmp_path)
+    test_path = tmp_path / "tests" / "test_parser.py"
+    test_path.parent.mkdir()
+    test_path.write_text("assert parse('a') == 1\n", encoding="utf-8")
+    changed_files = [ChangedFile(path="tests/test_parser.py", status="M", additions=1, deletions=0)]
+    successful_action = TriggeringAction(
+        kind="commandExecution",
+        command="python3 -c 'print(1)'",
+        exit_code=0,
+        status="completed",
+        summary="command completed",
+    )
+    failing_action = successful_action.model_copy(update={"exit_code": 1})
+
+    controller.should_wake_runtime_supervisor(
+        action=successful_action,
+        validation=None,
+        changed_files=changed_files,
+    )
+    decision = controller.should_wake_runtime_supervisor(
+        action=failing_action,
+        validation=None,
+        changed_files=changed_files,
+    )
+
+    assert decision.should_wake is True
+    assert decision.reasons == ("nonzero_exit",)
 
 
 def test_file_change_large_diff_noops_without_runtime_model(tmp_path: Path) -> None:
@@ -1678,7 +2263,7 @@ async def test_repeated_same_failing_validation_uses_command_identity(tmp_path: 
 
 async def test_done_without_fresh_validation_wakes_runtime_not_completion(tmp_path: Path) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
-    controller.last_coder_message = CoderMessage(text="Summary\nSENTINEL_READY_FOR_REVIEW", sequence=3)
+    controller.last_coder_message = CoderMessage(text="Summary\nBELLO_READY_FOR_REVIEW", sequence=3)
     controller.observed_changed_files = {
         "src/app.py": ChangedFile(path="src/app.py", status="modified", sequence=2)
     }
@@ -1698,7 +2283,7 @@ async def test_done_without_fresh_validation_wakes_runtime_not_completion(tmp_pa
 
     assert len(fake.runtime_packets) == 1
     assert fake.completion_packets == []
-    assert store.get_sentinel_config().last_relevant_edit_sequence == 2
+    assert store.get_bello_config().last_relevant_edit_sequence == 2
     trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
     assert trace["trigger_reasons"] == ["done_without_fresh_validation"]
 
@@ -1908,7 +2493,7 @@ def test_marked_behavior_demo_command_gets_validation_but_echo_is_rejected() -> 
     demo = _validation_from_action(
         TriggeringAction(
             kind="commandExecution",
-            command="SENTINEL_BEHAVIOR_DEMO=1 ./run_scenario src/app.py",
+            command="BELLO_BEHAVIOR_DEMO=1 ./run_scenario src/app.py",
             exit_code=0,
             status="completed",
             summary="command completed",
@@ -1920,7 +2505,7 @@ def test_marked_behavior_demo_command_gets_validation_but_echo_is_rejected() -> 
     echo = _validation_from_action(
         TriggeringAction(
             kind="commandExecution",
-            command="SENTINEL_BEHAVIOR_DEMO=1 echo PASS",
+            command="BELLO_BEHAVIOR_DEMO=1 echo PASS",
             exit_code=0,
             status="completed",
             summary="command completed",
@@ -1937,7 +2522,7 @@ def test_marked_behavior_demo_command_gets_validation_but_echo_is_rejected() -> 
 
 def test_marked_behavior_demo_allows_honest_shell_sequence() -> None:
     command = (
-        "SENTINEL_BEHAVIOR_DEMO=1 bash -lc 'set -euo pipefail; "
+        "BELLO_BEHAVIOR_DEMO=1 bash -lc 'set -euo pipefail; "
         "./bin/app --scenario smoke; printf \"scenario=smoke state=requested\\n\"'"
     )
 
@@ -1964,7 +2549,7 @@ def test_marked_behavior_demo_does_not_unmask_status_manipulation() -> None:
     logical_or = _validation_from_action(
         TriggeringAction(
             kind="commandExecution",
-            command="SENTINEL_BEHAVIOR_DEMO=1 bash -lc './bin/app --scenario smoke || true; echo PASS'",
+            command="BELLO_BEHAVIOR_DEMO=1 bash -lc './bin/app --scenario smoke || true; echo PASS'",
             exit_code=0,
             status="completed",
             summary="command completed",
@@ -1976,7 +2561,7 @@ def test_marked_behavior_demo_does_not_unmask_status_manipulation() -> None:
     pipeline = _validation_from_action(
         TriggeringAction(
             kind="commandExecution",
-            command="SENTINEL_BEHAVIOR_DEMO=1 ./bin/app --scenario smoke | cat",
+            command="BELLO_BEHAVIOR_DEMO=1 ./bin/app --scenario smoke | cat",
             exit_code=0,
             status="completed",
             summary="command completed",
@@ -1988,7 +2573,7 @@ def test_marked_behavior_demo_does_not_unmask_status_manipulation() -> None:
     bare_pass = _validation_from_action(
         TriggeringAction(
             kind="commandExecution",
-            command="SENTINEL_BEHAVIOR_DEMO=1 bash -lc './bin/app --scenario smoke; echo PASS'",
+            command="BELLO_BEHAVIOR_DEMO=1 bash -lc './bin/app --scenario smoke; echo PASS'",
             exit_code=0,
             status="completed",
             summary="command completed",
@@ -2013,7 +2598,7 @@ def test_validation_ledger_reads_aggregated_output_field() -> None:
     validation = _validation_from_action(
         TriggeringAction(
             kind="commandExecution",
-            command="SENTINEL_BEHAVIOR_DEMO=1 ./bin/app --scenario smoke",
+            command="BELLO_BEHAVIOR_DEMO=1 ./bin/app --scenario smoke",
             exit_code=0,
             status="completed",
             summary="command completed",
@@ -2033,7 +2618,7 @@ def test_command_output_aliases_are_attached_to_validation_ledger() -> None:
     validation = _validation_from_action(
         TriggeringAction(
             kind="commandExecution",
-            command="SENTINEL_BEHAVIOR_DEMO=1 ./bin/app --scenario smoke",
+            command="BELLO_BEHAVIOR_DEMO=1 ./bin/app --scenario smoke",
             exit_code=0,
             status="completed",
             summary="command completed",
@@ -2053,7 +2638,7 @@ def test_behavior_demo_without_real_output_is_not_passed() -> None:
     validation = _validation_from_action(
         TriggeringAction(
             kind="commandExecution",
-            command="SENTINEL_BEHAVIOR_DEMO=1 ./bin/app --scenario smoke",
+            command="BELLO_BEHAVIOR_DEMO=1 ./bin/app --scenario smoke",
             exit_code=0,
             status="completed",
             summary="command completed",
@@ -2089,7 +2674,7 @@ def test_non_python_behavior_demo_commands_are_classified() -> None:
             '{"status":"ok","feature":"requested"}\n',
         ),
         (
-            "SENTINEL_BEHAVIOR_DEMO=1 ./bin/app --scenario smoke",
+            "BELLO_BEHAVIOR_DEMO=1 ./bin/app --scenario smoke",
             ["bin/app"],
             "scenario=smoke result=requested\n",
         ),
@@ -2309,7 +2894,7 @@ async def test_declared_grading_path_completed_command_escalates_integrity_failu
         )
     )
 
-    assert store.get_sentinel_config().status == SentinelStatus.ESCALATED
+    assert store.get_bello_config().status == BelloStatus.ESCALATED
     assert controller.running is False
     assert fake.runtime_packets == []
     progress = store.path(PROGRESS).read_text(encoding="utf-8")
@@ -2343,7 +2928,7 @@ async def test_completion_review_agent_reuses_thread_until_closed(tmp_path: Path
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
     class FakeClient:
         def __init__(self) -> None:
@@ -2414,7 +2999,7 @@ async def test_supervisor_fast_mode_sets_codex_service_tier(tmp_path: Path) -> N
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
     class FakeClient:
         def __init__(self) -> None:
@@ -2461,7 +3046,7 @@ async def test_supervisor_agent_sets_intelligence_effort(tmp_path: Path) -> None
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
     class FakeClient:
         def __init__(self) -> None:
@@ -2502,7 +3087,7 @@ async def test_completion_review_agent_overrides_stale_model_wake_sequence(tmp_p
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
     class FakeClient:
         async def thread_start(self, params, *, timeout):
@@ -2561,7 +3146,7 @@ async def test_completion_review_reads_assistant_message_content_from_turns_list
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
     decision_text = json.dumps(
         {
             "decision": "return",
@@ -2628,7 +3213,7 @@ async def test_completion_review_no_message_retries_with_ultra_compact_minimal_p
     task = tmp_path / "TASK.md"
     task.write_text("# Task\nImplement the compiler.\n", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
     valid_decision = {
         "decision": "return",
         "reason": "needs independent demo",
@@ -2733,7 +3318,7 @@ async def test_supervisor_agent_retries_invalid_structured_output_once(tmp_path:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
     valid_decision = {
         "decision": "return",
         "reason": "needs factual demo",
@@ -2805,7 +3390,7 @@ async def test_terminal_state_denies_new_server_request_without_policy_path(tmp_
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
     class FakeClient:
         def __init__(self) -> None:
@@ -2814,7 +3399,7 @@ async def test_terminal_state_denies_new_server_request_without_policy_path(tmp_
         async def respond(self, request_id, response):
             self.responses.append((request_id, response))
 
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.store = store
     controller.client = FakeClient()
@@ -2839,8 +3424,8 @@ async def test_completion_return_sends_message_and_continues_same_generation(tmp
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
         overwrite=True,
     )
 
@@ -2852,7 +3437,7 @@ async def test_completion_return_sends_message_and_continues_same_generation(tmp
             self.messages.append(message)
             return "turn"
 
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
@@ -2901,7 +3486,7 @@ async def test_completion_return_sends_message_and_continues_same_generation(tmp
         packet_thread_id="thread",
     )
 
-    assert store.get_sentinel_config().generation == 0
+    assert store.get_bello_config().generation == 0
     assert controller.coder.messages == ["Validate missing-key fallback before marking ready again."]
     assert len(controller.completion_returns) == 1
     assert store.get_health().interventions == 0
@@ -2944,10 +3529,10 @@ async def test_completion_accept_gate_allows_minimal_accept_with_fresh_validatio
         packet=_gate_packet(task, validations=validations),
     )
 
-    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
     assert len(controller.completion_returns) == 0
     assert coder.messages == []
-    assert store.get_sentinel_config().accept_gate_accepts == 1
+    assert store.get_bello_config().accept_gate_accepts == 1
     log_entries = [json.loads(line) for line in store.path(LOG).read_text(encoding="utf-8").splitlines()]
     log_entry = next(entry for entry in log_entries if entry.get("type") == "completion_accept_gate_pass")
     check_names = {check["check_name"] for check in log_entry["checks"]}
@@ -2990,10 +3575,10 @@ async def test_completion_accept_gate_allows_changed_test_without_independent_ev
         packet=packet,
     )
 
-    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
     assert len(controller.completion_returns) == 0
     assert coder.messages == []
-    assert store.get_sentinel_config().accept_gate_accepts == 1
+    assert store.get_bello_config().accept_gate_accepts == 1
 
 
 async def test_adversary_remaining_limit_runs_before_completion_finalize(
@@ -3061,13 +3646,13 @@ async def test_adversary_remaining_limit_runs_before_completion_finalize(
         packet=_gate_packet(task, validations=validations),
     )
 
-    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
     assert controller._pending_adversary_report is not None
     assert controller._pending_adversary_report.thread_id == "adv-thread"
     assert controller._pending_adversary_report.candidate_finding is False
     assert controller._pending_adversary_report.latest_relevant_change_sequence == 2
     assert controller._pending_adversary_report.workspace_state_id is not None
-    assert store.get_sentinel_config().adversary_run_count == 1
+    assert store.get_bello_config().adversary_run_count == 1
     assert coder.messages == []
     assert seen_snapshot_roots and not seen_snapshot_roots[0].exists()
     progress = store.path(PROGRESS).read_text(encoding="utf-8")
@@ -3092,7 +3677,7 @@ async def test_adversary_run_limit_skips_additional_run_and_finalizes(
     ]
     controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
     controller.adversary_enabled = True
-    store.update_sentinel_config(
+    store.update_bello_config(
         lambda cfg: cfg.model_copy(update={"max_adversary_runs": 1, "adversary_run_count": 1})
     )
 
@@ -3108,8 +3693,8 @@ async def test_adversary_run_limit_skips_additional_run_and_finalizes(
         packet=_gate_packet(task, validations=validations),
     )
 
-    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
-    assert store.get_sentinel_config().adversary_run_count == 1
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
+    assert store.get_bello_config().adversary_run_count == 1
     assert coder.messages == []
     progress = store.path(PROGRESS).read_text(encoding="utf-8")
     assert "Skipping adversarial tester before complete: adversary run limit reached (1/1)" in progress
@@ -3159,7 +3744,7 @@ async def test_adversary_infra_failure_completes_with_recorded_gap(
         packet=_gate_packet(task, validations=validations),
     )
 
-    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
     assert coder.messages == []
     accepted = controller._accepted_adversary_report
     assert accepted is not None
@@ -3208,7 +3793,7 @@ async def test_adversary_fresh_report_allows_completion_finalize(tmp_path: Path)
         packet=packet,
     )
 
-    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
     assert coder.messages == []
     final_report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
     assert "## Adversary Reports" in final_report
@@ -3280,12 +3865,338 @@ async def test_adversary_candidate_finding_reruns_completion_review_with_report(
     assert controller._supervisor_task is not None
     await controller._supervisor_task
 
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert store.get_bello_config().status == BelloStatus.STARTING
     assert fake.completion_packets
     assert fake.completion_packets[0].adversary_report is not None
     assert fake.completion_packets[0].adversary_report.candidate_finding is True
-    assert store.get_sentinel_config().adversary_run_count == 1
+    assert store.get_bello_config().adversary_run_count == 1
     assert "Adversarial tester report:" in coder.messages[0]
+
+
+async def test_completion_return_budget_waits_for_coder_readiness_before_forcing_adversary(
+    tmp_path: Path,
+) -> None:
+    controller, store, _, coder = _completion_gate_controller(tmp_path, validations=[])
+    controller.adversary_enabled = True
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(
+            update={
+                "max_adversary_runs": 1,
+                "max_completion_returns_before_adversary": 1,
+                "max_completion_returns_after_adversary": 2,
+            }
+        )
+    )
+    decision = CompletionReviewDecision(
+        decision="return",
+        reason="one material gap remains",
+        validation_gaps=["edge case is not validated"],
+        message_to_coder="Fix and validate the edge case, then report readiness again.",
+        persistent_decision=None,
+        progress_update=None,
+        clear_handoff=False,
+        display_message=None,
+        handoff=None,
+        wake_sequence=1,
+        generation=0,
+    )
+
+    await controller._return_completion_to_coder(decision)
+
+    cfg = store.get_bello_config()
+    assert cfg.completion_return_count == 1
+    assert cfg.completion_returns_since_adversary == 0
+    assert cfg.adversary_run_count == 0
+    assert coder.messages == ["Fix and validate the edge case, then report readiness again."]
+    assert controller._completion_review_budget_action() == "adversary"
+
+
+async def test_completion_only_review_budget_finalizes_without_restart_or_extra_review(
+    tmp_path: Path,
+) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    controller.adversary_enabled = False
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(
+            update={
+                "max_adversary_runs": 1,
+                "max_completion_returns_before_adversary": 4,
+                "completion_return_count": 4,
+            }
+        )
+    )
+    finalized: list[tuple[str, BelloStatus, bool]] = []
+
+    async def capture_finalize(
+        result: str,
+        *,
+        status: BelloStatus = BelloStatus.COMPLETE,
+        completion_review_accepted: bool = False,
+    ) -> None:
+        finalized.append((result, status, completion_review_accepted))
+
+    controller.finalize = capture_finalize
+
+    await controller._run_supervisor_check("coder ready after final allowed review", None, None, None, None, True)
+
+    assert fake.completion_packets == []
+    assert controller.completion_restarts == 0
+    assert finalized == [
+        (
+            "completed by bounded review policy: completion review budget exhausted",
+            BelloStatus.COMPLETE,
+            False,
+        )
+    ]
+
+
+def test_completion_only_zero_review_budget_skips_review(tmp_path: Path) -> None:
+    controller, store, _ = _runtime_controller(tmp_path)
+    controller.adversary_enabled = False
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(
+            update={
+                "max_completion_returns_before_adversary": 0,
+                "completion_return_count": 100,
+            }
+        )
+    )
+
+    assert controller._completion_review_budget_action() == "complete"
+
+
+def test_completion_only_unlimited_review_budget_has_no_cap(tmp_path: Path) -> None:
+    controller, store, _ = _runtime_controller(tmp_path)
+    controller.adversary_enabled = False
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(
+            update={
+                "max_completion_returns_before_adversary": "unlimited",
+                "completion_return_count": 100,
+            }
+        )
+    )
+
+    assert controller._completion_review_budget_action() is None
+
+
+def test_zero_pre_adversary_review_budget_starts_adversary(tmp_path: Path) -> None:
+    controller, store, _ = _runtime_controller(tmp_path)
+    controller.adversary_enabled = True
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(
+            update={
+                "max_adversary_runs": 1,
+                "max_completion_returns_before_adversary": 0,
+                "completion_return_count": 0,
+            }
+        )
+    )
+
+    assert controller._completion_review_budget_action() == "adversary"
+
+
+def test_zero_post_adversary_review_budget_completes(tmp_path: Path) -> None:
+    controller, store, _ = _runtime_controller(tmp_path)
+    controller.adversary_enabled = True
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(
+            update={
+                "max_adversary_runs": 1,
+                "max_completion_returns_after_adversary": 0,
+                "adversary_run_count": 1,
+                "completion_returns_since_adversary": 0,
+            }
+        )
+    )
+
+    assert controller._completion_review_budget_action() == "complete"
+
+
+def test_zero_post_adversary_budget_allows_one_candidate_adjudication(tmp_path: Path) -> None:
+    controller, store, task, _ = _completion_gate_controller(tmp_path, validations=[])
+    controller.adversary_enabled = True
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(
+            update={
+                "max_adversary_runs": 1,
+                "max_completion_returns_after_adversary": 0,
+                "adversary_run_count": 1,
+                "completion_returns_since_adversary": 0,
+            }
+        )
+    )
+    packet = _gate_packet(task, validations=[])
+    packet.adversary_report = AdversaryReport(
+        candidate_finding=True,
+        report_text="attacked: edge\nfindings: candidate defect\noverall: broke",
+        generation=packet.generation,
+        completion_wake_sequence=packet.wake_sequence,
+        latest_relevant_change_sequence=packet.latest_relevant_change_sequence,
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    assert controller._completion_review_budget_action(packet=packet) is None
+
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(update={"completion_returns_since_adversary": 1})
+    )
+    assert controller._completion_review_budget_action(packet=packet) == "complete"
+
+
+async def test_pre_adversary_return_budget_runs_adversary_without_an_extra_completion_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    controller.adversary_enabled = True
+    controller.client = object()
+    controller.model = None
+    controller.adversary_model = "gpt-adversary"
+    controller.adversary_intelligence = "ultra"
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(
+            update={
+                "max_adversary_runs": 1,
+                "max_completion_returns_before_adversary": 7,
+                "max_completion_returns_after_adversary": 2,
+                "completion_return_count": 7,
+            }
+        )
+    )
+    finalized: list[tuple[str, BelloStatus, bool]] = []
+
+    async def capture_finalize(
+        result: str,
+        *,
+        status: BelloStatus = BelloStatus.COMPLETE,
+        completion_review_accepted: bool = False,
+    ) -> None:
+        finalized.append((result, status, completion_review_accepted))
+
+    controller.finalize = capture_finalize
+
+    class CleanAdversary:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def run(self, packet, *, previous_adversary_report=None):
+            return SimpleNamespace(
+                report_text="attacked: boundaries\nfindings: none\noverall: held",
+                thread_id="adv-thread",
+                turn_id="adv-turn",
+                candidate_finding=False,
+            )
+
+    monkeypatch.setattr("supervisor.controller.AdversaryAgent", CleanAdversary)
+
+    await controller._run_supervisor_check("coder ready", None, None, None, None, True)
+
+    cfg = store.get_bello_config()
+    assert fake.completion_packets == []
+    assert cfg.adversary_run_count == 1
+    assert cfg.completion_returns_since_adversary == 0
+    assert finalized == [
+        (
+            "completed by bounded review policy: completion review budget reached and adversary reported no candidate finding",
+            BelloStatus.COMPLETE,
+            False,
+        )
+    ]
+
+
+async def test_post_adversary_return_budget_finalizes_on_next_readiness_without_extra_review(
+    tmp_path: Path,
+) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    controller.adversary_enabled = True
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(
+            update={
+                "max_adversary_runs": 1,
+                "max_completion_returns_before_adversary": 7,
+                "max_completion_returns_after_adversary": 2,
+                "adversary_run_count": 1,
+                "completion_return_count": 9,
+                "completion_returns_since_adversary": 2,
+            }
+        )
+    )
+    finalized: list[tuple[str, BelloStatus, bool]] = []
+
+    async def capture_finalize(
+        result: str,
+        *,
+        status: BelloStatus = BelloStatus.COMPLETE,
+        completion_review_accepted: bool = False,
+    ) -> None:
+        finalized.append((result, status, completion_review_accepted))
+
+    controller.finalize = capture_finalize
+
+    await controller._run_supervisor_check("coder ready after final return", None, None, None, None, True)
+
+    assert fake.completion_packets == []
+    assert finalized == [
+        (
+            "completed by bounded review policy: post-adversary completion review budget exhausted",
+            BelloStatus.COMPLETE,
+            False,
+        )
+    ]
+    events = [json.loads(line) for line in store.path(EVENTS).read_text(encoding="utf-8").splitlines()]
+    assert events[-1]["event_type"] == "completion/budget_finalize"
+    assert events[-1]["decision"]["completion_return_count"] == 9
+
+
+async def test_required_budget_adversary_failure_is_not_reported_as_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    controller.adversary_enabled = True
+    controller.client = object()
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(
+            update={
+                "max_adversary_runs": 1,
+                "max_completion_returns_before_adversary": 1,
+                "completion_return_count": 1,
+            }
+        )
+    )
+    finalized: list[tuple[str, BelloStatus, bool]] = []
+
+    async def capture_finalize(
+        result: str,
+        *,
+        status: BelloStatus = BelloStatus.COMPLETE,
+        completion_review_accepted: bool = False,
+    ) -> None:
+        finalized.append((result, status, completion_review_accepted))
+
+    controller.finalize = capture_finalize
+
+    class FailingAdversary:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def run(self, packet, *, previous_adversary_report=None):
+            raise AdversaryAgentError("provider unavailable")
+
+    monkeypatch.setattr("supervisor.controller.AdversaryAgent", FailingAdversary)
+
+    await controller._run_supervisor_check("coder ready", None, None, None, None, True)
+
+    assert fake.completion_packets == []
+    assert finalized == [
+        (
+            "required adversary failed under bounded review policy: provider unavailable",
+            BelloStatus.PROVIDER_FAILURE,
+            False,
+        )
+    ]
+    assert controller._pending_adversary_report.status == "error"
 
 
 async def test_adversary_receives_previous_report_as_regression_context(
@@ -3308,7 +4219,7 @@ async def test_adversary_receives_previous_report_as_regression_context(
     controller.client = object()
     controller.model = None
     controller.running = False
-    store.update_sentinel_config(
+    store.update_bello_config(
         lambda cfg: cfg.model_copy(update={"max_adversary_runs": 2, "adversary_run_count": 1})
     )
     controller._pending_adversary_report = AdversaryReport(
@@ -3351,9 +4262,9 @@ async def test_adversary_receives_previous_report_as_regression_context(
         packet=_gate_packet(task, validations=validations),
     )
 
-    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
     assert controller._accepted_adversary_report.thread_id == "new-adv-thread"
-    assert store.get_sentinel_config().adversary_run_count == 2
+    assert store.get_bello_config().adversary_run_count == 2
     assert coder.messages == []
 
 
@@ -3441,9 +4352,9 @@ async def test_completion_accept_gate_returns_for_vacuous_changed_test_masking(t
         packet=packet,
     )
 
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert store.get_bello_config().status == BelloStatus.STARTING
     assert len(controller.completion_returns) == 1
-    assert store.get_sentinel_config().accept_gate_coder_returns == 1
+    assert store.get_bello_config().accept_gate_coder_returns == 1
     assert "changed test appears to mask validation" in coder.messages[0]
     assert "trivially true assertion" in coder.messages[0]
 
@@ -3477,9 +4388,9 @@ async def test_completion_accept_gate_returns_for_skipped_changed_test_masking(t
         packet=packet,
     )
 
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert store.get_bello_config().status == BelloStatus.STARTING
     assert len(controller.completion_returns) == 1
-    assert store.get_sentinel_config().accept_gate_coder_returns == 1
+    assert store.get_bello_config().accept_gate_coder_returns == 1
     assert "changed test appears to mask validation" in coder.messages[0]
     assert "skipped/todo test marker" in coder.messages[0]
 
@@ -3503,17 +4414,17 @@ async def test_completion_accept_gate_returns_to_coder_without_fresh_behavioral_
         packet=_gate_packet(task, validations=validations),
     )
 
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert store.get_bello_config().status == BelloStatus.STARTING
     assert len(controller.completion_returns) == 1
     assert "no fresh passing behavioral validation" in coder.messages[0]
-    assert store.get_sentinel_config().accept_gate_coder_returns == 1
+    assert store.get_bello_config().accept_gate_coder_returns == 1
 
 
 async def test_completion_decision_with_stale_anchor_sequences_reruns_reviewer(tmp_path: Path) -> None:
     validations = [
         ValidationRun(
             validation_id="validation-new",
-            command="SENTINEL_BEHAVIOR_DEMO=1 ./bin/app --scenario fixed",
+            command="BELLO_BEHAVIOR_DEMO=1 ./bin/app --scenario fixed",
             exit_code=0,
             type="behavior_demo",
             passed=True,
@@ -3571,7 +4482,7 @@ async def test_completion_decision_with_stale_anchor_sequences_reruns_reviewer(t
 
     await controller.apply_completion_decision(decision, packet_thread_id="thread", packet=packet)
 
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert store.get_bello_config().status == BelloStatus.STARTING
     assert controller.completion_returns == []
     assert coder.messages == []
     assert controller.completion_decision_staleness_rerun_count == 1
@@ -3586,8 +4497,8 @@ async def test_completion_restart_writes_handoff_and_starts_new_generation(tmp_p
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
         overwrite=True,
     )
 
@@ -3613,7 +4524,7 @@ async def test_completion_restart_writes_handoff_and_starts_new_generation(tmp_p
         next_step="read task",
         recovery_signal="fallback validated",
     )
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
@@ -3661,7 +4572,7 @@ async def test_completion_restart_writes_handoff_and_starts_new_generation(tmp_p
         packet_thread_id="thread",
     )
 
-    assert store.get_sentinel_config().generation == 1
+    assert store.get_bello_config().generation == 1
     assert "repeated completion miss" in store.path(HANDOFF).read_text(encoding="utf-8")
     assert controller.completion_restarts == 1
     assert controller.client.started_turns
@@ -3671,9 +4582,9 @@ async def test_transport_error_writes_provider_failure_final_report(tmp_path: Pa
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
@@ -3692,7 +4603,7 @@ async def test_transport_error_writes_provider_failure_final_report(tmp_path: Pa
     )
 
     text = store.path(FINAL_REPORT).read_text(encoding="utf-8")
-    assert store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE
+    assert store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE
     assert "- Status: provider_failure" in text
     assert "app-server transport error" in text
     assert controller.running is False
@@ -3702,7 +4613,7 @@ async def test_supervisor_turn_start_timeout_writes_provider_failure_final_repor
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
     class HangingTurnStartClient:
         async def thread_start(self, params, *, timeout):
@@ -3714,7 +4625,7 @@ async def test_supervisor_turn_start_timeout_writes_provider_failure_final_repor
         async def thread_archive(self, thread_id, *, timeout):
             return {}
 
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
@@ -3736,7 +4647,7 @@ async def test_supervisor_turn_start_timeout_writes_provider_failure_final_repor
     await controller._run_supervisor_check("check latest state", None, None, None, None)
 
     text = store.path(FINAL_REPORT).read_text(encoding="utf-8")
-    assert store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE
+    assert store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE
     assert "- Status: provider_failure" in text
     assert "supervisor check failed" in text
     assert "supervisor turn/start response timed out after 0.01s" in text
@@ -3753,7 +4664,7 @@ async def test_stale_runtime_supervisor_timeout_keeps_queued_completion_review(t
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
     class HangingTurnStartClient:
         async def thread_start(self, params, *, timeout):
@@ -3765,7 +4676,7 @@ async def test_stale_runtime_supervisor_timeout_keeps_queued_completion_review(t
         async def thread_archive(self, thread_id, *, timeout):
             return {}
 
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
@@ -3790,7 +4701,7 @@ async def test_stale_runtime_supervisor_timeout_keeps_queued_completion_review(t
 
     text = store.path(FINAL_REPORT).read_text(encoding="utf-8")
     health = store.get_health()
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert store.get_bello_config().status == BelloStatus.STARTING
     assert text == ""
     assert controller.running is True
     assert health.timeout_fallback_count == 1
@@ -3827,7 +4738,7 @@ async def test_supervisor_no_message_retries_from_latest_stable_state(tmp_path: 
     await controller._supervisor_check_loop("runtime check", None, None, None, None, False)
 
     assert supervisor.calls == 2
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert store.get_bello_config().status == BelloStatus.STARTING
     assert store.path(FINAL_REPORT).read_text(encoding="utf-8") == ""
     # After a successful recovery the consecutive no_message budget resets, so a recovered
     # provider does not carry earlier blips toward infra-invalid.
@@ -3856,7 +4767,7 @@ async def test_repeated_runtime_supervisor_no_message_skips_current_review(tmp_p
     await controller._supervisor_check_loop("runtime check", None, None, None, None, False)
 
     assert supervisor.calls == 2
-    assert store.get_sentinel_config().status == SentinelStatus.STARTING
+    assert store.get_bello_config().status == BelloStatus.STARTING
     assert store.path(FINAL_REPORT).read_text(encoding="utf-8") == ""
     assert controller.running is True
     assert controller._supervisor_dirty is False
@@ -3895,7 +4806,7 @@ async def test_repeated_supervisor_no_message_marks_infra_invalid_provider_failu
     await controller._supervisor_check_loop("completion check", None, None, None, None, True)
 
     assert supervisor.calls == 2
-    assert store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE
+    assert store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE
     report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
     assert "infra-invalid: supervisor no_message provider failure after retry/resume" in report
     assert "- Status: provider_failure" in report
@@ -3931,7 +4842,7 @@ async def test_completion_no_message_budget_rides_out_blip_before_infra_invalid(
 
     # 3 retries then the infra-invalid attempt = 4 model calls (old behavior gave up after 1 retry).
     assert supervisor.calls == 4
-    assert store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE
+    assert store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE
 
 
 async def test_preflight_appserver_timeout_writes_provider_failure_final_report(tmp_path: Path, monkeypatch) -> None:
@@ -3952,7 +4863,7 @@ async def test_preflight_appserver_timeout_writes_provider_failure_final_report(
             raise AppServerTimeoutError("app-server RPC account/read response timed out after 30s")
 
     monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
-    controller = SentinelController(
+    controller = BelloController(
         tmp_path,
         task_path=task,
         client=PreflightTimeoutClient(),  # type: ignore[arg-type]
@@ -3965,7 +4876,7 @@ async def test_preflight_appserver_timeout_writes_provider_failure_final_report(
     await controller.run()
 
     text = controller.store.path(FINAL_REPORT).read_text(encoding="utf-8")
-    assert controller.store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE
+    assert controller.store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE
     assert "- Status: provider_failure" in text
     assert "app-server RPC failed" in text
     assert "account/read response timed out" in text
@@ -4007,7 +4918,7 @@ async def test_missing_selected_model_interrupts_before_coder_and_writes_final_r
 
     client = MissingModelClient()
     monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
-    controller = SentinelController(
+    controller = BelloController(
         tmp_path,
         task_path=task,
         client=client,  # type: ignore[arg-type]
@@ -4022,7 +4933,7 @@ async def test_missing_selected_model_interrupts_before_coder_and_writes_final_r
     await controller.run()
 
     report = controller.store.path(FINAL_REPORT).read_text(encoding="utf-8")
-    assert controller.store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE
+    assert controller.store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE
     assert "- Status: provider_failure" in report
     assert "model availability preflight failed before coder start" in report
     assert "coder=gpt-5.6-unknown" in report
@@ -4068,7 +4979,7 @@ async def test_missing_fixed_adversary_model_interrupts_before_coder_and_writes_
 
     client = MissingAdversaryModelClient()
     monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
-    controller = SentinelController(
+    controller = BelloController(
         tmp_path,
         task_path=task,
         client=client,  # type: ignore[arg-type]
@@ -4077,13 +4988,15 @@ async def test_missing_fixed_adversary_model_interrupts_before_coder_and_writes_
         supervisor_model=MODEL_GPT_5_5,
         overwrite_state=True,
         use_git_diff=False,
+        completion_review=True,
+        adversary_enabled=True,
     )
     controller._generate_schema_hash_async = _async_schema_hash
 
     await controller.run()
 
     report = controller.store.path(FINAL_REPORT).read_text(encoding="utf-8")
-    assert controller.store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE
+    assert controller.store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE
     assert "- Status: provider_failure" in report
     assert "model availability preflight failed before coder start" in report
     assert f"adversary={ADVERSARY_MODEL}" in report
@@ -4131,7 +5044,7 @@ async def test_preflight_probe_cleanup_unsubscribes_and_logs_without_failing(
 
     client = ProbeCleanupClient()
     monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
-    controller = SentinelController(
+    controller = BelloController(
         tmp_path,
         task_path=task,
         client=client,  # type: ignore[arg-type]
@@ -4146,7 +5059,7 @@ async def test_preflight_probe_cleanup_unsubscribes_and_logs_without_failing(
     await controller.preflight()
 
     assert client.unsubscribed == ["probe-thread"]
-    config = controller.store.get_sentinel_config()
+    config = controller.store.get_bello_config()
     assert config.model == DEFAULT_MODEL
     assert config.coder_model == DEFAULT_MODEL
     assert config.supervisor_model == DEFAULT_MODEL
@@ -4195,7 +5108,7 @@ async def test_preflight_rate_limit_probe_failure_warns_and_continues(tmp_path: 
     client = RateLimitFailureClient()
     tui = _FakeTUI()
     monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
-    controller = SentinelController(
+    controller = BelloController(
         tmp_path,
         task_path=task,
         client=client,  # type: ignore[arg-type]
@@ -4209,7 +5122,7 @@ async def test_preflight_rate_limit_probe_failure_warns_and_continues(tmp_path: 
 
     await controller.preflight()
 
-    config = controller.store.get_sentinel_config()
+    config = controller.store.get_bello_config()
     assert config.model == DEFAULT_MODEL
     assert config.coder_model == DEFAULT_MODEL
     assert config.supervisor_model == DEFAULT_MODEL
@@ -4257,9 +5170,9 @@ async def test_preflight_accepts_configured_danger_full_access_sandbox(tmp_path:
             return {}
 
     client = DangerSandboxClient()
-    monkeypatch.setenv("SENTINEL_CODER_SANDBOX", "danger-full-access")
+    monkeypatch.setenv("BELLO_CODER_SANDBOX", "danger-full-access")
     monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
-    controller = SentinelController(
+    controller = BelloController(
         tmp_path,
         task_path=task,
         client=client,  # type: ignore[arg-type]
@@ -4282,8 +5195,8 @@ async def test_server_request_respond_timeout_writes_provider_failure_final_repo
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread", active_coder_turn_id="turn"),
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread", active_coder_turn_id="turn"),
         overwrite=True,
     )
 
@@ -4291,7 +5204,7 @@ async def test_server_request_respond_timeout_writes_provider_failure_final_repo
         async def respond(self, request_id, response):
             raise AppServerTimeoutError("app-server respond 61 send timed out after 15s")
 
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
@@ -4320,7 +5233,7 @@ async def test_server_request_respond_timeout_writes_provider_failure_final_repo
     )
 
     text = store.path(FINAL_REPORT).read_text(encoding="utf-8")
-    assert store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE
+    assert store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE
     assert "- Status: provider_failure" in text
     assert "app-server RPC failed while handling server_request" in text
     assert "respond 61 send timed out" in text
@@ -4331,8 +5244,8 @@ async def test_coder_turn_start_timeout_writes_provider_failure_final_report(tmp
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="coder-thread"),
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="coder-thread"),
         overwrite=True,
     )
 
@@ -4344,7 +5257,7 @@ async def test_coder_turn_start_timeout_writes_provider_failure_final_report(tmp
             assert timeout == APP_SERVER_CODER_RPC_TIMEOUT_SECONDS
             raise AppServerTimeoutError(f"app-server RPC turn/start response timed out after {timeout:g}s")
 
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
@@ -4382,10 +5295,10 @@ async def test_coder_turn_start_timeout_writes_provider_failure_final_report(tmp
     )
 
     text = store.path(FINAL_REPORT).read_text(encoding="utf-8")
-    assert store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE
+    assert store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE
     assert "- Status: provider_failure" in text
     assert "app-server RPC failed while handling server_request" in text
-    assert "turn/start response timed out after 1800s" in text
+    assert "turn/start response timed out after 3600s" in text
     assert controller.running is False
 
 
@@ -4393,7 +5306,7 @@ async def test_restart_preserves_coder_intelligence(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
     class FakeClient:
         def __init__(self) -> None:
@@ -4407,7 +5320,7 @@ async def test_restart_preserves_coder_intelligence(tmp_path: Path) -> None:
             return {"turn": {"id": "restart-turn", "status": "completed"}}
 
     client = FakeClient()
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
@@ -4434,10 +5347,10 @@ async def test_supervisor_decision_can_clear_handoff(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
     store.write_handoff("restart context\n")
 
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.store = store
 
     await controller.apply_supervisor_decision(
@@ -4457,7 +5370,7 @@ def test_structured_handoff_is_read_back_verbatim(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
     handoff = RestartHandoff(
         objective="task",
         restart_reason="loop",
@@ -4480,7 +5393,7 @@ async def test_controller_approval_packet_carries_structured_context(tmp_path: P
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
     context = normalize_approval_request(
         AppServerMessage(
             {
@@ -4516,7 +5429,7 @@ async def test_controller_approval_packet_carries_structured_context(tmp_path: P
             )
 
     fake = FakeSupervisor()
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.store = store
     controller.project_root = tmp_path
     controller.task_path = task
@@ -4542,8 +5455,8 @@ async def test_supervisor_deny_reason_is_steered_to_coder(tmp_path: Path) -> Non
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread", active_coder_turn_id="turn"),
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread", active_coder_turn_id="turn"),
         overwrite=True,
     )
     context = normalize_approval_request(
@@ -4580,7 +5493,7 @@ async def test_supervisor_deny_reason_is_steered_to_coder(tmp_path: Path) -> Non
             self.messages.append(message)
             return "turn"
 
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.store = store
     controller.client = FakeClient()
@@ -4600,8 +5513,8 @@ async def test_policy_deny_reason_is_steered_to_coder(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread", active_coder_turn_id="turn"),
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread", active_coder_turn_id="turn"),
         overwrite=True,
     )
 
@@ -4620,7 +5533,7 @@ async def test_policy_deny_reason_is_steered_to_coder(tmp_path: Path) -> None:
             self.messages.append(message)
             return "turn"
 
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.store = store
     controller.client = FakeClient()
@@ -4651,8 +5564,8 @@ async def test_adversary_file_change_request_is_denied_without_steering_coder(tm
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="coder-thread"),
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="coder-thread"),
         overwrite=True,
     )
 
@@ -4671,7 +5584,7 @@ async def test_adversary_file_change_request_is_denied_without_steering_coder(tm
             self.messages.append(message)
             return "turn"
 
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.store = store
     controller.client = FakeClient()
@@ -4711,8 +5624,8 @@ async def test_policy_deny_no_active_turn_starts_new_coder_turn(tmp_path: Path) 
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread", active_coder_turn_id="turn"),
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread", active_coder_turn_id="turn"),
         overwrite=True,
     )
 
@@ -4737,7 +5650,7 @@ async def test_policy_deny_no_active_turn_starts_new_coder_turn(tmp_path: Path) 
             return "new-turn"
 
     coder = FakeCoder()
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.store = store
     controller.client = FakeClient()
@@ -4765,7 +5678,7 @@ async def test_policy_deny_no_active_turn_starts_new_coder_turn(tmp_path: Path) 
     assert health.denied_requests == 1
     assert health.last_denial == "writes to supervisor runtime/state files are denied"
     assert coder.started_messages == ["writes to supervisor runtime/state files are denied"]
-    assert store.get_sentinel_config().active_coder_turn_id == "new-turn"
+    assert store.get_bello_config().active_coder_turn_id == "new-turn"
     assert "started a new coder turn with the denial reason" in store.path(PROGRESS).read_text(encoding="utf-8")
 
 
@@ -4773,8 +5686,8 @@ async def test_approval_accept_does_not_steer_coder(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread", active_coder_turn_id="turn"),
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread", active_coder_turn_id="turn"),
         overwrite=True,
     )
 
@@ -4793,7 +5706,7 @@ async def test_approval_accept_does_not_steer_coder(tmp_path: Path) -> None:
             self.messages.append(message)
             return "turn"
 
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.store = store
     controller.client = FakeClient()
@@ -4821,11 +5734,11 @@ async def test_execpolicy_amendment_approval_is_not_rendered_as_denied(tmp_path:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread", active_coder_turn_id="turn"),
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread", active_coder_turn_id="turn"),
         overwrite=True,
     )
-    amendment = ["/bin/zsh", "-lc", "printf 'hello sentinel\\n' > hello.txt"]
+    amendment = ["/bin/zsh", "-lc", "printf 'hello bello\\n' > hello.txt"]
     offered_decision = {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": amendment}}
 
     class FakeSupervisor:
@@ -4852,7 +5765,7 @@ async def test_execpolicy_amendment_approval_is_not_rendered_as_denied(tmp_path:
             self.messages.append(message)
             return "turn"
 
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.store = store
     controller.client = FakeClient()
@@ -4868,7 +5781,7 @@ async def test_execpolicy_amendment_approval_is_not_rendered_as_denied(tmp_path:
                 "id": 54,
                 "method": "item/commandExecution/requestApproval",
                 "params": {
-                    "command": "printf 'hello sentinel\\n' > hello.txt",
+                    "command": "printf 'hello bello\\n' > hello.txt",
                     "cwd": str(tmp_path),
                     "availableDecisions": [offered_decision, "decline"],
                 },
@@ -4936,7 +5849,7 @@ async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path:
 
     client = ShutdownClient()
     monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
-    controller = SentinelController(
+    controller = BelloController(
         tmp_path,
         task_path=task,
         client=client,  # type: ignore[arg-type]
@@ -4956,7 +5869,7 @@ async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path:
 
     run_task = asyncio.create_task(controller.run())
     await asyncio.wait_for(client.initial_turn_started.wait(), timeout=1)
-    await controller.finalize("task complete", status=SentinelStatus.COMPLETE)
+    await controller.finalize("task complete", status=BelloStatus.COMPLETE)
     await asyncio.wait_for(run_task, timeout=1)
 
     assert controller.coder is not None
@@ -4980,17 +5893,17 @@ async def test_finalize_writes_report_and_status_before_terminal_shutdown(tmp_pa
     async def fake_prepare_terminal_shutdown(reason: str) -> None:
         nonlocal shutdown_seen
         shutdown_seen = True
-        assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+        assert store.get_bello_config().status == BelloStatus.COMPLETE
         report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
         assert "# Final Report" in report
         assert "task complete" in report
 
     controller._prepare_terminal_shutdown = fake_prepare_terminal_shutdown  # type: ignore[method-assign]
 
-    await controller.finalize("task complete", status=SentinelStatus.COMPLETE)
+    await controller.finalize("task complete", status=BelloStatus.COMPLETE)
 
     assert shutdown_seen is True
-    assert store.get_sentinel_config().status == SentinelStatus.COMPLETE
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
     assert store.path(FINAL_REPORT).read_text(encoding="utf-8").strip()
 
 
@@ -5023,16 +5936,16 @@ def _completion_gate_controller(
     *,
     validations: list[ValidationRun],
     reruns: int = 0,
-) -> tuple[SentinelController, StateStore, Path, _GateFakeCoder]:
+) -> tuple[BelloController, StateStore, Path, _GateFakeCoder]:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
         overwrite=True,
     )
     coder = _GateFakeCoder()
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
@@ -5131,16 +6044,16 @@ class _CheapRuntimeNoopReviewer:
         return CheapRuntimeDecision(decision="noop", reason_code="routine_progress")
 
 
-def _runtime_controller(tmp_path: Path) -> tuple[SentinelController, StateStore, _RuntimeFakeSupervisor]:
+def _runtime_controller(tmp_path: Path) -> tuple[BelloController, StateStore, _RuntimeFakeSupervisor]:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
         overwrite=True,
     )
     fake = _RuntimeFakeSupervisor(store, task)
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
@@ -5200,10 +6113,10 @@ async def test_controller_idle_guard_forces_completion_review_for_stalled_no_act
     controller.coder = coder
     controller.running = True
     controller._last_controller_activity_monotonic = 0.0
-    store.update_sentinel_config(
+    store.update_bello_config(
         lambda cfg: cfg.model_copy(
             update={
-                "status": SentinelStatus.RUNNING,
+                "status": BelloStatus.RUNNING,
                 "last_event_sequence": 17,
                 "active_coder_turn_id": None,
             }
@@ -5302,7 +6215,7 @@ async def test_completion_return_with_fresh_delta_evidence_goes_to_coder_without
         ),
         ValidationRun(
             validation_id="validation-demo",
-            command="SENTINEL_BEHAVIOR_DEMO=1 ./c_compiler sample.c",
+            command="BELLO_BEHAVIOR_DEMO=1 ./c_compiler sample.c",
             exit_code=0,
             type="behavior_demo",
             passed=True,
@@ -5462,11 +6375,11 @@ def test_effective_max_adversary_runs_cli_override(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
         overwrite=True,
     )
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.store = store
 
     # No overrides: falls back to the persisted config (default 1).
@@ -5477,7 +6390,7 @@ def test_effective_max_adversary_runs_cli_override(tmp_path: Path) -> None:
     controller.adversary_enabled = True
     controller.adversary_runs = 3
     assert controller._effective_max_adversary_runs() == 3
-    assert store.get_sentinel_config().max_adversary_runs == 1
+    assert store.get_bello_config().max_adversary_runs == 1
 
     # CLI --adversary false wins regardless of budget.
     controller.adversary_enabled = False
@@ -5494,7 +6407,7 @@ class _FakeSteerCoder:
 
 async def test_no_marker_idle_skips_review_for_virgin_generation(tmp_path: Path) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
-    store.update_sentinel_config(
+    store.update_bello_config(
         lambda cfg: cfg.model_copy(update={"active_coder_turn_id": None, "last_event_sequence": 17})
     )
     controller._generation_has_coder_turn = False
@@ -5511,8 +6424,8 @@ async def test_completion_restart_discarded_for_virgin_generation(tmp_path: Path
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
         overwrite=True,
     )
     handoff = RestartHandoff(
@@ -5523,7 +6436,7 @@ async def test_completion_restart_discarded_for_virgin_generation(tmp_path: Path
         next_step="continue",
         recovery_signal="new coder work",
     )
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
@@ -5560,9 +6473,9 @@ async def test_completion_restart_discarded_for_virgin_generation(tmp_path: Path
         packet_thread_id="thread",
     )
 
-    cfg = store.get_sentinel_config()
+    cfg = store.get_bello_config()
     assert cfg.generation == 0
-    assert cfg.status not in (SentinelStatus.STUCK, SentinelStatus.RESTARTING)
+    assert cfg.status not in (BelloStatus.STUCK, BelloStatus.RESTARTING)
     assert controller.completion_restarts == 0
     assert "Discarded completion restart" in store.path(PROGRESS).read_text(encoding="utf-8")
     events = store.path(EVENTS).read_text(encoding="utf-8")

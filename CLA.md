@@ -1,6 +1,6 @@
-# Sentinel Individual Contributor License Agreement
+# Bello Individual Contributor License Agreement
 
-Thank you for your interest in contributing to Sentinel (the "Project"),
+Thank you for your interest in contributing to Bello (the "Project"),
 maintained by Maksim Bocharov and Alexey Kulaev (the "Maintainers").
 
 By signing this Contributor License Agreement (the "Agreement") you accept the

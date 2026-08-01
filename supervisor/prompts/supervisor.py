@@ -10,7 +10,7 @@ from typing import Any
 from supervisor.schemas import SupervisorWakePacket
 
 
-PROMPTS_ENV_VAR = "SENTINEL_PROMPTS_FILE"
+PROMPTS_ENV_VAR = "BELLO_PROMPTS_FILE"
 PROMPTS_RESOURCE = "prompts.toml"
 
 
@@ -23,15 +23,43 @@ def build_restart_prompt(task_path: Path) -> str:
 
 
 def build_stateless_supervisor_prompt(packet: SupervisorWakePacket) -> str:
-    payload = packet.model_dump(mode="json")
+    raw_payload = packet.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
     section_names = _stateless_supervisor_section_names(packet)
-    payload["prompt_sections"] = section_names
-    payload["instructions"] = [_stateless_supervisor_section_text(name) for name in section_names]
-    return json.dumps(payload, indent=2, sort_keys=True)
+    payload: dict[str, Any] = {
+        "instructions": [_stateless_supervisor_section_text(name) for name in section_names],
+        "prompt_sections": section_names,
+    }
+    stable_fields = (
+        "task_path",
+        "task_contents",
+        "progress_path",
+        "decisions_path",
+        "progress_total_entries",
+        "progress_omitted_entries",
+        "progress",
+        "decisions_total_entries",
+        "decisions_omitted_entries",
+        "decisions",
+    )
+    for name in stable_fields:
+        if name in raw_payload:
+            payload[name] = raw_payload.pop(name)
+    payload.update(raw_payload)
+    return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
 
 
 def build_completion_review_prompt(packet: SupervisorWakePacket) -> str:
-    payload = packet.model_dump(mode="json")
+    payload = packet.model_dump(
+        mode="json",
+        exclude={
+            "progress_path",
+            "progress_total_entries",
+            "progress_omitted_entries",
+            "decisions_path",
+            "decisions_total_entries",
+            "decisions_omitted_entries",
+        },
+    )
     section_names = _completion_review_section_names(packet)
     payload["prompt_sections"] = section_names
     payload["instructions"] = [_stateless_supervisor_section_text(name) for name in section_names]
@@ -73,12 +101,6 @@ def build_adversary_prompt(
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
-def build_cheap_approval_prompt(packet: dict[str, Any]) -> str:
-    payload = dict(packet)
-    payload["instructions"] = [_cheap_approval_prompt_text()]
-    return json.dumps(payload, indent=2, sort_keys=True)
-
-
 def build_cheap_runtime_prompt(packet: dict[str, Any]) -> str:
     payload = dict(packet)
     payload["instructions"] = [_cheap_runtime_prompt_text()]
@@ -109,13 +131,6 @@ def _template(name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise RuntimeError(f"prompt section [{name}] must define a non-empty template")
     return value
-
-
-def _cheap_approval_prompt_text() -> str:
-    value = _section("cheap_approval").get("text")
-    if not isinstance(value, str) or not value.strip():
-        raise RuntimeError("[cheap_approval] must define non-empty text")
-    return value.strip()
 
 
 def _cheap_runtime_prompt_text() -> str:

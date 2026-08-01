@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import shutil
 import sys
+import textwrap
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -29,10 +32,11 @@ from supervisor.project_config import (
     project_config_path,
     sync_runtime_config_fields,
 )
+from supervisor.review_limits import UNLIMITED_REVIEW_LIMIT, format_review_limit
 
 
 EditorAction = Literal["add_protected_path"]
-InlineEditKind = Literal["optional_text", "non_negative_int", "protected_path_entry"]
+InlineEditKind = Literal["optional_text", "non_negative_int", "protected_path_entry", "review_limit"]
 StyledFragment = tuple[str, str]
 FragmentLine = list[StyledFragment]
 FormattedRender = list[StyledFragment]
@@ -59,12 +63,68 @@ PANEL_BORDER_GRADIENT = (
 ACTIVE_ROW_BG_GRADIENT = (
     "#100832",
 )
+ANIMATION_INTERVAL_SECONDS = 0.10
+ICON_MOTION = (0, 0, 1, 1, 1, 1, 0, 0)
+ICON_GLOW = (
+    "#18f8ff",
+    "#10d0ff",
+    "#8078ff",
+    "#f060f8",
+    "#f3dcff",
+    "#f060f8",
+    "#8078ff",
+    "#10d0ff",
+)
+MAX_GLOW = (
+    "#8078ff",
+    "#a990ff",
+    "#d8b8ff",
+    "#f3dcff",
+    "#d8b8ff",
+    "#a990ff",
+)
+ULTRA_WAVE_SPEED = 1.35
+ULTRA_WAVELENGTH = 13.0
+ULTRA_WAVEFRONT_FADE = 4.0
+ULTRA_BASE_BG = "#100832"
+ULTRA_WAVE_BACKGROUNDS = (
+    "#160a35",
+    "#1d0a43",
+    "#250b50",
+    "#2d0c5d",
+    "#370e6b",
+    "#421178",
+    "#4e1587",
+    "#5a1a96",
+    "#6721a6",
+    "#742bb5",
+)
+ULTRA_WAVE_FOREGROUNDS = (
+    "#a78cff",
+    "#b294ff",
+    "#bd9dff",
+    "#c8a7ff",
+    "#d3b1ff",
+    "#debcff",
+    "#e8c8ff",
+    "#f0d4ff",
+    "#f7e1ff",
+    "#ffffff",
+)
+ULTRA_EDGE_LEFT = "#9d58ed bg:#210b4c"
+ULTRA_EDGE_RIGHT = "#c06cff bg:#321067"
 MODEL_FAMILY_5_6_LABEL = "GPT-5.6"
 MODEL_FAMILY_5_5_LABEL = "GPT-5.5"
 MODEL_VARIANT_LABELS = {
     MODEL_GPT_5_6_SOL: "Sol",
     MODEL_GPT_5_6_TERRA: "Terra",
     MODEL_GPT_5_6_LUNA: "Luna",
+}
+ROLE_PURPOSES = {
+    "coder": "coder that implements the task in the writable workspace snapshot",
+    "runtime": "runtime supervisor that evaluates live events and approval requests",
+    "completion": "read-only completion reviewer that decides whether the work is done",
+    "adversary": "adversarial tester that attacks the candidate in a disposable snapshot",
 }
 
 
@@ -83,6 +143,7 @@ class EditorParameter:
     value: str
     options: tuple[EditorOption, ...]
     edit_kind: InlineEditKind | None = None
+    help_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -150,7 +211,7 @@ class Theme:
 
     @classmethod
     def from_environment(cls) -> Theme:
-        ascii_enabled = os.environ.get("SENTINEL_CONFIG_ASCII", "").strip().lower() in {
+        ascii_enabled = os.environ.get("BELLO_CONFIG_ASCII", "").strip().lower() in {
             "1",
             "true",
             "yes",
@@ -353,21 +414,31 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
         config.runtime_intelligence,
         models,
     )
-    completion_parameters = _role_parameters(
-        "completion",
-        "completion_mod",
-        "completion_intelligence",
-        config.completion_mod,
-        config.completion_intelligence,
-        models,
+    completion_parameters = (
+        _role_parameters(
+            "completion",
+            "completion_mod",
+            "completion_intelligence",
+            config.completion_mod,
+            config.completion_intelligence,
+            models,
+        )
+        if config.completion_review
+        else ()
     )
-    adversary_parameters = _role_parameters(
-        "adversary",
-        "adversary_mod",
-        "adversary_intelligence",
-        config.adversary_mod,
-        config.adversary_intelligence,
-        models,
+    adversary_enabled = config.adversary and config.adversary_runs > 0
+    adversary_active = config.completion_review and adversary_enabled
+    adversary_parameters = (
+        _role_parameters(
+            "adversary",
+            "adversary_mod",
+            "adversary_intelligence",
+            config.adversary_mod,
+            config.adversary_intelligence,
+            models,
+        )
+        if adversary_active
+        else ()
     )
     protected_options = [
         EditorOption("clear all", "protected_path", ()),
@@ -376,6 +447,66 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
     if config.protected_path:
         protected_options.append(EditorOption(f"remove last ({config.protected_path[-1]})", "protected_path", config.protected_path[:-1]))
 
+    review_parameters: list[EditorParameter] = []
+    if config.completion_review:
+        review_parameters.append(
+            EditorParameter(
+                "adversary",
+                "adversary",
+                _format_bool(adversary_enabled),
+                (EditorOption("true", "adversary", True), EditorOption("false", "adversary", False)),
+                help_text=(
+                    "Run the adversarial tester before completion. It attacks the candidate in a disposable "
+                    "snapshot and requires completion review."
+                ),
+            )
+        )
+        before_adversary_help = (
+            "Maximum completion-review rounds that may return work before Bello forces the first adversary. "
+            "An earlier accept starts the adversary immediately. 0 skips these rounds; Unlimited removes the cap."
+            if adversary_enabled
+            else (
+                "Maximum completion-review rounds that may return work. After the coder applies the final return "
+                "and reports readiness, Bello completes without another review. 0 skips review; Unlimited removes "
+                "the cap."
+            )
+        )
+        review_parameters.append(
+            EditorParameter(
+                "completion_returns_before_adversary",
+                "max-reviews-before-adversary" if adversary_enabled else "max-reviews",
+                format_review_limit(config.completion_returns_before_adversary),
+                (),
+                edit_kind="review_limit",
+                help_text=before_adversary_help,
+            )
+        )
+        if adversary_enabled:
+            review_parameters.append(
+                EditorParameter(
+                    "adversary_runs",
+                    "max-adversary-runs",
+                    str(config.adversary_runs),
+                    (),
+                    edit_kind="non_negative_int",
+                    help_text="Maximum adversary passes in one run. 0 disables adversary passes.",
+                )
+            )
+            review_parameters.append(
+                EditorParameter(
+                    "completion_returns_after_adversary",
+                    "max-reviews-after-adversary",
+                    format_review_limit(config.completion_returns_after_adversary),
+                    (),
+                    edit_kind="review_limit",
+                    help_text=(
+                        "Maximum additional completion-review rounds after each adversary pass. 0 schedules none; "
+                        "Unlimited removes the cap. A candidate adversary finding is still adjudicated once before "
+                        "Bello accepts it or returns a real defect to the coder."
+                    ),
+                )
+            )
+
     return (
         EditorParameter(
             "task",
@@ -383,6 +514,7 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
             config.task or "absent",
             (),
             edit_kind="optional_text",
+            help_text="Default task file for this folder. A --task CLI argument overrides it for one run.",
         ),
         *coder_parameters,
         *runtime_parameters,
@@ -393,12 +525,33 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
             "speed",
             config.speed,
             tuple(EditorOption(value, "speed", value) for value in SPEED_CHOICES),
+            help_text=(
+                "fast uses the priority service tier for coder, runtime, and completion-review turns. "
+                "usual leaves the service tier unset."
+            ),
+        ),
+        EditorParameter(
+            "cheap_runtime",
+            "cheap-runtime",
+            _format_bool(config.cheap_runtime),
+            (
+                EditorOption("true", "cheap_runtime", True),
+                EditorOption("false", "cheap_runtime", False),
+            ),
+            help_text=(
+                "true lets cheap triage (Luna by default) dismiss routine runtime checks. Human messages, "
+                "approvals, and mandatory checks bypass it. false uses the full runtime supervisor for every check."
+            ),
         ),
         EditorParameter(
             "start_over",
             "start-over",
             _format_bool(config.start_over),
             (EditorOption("true", "start_over", True), EditorOption("false", "start_over", False)),
+            help_text=(
+                "true deletes prior Bello logs, archives, and recovery data. false preserves them. "
+                "Both start a new active run and leave project files unchanged."
+            ),
         ),
         EditorParameter(
             "completion_review",
@@ -408,38 +561,31 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
                 EditorOption("true", "completion_review", True),
                 EditorOption("false", "completion_review", False),
             ),
+            help_text=(
+                "true sends validated coder readiness to an independent read-only reviewer. false skips the final "
+                "review and adversary, then completes once coder readiness passes required validation checks."
+            ),
         ),
-        EditorParameter(
-            "adversary",
-            "adversary",
-            _format_bool(config.adversary and config.completion_review),
-            (EditorOption("true", "adversary", True), EditorOption("false", "adversary", False)),
-        ),
-        EditorParameter(
-            "adversary_runs",
-            "max-adversary-runs",
-            str(config.adversary_runs if config.adversary and config.completion_review else 0),
-            (),
-            edit_kind="non_negative_int",
-        ),
-        EditorParameter(
-            "completion_returns_per_generation",
-            "max-completion-returns-per-generation",
-            str(config.completion_returns_per_generation),
-            (),
-            edit_kind="non_negative_int",
-        ),
+        *review_parameters,
         EditorParameter(
             "clean",
             "clean",
             _format_bool(config.clean),
             (EditorOption("false", "clean", False), EditorOption("true", "clean", True)),
+            help_text=(
+                "DANGER: before launch, delete everything in the project folder except the task file and "
+                "protected paths, including .git. Use only in a disposable folder."
+            ),
         ),
         EditorParameter(
             "protected_path",
             "protected-path",
             ", ".join(config.protected_path) if config.protected_path else "absent",
             tuple(protected_options),
+            help_text=(
+                "Paths kept out of the coder snapshot and rejected by approval and final-patch checks. "
+                "They are also preserved by clean. Use for hidden tests, goldens, and grading files."
+            ),
         ),
     )
 
@@ -461,6 +607,10 @@ def _role_parameters(
             tuple(
                 EditorOption(value, intelligence_field, value)
                 for value in intelligence_choices_for_model(selected_model)
+            ),
+            help_text=(
+                f"Reasoning effort sent to the {ROLE_PURPOSES[role]}. "
+                "Higher levels allow more reasoning per turn."
             ),
         ),
     )
@@ -487,6 +637,7 @@ def _model_parameters(
             f"{role}-mod",
             _model_family_label(selected_model),
             tuple(family_options),
+            help_text=f"Model family for the {ROLE_PURPOSES[role]}.",
         )
     ]
     if selected_model in GPT_5_6_MODELS:
@@ -500,6 +651,7 @@ def _model_parameters(
                     for model in GPT_5_6_MODELS
                     if model in available or model == selected_model
                 ),
+                help_text=f"GPT-5.6 variant for the {ROLE_PURPOSES[role]}: Sol, Terra, or Luna.",
             )
         )
     return tuple(parameters)
@@ -546,7 +698,9 @@ def select_current(
     parameter = parameters[state.parameter_index]
     if state.editing:
         updated, updated_state = _commit_inline_edit(config, state, parameters)
-        return updated, updated_state, None
+        if updated_state.editing:
+            return updated, updated_state, None
+        return updated, _advance_after_parameter_change(state, parameters, updated, model_choices), None
     if parameter.edit_kind is not None and state.option_index is None:
         return config, _start_inline_edit(config, state, parameter), None
     if state.expanded_index != state.parameter_index:
@@ -560,11 +714,37 @@ def select_current(
     if option.field is None:
         return config, advance_after_selection(state, len(parameters)), None
     updated = _replace_config_field(config, option.field, option.value)
-    return updated, advance_after_selection(state, len(parameters)), None
+    return updated, _advance_after_parameter_change(state, parameters, updated, model_choices), None
 
 
 def advance_after_selection(state: EditorState, parameter_count: int) -> EditorState:
     return EditorState(parameter_index=min(state.parameter_index + 1, parameter_count - 1))
+
+
+def _advance_after_parameter_change(
+    state: EditorState,
+    previous_parameters: tuple[EditorParameter, ...],
+    updated_config: ProjectConfig,
+    model_choices: tuple[str, ...] | None,
+) -> EditorState:
+    updated_parameters = parameter_defs(updated_config, model_choices)
+    if not updated_parameters:
+        return EditorState()
+
+    current_index = min(max(state.parameter_index, 0), len(previous_parameters) - 1)
+    current_key = previous_parameters[current_index].key
+    updated_indexes = {parameter.key: index for index, parameter in enumerate(updated_parameters)}
+    if current_key in updated_indexes:
+        return EditorState(parameter_index=min(updated_indexes[current_key] + 1, len(updated_parameters) - 1))
+
+    for distance in range(1, len(previous_parameters)):
+        for candidate_index in (current_index + distance, current_index - distance):
+            if candidate_index < 0 or candidate_index >= len(previous_parameters):
+                continue
+            candidate_key = previous_parameters[candidate_index].key
+            if candidate_key in updated_indexes:
+                return EditorState(parameter_index=updated_indexes[candidate_key])
+    return EditorState(parameter_index=len(updated_parameters) - 1)
 
 
 def append_inline_text(state: EditorState, text: str) -> EditorState:
@@ -613,8 +793,10 @@ def _inline_initial_value(config: ProjectConfig, parameter: EditorParameter) -> 
         return config.task or ""
     if parameter.key == "adversary_runs":
         return str(config.adversary_runs if config.adversary and config.completion_review else 0)
-    if parameter.key == "completion_returns_per_generation":
-        return str(config.completion_returns_per_generation)
+    if parameter.key == "completion_returns_before_adversary":
+        return format_review_limit(config.completion_returns_before_adversary)
+    if parameter.key == "completion_returns_after_adversary":
+        return format_review_limit(config.completion_returns_after_adversary)
     return parameter.value if parameter.value != "absent" else ""
 
 
@@ -638,10 +820,26 @@ def _commit_inline_edit(
             return config, replace(state, edit_error="enter a non-negative integer")
         updated = _replace_config_field(config, parameter.key, int(raw))
         return updated, advance_after_selection(state, len(parameters))
+    if state.edit_kind == "review_limit":
+        if raw.lower() == UNLIMITED_REVIEW_LIMIT:
+            value: int | str = UNLIMITED_REVIEW_LIMIT
+        elif raw.isdecimal():
+            value = int(raw)
+        else:
+            return config, replace(state, edit_error="enter 0 or a positive integer, or Unlimited")
+        updated = _replace_config_field(config, parameter.key, value)
+        return updated, advance_after_selection(state, len(parameters))
     return config, cancel_inline_edit(state)
 
 
 def _replace_config_field(config: ProjectConfig, field: str, value: Any) -> ProjectConfig:
+    if field == "adversary":
+        enabled = bool(value)
+        return replace(
+            config,
+            adversary=enabled,
+            adversary_runs=max(1, config.adversary_runs) if enabled else config.adversary_runs,
+        )
     if field == "adversary_runs":
         runs = int(value)
         return replace(config, adversary_runs=runs, adversary=runs > 0)
@@ -672,7 +870,7 @@ class Header:
         left: FragmentLine = [
             (_merge_styles(theme.style("header"), theme.style("logo")), _logo_symbol(theme)),
             (theme.style("header"), " "),
-            (_merge_styles(theme.style("header"), theme.style("header_title")), "SENTINEL PROJECT CONFIG"),
+            (_merge_styles(theme.style("header"), theme.style("header_title")), "BELLO PROJECT CONFIG"),
             (theme.style("header"), " "),
             *_inline_badge(path.name, theme, "badge"),
         ]
@@ -751,15 +949,12 @@ class FooterStatus:
         layout: LayoutSpec,
         theme: Theme,
     ) -> FragmentLine:
-        nested_count = _visible_option_count(parameters, state)
         left: FragmentLine = [
             *_inline_badge(_code_symbol(theme), theme, "icon_badge"),
             (theme.style("footer"), " "),
             *_inline_badge("JSON", theme, "json_badge"),
             (theme.style("footer"), "  "),
             (_merge_styles(theme.style("footer"), theme.style("muted")), f"{len(parameters)} settings"),
-            (_merge_styles(theme.style("footer"), theme.style("muted")), f"  {theme.symbols.bullet}  "),
-            (_merge_styles(theme.style("footer"), theme.style("muted")), f"{nested_count} nested"),
             (theme.style("footer"), "  "),
         ]
         right: FragmentLine = [
@@ -784,8 +979,16 @@ class ConfigList:
         width: int,
         height: int,
         theme: Theme,
+        animation_frame: int | None = None,
     ) -> list[FragmentLine]:
-        rows, active_row = ConfigList._rows(config, parameters, state, width, theme)
+        rows, active_row, animated_background_rows = ConfigList._rows(
+            config,
+            parameters,
+            state,
+            width,
+            theme,
+            animation_frame,
+        )
         if height <= 0:
             return []
         if height == 1:
@@ -799,7 +1002,16 @@ class ConfigList:
         rendered: list[FragmentLine] = [_panel_border(width, theme, top=True)]
         if height > 2:
             rendered.append(_panel_row(ConfigList._table_header(label_width, theme), inner_width, theme))
-        rendered.extend(_panel_row(row, inner_width, theme) for row in visible)
+        rendered.extend(
+            _panel_row(
+                row,
+                inner_width,
+                theme,
+                active=start + offset == active_row,
+                preserve_active_background=start + offset in animated_background_rows,
+            )
+            for offset, row in enumerate(visible)
+        )
         while len(rendered) < height - 1:
             rendered.append(_panel_row([], inner_width, theme))
         rendered.append(_panel_border(width, theme, top=False))
@@ -812,9 +1024,11 @@ class ConfigList:
         state: EditorState,
         width: int,
         theme: Theme,
-    ) -> tuple[list[FragmentLine], int]:
+        animation_frame: int | None,
+    ) -> tuple[list[FragmentLine], int, set[int]]:
         rows: list[FragmentLine] = []
         active_row = 0
+        animated_background_rows: set[int] = set()
         label_width = _label_width(parameters, max(0, width - 2))
         inner_width = max(0, width - 2)
         for parameter_index, parameter in enumerate(parameters):
@@ -822,16 +1036,38 @@ class ConfigList:
             active_parameter = state.parameter_index == parameter_index and state.option_index is None
             if active_parameter:
                 active_row = len(rows)
-            rows.append(ConfigList._parameter_row(parameter, parameter_index, state, expanded, label_width, theme))
+            rows.append(
+                ConfigList._parameter_row(
+                    parameter,
+                    parameter_index,
+                    state,
+                    expanded,
+                    label_width,
+                    theme,
+                    animation_frame,
+                )
+            )
             if expanded:
                 for option_index, option in enumerate(parameter.options):
                     active_option = state.parameter_index == parameter_index and state.option_index == option_index
                     if active_option:
                         active_row = len(rows)
-                    rows.append(ConfigList._option_row(config, parameter, option, active_option, theme))
+                    if _is_animated_ultra_option(parameter, option, active_option, animation_frame):
+                        animated_background_rows.add(len(rows))
+                    rows.append(
+                        ConfigList._option_row(
+                            config,
+                            parameter,
+                            option,
+                            active_option,
+                            inner_width,
+                            theme,
+                            animation_frame,
+                        )
+                    )
             if parameter_index + 1 < len(parameters):
                 rows.append(ConfigList._row_divider(inner_width, theme))
-        return rows, active_row
+        return rows, active_row, animated_background_rows
 
     @staticmethod
     def _table_header(label_width: int, theme: Theme) -> FragmentLine:
@@ -861,8 +1097,10 @@ class ConfigList:
         expanded: bool,
         label_width: int,
         theme: Theme,
+        animation_frame: int | None,
     ) -> FragmentLine:
         active = state.parameter_index == parameter_index and state.option_index is None
+        focused = state.parameter_index == parameter_index
         active_style = theme.style("active") if active else theme.style("panel")
         marker = theme.symbols.active if active else " "
         expand_marker = theme.symbols.expanded if expanded else theme.symbols.collapsed
@@ -874,8 +1112,13 @@ class ConfigList:
             (active_style, " "),
             (_merge_styles(active_style, theme.style("violet")), expand_marker),
             (active_style, " "),
-            (_merge_styles(active_style, theme.style(_icon_style_key(parameter.key))), icon),
-            (active_style, "  "),
+            *_parameter_icon_fragments(
+                icon,
+                active_style,
+                theme.style(_icon_style_key(parameter.key)),
+                focused=focused,
+                animation_frame=animation_frame,
+            ),
             (_merge_styles(active_style, theme.style("name")), name),
             (active_style, "  "),
             *_parameter_value_fragments(parameter, parameter_index, state, active_style, theme),
@@ -887,13 +1130,18 @@ class ConfigList:
         parameter: EditorParameter,
         option: EditorOption,
         active: bool,
+        width: int,
         theme: Theme,
+        animation_frame: int | None,
     ) -> FragmentLine:
         active_style = theme.style("active") if active else theme.style("panel")
         active_marker = theme.symbols.active if active else " "
         selected_marker = theme.symbols.selected if _option_matches_current(config, parameter, option) else " "
         label_style = "muted" if option.action is not None else _value_style_key(parameter.key, option.label)
-        return [
+        rendered_label_style = _merge_styles(active_style, theme.style(label_style))
+        if _is_animated_max_option(parameter, option, active, animation_frame):
+            rendered_label_style = _max_glow_style(active_style, cast(int, animation_frame))
+        fragments: FragmentLine = [
             (active_style, " "),
             (_merge_styles(active_style, theme.style("active_marker" if active else "muted")), active_marker),
             (active_style, "      "),
@@ -901,8 +1149,25 @@ class ConfigList:
             (active_style, " "),
             (_merge_styles(active_style, theme.style("green" if selected_marker.strip() else "muted")), selected_marker),
             (active_style, "  "),
-            (_merge_styles(active_style, theme.style(label_style)), option.label),
+            (rendered_label_style, option.label),
         ]
+        if _is_animated_ultra_option(parameter, option, active, animation_frame):
+            fitted = _fit_fragments(fragments, width, theme, fill_style=active_style)
+            fitted_text = _plain_line(fitted)
+            label_start = fitted_text.rfind(option.label)
+            label_width = WidthUtils.display_width(option.label)
+            if label_start < 0:
+                source_center = width / 2
+            else:
+                source_center = WidthUtils.display_width(fitted_text[:label_start]) + label_width / 2
+            return _apply_ultra_wave(
+                fitted,
+                width,
+                cast(int, animation_frame),
+                source_center=source_center,
+                source_radius=max(0.5, label_width / 2),
+            )
+        return fragments
 
 
 class SidePanel:
@@ -918,24 +1183,46 @@ class SidePanel:
         if width <= 0 or height <= 0:
             return []
         symbols = theme.symbols
-        content: list[FragmentLine] = [
+        parameter_index = min(max(state.parameter_index, 0), max(0, len(parameters) - 1))
+        parameter = parameters[parameter_index]
+        tip_style = "red" if parameter.key == "clean" else "muted"
+        tip_lines = _wrapped_side_tip(parameter.help_text, width, theme, style_key=tip_style)
+        navigation: list[FragmentLine] = [
             _side_text("NAVIGATION", theme, style_key="panel_title"),
             _side_text("^ up", theme, style_key="name"),
             _side_text("v down", theme, style_key="name"),
             _side_text(f"{symbols.active} select", theme, style_key="name"),
             _side_text(f"{_enter_symbol(theme)} enter", theme, style_key="name"),
             _side_text("esc back / exit", theme, style_key="name"),
-            _side_divider(width, theme),
+        ]
+        compact_navigation: list[FragmentLine] = [
+            _side_text(f"NAVIGATION ^/v {_enter_symbol(theme)} select", theme, style_key="panel_title"),
+        ]
+        tips: list[FragmentLine] = [
+            _side_text("TIPS", theme, style_key="panel_title"),
+            *tip_lines,
+        ]
+        status: list[FragmentLine] = [
             _side_text("STATUS", theme, style_key="panel_title"),
             _side_text(f"{symbols.selected} Ready", theme, style_key="green"),
             _side_text("  Config valid", theme, style_key="muted"),
-            _side_divider(width, theme),
-            _side_text("TIPS", theme, style_key="panel_title"),
-            _side_text(f"{_tip_symbol(theme)} Use arrows to", theme, style_key="muted"),
-            _side_text("  navigate", theme, style_key="muted"),
-            _side_text("  Enter to edit", theme, style_key="muted"),
-            _side_text("  or expand", theme, style_key="muted"),
         ]
+        if height < 12:
+            content = tips
+        elif height < 18:
+            content = [
+                *compact_navigation,
+                _side_divider(width, theme),
+                *tips,
+            ]
+        else:
+            content = [
+                *navigation,
+                _side_divider(width, theme),
+                *tips,
+                _side_divider(width, theme),
+                *status,
+            ]
         if height == 1:
             return [_fit_fragments(content[0], width, theme, fill_style=theme.style("panel"))]
 
@@ -958,11 +1245,20 @@ def render_editor(
     width: int | None = None,
     height: int | None = None,
     formatted: bool = False,
+    animation_frame: int | None = None,
 ) -> str | FormattedRender:
     theme = Theme.from_environment()
     layout = LayoutSpec.from_size(width, height)
     parameters = parameter_defs(config, model_choices)
-    lines = _render_editor_lines(config, state, path, parameters, layout, theme)
+    lines = _render_editor_lines(
+        config,
+        state,
+        path,
+        parameters,
+        layout,
+        theme,
+        animation_frame=animation_frame,
+    )
     if formatted:
         return _join_fragment_lines(lines)
     return "\n".join(_plain_line(line) for line in lines)
@@ -975,6 +1271,8 @@ def _render_editor_lines(
     parameters: tuple[EditorParameter, ...],
     layout: LayoutSpec,
     theme: Theme,
+    *,
+    animation_frame: int | None,
 ) -> list[FragmentLine]:
     lines = [
         _horizontal_line(layout, theme, top=True),
@@ -984,7 +1282,15 @@ def _render_editor_lines(
         _horizontal_line(layout, theme, tee=True),
         HelpLine.render(layout, theme, state),
     ]
-    config_lines = ConfigList.render(config, parameters, state, layout.main_width, layout.list_height, theme)
+    config_lines = ConfigList.render(
+        config,
+        parameters,
+        state,
+        layout.main_width,
+        layout.list_height,
+        theme,
+        animation_frame,
+    )
     if layout.side_panel:
         side_lines = SidePanel.render(config, parameters, state, layout.side_width, layout.list_height, theme)
         body_lines = [
@@ -1114,22 +1420,42 @@ def _panel_border(width: int, theme: Theme, *, top: bool) -> FragmentLine:
     ]
 
 
-def _panel_row(fragments: FragmentLine, inner_width: int, theme: Theme) -> FragmentLine:
-    active = _line_has_style(fragments, theme.style("active"))
-    if active:
+def _panel_row(
+    fragments: FragmentLine,
+    inner_width: int,
+    theme: Theme,
+    *,
+    active: bool | None = None,
+    preserve_active_background: bool = False,
+) -> FragmentLine:
+    resolved_active = _line_has_style(fragments, theme.style("active")) if active is None else active
+    if resolved_active:
         fill_style = theme.style("active")
     elif _line_has_style(fragments, theme.style("panel_header")):
         fill_style = theme.style("panel_header")
     else:
         fill_style = theme.style("panel")
-    fitted = _fit_active_row_fragments(fragments, inner_width, theme) if active else _fit_fragments(
-        fragments,
-        inner_width,
-        theme,
-        fill_style=fill_style,
+    fitted = (
+        _fit_active_row_fragments(
+            fragments,
+            inner_width,
+            theme,
+            preserve_background=preserve_active_background,
+        )
+        if resolved_active
+        else _fit_fragments(
+            fragments,
+            inner_width,
+            theme,
+            fill_style=fill_style,
+        )
     )
-    left_edge_style = theme.style("active_glow_left") if active else theme.style("panel_border")
-    right_edge_style = theme.style("active_glow_right") if active else theme.style("panel_border")
+    if preserve_active_background:
+        left_edge_style = ULTRA_EDGE_LEFT
+        right_edge_style = ULTRA_EDGE_RIGHT
+    else:
+        left_edge_style = theme.style("active_glow_left") if resolved_active else theme.style("panel_border")
+        right_edge_style = theme.style("active_glow_right") if resolved_active else theme.style("panel_border")
     return [
         (left_edge_style, theme.symbols.vertical),
         *fitted,
@@ -1137,8 +1463,16 @@ def _panel_row(fragments: FragmentLine, inner_width: int, theme: Theme) -> Fragm
     ]
 
 
-def _fit_active_row_fragments(fragments: FragmentLine, width: int, theme: Theme) -> FragmentLine:
+def _fit_active_row_fragments(
+    fragments: FragmentLine,
+    width: int,
+    theme: Theme,
+    *,
+    preserve_background: bool = False,
+) -> FragmentLine:
     fitted = _fit_fragments(fragments, width, theme, fill_style=theme.style("active"))
+    if preserve_background:
+        return fitted
     return _apply_background_gradient(fitted, max(1, width), ACTIVE_ROW_BG_GRADIENT)
 
 
@@ -1168,10 +1502,37 @@ def _style_with_bg(style: str, bg: str) -> str:
     return " ".join([*tokens, f"bg:{bg}"])
 
 
+def _style_with_colors(style: str, *, fg: str, bg: str) -> str:
+    tokens = [
+        token
+        for token in style.split()
+        if not token.startswith("#") and not token.startswith("fg:") and not token.startswith("bg:")
+    ]
+    return " ".join([fg, *tokens, f"bg:{bg}"])
+
+
 def _side_text(text: str, theme: Theme, *, style_key: str) -> FragmentLine:
     return [
         (theme.style("panel"), "  "),
         (_merge_styles(theme.style("panel"), theme.style(style_key)), text),
+    ]
+
+
+def _wrapped_side_tip(text: str, width: int, theme: Theme, *, style_key: str) -> list[FragmentLine]:
+    line_width = max(1, width - 6)
+    wrapped = textwrap.wrap(
+        text,
+        width=line_width,
+        break_long_words=True,
+        break_on_hyphens=False,
+    ) or ["No details available."]
+    return [
+        _side_text(
+            f"{_tip_symbol(theme)} {line}" if index == 0 else f"  {line}",
+            theme,
+            style_key=style_key,
+        )
+        for index, line in enumerate(wrapped)
     ]
 
 
@@ -1243,14 +1604,115 @@ def _label_width(parameters: tuple[EditorParameter, ...], width: int) -> int:
     return min(max(32, widest), max(24, width // 2))
 
 
-def _visible_option_count(parameters: tuple[EditorParameter, ...], state: EditorState) -> int:
-    if state.editing:
-        return 0
-    if state.expanded_index is None:
-        return 0
-    if state.expanded_index < 0 or state.expanded_index >= len(parameters):
-        return 0
-    return len(parameters[state.expanded_index].options)
+def _parameter_icon_fragments(
+    icon: str,
+    row_style: str,
+    icon_style: str,
+    *,
+    focused: bool,
+    animation_frame: int | None,
+) -> FragmentLine:
+    if not focused or animation_frame is None:
+        return [(_merge_styles(row_style, icon_style), icon), (row_style, "  ")]
+    position = ICON_MOTION[animation_frame % len(ICON_MOTION)]
+    glow = ICON_GLOW[animation_frame % len(ICON_GLOW)]
+    return [
+        (row_style, " " * position),
+        (_style_with_colors(_merge_styles(row_style, icon_style, "bold"), fg=glow, bg=_style_bg(row_style)), icon),
+        (row_style, " " * (2 - position)),
+    ]
+
+
+def _is_effort_option(parameter: EditorParameter, option: EditorOption, value: str) -> bool:
+    return "intelligence" in parameter.key and option.label.strip().lower() == value
+
+
+def _is_animated_max_option(
+    parameter: EditorParameter,
+    option: EditorOption,
+    active: bool,
+    animation_frame: int | None,
+) -> bool:
+    return active and animation_frame is not None and _is_effort_option(parameter, option, "max")
+
+
+def _is_animated_ultra_option(
+    parameter: EditorParameter,
+    option: EditorOption,
+    active: bool,
+    animation_frame: int | None,
+) -> bool:
+    return active and animation_frame is not None and _is_effort_option(parameter, option, "ultra")
+
+
+def _max_glow_style(row_style: str, animation_frame: int) -> str:
+    color = MAX_GLOW[animation_frame % len(MAX_GLOW)]
+    emphasis = "bold" if color in {"#d8b8ff", "#f3dcff"} else ""
+    return _style_with_colors(_merge_styles(row_style, emphasis), fg=color, bg=_style_bg(row_style))
+
+
+def _apply_ultra_wave(
+    fragments: FragmentLine,
+    width: int,
+    animation_frame: int,
+    *,
+    source_center: float,
+    source_radius: float,
+) -> FragmentLine:
+    if width <= 0:
+        return []
+    wavefront = animation_frame * ULTRA_WAVE_SPEED
+    rendered: FragmentLine = []
+    column = 0
+    for style, text in fragments:
+        current_style: str | None = None
+        current_text: list[str] = []
+        for char in text:
+            char_width = max(wcwidth(char), 0)
+            cell_center = column + max(1, char_width) / 2
+            distance = max(0.0, abs(cell_center - source_center) - source_radius)
+            distance_behind_front = wavefront - distance
+            if distance_behind_front < -ULTRA_WAVEFRONT_FADE:
+                next_style = _style_with_bg(style, ULTRA_BASE_BG)
+            else:
+                front_activation = min(
+                    1.0,
+                    max(0.0, (distance_behind_front + ULTRA_WAVEFRONT_FADE) / ULTRA_WAVEFRONT_FADE),
+                )
+                phase = math.tau * distance_behind_front / ULTRA_WAVELENGTH
+                primary_wave = (math.cos(phase) + 1.0) / 2.0
+                secondary_wave = (math.cos(phase * 2.0 + 0.65) + 1.0) / 2.0
+                source_glow = max(0.0, 1.0 - distance / 5.0) * 0.18
+                intensity = min(
+                    1.0,
+                    (0.14 + primary_wave * 0.68 + secondary_wave * 0.18 + source_glow) * front_activation,
+                )
+                shade_index = min(
+                    len(ULTRA_WAVE_BACKGROUNDS) - 1,
+                    round(intensity * (len(ULTRA_WAVE_BACKGROUNDS) - 1)),
+                )
+                wave_style = _merge_styles(style, "bold") if intensity >= 0.82 else style
+                next_style = _style_with_colors(
+                    wave_style,
+                    fg=ULTRA_WAVE_FOREGROUNDS[shade_index],
+                    bg=ULTRA_WAVE_BACKGROUNDS[shade_index],
+                )
+            if next_style != current_style and current_text:
+                rendered.append((cast(str, current_style), "".join(current_text)))
+                current_text = []
+            current_style = next_style
+            current_text.append(char)
+            column += char_width
+        if current_text and current_style is not None:
+            rendered.append((current_style, "".join(current_text)))
+    return rendered
+
+
+def _style_bg(style: str) -> str:
+    for token in reversed(style.split()):
+        if token.startswith("bg:"):
+            return token[3:]
+    return "#06091c"
 
 
 def _parameter_icon(parameter_key: str, theme: Theme) -> str:
@@ -1270,11 +1732,13 @@ def _parameter_icon(parameter_key: str, theme: Theme) -> str:
             "completion_intelligence": "I",
             "adversary_intelligence": "I",
             "speed": "F",
+            "cheap_runtime": "L",
             "start_over": "R",
             "completion_review": "V",
             "adversary": "A",
             "adversary_runs": "N",
-            "completion_returns_per_generation": "N",
+            "completion_returns_before_adversary": "N",
+            "completion_returns_after_adversary": "M",
             "clean": "X",
             "protected_path": "P",
         }.get(parameter_key, "-")
@@ -1293,11 +1757,13 @@ def _parameter_icon(parameter_key: str, theme: Theme) -> str:
         "completion_intelligence": "✾",
         "adversary_intelligence": "✾",
         "speed": "⚡",
+        "cheap_runtime": "☆",
         "start_over": "↻",
         "completion_review": "✓",
         "adversary": "◈",
         "adversary_runs": "#",
-        "completion_returns_per_generation": "#",
+        "completion_returns_before_adversary": "#",
+        "completion_returns_after_adversary": "#",
         "clean": "✧",
         "protected_path": "▣",
     }.get(parameter_key, "•")
@@ -1347,11 +1813,13 @@ def _icon_style_key(parameter_key: str) -> str:
         "completion_intelligence": "green",
         "adversary_intelligence": "cyan",
         "speed": "yellow",
+        "cheap_runtime": "magenta",
         "start_over": "magenta",
         "completion_review": "green",
         "adversary": "green",
         "adversary_runs": "cyan",
-        "completion_returns_per_generation": "cyan",
+        "completion_returns_before_adversary": "cyan",
+        "completion_returns_after_adversary": "cyan",
         "clean": "red",
         "protected_path": "magenta",
     }.get(parameter_key, "muted")
@@ -1400,7 +1868,11 @@ def _value_style_key(parameter_key: str, value: str) -> str:
     normalized = value.strip().lower()
     if parameter_key.endswith("_mod") or parameter_key.endswith("_mod_variant"):
         return "magenta_soft"
-    if parameter_key in {"adversary_runs", "completion_returns_per_generation"}:
+    if parameter_key in {
+        "adversary_runs",
+        "completion_returns_before_adversary",
+        "completion_returns_after_adversary",
+    }:
         return "cyan"
     if "intelligence" in parameter_key:
         return "violet" if normalized in {"xhigh", "max", "ultra"} else "magenta"
@@ -1455,9 +1927,18 @@ def _prompt_toolkit_size(get_app: Any) -> tuple[int, int]:
     return max(20, size.columns), max(4, size.rows)
 
 
+def _config_animations_enabled() -> bool:
+    return os.environ.get("BELLO_CONFIG_ANIMATIONS", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
 def run_config_editor(project_root: Path) -> ProjectConfig:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        raise RuntimeError("sentinel config requires an interactive terminal")
+        raise RuntimeError("bello config requires an interactive terminal")
     try:
         from prompt_toolkit import Application
         from prompt_toolkit.application.current import get_app
@@ -1467,19 +1948,42 @@ def run_config_editor(project_root: Path) -> ProjectConfig:
         from prompt_toolkit.layout.containers import Window
         from prompt_toolkit.styles import Style
     except ImportError as exc:
-        raise RuntimeError("sentinel config requires prompt_toolkit; reinstall Sentinel with project dependencies") from exc
+        raise RuntimeError("bello config requires prompt_toolkit; reinstall Bello with project dependencies") from exc
 
     config = load_project_config(project_root, create=True)
     model_choices = available_model_choices(project_root)
     path = project_config_path(project_root)
     state = EditorState()
     should_exit = False
+    animations_enabled = _config_animations_enabled()
+    animation_started = time.monotonic()
+    animation_focus: tuple[int, int | None, int | None, bool] | None = None
 
     def render_current() -> FormattedRender:
+        nonlocal animation_focus, animation_started
         width, height = _prompt_toolkit_size(get_app)
+        now = time.monotonic()
+        current_focus = (state.parameter_index, state.expanded_index, state.option_index, state.editing)
+        if current_focus != animation_focus:
+            animation_focus = current_focus
+            animation_started = now
+        animation_frame = (
+            int((now - animation_started) / ANIMATION_INTERVAL_SECONDS)
+            if animations_enabled
+            else None
+        )
         return cast(
             FormattedRender,
-            render_editor(config, state, path, model_choices, width=width, height=height, formatted=True),
+            render_editor(
+                config,
+                state,
+                path,
+                model_choices,
+                width=width,
+                height=height,
+                formatted=True,
+                animation_frame=animation_frame,
+            ),
         )
 
     control = FormattedTextControl(render_current, focusable=True, show_cursor=False)
@@ -1548,6 +2052,8 @@ def run_config_editor(project_root: Path) -> ProjectConfig:
         key_bindings=kb,
         full_screen=True,
         style=Style.from_dict({"": "bg:#050617"}),
+        refresh_interval=ANIMATION_INTERVAL_SECONDS if animations_enabled else None,
+        min_redraw_interval=ANIMATION_INTERVAL_SECONDS / 2 if animations_enabled else None,
     )
     app.run()
     if should_exit:

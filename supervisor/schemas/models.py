@@ -8,6 +8,13 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from supervisor.review_limits import (
+    EXPLICIT_REVIEW_LIMIT_FORMAT,
+    REVIEW_LIMIT_FIELDS,
+    ReviewLimit,
+    normalize_review_limit,
+)
+
 
 class PolicyDecisionKind(str, Enum):
     ALLOW = "allow"
@@ -15,7 +22,7 @@ class PolicyDecisionKind(str, Enum):
     ROUTE_LLM = "route_llm"
 
 
-class SentinelStatus(str, Enum):
+class BelloStatus(str, Enum):
     STARTING = "starting"
     RUNNING = "running"
     PAUSED = "paused"
@@ -69,30 +76,6 @@ class ApprovalDecisionKind(str, Enum):
     CANCEL = "cancel"
 
 
-class CheapApprovalDecision(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    decision: Literal["approve_low_impact", "escalate"]
-    reason_code: Literal[
-        "bounded_read_only",
-        "workspace_local_safe",
-        "needs_task_judgment",
-        "possible_side_effect",
-        "sensitive_or_ambiguous",
-        "unsupported_request",
-    ]
-
-    _APPROVE_CODES = {"bounded_read_only", "workspace_local_safe"}
-
-    @model_validator(mode="after")
-    def validate_reason_code(self) -> "CheapApprovalDecision":
-        if self.decision == "approve_low_impact" and self.reason_code not in self._APPROVE_CODES:
-            raise ValueError("approve_low_impact requires an approve reason_code")
-        if self.decision == "escalate" and self.reason_code in self._APPROVE_CODES:
-            raise ValueError("escalate requires an escalation reason_code")
-        return self
-
-
 class CheapRuntimeDecision(BaseModel):
     """Cheap-model triage of a runtime supervisor wake: route to full supervisor or skip."""
 
@@ -138,7 +121,7 @@ class PolicyDecision(BaseModel):
         return cls(kind=PolicyDecisionKind.ROUTE_LLM, reason=reason, payload=payload)
 
 
-class SentinelConfig(BaseModel):
+class BelloConfig(BaseModel):
     project_root: str
     task: str | None = None
     task_path: str
@@ -153,7 +136,7 @@ class SentinelConfig(BaseModel):
     last_event_sequence: int = 0
     last_applied_supervisor_sequence: int = 0
     pending_server_request_ids: list[int | str] = Field(default_factory=list)
-    status: SentinelStatus = SentinelStatus.STARTING
+    status: BelloStatus = BelloStatus.STARTING
     coder_mod: str | None = None
     super_mod: str | None = None
     runtime_mod: str | None = None
@@ -177,12 +160,18 @@ class SentinelConfig(BaseModel):
     start_over: bool = False
     clean: bool = False
     protected_paths: list[str] = Field(default_factory=list)
+    # Legacy run-state fallback. New projects persist the explicit ProjectConfig defaults.
     adversary: bool = True
     max_no_marker_idle_nudges: int = 2
-    max_completion_returns_per_generation: int = 10
+    review_limit_format: Literal["explicit"] = EXPLICIT_REVIEW_LIMIT_FORMAT
+    max_completion_returns_before_adversary: ReviewLimit = 1
+    max_completion_returns_after_adversary: ReviewLimit = 0
     max_adversary_runs: int = 1
     completion_review_enabled: bool = True
+    cheap_runtime: bool = True
     adversary_run_count: int = 0
+    completion_return_count: int = 0
+    completion_returns_since_adversary: int = 0
     accept_gate_accepts: int = 0
     accept_gate_rejections: int = 0
     accept_gate_reviewer_reruns: int = 0
@@ -192,6 +181,21 @@ class SentinelConfig(BaseModel):
     last_validation_sequence: int | None = None
     last_trusted_behavioral_validation_sequence: int | None = None
     last_trusted_passing_behavioral_validation_sequence: int | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_review_limits(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        for field in REVIEW_LIMIT_FIELDS:
+            if field not in normalized:
+                continue
+            try:
+                normalized[field] = normalize_review_limit(normalized[field])
+            except ValueError as exc:
+                raise ValueError(f"{field} {exc}") from exc
+        return normalized
 
 
 class AppEvent(BaseModel):
@@ -718,7 +722,13 @@ class SupervisorWakePacket(BaseModel):
     task_path: str
     task_contents: str
     progress: str = ""
+    progress_path: str | None = None
+    progress_total_entries: int = 0
+    progress_omitted_entries: int = 0
     decisions: str = ""
+    decisions_path: str | None = None
+    decisions_total_entries: int = 0
+    decisions_omitted_entries: int = 0
     last_actions: list[str] = Field(default_factory=list)
     health: dict[str, Any] = Field(default_factory=dict)
     handoff: RestartHandoff | None = None
@@ -766,7 +776,7 @@ class SupervisorWakePacket(BaseModel):
 
 class FinalReport(BaseModel):
     task_path: str
-    status: SentinelStatus | str
+    status: BelloStatus | str
     result: str
     files_changed: list[str] = Field(default_factory=list)
     validations: list[str] = Field(default_factory=list)
@@ -785,6 +795,12 @@ class FinalReport(BaseModel):
     diff_summary: str | None = None
 
 
+class RestartIssueState(BaseModel):
+    interventions: int = 0
+    last_sequence: int = 0
+    validation_id: str | None = None
+
+
 class HealthState(BaseModel):
     generation: int = 0
     restart_count: int = 0
@@ -798,6 +814,11 @@ class HealthState(BaseModel):
     last_denial: str | None = None
     timeout_fallback_count: int = 0
     parse_failure_count: int = 0
+    restart_issue_key: str | None = None
+    restart_issue_interventions: int = 0
+    restart_issue_last_sequence: int = 0
+    restart_issue_validation_id: str | None = None
+    restart_issues: dict[str, RestartIssueState] = Field(default_factory=dict)
 
 
 class HealthDelta(BaseModel):
@@ -832,14 +853,6 @@ def json_schema_for_completion_review_decision() -> dict[str, Any]:
 
 def openai_strict_json_schema_for_completion_review_decision() -> dict[str, Any]:
     return openai_strict_json_schema(json_schema_for_completion_review_decision())
-
-
-def json_schema_for_cheap_approval_decision() -> dict[str, Any]:
-    return CheapApprovalDecision.model_json_schema()
-
-
-def openai_strict_json_schema_for_cheap_approval_decision() -> dict[str, Any]:
-    return openai_strict_json_schema(json_schema_for_cheap_approval_decision())
 
 
 def json_schema_for_cheap_runtime_decision() -> dict[str, Any]:

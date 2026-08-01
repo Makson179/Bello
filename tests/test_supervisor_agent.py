@@ -4,17 +4,20 @@ import json
 from pathlib import Path
 
 from supervisor.appserver import AppServerError, AppServerMessage
+from supervisor.prompts import build_completion_review_prompt
 from supervisor.schemas import (
     ChangedFileContext,
     ChangedFileDiff,
     InspectionOutput,
     InspectionRun,
-    SentinelConfig,
+    PriorIntervention,
+    BelloConfig,
     SupervisorDecisionKind,
+    TriggeringAction,
     ValidationOutput,
     ValidationRun,
 )
-from supervisor.state import LOG, SUPERVISOR_WAKES, StateStore
+from supervisor.state import DECISIONS, LOG, PROGRESS, SUPERVISOR_WAKES, StateStore
 from supervisor.supervisor_agent import StatelessSupervisorAgent
 
 
@@ -22,7 +25,7 @@ async def test_stateless_supervisor_persists_wake_packet_and_decision(tmp_path: 
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
     class FakeClient:
         async def thread_start(self, params, *, timeout):
@@ -73,7 +76,7 @@ def test_supervisor_packet_uses_canonical_task_contents_override(tmp_path: Path)
     task = tmp_path / "TASK.md"
     task.write_text("weakened after start", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
     agent = StatelessSupervisorAgent(
         object(),  # type: ignore[arg-type]
         store,
@@ -87,11 +90,164 @@ def test_supervisor_packet_uses_canonical_task_contents_override(tmp_path: Path)
     assert packet.task_contents == "strict original task"
 
 
+async def test_runtime_prompt_uses_recent_state_and_relevant_ledgers(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\nImplement the parser.\n", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.write_text_locked(
+        PROGRESS,
+        "# Progress\n\n" + "".join(f"- progress entry {index}\n" for index in range(40)),
+    )
+    store.write_text_locked(
+        DECISIONS,
+        "# Decisions\n\n" + "".join(f"- decision entry {index}\n" for index in range(30)),
+    )
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.prompt = ""
+
+        async def thread_start(self, params, *, timeout):
+            return {"thread": {"id": "runtime-thread"}}
+
+        async def turn_start(self, params, *, timeout):
+            self.prompt = params["input"][0]["text"]
+            return {
+                "turn": {
+                    "id": "runtime-turn",
+                    "status": "completed",
+                    "items": [
+                        {
+                            "type": "agentMessage",
+                            "text": json.dumps({"decision": "noop", "reason": "routine progress"}),
+                        }
+                    ],
+                }
+            }
+
+        async def thread_archive(self, thread_id, *, timeout):
+            return {}
+
+    validations = [
+        ValidationRun(
+            validation_id=f"validation-{index}",
+            command="pytest tests/test_target.py" if index in {2, 8, 19} else f"pytest tests/test_{index}.py",
+            exit_code=0 if index % 3 else 1,
+            passed=index % 3 != 0,
+            trusted_validation_outcome="passed" if index % 3 else "failed",
+            summary=f"validation summary {index}\n" + ("V" * 1200),
+            captured_output="raw validation output\n" + ("v" * 2000),
+            sequence=100 + index,
+            executed_test_names=[f"test_{item}" for item in range(30)],
+        )
+        for index in range(20)
+    ]
+    validations[5] = validations[5].model_copy(
+        update={
+            "passed": False,
+            "trusted_validation_outcome": "masked_or_unknown",
+            "masking_reason": "status was hidden",
+        }
+    )
+    inspections = [
+        InspectionRun(
+            inspection_id=f"inspection-{index}",
+            command="sed -n '1,80p' parser.py" if index in {1, 9, 14} else f"rg symbol_{index} src",
+            exit_code=0,
+            passed=True,
+            summary=f"inspection summary {index}\n" + ("I" * 1000),
+            captured_output="raw inspection output\n" + ("i" * 2000),
+            sequence=200 + index,
+            inspected_paths=[f"src/file_{item}.py" for item in range(30)],
+        )
+        for index in range(15)
+    ]
+    interventions = [
+        PriorIntervention(
+            reason=f"reason {index}",
+            message_to_coder=f"message {index}",
+            sequence=300 + index,
+        )
+        for index in range(15)
+    ]
+    client = FakeClient()
+    agent = StatelessSupervisorAgent(client, store, task)  # type: ignore[arg-type]
+    packet = agent.build_packet(
+        wake_sequence=7,
+        current_summary="Runtime trigger (nonzero_exit): targeted test failed",
+        triggering_action=TriggeringAction(
+            kind="commandExecution",
+            command="pytest tests/test_target.py",
+            exit_code=1,
+            status="completed",
+            summary="targeted test failed",
+        ),
+        validations=validations,
+        inspections=inspections,
+        prior_interventions=interventions,
+    )
+
+    await agent.decide(packet)
+
+    payload = json.loads(client.prompt)
+    assert client.prompt.startswith('{"instructions":')
+    assert len(client.prompt) < 120_000
+    assert payload["progress_path"] == ".supervisor/PROGRESS.md"
+    assert payload["progress_total_entries"] == 40
+    assert payload["progress_omitted_entries"] == 10
+    assert "progress entry 39" in payload["progress"]
+    assert "progress entry 0\n" not in payload["progress"]
+    assert any("Read the complete progress file" in instruction for instruction in payload["instructions"])
+    assert payload["decisions_path"] == ".supervisor/DECISIONS.md"
+    assert payload["decisions_total_entries"] == 30
+    assert payload["decisions_omitted_entries"] == 10
+    assert "decision entry 29" in payload["decisions"]
+    assert "decision entry 0\n" not in payload["decisions"]
+    assert len(payload["validations"]) <= 12
+    assert {"validation-2", "validation-8", "validation-19"} <= {
+        value["validation_id"] for value in payload["validations"]
+    }
+    assert any(value["trusted_validation_outcome"] == "masked_or_unknown" for value in payload["validations"])
+    assert all("captured_output" not in value for value in payload["validations"])
+    assert len(payload["inspections"]) <= 8
+    assert "inspection-14" in {value["inspection_id"] for value in payload["inspections"]}
+    assert len(payload["prior_interventions"]) == 10
+    assert payload["prior_interventions"][0]["sequence"] == 305
+    assert len(packet.validations) == 20
+    assert len(packet.inspections) == 15
+    assert "progress entry 0" in packet.progress
+    assert packet.progress_path is None
+
+    completion_payload = json.loads(build_completion_review_prompt(packet))
+    assert "progress_path" not in completion_payload
+    assert "progress entry 0" in completion_payload["progress"]
+    assert len(completion_payload["validations"]) == 20
+
+    await agent.decide(
+        packet.model_copy(
+            update={
+                "triggering_action": TriggeringAction(
+                    kind="commandExecution",
+                    command="sed -n '1,80p' parser.py",
+                    exit_code=0,
+                    status="completed",
+                    summary="source inspection",
+                )
+            }
+        )
+    )
+    inspection_payload = json.loads(client.prompt)
+    assert {"inspection-1", "inspection-9", "inspection-14"} <= {
+        value["inspection_id"] for value in inspection_payload["inspections"]
+    }
+
+
 async def test_completion_review_persists_use_case_and_decision(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
     class FakeClient:
         async def thread_start(self, params, *, timeout):
@@ -154,7 +310,7 @@ async def test_completion_review_uses_minimal_retry_after_repair_output_is_inval
     task = tmp_path / "TASK.md"
     task.write_text("# Task\nImplement the compiler.\n", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
     valid_decision = {
         "decision": "return",
         "reason": "stack-passed arguments still need validation",
@@ -244,7 +400,7 @@ async def test_completion_review_compacts_large_packet_under_budget(tmp_path: Pa
     task = tmp_path / "TASK.md"
     task.write_text("# Task\nImplement the compiler.\n", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
     class FakeClient:
         def __init__(self) -> None:
@@ -393,7 +549,7 @@ async def test_completion_review_uses_dedicated_long_timeout(tmp_path: Path) -> 
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
     class FakeClient:
         def __init__(self) -> None:
@@ -477,7 +633,7 @@ async def test_completion_review_reuses_thread_until_closed(tmp_path: Path) -> N
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
     class FakeClient:
         def __init__(self) -> None:
@@ -548,7 +704,7 @@ async def test_stateless_supervisor_cleanup_error_after_decision_is_logged_not_f
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(SentinelConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
     class FakeClient:
         def __init__(self) -> None:

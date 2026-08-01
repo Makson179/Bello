@@ -3,8 +3,8 @@ requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sentinel-supervisor"
-version = "0.2.0"
+name = "Bello"
+version = "0.3.0"
 description = "Terminal supervisor for autonomous Codex app-server runs"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,9 +21,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Makson179/Sentinel"
-Repository = "https://github.com/Makson179/Sentinel"
-Issues = "https://github.com/Makson179/Sentinel/issues"
+Homepage = "https://github.com/Makson179/Bello"
+Repository = "https://github.com/Makson179/Bello"
+Issues = "https://github.com/Makson179/Bello/issues"
 
 [project.optional-dependencies]
 test = [
@@ -32,7 +32,7 @@ test = [
 ]
 
 [project.scripts]
-sentinel = "supervisor.main:cli"
+bello = "supervisor.main:cli"
 
 [tool.setuptools.packages.find]
 include = ["supervisor*"]

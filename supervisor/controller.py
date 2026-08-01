@@ -17,13 +17,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 from supervisor.approval_triage import (
-    CheapApprovalReviewer,
-    CheapApprovalReviewerError,
-    CheapApprovalTriageConfig,
     CheapRuntimeReviewer,
     CheapRuntimeReviewerError,
     CheapRuntimeTriageConfig,
-    cheap_approval_triage_config_from_env,
     runtime_triage_config_from_env,
 )
 from supervisor.adversary_agent import AdversaryAgent, AdversaryAgentError
@@ -37,18 +33,22 @@ from supervisor.coder import (
     coder_sandbox_mode,
     coder_thread_params,
 )
-from supervisor.health import kill_restart_candidate, patch_health
+from supervisor.health import (
+    clear_restart_issue_for_validation,
+    kill_restart_candidate,
+    patch_health,
+    record_restart_issue_intervention,
+)
 from supervisor.project_config import DEFAULT_MODEL, ProjectConfig
+from supervisor.review_limits import review_limit_reached
 from supervisor.schemas import (
     AppEvent,
     AppEventSource,
     ApprovalContext,
-    ApprovalRequestType,
     AdversaryReport,
     ApprovalWakeContext,
     BehaviorSurfaceItem,
     BreadthRiskSummary,
-    CheapApprovalDecision,
     CheapRuntimeDecision,
     ChangedFile,
     ChangedFileContext,
@@ -66,10 +66,9 @@ from supervisor.schemas import (
     InspectionOutput,
     InspectionRun,
     PriorIntervention,
-    PolicyDecision,
     RestartHandoff,
-    SentinelConfig,
-    SentinelStatus,
+    BelloConfig,
+    BelloStatus,
     SupervisorDecision,
     SupervisorDecisionKind,
     SupervisorWakePacket,
@@ -96,11 +95,11 @@ from supervisor.workspace_clean import clean_workspace_except_task
 
 VALIDATION_LEDGER_LIMIT = 50
 INSPECTION_LEDGER_LIMIT = 50
-READINESS_MARKER = "SENTINEL_READY_FOR_REVIEW"
-READINESS_MARKER_RE = re.compile(r"^\s*SENTINEL_READY_FOR_REVIEW\s*$", re.MULTILINE)
+READINESS_MARKER = "BELLO_READY_FOR_REVIEW"
+READINESS_MARKER_RE = re.compile(r"^\s*BELLO_READY_FOR_REVIEW\s*$", re.MULTILINE)
 NO_MARKER_IDLE_NUDGE = (
     "Continue working. If you believe the task is ready, provide Summary, Validation evidence, "
-    "and the exact readiness marker on its own line: SENTINEL_READY_FOR_REVIEW."
+    "and the exact readiness marker on its own line: BELLO_READY_FOR_REVIEW."
 )
 POST_RESTART_CONTINUE_NUDGE = (
     "You are a fresh generation after a restart. Read HANDOFF.md and continue the task from there. "
@@ -118,6 +117,10 @@ PROTECTED_RUNTIME_WAKE_REASONS = {
     "restart_budget",
     "suspicious_file_touched",
     "validation_regression",
+}
+MANDATORY_FULL_RUNTIME_WAKE_REASONS = {
+    "done_without_fresh_validation",
+    "runtime_control_replacement",
 }
 CONTROLLER_IDLE_GUARD_INTERVAL_SECONDS = 60.0
 CONTROLLER_IDLE_GUARD_STALL_SECONDS = 300.0
@@ -206,6 +209,13 @@ class RuntimeTriggerDecision:
 
 
 @dataclass(frozen=True)
+class RuntimeRestartIssue:
+    key: str
+    sequence: int
+    validation_id: str | None = None
+
+
+@dataclass(frozen=True)
 class ModelAvailabilityResult:
     missing_roles: tuple[str, ...]
     available_models: tuple[str, ...]
@@ -229,7 +239,7 @@ class EvidenceBindingIssue:
     inspection_id: str | None = None
 
 
-class SentinelController:
+class BelloController:
     def __init__(
         self,
         project_root: Path,
@@ -267,8 +277,13 @@ class SentinelController:
         self._coder_snapshot: WorkspaceSnapshot | None = None
         self._snapshot_patch_applied = False
         self._coder_started = False
+        self.declared_grading_roots = tuple(str(Path(root).expanduser()) for root in declared_grading_roots or ())
         if clean_workspace:
-            clean_workspace_except_task(self.project_root, self.task_path)
+            clean_workspace_except_task(
+                self.project_root,
+                self.task_path,
+                protected_paths=self.declared_grading_roots,
+            )
         self.store = StateStore(self.project_root)
         self.coder_model, self.runtime_model, self.completion_model, self.adversary_model = _resolve_controller_models(
             model=model,
@@ -296,7 +311,6 @@ class SentinelController:
         # CLI override for the completion-review toggle; stays runtime-scoped and never
         # rewrites the persisted project config, matching the other run settings.
         self.completion_review = completion_review
-        self.declared_grading_roots = tuple(str(Path(root).expanduser()) for root in declared_grading_roots or ())
         self.project_config = project_config
         self.event_queue: asyncio.Queue[ControllerEvent] = asyncio.Queue()
         self.client = client or AppServerClient(
@@ -309,9 +323,9 @@ class SentinelController:
         self.supervisor: StatelessSupervisorAgent | None = None
         self.completion_supervisor: StatelessSupervisorAgent | None = None
         self.approvals: ApprovalManager | None = None
-        self.approval_triage_config: CheapApprovalTriageConfig = cheap_approval_triage_config_from_env()
-        self.approval_triage_reviewer: CheapApprovalReviewer | None = None
-        self.runtime_triage_config: CheapRuntimeTriageConfig = runtime_triage_config_from_env()
+        self.runtime_triage_config: CheapRuntimeTriageConfig = runtime_triage_config_from_env(
+            enabled=project_config.cheap_runtime if project_config is not None else True
+        )
         self.runtime_triage_reviewer: CheapRuntimeReviewer | None = None
         self.coder: CoderSession | None = None
         self.pending_approvals: dict[int | str, ApprovalContext] = {}
@@ -360,6 +374,8 @@ class SentinelController:
         self._idle_guard_fired_for_sequence: int | None = None
         self._no_marker_completion_review_key: str | None = None
         self._last_large_diff_signature: str | None = None
+        self._last_suspicious_file_signature: str | None = None
+        self._suspicious_file_hash_cache: dict[str, tuple[tuple[Any, ...], str]] = {}
         self._pending_adversary_report: AdversaryReport | None = None
         self._active_adversary_thread_id: str | None = None
         self._active_adversary_workspace_root: Path | None = None
@@ -402,14 +418,11 @@ class SentinelController:
                 fast=self._fast_mode(),
                 intelligence=self._completion_intelligence(),
             )
-            self.approval_triage_reviewer = self._build_cheap_approval_reviewer()
             self.approvals = ApprovalManager(
                 self._active_workspace_root(),
                 supervisor=self,
-                cheap_reviewer=self.approval_triage_reviewer,
                 declared_grading_roots=self.declared_grading_roots,
                 immutable_paths=self._immutable_approval_paths(),
-                cheap_review_timeout_seconds=self.approval_triage_config.timeout_seconds,
             )
             self.coder = CoderSession(
                 self.client,
@@ -423,7 +436,7 @@ class SentinelController:
             await self.coder.start_thread()
             self._coder_started = True
             await self.coder.start_initial_turn()
-            self.store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"status": SentinelStatus.RUNNING}))
+            self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"status": BelloStatus.RUNNING}))
             self.tui.status("supervised coder started")
             await self.event_loop()
         except (AppServerError, SupervisorAgentError) as exc:
@@ -445,7 +458,7 @@ class SentinelController:
 
     def initialize_state(self) -> None:
         project_config = self._project_config_for_persistence()
-        config = SentinelConfig(
+        config = BelloConfig(
             project_root=str(self.project_root),
             task=project_config.task,
             task_path=project_config.task or "",
@@ -475,17 +488,19 @@ class SentinelController:
             fast=project_config.fast,
             protected_paths=list(project_config.protected_path),
             max_adversary_runs=self._configured_adversary_runs(project_config),
-            max_completion_returns_per_generation=project_config.completion_returns_per_generation,
+            max_completion_returns_before_adversary=project_config.completion_returns_before_adversary,
+            max_completion_returns_after_adversary=project_config.completion_returns_after_adversary,
             completion_review_enabled=project_config.completion_review,
+            cheap_runtime=project_config.cheap_runtime,
         )
         mode = "fresh" if self.overwrite_state else "resume"
-        self.store.initialize_sentinel(config, mode=mode)
+        self.store.initialize_bello(config, mode=mode)
         self._sequence = self.store.max_event_sequence()
         _ensure_internal_runtime_git_excluded(self.project_root)
 
     def _persist_model_config(self) -> None:
         project_config = self._project_config_for_persistence()
-        self.store.update_sentinel_config(
+        self.store.update_bello_config(
             lambda cfg: cfg.model_copy(
                 update={
                     "model": _shared_primary_model(project_config),
@@ -501,8 +516,10 @@ class SentinelController:
                     "fast": project_config.fast,
                     "protected_paths": list(project_config.protected_path),
                     "max_adversary_runs": self._configured_adversary_runs(project_config),
-                    "max_completion_returns_per_generation": project_config.completion_returns_per_generation,
+                    "max_completion_returns_before_adversary": project_config.completion_returns_before_adversary,
+                    "max_completion_returns_after_adversary": project_config.completion_returns_after_adversary,
                     "completion_review_enabled": project_config.completion_review,
+                    "cheap_runtime": project_config.cheap_runtime,
                 }
             )
         )
@@ -570,7 +587,7 @@ class SentinelController:
             "integrity/runtime_controls_restored",
             reason=message,
         )
-        cfg = self.store.get_sentinel_config()
+        cfg = self.store.get_bello_config()
         patch_health(
             self.store,
             HealthDelta(generation=cfg.generation, add_risk_signals=["runtime_control_replacement"]),
@@ -624,6 +641,13 @@ class SentinelController:
     def _fast_mode(self) -> bool:
         return bool(getattr(self, "fast", False))
 
+    def _cheap_runtime_enabled(self) -> bool:
+        try:
+            return bool(self.store.get_bello_config().cheap_runtime)
+        except Exception:
+            project_config = getattr(self, "project_config", None)
+            return bool(project_config.cheap_runtime) if project_config is not None else True
+
     def _effective_completion_review(self) -> bool:
         """Whether the completion review gate is active for this run.
 
@@ -635,7 +659,7 @@ class SentinelController:
         if override is not None:
             return bool(override)
         try:
-            return bool(self.store.get_sentinel_config().completion_review_enabled)
+            return bool(self.store.get_bello_config().completion_review_enabled)
         except Exception:
             project_config = getattr(self, "project_config", None)
             if project_config is not None:
@@ -694,6 +718,7 @@ class SentinelController:
             f"completion-intelligence={self._completion_intelligence()} "
             f"adversary-intelligence={self._adversary_intelligence()} "
             f"speed={speed} "
+            f"cheap-runtime={_format_bool(self._cheap_runtime_enabled())} "
             f"start-over={_format_bool(self.overwrite_state)} "
             f"clean={_format_bool(self.clean_workspace)} "
             f"completion-review={_format_bool(self._effective_completion_review())} "
@@ -728,13 +753,13 @@ class SentinelController:
         version = _run_probe(["codex", "--version"])[1]
         self.tui.status("checking Codex app-server schema")
         schema_hash = await self._generate_schema_hash_async()
-        self.store.update_sentinel_config(
+        self.store.update_bello_config(
             lambda cfg: cfg.model_copy(update={"codex_version": version, "appserver_schema_hash": schema_hash})
         )
         self.tui.status("checking Codex account")
         account = await self.client.account_read()
         if account.get("requiresOpenaiAuth") and account.get("account") is None:
-            raise RuntimeError("Codex auth missing. Run `codex login` before starting Sentinel.")
+            raise RuntimeError("Codex auth missing. Run `codex login` before starting Bello.")
         self.tui.status("checking Codex rate limits")
         try:
             await self.client.account_rate_limits_read()
@@ -754,11 +779,10 @@ class SentinelController:
         models_response = await self.client.model_list()
         self._persist_model_config()
         await self._ensure_selected_models_available(models_response)
-        if self.store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE:
+        if self.store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE:
             return
         self.tui.status("checking supervisor structured output")
         await self._structured_output_self_test()
-        await self._configure_approval_triage()
         await self._configure_runtime_triage()
         self.tui.status("checking config requirements")
         await self.client.config_requirements_read()
@@ -800,7 +824,7 @@ class SentinelController:
             "The interruption is recorded in .supervisor/FINAL_REPORT.md."
         )
         self.store.append_text_locked(PROGRESS, f"- {message}\n")
-        await self.finalize(message, status=SentinelStatus.PROVIDER_FAILURE)
+        await self.finalize(message, status=BelloStatus.PROVIDER_FAILURE)
 
     def _adversary_model_required_for_preflight(self) -> bool:
         if not self._effective_completion_review():
@@ -810,7 +834,7 @@ class SentinelController:
             return False
         if enabled is True:
             return True
-        return self.store.get_sentinel_config().max_adversary_runs > 0
+        return self.store.get_bello_config().max_adversary_runs > 0
 
     async def event_loop(self) -> None:
         assert self.tui is not None
@@ -844,14 +868,14 @@ class SentinelController:
     async def _handle_controller_idle_guard(self, *, now: float | None = None, force: bool = False) -> None:
         if not self.running or getattr(self, "paused", False) or getattr(self, "_terminal_cleanup_started", False):
             return
-        cfg = self.store.get_sentinel_config()
+        cfg = self.store.get_bello_config()
         if cfg.active_coder_turn_id:
             return
         coder = getattr(self, "coder", None)
         if coder is None:
             await self.finalize(
                 "controller idle guard: no active coder session, no pending approvals, and no supervisor check",
-                status=SentinelStatus.PROVIDER_FAILURE,
+                status=BelloStatus.PROVIDER_FAILURE,
             )
             return
         if getattr(coder, "active_turn_id", None):
@@ -900,12 +924,12 @@ class SentinelController:
     async def handle_transport_error(self, event: ControllerEvent) -> None:
         message = event.error_message or str(event.error) or "app-server transport error"
         self._append_event(AppEventSource.APP_SERVER, "appServer/transportError", reason=message)
-        await self.finalize(f"app-server transport error: {message}", status=SentinelStatus.PROVIDER_FAILURE)
+        await self.finalize(f"app-server transport error: {message}", status=BelloStatus.PROVIDER_FAILURE)
 
     async def fail_provider(self, message: str) -> None:
-        if not self.running and self.store.get_sentinel_config().status == SentinelStatus.PROVIDER_FAILURE:
+        if not self.running and self.store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE:
             return
-        await self.finalize(message, status=SentinelStatus.PROVIDER_FAILURE)
+        await self.finalize(message, status=BelloStatus.PROVIDER_FAILURE)
 
     async def _cleanup_preflight_probe_thread(self, thread_id: str) -> None:
         try:
@@ -924,21 +948,21 @@ class SentinelController:
             return
         self._append_event(AppEventSource.USER, "user/input", reason=text)
         if text == "/quit":
-            await self.finalize("exited by user", status=SentinelStatus.EXITED)
+            await self.finalize("exited by user", status=BelloStatus.EXITED)
             return
         if text in {"/pause", "\x03"}:
             await self.pause()
             return
         if text == "/resume":
             self.paused = False
-            self.store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"status": SentinelStatus.RUNNING}))
+            self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"status": BelloStatus.RUNNING}))
             self.tui.status("resumed")
             return
         if text == "/restart":
             await self.restart("user requested supervised restart")
             return
         if text == "/status":
-            cfg = self.store.get_sentinel_config()
+            cfg = self.store.get_bello_config()
             health = self.store.get_health()
             self.tui.render("SYSTEM", f"task={Path(cfg.task_path).name} generation={cfg.generation} active_turn={cfg.active_coder_turn_id} pending_approvals={len(self.pending_approvals)} restarts={health.restart_count}")
             return
@@ -960,7 +984,7 @@ class SentinelController:
             self.tui.render("DENIED", f"{resolution.decision}: {resolution.reason}")
             return
         self.pending_approvals[context.server_request_id] = context
-        self.store.update_sentinel_config(
+        self.store.update_bello_config(
             lambda cfg: cfg.model_copy(update={"pending_server_request_ids": list(self.pending_approvals)})
         )
         self._append_event(
@@ -997,7 +1021,6 @@ class SentinelController:
         else:
             resolution = await self.approvals.decide(context)
             response = self.approvals.response_payload(context, resolution)
-            self._record_cheap_approval_attempt(context, self.approvals)
         await self.client.respond(context.server_request_id, response)
         is_denial = _approval_resolution_is_denial(resolution.decision)
         decision_key = _approval_resolution_metric_key(resolution.decision)
@@ -1027,12 +1050,12 @@ class SentinelController:
                     self.tui.render("SUPERVISOR", f"denial delivered as approval response; starting a new coder turn: {exc}")
                     if hasattr(self.coder, "active_turn_id"):
                         self.coder.active_turn_id = None
-                    self.store.update_sentinel_config(
+                    self.store.update_bello_config(
                         lambda cfg: cfg.model_copy(update={"active_coder_turn_id": None})
                     )
                     turn_id = await self.coder.start_turn(resolution.reason)
                     if isinstance(turn_id, str):
-                        self.store.update_sentinel_config(
+                        self.store.update_bello_config(
                             lambda cfg: cfg.model_copy(update={"active_coder_turn_id": turn_id})
                         )
                     self.store.append_text_locked(
@@ -1050,7 +1073,7 @@ class SentinelController:
         if self.supervisor is None:
             raise SupervisorAgentError("supervisor not ready")
         self._reconcile_intervention_accounting()
-        cfg = self.store.get_sentinel_config()
+        cfg = self.store.get_bello_config()
         wake_sequence = cfg.last_event_sequence + 1
         origin = "adversary_snapshot" if self._is_adversary_approval_context(context) else "coder"
         approval_context = _approval_wake_context(context, reason, origin=origin)
@@ -1077,11 +1100,6 @@ class SentinelController:
         )
         return await self.supervisor.decide(packet)
 
-    async def decide_cheap_approval(self, context: ApprovalContext, evaluation: PolicyDecision) -> CheapApprovalDecision:
-        if self.approval_triage_reviewer is None:
-            raise CheapApprovalReviewerError("cheap approval triage not configured")
-        return await self.approval_triage_reviewer.review(context, evaluation)
-
     async def handle_notification(self, message: AppServerMessage) -> None:
         params = message.params
         method = message.method or "notification"
@@ -1095,11 +1113,11 @@ class SentinelController:
         if getattr(self, "_terminal_cleanup_started", False) and method != "serverRequest/resolved":
             return
 
-        cfg = self.store.get_sentinel_config()
+        cfg = self.store.get_bello_config()
         if method == "serverRequest/resolved":
             request_id = params.get("requestId")
             self.pending_approvals.pop(request_id, None)
-            self.store.update_sentinel_config(
+            self.store.update_bello_config(
                 lambda current: current.model_copy(update={"pending_server_request_ids": list(self.pending_approvals)})
             )
             return
@@ -1108,7 +1126,7 @@ class SentinelController:
                 self.coder.active_turn_id = turn_id
             self._current_turn_action_count = 0
             self._generation_has_coder_turn = True
-            self.store.update_sentinel_config(lambda current: current.model_copy(update={"active_coder_turn_id": turn_id}))
+            self.store.update_bello_config(lambda current: current.model_copy(update={"active_coder_turn_id": turn_id}))
             self.tui.render("CODER", f"turn started {turn_id}")
             return
         if method == "item/completed" and thread_id == cfg.coder_thread_id:
@@ -1137,7 +1155,7 @@ class SentinelController:
                     )
                     await self.finalize(
                         f"escalated: {declared_grading_issue}",
-                        status=SentinelStatus.ESCALATED,
+                        status=BelloStatus.ESCALATED,
                     )
                     return
                 validation_item = _item_with_recorded_output(item, self._pop_command_output(item_id))
@@ -1291,7 +1309,7 @@ class SentinelController:
         self._schedule_supervisor_check("Coder turn completed", triggering_item_id=item_id)
 
     async def _handle_coder_material_limitation(self, message: CoderMessage) -> None:
-        cfg = self.store.get_sentinel_config()
+        cfg = self.store.get_bello_config()
         summary = _material_limitation_summary(message.text)
         self.store.append_text_locked(
             PROGRESS,
@@ -1308,13 +1326,13 @@ class SentinelController:
         )
         await self.finalize(
             f"escalated: coder reported material validation limitation without readiness marker: {summary}",
-            status=SentinelStatus.ESCALATED,
+            status=BelloStatus.ESCALATED,
         )
 
     async def _done_without_fresh_behavioral_validation(self) -> str | None:
         changed_files = await self.changed_files()
         self._update_relevant_edit_state(changed_files)
-        cfg = self.store.get_sentinel_config()
+        cfg = self.store.get_bello_config()
         latest_relevant_edit = cfg.last_relevant_edit_sequence
         if latest_relevant_edit is None:
             return None
@@ -1332,7 +1350,7 @@ class SentinelController:
         sequence: int | None = None,
         message: str = NO_MARKER_IDLE_NUDGE,
     ) -> None:
-        cfg = self.store.get_sentinel_config()
+        cfg = self.store.get_bello_config()
         self.prior_interventions.append(
             PriorIntervention(reason=reason, message_to_coder=message, sequence=sequence or cfg.last_event_sequence)
         )
@@ -1343,7 +1361,7 @@ class SentinelController:
             await self.coder.steer_or_start(message)
 
     async def _handle_no_marker_idle(self) -> None:
-        cfg = self.store.get_sentinel_config()
+        cfg = self.store.get_bello_config()
         if cfg.active_coder_turn_id:
             return
         if not getattr(self, "_generation_has_coder_turn", True):
@@ -1383,7 +1401,7 @@ class SentinelController:
 
     async def pause(self) -> None:
         self.paused = True
-        self.store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"status": SentinelStatus.PAUSED}))
+        self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"status": BelloStatus.PAUSED}))
         if self.coder:
             try:
                 await self.coder.interrupt()
@@ -1395,13 +1413,13 @@ class SentinelController:
         self.tui.status("paused")
 
     async def restart(self, reason: str, *, handoff: RestartHandoff | None = None) -> None:
-        cfg = self.store.get_sentinel_config()
+        cfg = self.store.get_bello_config()
         if cfg.restart_count >= cfg.max_restarts:
-            await self.finalize("restart cap reached", status=SentinelStatus.STUCK)
+            await self.finalize("restart cap reached", status=BelloStatus.STUCK)
             return
         self._append_event(AppEventSource.SUPERVISOR, "controller/restart", reason=reason)
         await self._close_completion_review_session()
-        self.store.update_sentinel_config(lambda current: current.model_copy(update={"status": SentinelStatus.RESTARTING}))
+        self.store.update_bello_config(lambda current: current.model_copy(update={"status": BelloStatus.RESTARTING}))
         if self.coder:
             try:
                 await self.coder.interrupt()
@@ -1439,14 +1457,14 @@ class SentinelController:
                 new_generation=cfg.generation + 1,
             ),
         )
-        self.store.update_sentinel_config(
+        self.store.update_bello_config(
             lambda current: current.model_copy(
                 update={
                     "generation": current.generation + 1,
                     "restart_count": current.restart_count + 1,
                     "active_coder_turn_id": None,
                     "coder_thread_id": None,
-                    "status": SentinelStatus.RUNNING,
+                    "status": BelloStatus.RUNNING,
                 }
             )
         )
@@ -1467,7 +1485,7 @@ class SentinelController:
         self,
         result: str,
         *,
-        status: SentinelStatus = SentinelStatus.COMPLETE,
+        status: BelloStatus = BelloStatus.COMPLETE,
         completion_review_accepted: bool = False,
     ) -> None:
         self._reconcile_intervention_accounting()
@@ -1475,7 +1493,7 @@ class SentinelController:
         changed_files = await self.changed_files()
         patch_error, recovery_path = await self._apply_final_snapshot_patch_if_needed(status)
         if patch_error is not None:
-            status = SentinelStatus.ESCALATED
+            status = BelloStatus.ESCALATED
             completion_review_accepted = False
             result = patch_error
         elif recovery_path is not None:
@@ -1497,7 +1515,7 @@ class SentinelController:
             interventions=health.interventions,
             restarts=health.restart_count,
             completion_review_accepted=completion_review_accepted,
-            completion_returns=len(getattr(self, "completion_returns", [])),
+            completion_returns=self.store.get_bello_config().completion_return_count,
             completion_restarts=getattr(self, "completion_restarts", 0),
             no_marker_idle_nudges=getattr(self, "no_marker_idle_nudge_count", 0),
             behavior_evidence_summary=_behavior_evidence_summary(accepted_completion),
@@ -1516,7 +1534,7 @@ class SentinelController:
         )
         self.store.write_final_report(report)
         self._archive_final_report_once()
-        self.store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"status": status}))
+        self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"status": status}))
         self.tui.render("SUPERVISOR", result)
         self.tui.status("final report written: .supervisor/FINAL_REPORT.md")
         await self._prepare_terminal_shutdown(result)
@@ -1525,12 +1543,12 @@ class SentinelController:
 
     async def _apply_final_snapshot_patch_if_needed(
         self,
-        status: SentinelStatus,
+        status: BelloStatus,
     ) -> tuple[str | None, str | None]:
         snapshot = getattr(self, "_coder_snapshot", None)
         if snapshot is None or getattr(self, "_snapshot_patch_applied", False):
             return None, getattr(self, "_snapshot_recovery_path", None)
-        if status != SentinelStatus.COMPLETE:
+        if status != BelloStatus.COMPLETE:
             if not getattr(self, "_coder_started", False):
                 snapshot.cleanup()
                 self._coder_snapshot = None
@@ -1748,7 +1766,7 @@ class SentinelController:
         )
 
     def _record_validation_progress(self, validation: ValidationRun) -> None:
-        def patch(current: SentinelConfig) -> SentinelConfig:
+        def patch(current: BelloConfig) -> BelloConfig:
             updates: dict[str, Any] = {"last_validation_sequence": validation.sequence}
             if _is_behavior_proving_validation(validation) and validation.trusted_validation_outcome != "masked_or_unknown":
                 updates["last_trusted_behavioral_validation_sequence"] = validation.sequence
@@ -1756,7 +1774,7 @@ class SentinelController:
                     updates["last_trusted_passing_behavioral_validation_sequence"] = validation.sequence
             return current.model_copy(update=updates)
 
-        self.store.update_sentinel_config(patch)
+        self.store.update_bello_config(patch)
 
     def _record_validation_runtime_state(self, validation: ValidationRun) -> tuple[str, ...]:
         key = validation.validation_id
@@ -1787,6 +1805,16 @@ class SentinelController:
             "normalized_command": validation.normalized_command,
             "type": validation.type,
         }
+        if current_outcome == "passed":
+            clear_restart_issue_for_validation(
+                self.store,
+                generation=self.store.get_bello_config().generation,
+                validation_id=validation.validation_id,
+                sequence=validation.sequence,
+                matching_issue_keys=(
+                    _runtime_unresolved_execution_key(validation.command, validation.cwd),
+                ),
+            )
         return tuple(dict.fromkeys(reasons))
 
     def _has_unresolved_runtime_validation_risk(self) -> bool:
@@ -1832,13 +1860,13 @@ class SentinelController:
             return
         latest = max(relevant_sequences)
 
-        def patch(current: SentinelConfig) -> SentinelConfig:
+        def patch(current: BelloConfig) -> BelloConfig:
             existing = current.last_relevant_edit_sequence
             if existing is not None and existing >= latest:
                 return current
             return current.model_copy(update={"last_relevant_edit_sequence": latest})
 
-        self.store.update_sentinel_config(patch)
+        self.store.update_bello_config(patch)
 
     def should_wake_runtime_supervisor(
         self,
@@ -1867,8 +1895,19 @@ class SentinelController:
         large_diff_signature = _large_diff_signature(changed_files) if _has_large_diff(changed_files) else None
         if large_diff_signature is not None and not read_only_action:
             reasons.append("large_diff")
-        if any(_is_suspicious_changed_path(changed.path) for changed in changed_files):
+        suspicious_file_hash_cache = getattr(self, "_suspicious_file_hash_cache", None)
+        if suspicious_file_hash_cache is None:
+            suspicious_file_hash_cache = self._suspicious_file_hash_cache = {}
+        suspicious_file_signature = _suspicious_changed_file_signature(
+            self._active_workspace_root(),
+            changed_files,
+            cache=suspicious_file_hash_cache,
+        )
+        if suspicious_file_signature is None:
+            self._last_suspicious_file_signature = None
+        elif suspicious_file_signature != getattr(self, "_last_suspicious_file_signature", None):
             reasons.append("suspicious_file_touched")
+            self._last_suspicious_file_signature = suspicious_file_signature
         restart_candidate, restart_reason = kill_restart_candidate(self.store.get_health())
         if restart_candidate and restart_reason and not read_only_action:
             reasons.append("restart_budget")
@@ -1902,7 +1941,7 @@ class SentinelController:
         trace = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "event_sequence": getattr(self, "_sequence", None),
-            "generation": self.store.get_sentinel_config().generation,
+            "generation": self.store.get_bello_config().generation,
             "event_type": event_type,
             "action_kind": action.kind if action is not None else None,
             "tool_name": action.kind if action is not None else None,
@@ -2053,7 +2092,7 @@ class SentinelController:
         if agent is None:
             return
         self._reconcile_intervention_accounting()
-        cfg = self.store.get_sentinel_config()
+        cfg = self.store.get_bello_config()
         wake_sequence = cfg.last_event_sequence + 1
         changed_files = await self.changed_files()
         latest_change_sequence = _latest_relevant_change_sequence(changed_files)
@@ -2116,6 +2155,21 @@ class SentinelController:
             ),
             **completion_details,
         )
+        if completion_review:
+            budget_action = self._completion_review_budget_action(packet=packet)
+            if budget_action == "adversary":
+                await self._run_adversary_before_complete(None, packet=packet)
+                return
+            if budget_action == "complete":
+                reason = (
+                    "completion review budget exhausted"
+                    if self._effective_max_adversary_runs() <= 0
+                    else "post-adversary completion review budget exhausted"
+                )
+                await self._finalize_bounded_completion(
+                    reason=reason,
+                )
+                return
         try:
             if completion_review:
                 self.completion_attempt_count = getattr(self, "completion_attempt_count", 0) + 1
@@ -2129,7 +2183,7 @@ class SentinelController:
                     getattr(self, "runtime_triage_reviewer", None) is not None
                     and human_message is None
                     and not packet.pending_approvals
-                    and not _runtime_packet_has_protected_reason(packet)
+                    and not _runtime_packet_requires_full_supervisor(packet)
                 ):
                     cheap = await self._cheap_runtime_route(packet)
                     if cheap is not None and cheap.decision == "noop":
@@ -2168,7 +2222,7 @@ class SentinelController:
                     "- Runtime supervisor check timed out after newer coder activity; continuing with the latest queued review.\n",
                 )
                 return
-            await self.finalize(message, status=SentinelStatus.PROVIDER_FAILURE)
+            await self.finalize(message, status=BelloStatus.PROVIDER_FAILURE)
             return
         # Successful supervisor decision: reset the transient provider no_message budget so it
         # counts CONSECUTIVE empty-completion failures, not lifetime ones (a recovered provider
@@ -2178,7 +2232,11 @@ class SentinelController:
         if completion_review:
             await self.apply_completion_decision(decision, packet_thread_id=packet.coder_thread_id, packet=packet)
         else:
-            await self.apply_supervisor_decision(decision, packet_thread_id=packet.coder_thread_id)
+            await self.apply_supervisor_decision(
+                decision,
+                packet_thread_id=packet.coder_thread_id,
+                packet=packet,
+            )
 
     async def _handle_completion_review_timeout_failure(self, *, message: str, summary: str) -> bool:
         """One fresh-thread retry when a completion-review turn times out.
@@ -2323,7 +2381,7 @@ class SentinelController:
         )
         await self.finalize(
             f"infra-invalid: supervisor no_message provider failure after retry/resume: {message}",
-            status=SentinelStatus.PROVIDER_FAILURE,
+            status=BelloStatus.PROVIDER_FAILURE,
         )
         return True
 
@@ -2343,54 +2401,108 @@ class SentinelController:
             return "full_fallback", None
         return "delta", since_sequence
 
-    async def apply_supervisor_decision(self, decision: SupervisorDecision, *, packet_thread_id: str | None) -> None:
-        cfg = self.store.get_sentinel_config()
+    def _record_runtime_intervention(
+        self,
+        *,
+        reason: str,
+        message: str,
+        sequence: int,
+        generation: int,
+        issue: RuntimeRestartIssue | None,
+    ) -> None:
+        self.prior_interventions.append(
+            PriorIntervention(reason=reason, message_to_coder=message, sequence=sequence)
+        )
+        self.prior_interventions = self.prior_interventions[-20:]
+        patch_health(self.store, HealthDelta(generation=generation, interventions=1))
+        if issue is not None:
+            record_restart_issue_intervention(
+                self.store,
+                generation=generation,
+                issue_key=issue.key,
+                sequence=issue.sequence,
+                validation_id=issue.validation_id,
+            )
+
+    async def apply_supervisor_decision(
+        self,
+        decision: SupervisorDecision,
+        *,
+        packet_thread_id: str | None,
+        packet: SupervisorWakePacket | None = None,
+    ) -> None:
+        cfg = self.store.get_bello_config()
         if decision.generation is not None and decision.generation != cfg.generation:
             return
         if packet_thread_id != cfg.coder_thread_id:
             return
         if decision.wake_sequence is not None and decision.wake_sequence <= cfg.last_applied_supervisor_sequence:
             return
-        self.store.update_sentinel_config(
+        self.store.update_bello_config(
             lambda current: current.model_copy(update={"last_applied_supervisor_sequence": decision.wake_sequence or current.last_applied_supervisor_sequence})
         )
         self._record_supervisor_decision_metric(use_case="runtime", decision=decision.decision.value)
+        health = self.store.get_health()
+        issue = (
+            _runtime_restart_issue(
+                packet,
+                active_issue_key=health.restart_issue_key,
+                active_issue_last_sequence=health.restart_issue_last_sequence,
+            )
+            if packet is not None
+            else None
+        )
+        restart_candidate = False
+        restart_candidate_reason: str | None = None
+        if decision.decision == SupervisorDecisionKind.RESTART:
+            restart_candidate, restart_candidate_reason = kill_restart_candidate(
+                health,
+                issue_key=issue.key if issue is not None else None,
+                issue_sequence=issue.sequence if issue is not None else None,
+            )
         if decision.persistent_decision:
             self.store.append_text_locked(DECISIONS, f"- {decision.persistent_decision}\n")
-        if decision.progress_update:
+        apply_restart_metadata = decision.decision != SupervisorDecisionKind.RESTART or restart_candidate
+        if decision.progress_update and apply_restart_metadata:
             self.store.append_text_locked(PROGRESS, f"- {decision.progress_update}\n")
-            patch_health(self.store, HealthDelta(generation=cfg.generation, last_progress_sequence=cfg.last_event_sequence))
-        if decision.clear_handoff:
+            if decision.decision != SupervisorDecisionKind.RESTART:
+                patch_health(
+                    self.store,
+                    HealthDelta(generation=cfg.generation, last_progress_sequence=cfg.last_event_sequence),
+                )
+        if decision.clear_handoff and apply_restart_metadata:
             self.store.write_text_locked(HANDOFF, "")
-        if decision.display_message:
+        if decision.display_message and apply_restart_metadata:
             self.tui.render("SUPERVISOR", decision.display_message)
         if decision.decision == SupervisorDecisionKind.NOOP:
             return
         if decision.decision == SupervisorDecisionKind.INTERVENE and decision.message_to_coder and self.coder:
             self.tui.render("SUPERVISOR", f"steering coder: {decision.reason}")
-            self.prior_interventions.append(
-                PriorIntervention(
-                    reason=decision.reason,
-                    message_to_coder=decision.message_to_coder,
-                    sequence=decision.wake_sequence or cfg.last_event_sequence,
-                )
+            self._record_runtime_intervention(
+                reason=decision.reason,
+                message=decision.message_to_coder,
+                sequence=decision.wake_sequence or cfg.last_event_sequence,
+                generation=cfg.generation,
+                issue=issue,
             )
-            self.prior_interventions = self.prior_interventions[-20:]
-            patch_health(self.store, HealthDelta(generation=cfg.generation, interventions=1))
             await self.coder.steer_or_start(decision.message_to_coder)
             return
         if decision.decision == SupervisorDecisionKind.RESTART:
-            candidate, candidate_reason = kill_restart_candidate(self.store.get_health())
-            if not candidate:
-                message = decision.message_to_coder or (
-                    "Continue the current task. Do not restart; use the latest observation to make the next concrete progress step."
-                )
+            if not restart_candidate:
+                message = decision.message_to_coder or _restart_rejection_steering(decision.handoff)
                 self.tui.render("SUPERVISOR", f"restart rejected without health evidence: {decision.reason}")
+                self._record_runtime_intervention(
+                    reason=decision.reason,
+                    message=message,
+                    sequence=decision.wake_sequence or cfg.last_event_sequence,
+                    generation=cfg.generation,
+                    issue=issue,
+                )
                 if self.coder:
                     await self.coder.steer_or_start(message)
                 return
-            if candidate_reason:
-                self.tui.render("SUPERVISOR", f"restart candidate: {candidate_reason}")
+            if restart_candidate_reason:
+                self.tui.render("SUPERVISOR", f"restart candidate: {restart_candidate_reason}")
             await self.restart(decision.reason or "supervisor requested restart", handoff=decision.handoff)
             return
         if decision.decision == SupervisorDecisionKind.PAUSE:
@@ -2404,7 +2516,7 @@ class SentinelController:
         packet_thread_id: str | None,
         packet: SupervisorWakePacket | None = None,
     ) -> None:
-        cfg = self.store.get_sentinel_config()
+        cfg = self.store.get_bello_config()
         if decision.generation != cfg.generation:
             return
         if packet_thread_id != cfg.coder_thread_id:
@@ -2415,7 +2527,7 @@ class SentinelController:
         if stale_issue is not None:
             await self._handle_completion_decision_staleness_failure(stale_issue)
             return
-        self.store.update_sentinel_config(
+        self.store.update_bello_config(
             lambda current: current.model_copy(update={"last_applied_supervisor_sequence": decision.wake_sequence})
         )
         self._append_completion_anchor_log(decision, packet=packet)
@@ -2456,7 +2568,7 @@ class SentinelController:
             self._accepted_adversary_report = packet.adversary_report if packet is not None else None
             await self.finalize(
                 f"accepted by completion_review: {decision.reason or 'task complete'}",
-                status=SentinelStatus.COMPLETE,
+                status=BelloStatus.COMPLETE,
                 completion_review_accepted=True,
             )
             return
@@ -2489,25 +2601,32 @@ class SentinelController:
 
     async def _run_adversary_before_complete(
         self,
-        decision: CompletionReviewDecision,
+        decision: CompletionReviewDecision | None,
         *,
         packet: SupervisorWakePacket | None,
     ) -> None:
         if packet is None:
-            await self._complete_after_adversary_unavailable(
-                decision,
-                packet=None,
-                error_summary="completion packet missing for the adversary run",
-            )
+            error_summary = "completion packet missing for the adversary run"
+            if decision is None:
+                await self._fail_required_adversary(packet=None, error_summary=error_summary)
+            else:
+                await self._complete_after_adversary_unavailable(
+                    decision,
+                    packet=None,
+                    error_summary=error_summary,
+                )
             return
         adversary_run_count, max_adversary_runs = self._reserve_adversary_run()
+        forced_by_budget = decision is None
+        run_reason = "completion review budget" if forced_by_budget else "completion accept"
         self.tui.render(
             "ADVERSARY",
-            f"running pre-complete adversarial tester ({adversary_run_count}/{max_adversary_runs})",
+            f"running pre-complete adversarial tester ({adversary_run_count}/{max_adversary_runs}; {run_reason})",
         )
         self.store.append_text_locked(
             PROGRESS,
-            f"- Adversarial tester starting before final complete ({adversary_run_count}/{max_adversary_runs}).\n",
+            f"- Adversarial tester starting before final complete ({adversary_run_count}/{max_adversary_runs}; "
+            f"trigger: {run_reason}).\n",
         )
         workspace_state_id = _workspace_state_id(self._active_workspace_root())
         snapshot_root: Path | None = None
@@ -2516,11 +2635,15 @@ class SentinelController:
         try:
             snapshot_root = _create_adversary_snapshot(self._active_workspace_root())
         except Exception as exc:
-            await self._complete_after_adversary_unavailable(
-                decision,
-                packet=packet,
-                error_summary=f"snapshot setup failed: {exc.__class__.__name__}: {exc}",
-            )
+            error_summary = f"snapshot setup failed: {exc.__class__.__name__}: {exc}"
+            if decision is None:
+                await self._fail_required_adversary(packet=packet, error_summary=error_summary)
+            else:
+                await self._complete_after_adversary_unavailable(
+                    decision,
+                    packet=packet,
+                    error_summary=error_summary,
+                )
             return
         self._active_adversary_workspace_root = snapshot_root
         self._adversary_denied_commands = []
@@ -2541,17 +2664,22 @@ class SentinelController:
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "type": "adversary_error",
                     "generation": packet.generation,
-                    "completion_wake_sequence": decision.wake_sequence,
+                    "completion_wake_sequence": (
+                        decision.wake_sequence if decision is not None else packet.wake_sequence
+                    ),
                     "adversary_run_count": adversary_run_count,
                     "max_adversary_runs": max_adversary_runs,
                     "error": str(exc),
                 }
             )
-            await self._complete_after_adversary_unavailable(
-                decision,
-                packet=packet,
-                error_summary=str(exc),
-            )
+            if decision is None:
+                await self._fail_required_adversary(packet=packet, error_summary=str(exc))
+            else:
+                await self._complete_after_adversary_unavailable(
+                    decision,
+                    packet=packet,
+                    error_summary=str(exc),
+                )
             return
         finally:
             self._active_adversary_workspace_root = None
@@ -2564,7 +2692,7 @@ class SentinelController:
             thread_id=result.thread_id,
             turn_id=result.turn_id,
             generation=packet.generation,
-            completion_wake_sequence=decision.wake_sequence,
+            completion_wake_sequence=decision.wake_sequence if decision is not None else packet.wake_sequence,
             latest_relevant_change_sequence=packet.latest_relevant_change_sequence,
             validation_sequence=_latest_validation_sequence(packet.validations),
             workspace_state_id=workspace_state_id,
@@ -2591,13 +2719,22 @@ class SentinelController:
         if not report.candidate_finding:
             self.store.append_text_locked(
                 PROGRESS,
-                "- Adversarial tester completed without a candidate finding; finalizing prior completion accept.\n",
+                "- Adversarial tester completed without a candidate finding; finalizing.\n",
             )
-            await self._finalize_accepted_completion(
-                decision,
-                adversary_report=report,
-                result=f"accepted by completion_review after clean adversary report: {decision.reason or 'task complete'}",
-            )
+            if decision is None:
+                self._accepted_adversary_report = report
+                await self._finalize_bounded_completion(
+                    reason="completion review budget reached and adversary reported no candidate finding",
+                )
+            else:
+                await self._finalize_accepted_completion(
+                    decision,
+                    adversary_report=report,
+                    result=(
+                        "accepted by completion_review after clean adversary report: "
+                        f"{decision.reason or 'task complete'}"
+                    ),
+                )
             return
         self.store.append_text_locked(
             PROGRESS,
@@ -2613,6 +2750,100 @@ class SentinelController:
             "Adversarial tester report is available. Rerun completion_review; weigh the report as input, "
             "return only for a real reproduced required-behavior defect, otherwise accept.",
             completion_review=True,
+        )
+
+    def _completion_review_budget_action(
+        self,
+        *,
+        packet: SupervisorWakePacket | None = None,
+    ) -> Literal["adversary", "complete"] | None:
+        cfg = self.store.get_bello_config()
+        if self._effective_max_adversary_runs() <= 0:
+            limit = cfg.max_completion_returns_before_adversary
+            if review_limit_reached(limit, cfg.completion_return_count):
+                return "complete"
+            return None
+        if cfg.adversary_run_count == 0:
+            limit = cfg.max_completion_returns_before_adversary
+            if review_limit_reached(limit, cfg.completion_return_count):
+                return "adversary"
+            return None
+        adversary_report = packet.adversary_report if packet is not None else None
+        if (
+            cfg.completion_returns_since_adversary == 0
+            and adversary_report is not None
+            and self._packet_has_fresh_adversary_report(packet)
+            and adversary_report.candidate_finding
+        ):
+            # Candidate findings always receive one independent adjudication. Optional
+            # post-adversary return budgets apply after that required check.
+            return None
+        limit = cfg.max_completion_returns_after_adversary
+        if not review_limit_reached(limit, cfg.completion_returns_since_adversary):
+            return None
+        if self._adversary_runs_remaining():
+            return "adversary"
+        return "complete"
+
+    async def _finalize_bounded_completion(self, *, reason: str) -> None:
+        cfg = self.store.get_bello_config()
+        self.store.append_text_locked(
+            PROGRESS,
+            "- Bounded completion policy reached its final review budget after the coder applied the last return; "
+            "finalizing without fabricating a completion-review accept.\n",
+        )
+        self._append_event(
+            AppEventSource.SUPERVISOR,
+            "completion/budget_finalize",
+            decision={
+                "kind": "complete",
+                "completion_return_count": cfg.completion_return_count,
+                "completion_returns_since_adversary": cfg.completion_returns_since_adversary,
+                "adversary_run_count": cfg.adversary_run_count,
+                "max_adversary_runs": self._effective_max_adversary_runs(),
+            },
+            reason=reason,
+        )
+        self._accepted_completion_decision = None
+        await self.finalize(
+            f"completed by bounded review policy: {reason}",
+            status=BelloStatus.COMPLETE,
+            completion_review_accepted=False,
+        )
+
+    async def _fail_required_adversary(
+        self,
+        *,
+        packet: SupervisorWakePacket | None,
+        error_summary: str,
+    ) -> None:
+        cfg = self.store.get_bello_config()
+        report = AdversaryReport(
+            status="error",
+            candidate_finding=False,
+            report_text=f"required adversary did not run: {error_summary}",
+            generation=packet.generation if packet is not None else cfg.generation,
+            completion_wake_sequence=packet.wake_sequence if packet is not None else cfg.last_event_sequence + 1,
+            latest_relevant_change_sequence=packet.latest_relevant_change_sequence if packet is not None else None,
+            validation_sequence=_latest_validation_sequence(packet.validations) if packet is not None else None,
+            workspace_state_id=_workspace_state_id(self._active_workspace_root()),
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        self._pending_adversary_report = report
+        self.tui.render("ADVERSARY", f"required adversarial tester could not run: {error_summary}")
+        self.store.append_text_locked(
+            PROGRESS,
+            f"- Required adversarial tester could not run ({error_summary}); failing the run instead of treating it as accepted.\n",
+        )
+        self._append_event(
+            AppEventSource.SUPERVISOR,
+            "adversary/required_unavailable",
+            reason=error_summary,
+        )
+        await self.finalize(
+            f"required adversary failed under bounded review policy: {error_summary}",
+            status=BelloStatus.PROVIDER_FAILURE,
+            completion_review_accepted=False,
         )
 
     async def _finalize_completion_review_disabled(self) -> None:
@@ -2633,7 +2864,7 @@ class SentinelController:
         )
         await self.finalize(
             "coder declared readiness; completion review disabled by config (no review or adversary certification)",
-            status=SentinelStatus.COMPLETE,
+            status=BelloStatus.COMPLETE,
             completion_review_accepted=False,
         )
 
@@ -2644,7 +2875,7 @@ class SentinelController:
         adversary_report: AdversaryReport | None,
         result: str,
     ) -> None:
-        cfg = self.store.get_sentinel_config()
+        cfg = self.store.get_bello_config()
         if decision.persistent_decision:
             self.store.append_text_locked(DECISIONS, f"- {decision.persistent_decision}\n")
         if decision.progress_update:
@@ -2671,7 +2902,7 @@ class SentinelController:
         self._accepted_adversary_report = adversary_report
         await self.finalize(
             result,
-            status=SentinelStatus.COMPLETE,
+            status=BelloStatus.COMPLETE,
             completion_review_accepted=True,
         )
 
@@ -2689,7 +2920,7 @@ class SentinelController:
         terminal shape as adversary-disabled or limit-reached) instead of declaring the
         whole run infrastructure-invalid and discarding a reviewed, accepted solution.
         """
-        cfg = self.store.get_sentinel_config()
+        cfg = self.store.get_bello_config()
         report = AdversaryReport(
             status="error",
             candidate_finding=False,
@@ -2722,7 +2953,7 @@ class SentinelController:
         )
 
     def _adversary_runs_remaining(self) -> bool:
-        cfg = self.store.get_sentinel_config()
+        cfg = self.store.get_bello_config()
         return cfg.adversary_run_count < self._effective_max_adversary_runs()
 
     def _should_run_adversary_before_complete(self, packet: SupervisorWakePacket | None) -> bool:
@@ -2733,17 +2964,22 @@ class SentinelController:
             return False
         if enabled is True:
             return True
-        return self.store.get_sentinel_config().max_adversary_runs > 0
+        return self.store.get_bello_config().max_adversary_runs > 0
 
     def _reserve_adversary_run(self) -> tuple[int, int]:
         max_adversary_runs = self._effective_max_adversary_runs()
-        updated = self.store.update_sentinel_config(
-            lambda current: current.model_copy(update={"adversary_run_count": current.adversary_run_count + 1})
+        updated = self.store.update_bello_config(
+            lambda current: current.model_copy(
+                update={
+                    "adversary_run_count": current.adversary_run_count + 1,
+                    "completion_returns_since_adversary": 0,
+                }
+            )
         )
         return updated.adversary_run_count, max_adversary_runs
 
     def _record_adversary_limit_reached(self, packet: SupervisorWakePacket | None) -> None:
-        cfg = self.store.get_sentinel_config()
+        cfg = self.store.get_bello_config()
         max_adversary_runs = self._effective_max_adversary_runs()
         reason = f"adversary run limit reached ({cfg.adversary_run_count}/{max_adversary_runs})"
         self.tui.render("ADVERSARY", f"{reason}; finalizing completion accept")
@@ -2776,7 +3012,7 @@ class SentinelController:
         if enabled is False:
             return 0
         override = getattr(self, "adversary_runs", None)
-        configured_runs = self.store.get_sentinel_config().max_adversary_runs if override is None else override
+        configured_runs = self.store.get_bello_config().max_adversary_runs if override is None else override
         if enabled is True:
             return max(1, configured_runs)
         return configured_runs
@@ -3072,7 +3308,7 @@ class SentinelController:
             self._increment_accept_gate_counter("accept_gate_audit_failures")
             await self.finalize(
                 f"escalated: controller-side integrity failure: {check_name}: {reason}",
-                status=SentinelStatus.ESCALATED,
+                status=BelloStatus.ESCALATED,
             )
             return
 
@@ -3113,7 +3349,7 @@ class SentinelController:
                 self._increment_accept_gate_counter("accept_gate_audit_failures")
                 await self.finalize(
                     f"infra-invalid: controller-side proof-format repair failed: {infra_reason}",
-                    status=SentinelStatus.PROVIDER_FAILURE,
+                    status=BelloStatus.PROVIDER_FAILURE,
                 )
                 return
 
@@ -3128,7 +3364,7 @@ class SentinelController:
             self._increment_accept_gate_counter("accept_gate_audit_failures")
             await self.finalize(
                 f"escalated: controller-side audit failure: {audit_reason}",
-                status=SentinelStatus.ESCALATED,
+                status=BelloStatus.ESCALATED,
             )
             return
 
@@ -3285,7 +3521,7 @@ class SentinelController:
         )
 
     def _increment_accept_gate_counter(self, field: str) -> None:
-        self.store.update_sentinel_config(
+        self.store.update_bello_config(
             lambda current: current.model_copy(update={field: getattr(current, field, 0) + 1})
         )
 
@@ -3308,7 +3544,6 @@ class SentinelController:
         return False
 
     async def _return_completion_to_coder(self, decision: CompletionReviewDecision) -> None:
-        cfg = self.store.get_sentinel_config()
         record = CompletionReturnRecord(
             reason=decision.reason,
             uncovered_behaviors=decision.uncovered_behaviors,
@@ -3338,26 +3573,18 @@ class SentinelController:
             )
         )
         self.prior_interventions = self.prior_interventions[-20:]
-        returns_this_generation = _completion_returns_this_generation(self, cfg.generation)
-        health_delta = HealthDelta(generation=cfg.generation)
-        if returns_this_generation >= cfg.max_completion_returns_per_generation:
-            health_delta.add_risk_signals.append("completion_non_convergence")
-        patch_health(self.store, health_delta)
-        if returns_this_generation > cfg.max_completion_returns_per_generation:
-            if cfg.restart_count < cfg.max_restarts:
-                handoff = _fallback_restart_handoff(
-                    task_contents=self._canonical_task_text(),
-                    reason="completion return cap reached",
-                    last_actions=self.store.read_recent_actions(10),
-                )
-                self.completion_restarts = getattr(self, "completion_restarts", 0) + 1
-                await self.restart("completion return cap reached", handoff=handoff)
-                return
-            await self.finalize(
-                "escalated: completion return cap reached and restart cap exhausted",
-                status=SentinelStatus.ESCALATED,
+        self.store.update_bello_config(
+            lambda current: current.model_copy(
+                update={
+                    "completion_return_count": current.completion_return_count + 1,
+                    "completion_returns_since_adversary": (
+                        current.completion_returns_since_adversary + 1
+                        if current.adversary_run_count > 0
+                        else 0
+                    ),
+                }
             )
-            return
+        )
         if self.coder and decision.message_to_coder:
             await self.coder.steer_or_start(decision.message_to_coder)
         # Fresh completion-review thread per review: close the session after each return so
@@ -3384,7 +3611,7 @@ class SentinelController:
             resolution = manager._deny(context, reason)
             await self.client.respond(request_id, manager.response_payload(context, resolution))
             self.pending_approvals.pop(request_id, None)
-        self.store.update_sentinel_config(lambda cfg: cfg.model_copy(update={"pending_server_request_ids": []}))
+        self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"pending_server_request_ids": []}))
 
     async def _stop_supervisor_task(self) -> None:
         task = self._supervisor_task
@@ -3422,18 +3649,14 @@ class SentinelController:
             return _observed_changed_files(self)
         if not await self._is_git_work_tree():
             return _observed_changed_files(self)
-        status_text = await self._git_output(["git", "status", "--short"])
+        status_text = await self._git_output(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"]
+        )
         numstat_text = await self._git_output(["git", "diff", "--numstat", "HEAD", "--"])
         if status_text is None and numstat_text is None:
             return []
         files: dict[str, ChangedFile] = {}
-        for line in (status_text or "").splitlines():
-            if not line.strip():
-                continue
-            status = line[:2].strip() or "modified"
-            path = _path_from_git_status_line(line)
-            if " -> " in path:
-                path = path.rsplit(" -> ", 1)[1].strip()
+        for path, status in _git_status_entries_from_porcelain_v1_z(status_text or ""):
             if path and not _is_ignored_changed_path(path, project_root=self._active_workspace_root(), task_path=self._active_task_path()):
                 files[path] = ChangedFile(path=path, status=status)
         for line in (numstat_text or "").splitlines():
@@ -3703,7 +3926,7 @@ class SentinelController:
         reason: str | None = None,
     ) -> None:
         self._sequence += 1
-        cfg = self.store.get_sentinel_config()
+        cfg = self.store.get_bello_config()
         event = AppEvent(
             sequence=self._sequence,
             generation=cfg.generation,
@@ -3716,12 +3939,12 @@ class SentinelController:
             reason=reason,
         )
         self.store.append_event(event)
-        self.store.update_sentinel_config(lambda current: current.model_copy(update={"last_event_sequence": self._sequence}))
+        self.store.update_bello_config(lambda current: current.model_copy(update={"last_event_sequence": self._sequence}))
 
     def _generate_schema_hash(self) -> str:
         if shutil.which("codex") is None:
             raise RuntimeError("codex executable not found")
-        with tempfile.TemporaryDirectory(prefix="sentinel-appserver-schema-") as tmp_dir:
+        with tempfile.TemporaryDirectory(prefix="bello-appserver-schema-") as tmp_dir:
             out_dir = Path(tmp_dir)
             completed = subprocess.run(
                 ["codex", "app-server", "generate-json-schema", "--experimental", "--out", str(out_dir)],
@@ -3737,7 +3960,7 @@ class SentinelController:
                 if not _schema_file_exists(out_dir, rel):
                     raise RuntimeError(f"app-server schema missing required file: {rel}")
             if not _turn_start_schema_supports_effort(out_dir):
-                raise RuntimeError("app-server schema missing required turn effort field for Sentinel intelligence settings")
+                raise RuntimeError("app-server schema missing required turn effort field for Bello intelligence settings")
             digest = hashlib.sha256()
             for path in sorted(out_dir.rglob("*.json")):
                 digest.update(str(path.relative_to(out_dir)).encode("utf-8"))
@@ -3758,7 +3981,7 @@ class SentinelController:
             fast=self._fast_mode(),
             intelligence=self._runtime_intelligence(),
         )
-        cfg = self.store.get_sentinel_config()
+        cfg = self.store.get_bello_config()
         packet = SupervisorWakePacket(
             wake_sequence=1,
             latest_event_sequence=cfg.last_event_sequence,
@@ -3775,104 +3998,12 @@ class SentinelController:
             coder_thread_id=None,
             active_coder_turn_id=None,
         )
-        decision = await asyncio.wait_for(agent.decide(packet), timeout=120)
+        decision = await asyncio.wait_for(agent.decide(packet), timeout=240)
         if decision.decision not in {SupervisorDecisionKind.NOOP, SupervisorDecisionKind.PAUSE}:
             raise RuntimeError("structured-output supervisor self-test returned an unexpected decision")
 
-    async def _configure_approval_triage(self) -> None:
-        config = cheap_approval_triage_config_from_env()
-        self.approval_triage_config = config
-        self.approval_triage_reviewer = None
-        if not config.enabled:
-            self.tui.render("SYSTEM", "cheap approval triage disabled by configuration")
-            return
-        if config.model is None:
-            self.tui.render(
-                "SYSTEM",
-                "cheap approval triage disabled: SENTINEL_APPROVAL_TRIAGE_MODEL is not configured",
-            )
-            self.approval_triage_config = CheapApprovalTriageConfig(
-                enabled=False,
-                model=None,
-                timeout_seconds=config.timeout_seconds,
-            )
-            return
-        reviewer = CheapApprovalReviewer(
-            self.client,
-            self._active_workspace_root(),
-            model=config.model,
-            timeout_seconds=config.timeout_seconds,
-        )
-        try:
-            await self._cheap_approval_structured_output_self_test(reviewer)
-        except Exception as exc:
-            self.tui.render(
-                "SYSTEM",
-                f"cheap approval triage unavailable; falling back to full supervisor ({exc.__class__.__name__})",
-            )
-            self.approval_triage_config = CheapApprovalTriageConfig(
-                enabled=False,
-                model=config.model,
-                timeout_seconds=config.timeout_seconds,
-            )
-            return
-        self.approval_triage_reviewer = reviewer
-        self.tui.render("SYSTEM", f"cheap approval triage enabled with model {config.model}")
-
-    async def _cheap_approval_structured_output_self_test(self, reviewer: CheapApprovalReviewer) -> None:
-        command = "git status --short && git diff --stat"
-        context = ApprovalContext(
-            server_request_id="cheap-approval-self-test",
-            server_request_method="item/commandExecution/requestApproval",
-            request_type=ApprovalRequestType.COMMAND,
-            command=command,
-            cwd=str(self._active_workspace_root()),
-            available_decisions=["accept", "decline", "cancel"],
-        )
-        evaluation = ApprovalManager(
-            self._active_workspace_root(),
-            declared_grading_roots=getattr(self, "declared_grading_roots", ()),
-            immutable_paths=self._immutable_approval_paths(),
-        ).policy.evaluate({"command": command, "cwd": str(self._active_workspace_root())})
-        decision = await asyncio.wait_for(reviewer.review(context, evaluation), timeout=reviewer.timeout_seconds)
-        if decision.decision not in {"approve_low_impact", "escalate"}:
-            raise RuntimeError("cheap approval structured-output self-test returned an unexpected decision")
-
-    def _build_cheap_approval_reviewer(self) -> CheapApprovalReviewer | None:
-        if self.approval_triage_reviewer is not None:
-            return self.approval_triage_reviewer
-        config = self.approval_triage_config
-        if not config.enabled or config.model is None:
-            return None
-        return CheapApprovalReviewer(
-            self.client,
-            self._active_workspace_root(),
-            model=config.model,
-            timeout_seconds=config.timeout_seconds,
-        )
-
-    def _record_cheap_approval_attempt(self, context: ApprovalContext, manager: ApprovalManager) -> None:
-        attempt = manager.last_cheap_review_attempt
-        if attempt is None:
-            return
-        self.store.append_raw_log(
-            {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "type": "cheap_approval_review",
-                "server_request_id": context.server_request_id,
-                "request_type": context.request_type.value,
-                "eligible": attempt.eligible,
-                "attempted": attempt.attempted,
-                "outcome": attempt.outcome,
-                "reason_code": attempt.reason_code,
-                "latency_seconds": attempt.latency_seconds,
-                "model": attempt.model,
-                "full_supervisor_fallback": attempt.full_supervisor_fallback,
-            }
-        )
-
     async def _configure_runtime_triage(self) -> None:
-        config = runtime_triage_config_from_env()
+        config = runtime_triage_config_from_env(enabled=self._cheap_runtime_enabled())
         self.runtime_triage_config = config
         self.runtime_triage_reviewer = None
         if not config.enabled:
@@ -3957,6 +4088,7 @@ class SentinelController:
                 "wake_sequence": packet.wake_sequence,
                 "generation": packet.generation,
                 "current_summary": (packet.current_summary or "")[:160],
+                "trigger_reasons": list(_runtime_trigger_reasons_from_summary(packet.current_summary)),
                 "decision": decision.decision if decision is not None else None,
                 "reason_code": decision.reason_code if decision is not None else None,
                 "outcome": outcome,
@@ -3991,8 +4123,11 @@ def _approval_wake_context(
     )
 
 
-def _runtime_packet_has_protected_reason(packet: SupervisorWakePacket) -> bool:
-    return bool(set(_runtime_trigger_reasons_from_summary(packet.current_summary)) & PROTECTED_RUNTIME_WAKE_REASONS)
+def _runtime_packet_requires_full_supervisor(packet: SupervisorWakePacket) -> bool:
+    reasons = set(_runtime_trigger_reasons_from_summary(packet.current_summary))
+    if reasons & MANDATORY_FULL_RUNTIME_WAKE_REASONS:
+        return True
+    return (packet.current_summary or "").lstrip().startswith("Runtime integrity trigger:")
 
 
 def _runtime_trigger_reasons_from_summary(summary: str | None) -> tuple[str, ...]:
@@ -4002,6 +4137,189 @@ def _runtime_trigger_reasons_from_summary(summary: str | None) -> tuple[str, ...
     if not match:
         return ()
     return tuple(reason.strip() for reason in match.group(1).split(",") if reason.strip())
+
+
+_RESTART_SHELL_NAMES = frozenset({"bash", "dash", "ksh", "sh", "zsh"})
+
+
+def _canonical_restart_command(command: str) -> str:
+    current = _normalize_command(command)
+    for _ in range(6):
+        try:
+            parts = shlex.split(current)
+        except ValueError:
+            break
+        if len(parts) < 3 or Path(parts[0]).name not in _RESTART_SHELL_NAMES:
+            break
+        command_index = next(
+            (
+                index + 1
+                for index, token in enumerate(parts[1:-1], start=1)
+                if token.startswith("-")
+                and not token.startswith("--")
+                and "c" in token[1:]
+            ),
+            None,
+        )
+        if command_index is None or command_index != len(parts) - 1:
+            break
+        nested = _normalize_command(parts[command_index])
+        if not nested or nested == current:
+            break
+        current = nested
+    return current
+
+
+def _runtime_unresolved_execution_key(command: str, cwd: str | None) -> str:
+    payload = {
+        "command": _canonical_restart_command(command),
+        "cwd": cwd or "",
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"unresolved-execution:{digest[:16]}"
+
+
+def _runtime_validation_restart_issue(validation: ValidationRun) -> RuntimeRestartIssue | None:
+    if validation.trusted_validation_outcome == "passed":
+        return None
+    if validation.exit_code is None or validation.shell_exit_code is None:
+        return RuntimeRestartIssue(
+            key=_runtime_unresolved_execution_key(validation.command, validation.cwd),
+            sequence=validation.sequence,
+            validation_id=validation.validation_id,
+        )
+    if validation.trusted_validation_outcome == "masked_or_unknown":
+        masking_reason = validation.masking_reason or "unknown"
+        return RuntimeRestartIssue(
+            key=f"masked-validation:{masking_reason}",
+            sequence=validation.sequence,
+            validation_id=validation.validation_id,
+        )
+    if validation.trusted_validation_outcome != "failed":
+        return None
+    evidence = validation.captured_output or validation.summary
+    normalized_evidence = " ".join(evidence.split())
+    payload = {
+        "validation_id": validation.validation_id,
+        "exit_code": validation.exit_code,
+        "shell_exit_code": validation.shell_exit_code,
+        "executed_test_names": sorted(validation.executed_test_names),
+        "executed_test_files": sorted(validation.executed_test_files),
+        "failed_count": validation.failed_count,
+        "evidence_sha256": hashlib.sha256(normalized_evidence.encode("utf-8")).hexdigest(),
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    return RuntimeRestartIssue(
+        key=f"failed-validation:{validation.validation_id}:{digest}",
+        sequence=validation.sequence,
+        validation_id=validation.validation_id,
+    )
+
+
+def _matching_active_validation_issue(
+    packet: SupervisorWakePacket,
+    *,
+    active_issue_key: str | None,
+    active_issue_last_sequence: int,
+) -> RuntimeRestartIssue | None:
+    if active_issue_key is None:
+        return None
+    issues = [
+        issue
+        for validation in packet.validations
+        if validation.sequence > active_issue_last_sequence
+        if (issue := _runtime_validation_restart_issue(validation)) is not None
+    ]
+    if not issues:
+        return None
+    latest = max(issues, key=lambda issue: issue.sequence)
+    return latest if latest.key == active_issue_key else None
+
+
+def _runtime_event_issue_payload(
+    packet: SupervisorWakePacket,
+    *,
+    reasons: tuple[str, ...],
+) -> dict[str, Any]:
+    action = packet.triggering_action
+    approval = packet.approval_context
+    payload: dict[str, Any] = {"reasons": reasons}
+    if approval is not None:
+        payload["approval"] = {
+            "request_type": str(approval.request_type),
+            "command": (
+                _canonical_restart_command(approval.command) if approval.command else None
+            ),
+            "cwd": approval.cwd,
+            "paths": sorted(approval.paths),
+        }
+        return payload
+    if action is not None and action.command:
+        payload["command"] = {
+            "kind": action.kind,
+            "command": _canonical_restart_command(action.command),
+            "cwd": action.cwd,
+            "exit_code": action.exit_code,
+        }
+        return payload
+    changed_paths = sorted({changed.path for changed in packet.changed_files})
+    if not changed_paths and action is not None:
+        changed_paths = sorted(action.paths)
+    payload["paths"] = changed_paths
+    if not reasons and action is not None:
+        payload["kind"] = action.kind
+    return payload
+
+
+def _runtime_restart_issue(
+    packet: SupervisorWakePacket,
+    *,
+    active_issue_key: str | None = None,
+    active_issue_last_sequence: int = 0,
+) -> RuntimeRestartIssue | None:
+    validation = _runtime_triggering_validation(packet)
+    if validation is not None:
+        issue = _runtime_validation_restart_issue(validation)
+        if issue is not None:
+            return issue
+
+    reasons = tuple(sorted(_runtime_trigger_reasons_from_summary(packet.current_summary)))
+    action = packet.triggering_action
+    approval = packet.approval_context
+    if action is None and approval is None and not reasons:
+        if packet.current_summary.strip() != "Coder turn completed":
+            return None
+        return _matching_active_validation_issue(
+            packet,
+            active_issue_key=active_issue_key,
+            active_issue_last_sequence=active_issue_last_sequence,
+        )
+    payload = _runtime_event_issue_payload(packet, reasons=reasons)
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    return RuntimeRestartIssue(key=f"runtime-event:{digest}", sequence=packet.latest_event_sequence)
+
+
+def _runtime_triggering_validation(packet: SupervisorWakePacket) -> ValidationRun | None:
+    if not packet.validations:
+        return None
+    action = packet.triggering_action
+    if action is not None and action.command:
+        normalized_command = _normalize_command(action.command)
+        matches = [
+            validation
+            for validation in packet.validations
+            if validation.normalized_command == normalized_command
+        ]
+        if matches:
+            return max(matches, key=lambda validation: validation.sequence)
+    validation_reasons = {
+        "masked_validation",
+        "repeated_same_failing_validation",
+        "validation_regression",
+    }
+    if validation_reasons & set(_runtime_trigger_reasons_from_summary(packet.current_summary)):
+        return max(packet.validations, key=lambda validation: validation.sequence)
+    return None
 
 
 def _is_no_active_turn_to_steer_error(exc: AppServerError) -> bool:
@@ -4018,6 +4336,15 @@ def _fallback_restart_handoff(*, task_contents: str, reason: str, last_actions: 
         known_evidence=known_evidence,
         next_step="Read the task, progress, decisions, and this handoff, then take the next concrete task step.",
         recovery_signal="The new generation makes task-relevant progress without repeating the prior failure mode.",
+    )
+
+
+def _restart_rejection_steering(handoff: RestartHandoff | None) -> str:
+    if handoff is None:
+        return "Continue the current task. Use the latest observation to make the next concrete progress step."
+    return (
+        f"Correct the current non-converging pattern before continuing. Avoid: {handoff.bad_pattern} "
+        f"Next step: {handoff.next_step} Recovery signal: {handoff.recovery_signal}"
     )
 
 
@@ -4394,7 +4721,7 @@ def _is_behavior_demo_command(command: str, *, changed_paths: list[str]) -> bool
 
 
 def _has_behavior_demo_marker(command: str) -> bool:
-    return bool(re.search(r"\bSENTINEL_BEHAVIOR_DEMO\s*=\s*(?:1|true|yes)\b", command, re.IGNORECASE))
+    return bool(re.search(r"\bBELLO_BEHAVIOR_DEMO\s*=\s*(?:1|true|yes)\b", command, re.IGNORECASE))
 
 
 def _marked_behavior_demo_command_is_plausible(command: str, changed_paths: list[str]) -> bool:
@@ -4880,9 +5207,9 @@ def _has_malformed_readiness_marker(text: str) -> bool:
     return any(
         marker in lowered or marker in compact
         for marker in (
-            "sentinel ready for review",
-            "sentinel_ready",
-            "sentinel_ready_for_review",
+            "bello ready for review",
+            "bello_ready",
+            "bello_ready_for_review",
             "ready_for_review",
         )
     )
@@ -4890,7 +5217,7 @@ def _has_malformed_readiness_marker(text: str) -> bool:
 
 def _readiness_reference_is_negated(text: str) -> bool:
     lowered = " ".join(text.lower().split())
-    marker = r"(?:sentinel[\s_`'\-]*ready[\s_`'\-]*for[\s_`'\-]*review|ready[\s_`'\-]*for[\s_`'\-]*review|readiness marker)"
+    marker = r"(?:bello[\s_`'\-]*ready[\s_`'\-]*for[\s_`'\-]*review|ready[\s_`'\-]*for[\s_`'\-]*review|readiness marker)"
     negator = r"(?:do not|don't|not|cannot|can't|will not|won't|without|no)"
     return bool(re.search(rf"\b{negator}\b.{{0,120}}\b{marker}\b", lowered))
 
@@ -6984,6 +7311,91 @@ def _large_diff_signature(changed_files: list[ChangedFile]) -> str:
     return digest[:16]
 
 
+def _suspicious_changed_file_signature(
+    workspace_root: Path,
+    changed_files: list[ChangedFile],
+    *,
+    cache: dict[str, tuple[tuple[Any, ...], str]] | None = None,
+) -> str | None:
+    suspicious = sorted(
+        (changed for changed in changed_files if _is_suspicious_changed_path(changed.path)),
+        key=lambda item: item.path,
+    )
+    if not suspicious:
+        return None
+    cache = cache if cache is not None else {}
+    payload = [
+        {
+            "path": changed.path,
+            "status": changed.status,
+            "additions": changed.additions,
+            "deletions": changed.deletions,
+            "content": _workspace_path_fingerprint(workspace_root, changed.path, cache=cache),
+        }
+        for changed in suspicious
+    ]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def _workspace_path_fingerprint(
+    workspace_root: Path,
+    relative_path: str,
+    *,
+    cache: dict[str, tuple[tuple[Any, ...], str]],
+) -> str:
+    raw_path = Path(relative_path)
+    if raw_path.is_absolute() or ".." in raw_path.parts:
+        return "invalid-path"
+    path = workspace_root / raw_path
+    try:
+        lexical_stat = path.lstat()
+    except OSError as exc:
+        cache.pop(relative_path, None)
+        return f"unavailable:{type(exc).__name__}"
+    if stat.S_ISLNK(lexical_stat.st_mode):
+        try:
+            target = os.readlink(path)
+        except OSError as exc:
+            target = f"unreadable:{type(exc).__name__}"
+        cache.pop(relative_path, None)
+        return "symlink:" + hashlib.sha256(target.encode("utf-8", errors="replace")).hexdigest()
+    try:
+        resolved = path.resolve()
+    except OSError as exc:
+        cache.pop(relative_path, None)
+        return f"unresolved:{type(exc).__name__}"
+    if not ensure_relative_to(resolved, workspace_root):
+        cache.pop(relative_path, None)
+        return "outside-workspace"
+    try:
+        file_stat = resolved.stat()
+    except OSError as exc:
+        cache.pop(relative_path, None)
+        return f"unavailable:{type(exc).__name__}"
+    stat_key = (
+        file_stat.st_mode,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+        file_stat.st_ino,
+    )
+    cached = cache.get(relative_path)
+    if cached is not None and cached[0] == stat_key:
+        return cached[1]
+    if not stat.S_ISREG(file_stat.st_mode):
+        fingerprint = hashlib.sha256(repr(stat_key).encode("ascii")).hexdigest()
+    else:
+        try:
+            digest = _hash_file(resolved)
+            fingerprint = f"regular:{stat.S_IMODE(file_stat.st_mode):o}:{digest}"
+        except OSError as exc:
+            fingerprint = (
+                f"unreadable:{stat.S_IMODE(file_stat.st_mode):o}:{type(exc).__name__}"
+            )
+    cache[relative_path] = (stat_key, fingerprint)
+    return fingerprint
+
+
 def _action_timed_out(action: TriggeringAction) -> bool:
     text = " ".join(part for part in (action.status, action.summary) if part).lower()
     return "timeout" in text or "timed out" in text
@@ -7644,6 +8056,26 @@ def _path_from_git_status_line(line: str) -> str:
     return line.strip()
 
 
+def _git_status_entries_from_porcelain_v1_z(output: str) -> list[tuple[str, str]]:
+    records = output.split("\0")
+    entries: list[tuple[str, str]] = []
+    index = 0
+    while index < len(records):
+        record = records[index]
+        index += 1
+        if not record or len(record) < 4 or record[2] != " ":
+            continue
+        raw_status = record[:2]
+        path = record[3:]
+        if path:
+            entries.append((path, raw_status.strip() or "modified"))
+        if "R" in raw_status or "C" in raw_status:
+            # In -z mode Git emits the destination in this record and the
+            # source path as the following NUL-delimited record.
+            index += 1
+    return entries
+
+
 def _format_validation(validation: ValidationRun) -> str:
     exit_code = "unknown" if validation.exit_code is None else str(validation.exit_code)
     return f"{validation.command} ({validation.type} {validation.outcome}, exit={exit_code})"
@@ -7820,7 +8252,7 @@ def _is_completed_action(item: Any) -> bool:
 
 
 def _adversary_enabled_from_env() -> bool | None:
-    raw = os.environ.get("SENTINEL_ADVERSARY_ENABLED", "").strip().lower()
+    raw = os.environ.get("BELLO_ADVERSARY_ENABLED", "").strip().lower()
     if not raw:
         return None
     if raw in {"1", "true", "yes", "on", "enabled"}:
@@ -7831,7 +8263,7 @@ def _adversary_enabled_from_env() -> bool | None:
 
 
 def _create_adversary_snapshot(project_root: Path) -> Path:
-    temp_root = Path(tempfile.mkdtemp(prefix="sentinel-adversary-")).resolve()
+    temp_root = Path(tempfile.mkdtemp(prefix="bello-adversary-")).resolve()
     snapshot_root = temp_root / "workspace"
     try:
         shutil.copytree(
@@ -7858,9 +8290,9 @@ def _init_snapshot_git(snapshot_root: Path) -> None:
         return
     identity = [
         "-c",
-        "user.email=sentinel@localhost",
+        "user.email=bello@localhost",
         "-c",
-        "user.name=Sentinel Snapshot",
+        "user.name=Bello Snapshot",
         "-c",
         "commit.gpgsign=false",
     ]
@@ -7897,7 +8329,7 @@ def _init_snapshot_git(snapshot_root: Path) -> None:
                 "--no-verify",
                 "--allow-empty",
                 "-m",
-                "sentinel adversary snapshot baseline",
+                "bello adversary snapshot baseline",
             ],
             cwd=snapshot_root,
             env=git_env,

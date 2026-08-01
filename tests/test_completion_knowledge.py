@@ -3,13 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from supervisor.controller import SentinelController, _merge_behavior_surface_items
+from supervisor.controller import BelloController, _merge_behavior_surface_items
 from supervisor.prompts import build_completion_review_prompt
 from supervisor.schemas import (
     BehaviorSurfaceItem,
     CompletionDecisionArtifact,
     CompletionReviewDecision,
-    SentinelConfig,
+    BelloConfig,
     SupervisorWakePacket,
 )
 from supervisor.schemas.models import openai_strict_json_schema_for_completion_review_decision
@@ -39,9 +39,9 @@ def _make_decision(**overrides: Any) -> CompletionReviewDecision:
     return CompletionReviewDecision(**base)
 
 
-def _knowledge_controller() -> SentinelController:
+def _knowledge_controller() -> BelloController:
     # Knowledge is in-memory on the controller; no store needed for these paths.
-    return SentinelController.__new__(SentinelController)
+    return BelloController.__new__(BelloController)
 
 
 # --- _merge_behavior_surface_items (pure) ---
@@ -144,7 +144,7 @@ def test_completion_knowledge_is_not_backed_by_workspace_file(tmp_path: Path) ->
     # The knowledge must never touch the coder-writable workspace/.supervisor dir (forgery and
     # parse-crash vectors); recording writes nothing under the state dir.
     store = StateStore(tmp_path)
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.store = store
     before = sorted(p.name for p in store.state_dir.iterdir())
     controller._record_completion_knowledge(
@@ -187,11 +187,11 @@ async def test_completion_review_timeout_retries_once_then_gives_up(tmp_path: Pa
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
-    store.initialize_sentinel(
-        SentinelConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
+    store.initialize_bello(
+        BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"),
         overwrite=True,
     )
-    controller = SentinelController.__new__(SentinelController)
+    controller = BelloController.__new__(BelloController)
     controller.store = store
     controller.supervisor = _StubSupervisor()
     controller.provider_failure_recovery_counts = {}
