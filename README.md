@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="./docs/assets/bello-readme-ambient.png" alt="Bello protective coding workspace" width="100%">
+  <img src="./bello_pixel_intro.gif" alt="Bello pixel intro" width="100%">
 </p>
 
 ---
