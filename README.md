@@ -1,39 +1,26 @@
 <h1 align="center">Bello</h1>
 
-<p align="center">
-  <strong>Simple setup, clear configuration, fully autonomous execution, and safety by design.</strong><br>
-  Assign the task and walk away. Bello keeps the coder inside a disposable
-  sandbox while an independent, fresh-context supervisor reviews risky actions,
-  catches drift, and manages recovery.<br>
-  Across three public ProgramBench tasks and three model-effort settings, Bello
-  outperformed Raw Codex in all 9 matched comparisons, increasing average
-  completion from 44.87% to 61.21%. It is ready to take on your most demanding
-  tasks.
-</p>
+Assign the task and walk away. Bello keeps the coder inside a disposable
+sandbox while an independent, fresh-context supervisor reviews risky actions,
+detects task drift, and manages recovery.
 
-<p align="center">
-  <a href="https://github.com/Makson179/Bello/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/Makson179/Bello/actions/workflows/tests.yml/badge.svg"></a>
-  <a href="https://www.python.org/downloads/"><img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white"></a>
-  <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-0F766E?style=flat-square"></a>
-  <img alt="Transport: Codex app-server JSON-RPC" src="https://img.shields.io/badge/transport-codex%20app--server-334155?style=flat-square">
-  <img alt="Approvals: fail closed" src="https://img.shields.io/badge/approvals-fail--closed-B91C1C?style=flat-square">
-</p>
-
-<p align="center">
-  <img src="./docs/assets/bello-readme-ambient.png" alt="Bello protective coding workspace" width="100%">
-</p>
-
----
+Across three public ProgramBench tasks, Bello outperformed Raw Codex in all comparisons, 
+increasing average completion from 44.87% to 61.21%. It is ready to take on your most demanding
+tasks.
 
 # Motivation
 
-Modern language models can write code, analyze documents, and solve complex problems, yet the model itself remains a generator of the next fragment of reasoning. When assigned a long, multi-stage task, it must simultaneously remember requirements, plan actions, execute them, assess its own progress, notice errors, and decide when the result can be considered complete.
+When you assign a long, multi-stage task to the language model, it must simultaneously 
+remember requirements, plan actions, execute them, assess its own progress, notice errors, 
+and decide when the result can be considered complete. **Combining all these functions is unreliable.**
 
-Combining all these functions is unreliable. As the context grows, the model degrades very quickly and begins to hallucinate [[1]](https://aclanthology.org/2024.tacl-1.9/) [[2]](https://arxiv.org/abs/2404.06654) [[3]](https://aclanthology.org/2022.acl-long.229/) [[4]](https://aclanthology.org/2023.emnlp-main.397/). Compressing the history partly addresses the context-size problem, but it can lose a critical rule, decision, or prohibition. Meanwhile, a confident model response is not evidence that the task has actually been completed.
+As the context grows, the model degrades very quickly and begins to hallucinate [\[1\]][1] [\[2\]][2] [\[3\]][3] [\[4\]][4].
+Context compaction partly addresses context-window limits, but it can lose a critical rule, decision, or prohibition.
+Meanwhile, a confident model response is not evidence that the task has actually been completed.
 
 Bello moves the management of complex work to a level above the language model.
 
-In our architecture, a single model is not expected to represent the entire thinking process. We treat a language model as a powerful but limited executor of cognitive operations. Planning the overall process, assigning roles, managing memory, evaluating effectiveness, and making the final decision about readiness should belong to a separate system.
+In our architecture, a single model is not expected to represent the entire thinking process. We treat a language model as a powerful but limited executor of cognitive operations. Planning the overall process, assigning roles, managing memory, evaluating effectiveness, and making the final decision about readiness should belong to a separate orchestration layer.
 Bello implements such a system: not a longer chain of reasoning from a single model, but a reproducible reasoning loop in which a solution is created, reviewed, attacked, corrected, and accepted only after independent confirmation.
 
 ## Cognitive foundations
@@ -54,15 +41,15 @@ Bello turns this structure into an executable system.
 
 ## How Bello solves tasks
 
-The process begins by building the first complete solution. The developer agent analyzes the task, modifies the project, runs checks, and creates a working prototype.
+The process begins with an initial implementation. The developer agent analyzes the task, modifies the project, and runs the relevant checks.
 
-The result is then passed to **completion review**. This component does not continue development or take the author's report at face value. It independently reconstructs the task's mandatory requirements and checks:
+The result then undergoes an **independent acceptance review**. This component does not continue development or take the author's report at face value. It independently reconstructs the task's requirements and acceptance criteria and checks:
 
 * whether the required behavior has been implemented;
-* whether the checks support the claimed result;
+* whether the validation evidence supports the claimed result;
 * whether any modes or edge cases remain untested;
 * whether any regressions have been introduced;
-* whether fresh validation was performed after the latest substantial changes.
+* whether trusted behavioral validation passed after the latest relevant source or test change.
 
 If a problem is found, the work returns to the developer. After the fix, a new full review is performed because a local change may affect other parts of the system.
 
@@ -80,9 +67,9 @@ Software development demonstrates the limitations of single-pass reasoning parti
 
 A programmer initially builds an implementation around the core functionality. Even a strong first version may fail to account for rare inputs, error recovery, compatibility, operation order, or interactions between multiple components. It is also difficult for authors to evaluate their own code independently: they know what they intended to implement and therefore tend to mentally fill in what the program does not actually contain.
 
-Completion review corresponds to rigorous code review and acceptance auditing. It evaluates the implementation's compliance with the requirements, not the elegance of its explanation. Passing a handful of visible tests is not considered sufficient if they do not cover the full required behavior.
+Completion review combines code review, requirements verification, and acceptance testing. It evaluates the implementation's compliance with the requirements, not the elegance of its explanation. Passing a handful of visible tests is not considered sufficient if they do not cover the full required behavior.
 
-The adversary corresponds to fuzzing, property-based testing, penetration testing, red teaming, and the work of an independent quality engineer. It does not seek confirmation of the standard scenario; it looks for conditions under which the system violates its contract.
+The adversary corresponds to fuzzing, property-based testing, penetration testing, red teaming, and the work of an independent quality engineer. It does not seek confirmation of the happy path; it looks for conditions under which the system violates its contract.
 
 Bello tracks not only the quality of the final code, but also the effectiveness of the development process. If the agent repeats the same mistakes, ignores feedback, loses sight of the original goal, or becomes stuck in a flawed interpretation, the system can stop the current line of work, preserve confirmed facts, and start a new pass with a clean context.
 
@@ -315,18 +302,18 @@ to the supervisor, not the coder:
 | any text | Delivered to the supervisor as an instruction or constraint. |
 
 Everything the run does is written to inspectable files under `.supervisor/`
-in your project: `PROGRESS.md` (what has happened), `DECISIONS.md` (standing
-decisions), `HANDOFF.md` (restart context), `events.jsonl` (full event
-stream), and `FINAL_REPORT.md` (the result).
+in your project: `PROGRESS.md` (progress log), `DECISIONS.md` (decision log),
+`HANDOFF.md` (restart handoff), `events.jsonl` (event log), and
+`FINAL_REPORT.md` (final report).
 
 ## Run modes
 
 Bello is built for walk-away execution. In both primary modes, the coder works
 inside a disposable, network-isolated snapshot rather than directly in your
 live project. A fresh-context runtime supervisor evaluates risky or
-out-of-sandbox actions, catches drift, and manages recovery; unsupported
+out-of-sandbox actions, detects task drift, and manages recovery; unsupported
 requests and supervisor failures fail closed. Only an accepted, policy-checked
-patch is transferred back to the project.
+patch is applied to the live project.
 
 The modes differ in what happens after the coder reports validated readiness.
 
@@ -340,9 +327,9 @@ routine cheap runtime triage. Completion review and the adversary are off.
 bello --task task.md
 ```
 
-The run finishes once the coder's readiness passes Bello's required
+The run finishes once the coder's readiness claim passes Bello's
 validation gates. Runtime supervision remains active throughout the run; only
-the final review loop is skipped.
+the post-implementation review phase is skipped.
 
 ### Deep Work
 
@@ -474,3 +461,8 @@ Bello is released under the MIT License. See [LICENSE](./LICENSE).
 
 Contributions require signing the project [CLA](./CLA.md); a bot will prompt
 you on your first pull request, and you only sign once.
+
+[1]: https://aclanthology.org/2024.tacl-1.9/
+[2]: https://arxiv.org/abs/2404.06654
+[3]: https://aclanthology.org/2022.acl-long.229/
+[4]: https://aclanthology.org/2023.emnlp-main.397/
