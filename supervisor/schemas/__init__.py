@@ -1,6 +1,7 @@
 from supervisor.schemas.models import (
     AppEvent,
     AppEventSource,
+    AdvReportControllerDecision,
     AdversaryReport,
     ApprovalContext,
     ApprovalDecisionKind,
@@ -49,6 +50,7 @@ from supervisor.schemas.models import (
 __all__ = [
     "AppEvent",
     "AppEventSource",
+    "AdvReportControllerDecision",
     "AdversaryReport",
     "ApprovalContext",
     "ApprovalDecisionKind",

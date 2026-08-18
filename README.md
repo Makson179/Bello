@@ -1,14 +1,8 @@
 <h1 align="center">Bello</h1>
 
 <p align="center">
-  <strong>Simple setup, clear configuration, fully autonomous execution, and safety by design.</strong><br>
-  Assign the task and walk away. Bello keeps the coder inside a disposable
-  sandbox while an independent, fresh-context supervisor reviews risky actions,
-  catches drift, and manages recovery.<br>
-  Across three public ProgramBench tasks and three model-effort settings, Bello
-  outperformed Raw Codex in all 9 matched comparisons, increasing average
-  completion from 44.87% to 61.21%. It is ready to take on your most demanding
-  tasks.
+  <strong>Research-backed verification, a 38% relative increase on benchmarks, and a fully autonomous system.</strong><br>
+  Assign the task and walk away. Bello keeps the coder inside a disposable sandbox while an independent, fresh-context supervisor reviews risky actions, catches drift, and manages recovery. <br>
 </p>
 
 <p align="center">
@@ -20,8 +14,22 @@
 </p>
 
 <p align="center">
-  <img src="./docs/assets/bello-readme-ambient.png" alt="Bello protective coding workspace" width="100%">
+  <img src="./bello_pixel_intro.gif" alt="Bello pixel intro" width="100%">
 </p>
+
+## Contents
+
+- [Motivation](#motivation)
+- [How Bello solves tasks](#how-bello-solves-tasks)
+- [Relationship to existing LLM research](#relationship-to-existing-llm-research)
+- [Choose your supervision depth](#choose-your-supervision-depth)
+- [Results](#results)
+- [Requirements](#requirements)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [Command reference](#command-reference)
+- [License](#license)
 
 ---
 
@@ -36,25 +44,9 @@ Bello moves the management of complex work to a level above the language model.
 In our architecture, a single model is not expected to represent the entire thinking process. We treat a language model as a powerful but limited executor of cognitive operations. Planning the overall process, assigning roles, managing memory, evaluating effectiveness, and making the final decision about readiness should belong to a separate system.
 Bello implements such a system: not a longer chain of reasoning from a single model, but a reproducible reasoning loop in which a solution is created, reviewed, attacked, corrected, and accepted only after independent confirmation.
 
-## Cognitive foundations
-
-Bello's architecture draws on several foundational areas of cognitive psychology.
-
-In [Allen Newell and Herbert Simon's heuristic search model](https://books.google.com/books?id=h03uAAAAMAAJ), problem solving is viewed as moving from the current state to a goal state through a sequence of operations and subproblems. A person compares the current state with the desired one, chooses an action that reduces the difference, evaluates the result, and restructures the search if the chosen strategy does not work.
-
-[Barry Zimmerman's research on self-regulated learning](https://doi.org/10.1207/S15430421TIP4102_2) describes activity as a recurring cycle of forethought, performance, and self-reflection. The outcome of an evaluation does not end the process; it changes the plan for the next attempt.
-
-[Research on metacognition by John Flavell](https://doi.org/10.1037/0003-066X.34.10.906), [Thomas Nelson, Louis Narens](https://doi.org/10.1016/S0079-7421%2808%2960053-5), and other authors distinguishes between performing a task and managing that performance. One level solves the task; another observes the work in progress, evaluates confidence and evidence, and decides whether to continue, verify, change strategy, or stop.
-
-Similar patterns have also been found in research on writing. [Linda Flower and John Hayes's model](https://doi.org/10.2307/356600) describes writing not as a linear sequence of “plan — draft — edit,” but as a recursive interaction between planning, translating ideas into text, and reviewing. A problem discovered while reading may require more than a local edit: it may call for returning to the goal, structure, or original intent.
-
-The common principle behind this work is that producing a result, monitoring the process, and evaluating it critically should not collapse into a single indistinguishable operation. Reliable reasoning requires cycles, specialized functions, and the ability to revisit earlier decisions.
-
-Bello turns this structure into an executable system.
-
 ## How Bello solves tasks
 
-The process begins by building the first complete solution. The developer agent analyzes the task, modifies the project, runs checks, and creates a working prototype.
+The process begins by building the first complete solution. The coder in the isolated sandbox analyzes the task, modifies the project, runs checks, and creates a working prototype, while an independent runtime supervisor continuously monitors the execution from a fresh context, intercepts risky actions before they happen, and steers the developer back on track when it detects drift, repeated mistakes, or unsafe behavior. If necessary, it can deny an action or restart a failing generation while preserving verified progress, keeping the run both autonomous and controlled.
 
 The result is then passed to **completion review**. This component does not continue development or take the author's report at face value. It independently reconstructs the task's mandatory requirements and checks:
 
@@ -70,43 +62,123 @@ Once the solution has passed several development and review cycles, the **advers
 
 The adversary works independently of the solution's development history. It evaluates the final artifact, not how convincing the author's explanation is. If it finds a potential defect, the solution is sent back to completion review, which determines whether the observed behavior is a genuine violation of the requirements.
 
+If a run ends unexpectedly after the coder has started working—for example because of a usage limit, a provider error, or the process being interrupted—Bello preserves the coder's current workspace under .supervisor/. To keep that recovery state available on the next run, leave Start over disabled (start-over: false). If a run is interrupted because of a security policy, restart it with `--start-over=false`. Enabling Start over discards previous recovery data.
+
 Bello therefore implements the following cycle:
 
 **build a solution → independently review completeness → fix defects → perform adversarial testing → reassess → accept the result.**
 
-## Why this structure is a natural fit for software development
-
-Software development demonstrates the limitations of single-pass reasoning particularly well.
-
-A programmer initially builds an implementation around the core functionality. Even a strong first version may fail to account for rare inputs, error recovery, compatibility, operation order, or interactions between multiple components. It is also difficult for authors to evaluate their own code independently: they know what they intended to implement and therefore tend to mentally fill in what the program does not actually contain.
-
-Completion review corresponds to rigorous code review and acceptance auditing. It evaluates the implementation's compliance with the requirements, not the elegance of its explanation. Passing a handful of visible tests is not considered sufficient if they do not cover the full required behavior.
-
-The adversary corresponds to fuzzing, property-based testing, penetration testing, red teaming, and the work of an independent quality engineer. It does not seek confirmation of the standard scenario; it looks for conditions under which the system violates its contract.
-
-Bello tracks not only the quality of the final code, but also the effectiveness of the development process. If the agent repeats the same mistakes, ignores feedback, loses sight of the original goal, or becomes stuck in a flawed interpretation, the system can stop the current line of work, preserve confirmed facts, and start a new pass with a clean context.
-
-This separates the accumulated knowledge about the task from an individual agent's unsuccessful reasoning trajectory.
-
-## The same structure in other forms of intellectual work
-
-Similar cycles are used far beyond programming: in mathematics, scientific research, engineering, law, and strategic planning.
-
-In all these fields, a reliable result emerges not from one long sequence of thoughts, but from the interaction between a creator, a reviewer, and a skeptic.
-
 ## Relationship to existing LLM research
 
-Individual parts of this approach have already been tested in language-model research.
+Bello separates iterative repair from acceptance. [Is Self-Repair a Silver Bullet for Code Generation?](https://arxiv.org/abs/2306.09896) found that cost-adjusted self-repair gains were often modest, variable, or absent, and increased substantially when feedback came from a stronger model or a human. [CRITIC](https://arxiv.org/abs/2305.11738) provides the complementary result that correction is more reliable when grounded in observable feedback from external tools. Bello therefore lets the coder execute tests and repair the artifact, but does not let the authoring trajectory certify completion. Acceptance is decided by a fresh reviewer that does not modify the artifact or treat the coder's report as evidence: it reads the specification, the artifact, and the diff, and obtains its own behavioral evidence by selectively rerunning checks against the result. The diff makes that evidence harder to stage, since weakened assertions, skipped cases, substituted mocks, and deleted tests appear as changes even when the suite reports green. [StackEval](https://arxiv.org/abs/2412.05288) found that reference answers consistently improved LLM code-judging accuracy and detected no statistically significant self-preference when such references were supplied. This supports evidence-anchored review, while StackEval's one-shot setting does not establish that a fresh reviewer is an independent correctness oracle. In Bello, the use of a fresh context separates the acceptance decision from the coder's trajectory; validation remains necessary.
 
-[**Self-Refine**](https://arxiv.org/abs/2303.17651) showed that a cycle of generation, critique, and refinement can substantially outperform a single-pass response. [**Reflexion**](https://arxiv.org/abs/2303.11366) demonstrated the value of retaining lessons from previous attempts. [**CRITIC**](https://arxiv.org/abs/2305.11738) connected self-correction with external tools and observable evidence. [Research on self-debugging](https://arxiv.org/abs/2304.05128) confirmed that models can improve code by analyzing execution results. [Work on adversarial testing and verifier-guided search](https://arxiv.org/abs/2604.10449) showed that a separate verifier or attacker can detect seemingly correct solutions that pass conventional checks.
+The adversarial stage addresses weaknesses in both fixed and model-generated tests. [EvalPlus](https://arxiv.org/abs/2305.01210) showed that the original HumanEval suites accepted substantial amounts of functionally incorrect code. [Revisit Self-Debugging with Self-Generated Tests for Code Generation](https://arxiv.org/abs/2501.12793) found that self-generated tests can produce biased and misleading repair signals. Taken together, the previously mentioned studies and the 2026 preprint [AdverMCTS](https://arxiv.org/abs/2604.10449) provide the closest evidence for Bello's attacker role; in AdverMCTS, targeted corner cases reduced pseudo-correctness caused by sparse static tests in its programming-problem setting. Bello accordingly separates implementation, counterexample generation, and adjudication. The adversary searches beyond the existing suite, but its tests are candidate evidence rather than ground truth; the completion reviewer decides whether a finding violates the specification, and relevant edits invalidate earlier acceptance evidence.
 
-These findings support individual elements of Bello's architecture. Most of this work, however, studies a single mechanism: reflection, correction, verification, debate, test generation, or adversarial search.
+The [AgentCoder](https://arxiv.org/abs/2312.13010) preprint is the closest prior architecture: it separates a programmer, an implementation-independent test designer, and a test executor, and its ablations support separating test construction from code generation. Its evaluation is limited to function-level synthesis and completion when generated tests pass. It therefore supports Bello's role separation without covering long-running runtime supervision, a separate completion gate, adversarial adjudication, or restart state. These additional controls target failures identified by [MAST](https://arxiv.org/abs/2503.13657) across more than 1,600 multi-agent traces, including role violations, history loss, task derailment, premature termination, and absent or incorrect verification. Bello maps them to fixed role contracts, durable handoffs, live drift detection, explicit stage transitions, and a separate final acceptance decision. Multi-agent specialization is prior art; Bello's architectural claim concerns the governance and evidence requirements imposed around the roles.
 
-Bello combines these mechanisms into a unified system for managing long-running work.
+Finally, [CaMeL](https://arxiv.org/abs/2503.18813) demonstrates a prompt-injection defense in which trusted control flow and security policy are enforced by a protective system layer rather than delegated to model compliance. Bello applies the same principle through isolated execution, mediated actions, live runtime supervision, and fail-closed approvals, without claiming CaMeL's capability model or formal guarantees.
+
+## Choose your supervision depth
+
+Bello can be used as a lightweight safety layer or as a full quality pipeline.
+In the schedules below, `C` is an independent **completion review** and `A` is
+an **adversarial pass**. Runtime supervision remains active in every mode.
+
+| Mode | Best for | What you get |
+| --- | --- | --- |
+| `runtime-only` | Everyday autonomous work | Spots when the coder takes a wrong turn and steers the run back toward the task. |
+| `C+A` | High-quality work on a practical budget | Captures 69% of the full schedule's gain while keeping every runtime safeguard. |
+| `4C+A+2C` | Flagship, high-stakes work | The deepest review schedule, delivering about 40% higher benchmark completion than Raw Codex. |
+
+### `runtime-only` — protect the run
+
+The coder works normally while a clean-context supervisor watches the live
+trajectory. It can stop abrupt, irreversible actions—such as dropping a
+database—and redirect a coder that has drifted away from the task. In our
+tests, this avoided rare but potentially fatal failures while costing about
+the same as Raw Codex on average, sometimes substantially less, and improving
+mean completion by roughly 2%.
+
+### `C+A` — concentrate the quality gain
+
+This schedule adds one independent completion review followed by an
+adversarial attempt to break the result. It retains all `runtime-only`
+protections and captured **69% of the improvement** delivered by
+the full `4C+A+2C` schedule in our shorter-run comparison. It is the balanced
+choice when material defects matter but the flagship schedule would be
+excessive.
+
+### `4C+A+2C` — maximize confidence
+
+Four completion-review opportunities refine the implementation before the
+adversary probes its assumptions; two further reviews resolve what the attack
+uncovers. This is Bello's flagship schedule for demanding, high-stakes work.
+Across the reported benchmarks it improved completion by roughly **40% over
+Raw Codex**, prioritizing coverage and confidence over elapsed time.
+
+Configure these schedules with `bello config`. For `runtime-only`, set
+`completion-review` and `adversary` to `false`. For `C+A`, enable both and
+set `max-reviews-before-adversary`, `max-adversary-runs`, and
+`max-reviews-after-adversary` to `1`, `1`, and `0`; use `4`, `1`, and `2` for
+`4C+A+2C`. The fields, defaults, and one-run CLI overrides are documented in
+the [Configuration section](#configuration).
 
 ## Results
 
-### Key findings
+### 1. `runtime-only` — low-cost protection
+
+On the three ProgramBench tasks—Solar, Samtools, and Rumdl—`runtime-only`
+improved average completion by approximately **2%** over Raw Codex. The larger
+benefit is risk control: a fresh supervisor can catch a dangerous action or a
+bad trajectory before it becomes an unrecoverable final result, without the
+cost of scheduled completion-review and adversary rounds.
+
+We also tested `runtime-only` on
+[three custom tasks](https://drive.google.com/drive/u/1/folders/1eLut349Wu_uxw59H6u87cuWNRqYb3x7x)
+designed to resemble ordinary work rather than polished benchmark prompts.
+**Their briefs are deliberately incomplete, awkward, and uneven—the way a
+task is often described by a normal colleague at work.**
+
+| Task | Raw Codex score | `runtime-only` score | Difference | Raw Codex time | `runtime-only` time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Marl | 32.91% | **37.91%** | **+5.00 pp** | 00:58:49 | 00:46:09 |
+| Slab | 81.08% | **85.69%** | **+4.61 pp** | 00:57:26 | 01:04:11 |
+| Pinch | 89.25% | **98.00%** | **+8.75 pp** | 00:40:09 | 00:43:34 |
+
+![Runtime-only results on custom workplace-style tasks](./docs/assets/runtime-only-custom-task-results.svg)
+
+*Figure R1. Comparable 0–100 evaluator scores for Marl, Slab, and Pinch. These
+are separate task-specific measures, not components of a pooled benchmark.*
+
+The [linked](https://drive.google.com/drive/u/1/folders/1eLut349Wu_uxw59H6u87cuWNRqYb3x7x)
+folder contains the complete task briefs, tests, evaluator outputs, and result
+artifacts.
+
+### 2. `C+A` — a shorter quality–efficiency balance
+
+With GPT-5.6 Sol at `ultra`, C+A raised the unweighted macro completion score
+from **53.53% to 67.67%**: **+14.14 percentage points** (**+26.41% relative**).
+The three-task runtime was **07:08:06**, compared with **03:39:22** for Raw
+Codex. The corresponding rows are available in the
+[C+A run-level data](./programbench_ca_run_info.csv).
+The corresponding Bello solutions are available in the
+[C+A solution artifacts folder](https://drive.google.com/drive/u/1/folders/1oWR5v3fziEZj1PkQ8xDyq5JBRCUPf5gV).
+
+| Task | Raw Codex completion | C+A completion | Difference (pp) | Relative change | Raw Codex time | C+A time |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Solar | 53.13% | **59.00%** | **+5.87** | +11.05% | 00:42:16 | 02:17:45 |
+| Samtools | 51.86% | **63.00%** | **+11.14** | +21.48% | 00:47:07 | 02:14:40 |
+| Rumdl | 55.60% | **81.00%** | **+25.40** | +45.68% | 02:09:59 | 02:35:41 |
+| **Macro mean / total time** | 53.53% | **67.67%** | **+14.14** | **+26.41%** | **03:39:22** | **07:08:06** |
+
+![C+A completion and runtime compared with Raw Codex](./docs/assets/programbench-ca-performance.svg)
+
+*Figure C1. ProgramBench completion and runtime for the three matched GPT-5.6
+Sol `ultra` task configurations.*
+
+### 3. `4C+A+2C` — flagship quality
+
+#### Key findings
 
 - Across all three tasks and model–effort settings, Bello achieved the higher
   completion score in **9 of 9 matched configurations**. The overall unweighted
@@ -121,7 +193,7 @@ Bello combines these mechanisms into a unified system for managing long-running 
   average increased from **36.79% to 49.53%**: **+12.74 percentage points**
   (+34.64% relative).
 
-### Evaluation protocol
+#### Evaluation protocol
 
 We evaluated Bello on three ProgramBench tasks: **Solar**, **Samtools**, and
 **Rumdl**. Raw Codex and Bello were observed on every task with GPT-5.6 Sol in
@@ -134,16 +206,16 @@ The final solution patches for all nine reported Bello runs, together with
 SHA-256 checksums, are available in the
 [public evaluation artifacts folder](https://drive.google.com/drive/folders/1MSyxidKXeQz7DA0gKn6KJtcWmefFu2-D?usp=share_link).
 
-### GPT-5.6 Sol
+#### GPT-5.6 Sol
 
-#### `ultra`
+##### `ultra`
 
 | Task | Raw Codex completion | Bello completion | Difference (pp) | Relative change | Raw Codex time | Bello time |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Solar | 53.13% | **71.30%** | **+18.17** | +34.20% | 00:32:33 | 07:39:17 |
-| Samtools | 51.86% | **70.60%** | **+18.74** | +36.14% | 00:36:17 | 19:25:22 |
-| Rumdl | 55.60% | **80.19%** | **+24.59** | +44.23% | 01:40:05 | 07:44:12 |
-| **Macro mean / total time** | 53.53% | **74.03%** | **+20.50** | **+38.30%** | **02:48:55** | **34:48:51** |
+| Solar | 53.13% | **71.30%** | **+18.17** | +34.20% | 00:42:16 | 07:39:17 |
+| Samtools | 51.86% | **70.60%** | **+18.74** | +36.14% | 00:47:07 | 19:25:22 |
+| Rumdl | 55.60% | **80.19%** | **+24.59** | +44.23% | 02:09:59 | 07:44:12 |
+| **Macro mean / total time** | 53.53% | **74.03%** | **+20.50** | **+38.30%** | **03:39:22** | **34:48:51** |
 
 *Bold completion values indicate the higher observed score within each matched
 row.*
@@ -159,14 +231,14 @@ from 53.53% to 74.03%, a gain of 20.50 points (38.30% relative).
 shows the unweighted mean difference (+20.50 points). Uncertainty intervals are
 not shown because each configuration has one observation.*
 
-#### `xhigh`
+##### `xhigh`
 
 | Task | Raw Codex completion | Bello completion | Difference (pp) | Relative change | Raw Codex time | Bello time |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Solar | 46.61% | **66.50%** | **+19.89** | +42.67% | 00:16:58 | 04:26:04 |
-| Samtools | 38.11% | **51.93%** | **+13.82** | +36.26% | 00:28:48 | 05:39:13 |
-| Rumdl | 48.19% | **61.74%** | **+13.55** | +28.12% | 00:31:57 | 03:53:35 |
-| **Macro mean / total time** | 44.30% | **60.06%** | **+15.75** | **+35.56%** | **01:17:43** | **13:58:52** |
+| Solar | 46.61% | **66.50%** | **+19.89** | +42.67% | 00:22:02 | 04:26:04 |
+| Samtools | 38.11% | **51.93%** | **+13.82** | +36.26% | 00:37:24 | 05:39:13 |
+| Rumdl | 48.19% | **61.74%** | **+13.55** | +28.12% | 00:41:30 | 03:53:35 |
+| **Macro mean / total time** | 44.30% | **60.06%** | **+15.75** | **+35.56%** | **01:40:56** | **13:58:52** |
 
 *Bold completion values indicate the higher observed score within each matched
 row.*
@@ -182,16 +254,16 @@ points, and the unweighted macro average increased from 44.30% to 60.06%
 shows the unweighted mean difference (+15.75 points). Uncertainty intervals are
 not shown because each configuration has one observation.*
 
-### GPT-5.5
+#### GPT-5.5
 
-#### `xhigh`
+##### `xhigh`
 
 | Task | Raw Codex completion | Bello completion | Difference (pp) | Relative change | Raw Codex time | Bello time |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Solar | 43.78% | **53.39%** | **+9.61** | +21.95% | 00:16:27 | 01:29:35 |
-| Samtools | 20.28% | **44.21%** | **+23.93** | +118.00% | 00:16:28 | 02:30:01 |
-| Rumdl | 46.30% | **50.99%** | **+4.69** | +10.13% | 00:26:03 | 03:30:01 |
-| **Macro mean / total time** | 36.79% | **49.53%** | **+12.74** | **+34.64%** | **00:58:58** | **07:29:37** |
+| Solar | 43.78% | **53.39%** | **+9.61** | +21.95% | 00:21:22 | 01:29:35 |
+| Samtools | 20.28% | **44.21%** | **+23.93** | +118.00% | 00:21:23 | 02:30:01 |
+| Rumdl | 46.30% | **50.99%** | **+4.69** | +10.13% | 00:33:50 | 03:30:01 |
+| **Macro mean / total time** | 36.79% | **49.53%** | **+12.74** | **+34.64%** | **01:16:35** | **07:29:37** |
 
 *Bold completion values indicate the higher observed score within each matched
 row.*
@@ -200,7 +272,7 @@ Bello's score was higher on all three tasks. The task-level differences ranged
 from 4.69 to 23.93 percentage points; the unweighted macro average increased
 from 36.79% to 49.53%, a gain of 12.74 points (34.64% relative).
 
-### Cross-task completion summary
+#### Cross-task completion summary
 
 ![Cross-task completion scores for all three model–effort comparisons](./docs/assets/programbench-cross-task-completion.svg)
 
@@ -209,7 +281,7 @@ from 36.79% to 49.53%, a gain of 12.74 points (34.64% relative).
 and GPT-5.5 `xhigh` comparisons. The unweighted macro differences are +20.50,
 +15.75, and +12.74 percentage points, respectively.*
 
-### Task-level configuration profiles
+#### Task-level configuration profiles
 
 The following panels compare all three complete three-task configurations:
 GPT-5.5 `xhigh`, GPT-5.6 Sol `xhigh`, and GPT-5.6 Sol `ultra`. Each panel
@@ -233,31 +305,6 @@ configurations, sorted from lowest to highest.*
 
 *Figure 3c. Rumdl completion scores for the six model–effort
 configurations, sorted from lowest to highest.*
-
-### A shorter quality–efficiency balance
-
-We also tested a shorter `C+A+C` schedule: it reached 63% completion on
-Samtools and 79% on Rumdl. Each completion-review or adversary pass is designed
-to find every material defect it can in the solution snapshot it receives, so
-each successive pass tends to deliver a smaller quality gain at roughly the
-same per-pass cost. The `C+A+C` results, together with an intermediate run in
-which the first two completion reviews delivered roughly 80% of the eventual
-improvement, support this diminishing-returns pattern. We therefore recommend
-`C+A`—one completion review followed by one adversary pass—as the best balance
-of quality, time, and cost. We expect it to retain about 60–70% of the full
-schedule's quality gain: against the roughly 35% average relative improvement
-observed above, that corresponds to an estimated gain of about 20% over Raw
-Codex.
-
-Time and cost remain limitations. We estimate that `C+A` takes approximately
-2.5× as long as Raw Codex and costs approximately 2.7× as much. The absolute
-impact is much smaller than those multipliers suggest: in our observed `ultra`
-runs, Raw Codex used about 0.2–0.3% of a weekly usage limit on a substantial
-task, while `C+A+C` used at most about 1.2%. In economic terms, the
-share of the available budget matters alongside the relative increase: tripling
-a negligible expense is less noticeable than a 5% increase in something that
-already consumes half the budget. We are actively working to reduce both
-runtime and cost without giving up the quality improvement.
 
 ## Requirements
 
@@ -318,66 +365,6 @@ Everything the run does is written to inspectable files under `.supervisor/`
 in your project: `PROGRESS.md` (what has happened), `DECISIONS.md` (standing
 decisions), `HANDOFF.md` (restart context), `events.jsonl` (full event
 stream), and `FINAL_REPORT.md` (the result).
-
-## Run modes
-
-Bello is built for walk-away execution. In both primary modes, the coder works
-inside a disposable, network-isolated snapshot rather than directly in your
-live project. A fresh-context runtime supervisor evaluates risky or
-out-of-sandbox actions, catches drift, and manages recovery; unsupported
-requests and supervisor failures fail closed. Only an accepted, policy-checked
-patch is transferred back to the project.
-
-The modes differ in what happens after the coder reports validated readiness.
-
-### Everyday (default)
-
-Everyday is for short and medium tasks. A fresh project uses GPT-5.6 Sol at
-`xhigh` for both the coder and full runtime supervisor, with Luna handling
-routine cheap runtime triage. Completion review and the adversary are off.
-
-```bash
-bello --task task.md
-```
-
-The run finishes once the coder's readiness passes Bello's required
-validation gates. Runtime supervision remains active throughout the run; only
-the final review loop is skipped.
-
-### Deep Work
-
-Deep Work is for long, demanding tasks with many details and edge cases, where
-quality takes priority over time and cost. It adds an independent completion
-reviewer and an adversarial tester, both GPT-5.6 Sol at `xhigh` by default.
-
-The default Deep Work schedule is `C+A`:
-
-- 1 completion-review round.
-- 1 adversary pass in a disposable snapshot.
-- No scheduled post-adversary review rounds.
-
-If completion review returns a defect, the coder fixes it before the adversary
-runs. If the adversary reports no candidate finding, the run completes. A
-candidate adversary finding always receives one independent completion-review
-adjudication so Bello can reject a false positive or return a real defect to
-the coder; this conditional integrity check is not a scheduled `+C` phase.
-
-To enable Deep Work, run `bello config`, set `completion-review` to `true`,
-then set `adversary` to `true`. The revealed schedule values default to `1`, `1`,
-and `0`: one completion-review return budget before one adversary pass, with no
-scheduled post-adversary review rounds. For a single run without rewriting the
-saved config:
-
-```bash
-bello --task task.md --completion-review=true --adversary=true
-```
-
-### Custom
-
-For experiments, configure the coder, runtime supervisor, completion reviewer,
-and adversary independently. Each role can use any available GPT-5.6 variant
-and its own reasoning effort, and the review and adversary budgets can be
-combined freely.
 
 ## Configuration
 

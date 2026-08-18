@@ -62,6 +62,7 @@ from supervisor.schemas import (
     EvidenceProvenanceSummary,
     FinalReport,
     HealthDelta,
+    HealthState,
     HumanMessage,
     InspectionOutput,
     InspectionRun,
@@ -112,7 +113,6 @@ LARGE_DIFF_CHANGED_LINES_THRESHOLD = 500
 LARGE_DIFF_CHANGED_FILES_THRESHOLD = 10
 PROTECTED_RUNTIME_WAKE_REASONS = {
     "done_without_fresh_validation",
-    "masked_validation",
     "repeated_same_failing_validation",
     "restart_budget",
     "suspicious_file_touched",
@@ -120,7 +120,10 @@ PROTECTED_RUNTIME_WAKE_REASONS = {
 }
 MANDATORY_FULL_RUNTIME_WAKE_REASONS = {
     "done_without_fresh_validation",
+    "restart_budget",
+    "runtime_apply_retry",
     "runtime_control_replacement",
+    "runtime_decision_retry",
 }
 CONTROLLER_IDLE_GUARD_INTERVAL_SECONDS = 60.0
 CONTROLLER_IDLE_GUARD_STALL_SECONDS = 300.0
@@ -193,6 +196,16 @@ class ControllerEvent:
 
 
 @dataclass(frozen=True)
+class QueuedSupervisorCheck:
+    summary: str
+    triggering_item_id: str | None = None
+    triggering_action: TriggeringAction | None = None
+    human_message: HumanMessage | None = None
+    patch_summary: str | None = None
+    completion_review: bool = False
+
+
+@dataclass(frozen=True)
 class AcceptGateResult:
     passed: bool
     failure_type: str | None = None
@@ -206,6 +219,8 @@ class AcceptGateResult:
 class RuntimeTriggerDecision:
     should_wake: bool
     reasons: tuple[str, ...] = ()
+    restart_reason: str | None = None
+    deterministic_action: str | None = None
 
 
 @dataclass(frozen=True)
@@ -322,6 +337,7 @@ class BelloController:
         self.tui = tui or TerminalTUI()
         self.supervisor: StatelessSupervisorAgent | None = None
         self.completion_supervisor: StatelessSupervisorAgent | None = None
+        self.adv_report_controller: StatelessSupervisorAgent | None = None
         self.approvals: ApprovalManager | None = None
         self.runtime_triage_config: CheapRuntimeTriageConfig = runtime_triage_config_from_env(
             enabled=project_config.cheap_runtime if project_config is not None else True
@@ -342,6 +358,10 @@ class BelloController:
         self._supervisor_dirty = False
         self._supervisor_next_summary: str | None = None
         self._supervisor_next_completion_review = False
+        self._supervisor_next_runtime_summary: str | None = None
+        self._supervisor_next_completion_summary: str | None = None
+        self._supervisor_next_runtime_check: QueuedSupervisorCheck | None = None
+        self._supervisor_next_completion_check: QueuedSupervisorCheck | None = None
         self._current_turn_action_count = 0
         # True at run start (the initial generation begins working immediately); reset to False by
         # restart() until the new generation's first coder turn starts.
@@ -354,6 +374,8 @@ class BelloController:
         self.completion_decision_staleness_rerun_count = 0
         self.completion_return_freshness_rerun_count = 0
         self.provider_failure_recovery_counts: dict[str, int] = {}
+        self._runtime_apply_retry_count = 0
+        self._runtime_decision_retry_count = 0
         self.no_marker_idle_nudge_count = 0
         self.validation_runtime_state: dict[str, dict[str, Any]] = {}
         # Cross-review knowledge: the behavior surface accumulated by completion reviews of
@@ -374,7 +396,10 @@ class BelloController:
         self._idle_guard_fired_for_sequence: int | None = None
         self._no_marker_completion_review_key: str | None = None
         self._last_large_diff_signature: str | None = None
+        self._last_restart_budget_signature: str | None = None
         self._last_suspicious_file_signature: str | None = None
+        self._pending_runtime_trigger_signatures: dict[str, tuple[str | None, str | None]] = {}
+        self._pending_runtime_trigger_actions: dict[str, TriggeringAction] = {}
         self._suspicious_file_hash_cache: dict[str, tuple[tuple[Any, ...], str]] = {}
         self._pending_adversary_report: AdversaryReport | None = None
         self._active_adversary_thread_id: str | None = None
@@ -417,6 +442,18 @@ class BelloController:
                 model=self._completion_model(),
                 fast=self._fast_mode(),
                 intelligence=self._completion_intelligence(),
+                completion_workspace_write=True,
+                completion_source_snapshot=getattr(self, "_coder_snapshot", None),
+            )
+            self.adv_report_controller = StatelessSupervisorAgent(
+                self.client,
+                self.store,
+                self.task_path,
+                workspace_root=self._active_workspace_root(),
+                task_contents=self._canonical_task_contents,
+                model=self._completion_model(),
+                fast=self._fast_mode(),
+                intelligence=self._completion_intelligence(),
             )
             self.approvals = ApprovalManager(
                 self._active_workspace_root(),
@@ -446,6 +483,7 @@ class BelloController:
         finally:
             self.running = False
             await self._stop_supervisor_task()
+            await self._close_completion_review_session()
             snapshot = getattr(self, "_coder_snapshot", None)
             if snapshot is not None and not getattr(self, "_snapshot_patch_applied", False):
                 if getattr(self, "_coder_started", False):
@@ -747,6 +785,9 @@ class BelloController:
 
     def _completion_supervisor_agent(self) -> StatelessSupervisorAgent | None:
         return getattr(self, "completion_supervisor", None) or getattr(self, "supervisor", None)
+
+    def _adv_report_controller_agent(self) -> StatelessSupervisorAgent | None:
+        return getattr(self, "adv_report_controller", None)
 
     async def preflight(self) -> None:
         self.tui.status("checking Codex version")
@@ -1106,14 +1147,18 @@ class BelloController:
         thread_id = params.get("threadId")
         turn_id = _turn_id_from_params(params)
         item_id = _item_id_from_params(params)
+        cfg = self.store.get_bello_config()
         if _is_stream_delta_method(method):
-            self._record_command_output_delta(method, params, item_id=item_id)
+            # Completion/adversary commands are deliberately outside the coder evidence
+            # ledger. Do not retain their potentially large output chunks waiting for a
+            # coder item/completed event that can never consume them.
+            if thread_id == cfg.coder_thread_id:
+                self._record_command_output_delta(method, params, item_id=item_id)
             return
         self._append_event(AppEventSource.APP_SERVER, method, thread_id=thread_id, turn_id=turn_id, item_id=item_id)
         if getattr(self, "_terminal_cleanup_started", False) and method != "serverRequest/resolved":
             return
 
-        cfg = self.store.get_bello_config()
         if method == "serverRequest/resolved":
             request_id = params.get("requestId")
             self.pending_approvals.pop(request_id, None)
@@ -1191,6 +1236,7 @@ class BelloController:
                     runtime_decision = RuntimeTriggerDecision(
                         should_wake=True,
                         reasons=tuple(dict.fromkeys((*runtime_decision.reasons, "runtime_control_replacement"))),
+                        restart_reason=runtime_decision.restart_reason,
                     )
                 self.tui.render("TOOL", summary)
                 self._record_runtime_trigger_trace(
@@ -1201,8 +1247,14 @@ class BelloController:
                     decision=runtime_decision,
                 )
                 if runtime_decision.should_wake:
+                    runtime_summary = f"Runtime trigger ({', '.join(runtime_decision.reasons)}): {summary}"
+                    if runtime_decision.restart_reason is not None:
+                        runtime_summary = (
+                            f"Runtime trigger ({', '.join(runtime_decision.reasons)}): "
+                            f"restart candidate because {runtime_decision.restart_reason}; {summary}"
+                        )
                     self._schedule_supervisor_check(
-                        f"Runtime trigger ({', '.join(runtime_decision.reasons)}): {summary}",
+                        runtime_summary,
                         triggering_item_id=item_id,
                         triggering_action=triggering_action,
                         patch_summary=_patch_summary_from_item(item),
@@ -1401,6 +1453,17 @@ class BelloController:
 
     async def pause(self) -> None:
         self.paused = True
+        self._supervisor_next_runtime_check = None
+        self._supervisor_next_completion_check = None
+        self._supervisor_next_runtime_summary = None
+        self._supervisor_next_completion_summary = None
+        self._pending_runtime_trigger_signatures = {}
+        self._pending_runtime_trigger_actions = {}
+        self._sync_legacy_supervisor_queue_fields()
+        supervisor_task = getattr(self, "_supervisor_task", None)
+        if supervisor_task is not None and supervisor_task is not asyncio.current_task():
+            await self._stop_supervisor_task()
+        await self._close_completion_review_session()
         self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"status": BelloStatus.PAUSED}))
         if self.coder:
             try:
@@ -1448,6 +1511,16 @@ class BelloController:
         self._active_adversary_workspace_root = None
         self._adversary_denied_commands: list[str] = []
         self.validation_runtime_state = {}
+        self._last_restart_budget_signature = None
+        self._pending_runtime_trigger_signatures = {}
+        self._pending_runtime_trigger_actions = {}
+        self._runtime_apply_retry_count = 0
+        self._runtime_decision_retry_count = 0
+        self._supervisor_next_runtime_check = None
+        self._supervisor_next_completion_check = None
+        self._supervisor_next_runtime_summary = None
+        self._supervisor_next_completion_summary = None
+        self._sync_legacy_supervisor_queue_fields()
         patch_health(
             self.store,
             HealthDelta(
@@ -1745,13 +1818,16 @@ class BelloController:
             or getattr(self, "supervisor", None) is None
         ):
             return
+        if not completion_review:
+            self._retain_runtime_trigger_summary(summary, triggering_action=triggering_action)
         if self._supervisor_task and not self._supervisor_task.done():
-            self._supervisor_dirty = True
-            self._supervisor_next_summary = summary
-            self._supervisor_next_completion_review = completion_review or getattr(
-                self,
-                "_supervisor_next_completion_review",
-                False,
+            self._queue_supervisor_check(
+                summary,
+                triggering_item_id=triggering_item_id,
+                triggering_action=triggering_action,
+                human_message=human_message,
+                patch_summary=patch_summary,
+                completion_review=completion_review,
             )
             return
         self._supervisor_task = asyncio.create_task(
@@ -1765,13 +1841,76 @@ class BelloController:
             )
         )
 
+    def _queue_supervisor_check(
+        self,
+        summary: str,
+        *,
+        triggering_item_id: str | None = None,
+        triggering_action: TriggeringAction | None = None,
+        human_message: HumanMessage | None = None,
+        patch_summary: str | None = None,
+        completion_review: bool,
+    ) -> None:
+        self._supervisor_dirty = True
+        queued = QueuedSupervisorCheck(
+            summary=summary,
+            triggering_item_id=triggering_item_id,
+            triggering_action=triggering_action,
+            human_message=human_message,
+            patch_summary=patch_summary,
+            completion_review=completion_review,
+        )
+        if completion_review:
+            self._supervisor_next_completion_check = queued
+            self._supervisor_next_completion_summary = summary
+        else:
+            self._retain_runtime_trigger_summary(summary, triggering_action=triggering_action)
+            existing = getattr(self, "_supervisor_next_runtime_check", None)
+            # Human input is mandatory full-supervisor context. Do not let a later routine
+            # runtime event overwrite it in the coalesced slot; its trigger reasons remain
+            # retained and will be merged into the human-message runtime pass.
+            if existing is not None:
+                existing_has_context = bool(
+                    existing.human_message is not None
+                    or existing.triggering_action is not None
+                    or existing.triggering_item_id is not None
+                    or existing.patch_summary is not None
+                )
+                new_has_context = bool(
+                    human_message is not None
+                    or triggering_action is not None
+                    or triggering_item_id is not None
+                    or patch_summary is not None
+                )
+                if existing.human_message is not None and human_message is None:
+                    queued = existing
+                elif existing_has_context and not new_has_context:
+                    queued = existing
+            self._supervisor_next_runtime_check = queued
+            self._supervisor_next_runtime_summary = queued.summary
+        self._sync_legacy_supervisor_queue_fields()
+
+    def _sync_legacy_supervisor_queue_fields(self) -> None:
+        """Keep the old single-slot fields coherent for diagnostics and old state tests."""
+        runtime_summary = getattr(self, "_supervisor_next_runtime_summary", None)
+        completion_summary = getattr(self, "_supervisor_next_completion_summary", None)
+        self._supervisor_next_summary = runtime_summary or completion_summary
+        self._supervisor_next_completion_review = bool(
+            completion_summary is not None and runtime_summary is None
+        )
+
+    def _cancel_queued_completion_review(self) -> None:
+        self._supervisor_next_completion_check = None
+        self._supervisor_next_completion_summary = None
+        self._sync_legacy_supervisor_queue_fields()
+
     def _record_validation_progress(self, validation: ValidationRun) -> None:
         def patch(current: BelloConfig) -> BelloConfig:
             updates: dict[str, Any] = {"last_validation_sequence": validation.sequence}
             if _is_behavior_proving_validation(validation) and validation.trusted_validation_outcome != "masked_or_unknown":
                 updates["last_trusted_behavioral_validation_sequence"] = validation.sequence
-                if validation.trusted_validation_outcome == "passed":
-                    updates["last_trusted_passing_behavioral_validation_sequence"] = validation.sequence
+            if _validation_is_usable_behavioral_pass(validation):
+                updates["last_trusted_passing_behavioral_validation_sequence"] = validation.sequence
             return current.model_copy(update=updates)
 
         self.store.update_bello_config(patch)
@@ -1787,9 +1926,7 @@ class BelloController:
         previous_failed_count = int(previous.get("consecutive_failed_count") or 0)
         current_outcome = validation.trusted_validation_outcome
         reasons: list[str] = []
-        if current_outcome == "masked_or_unknown":
-            reasons.append("masked_validation")
-        elif current_outcome == "failed":
+        if current_outcome == "failed":
             if previous_outcome == "passed":
                 reasons.append("validation_regression")
             failed_count = previous_failed_count + 1 if previous_outcome == "failed" else 1
@@ -1817,25 +1954,9 @@ class BelloController:
             )
         return tuple(dict.fromkeys(reasons))
 
-    def _has_unresolved_runtime_validation_risk(self) -> bool:
-        state = getattr(self, "validation_runtime_state", None) or {}
-        for entry in state.values():
-            if not isinstance(entry, dict):
-                continue
-            if entry.get("trusted_validation_outcome") == "masked_or_unknown":
-                return True
-            try:
-                failed_count = int(entry.get("consecutive_failed_count") or 0)
-            except (TypeError, ValueError):
-                failed_count = 0
-            if failed_count >= 2:
-                return True
-        return False
-
     def _deterministic_runtime_noop_reason(
         self,
         *,
-        action: TriggeringAction,
         reasons: list[str],
     ) -> str | None:
         if not reasons:
@@ -1843,11 +1964,143 @@ class BelloController:
         reason_set = set(reasons)
         if reason_set & PROTECTED_RUNTIME_WAKE_REASONS:
             return None
-        if self._has_unresolved_runtime_validation_risk():
-            return None
-        if reason_set == {"large_diff"} and _is_file_change_activity(action):
-            return "routine file-change large diff"
+        if reason_set == {"nonzero_exit"}:
+            return "first isolated nonzero exit"
         return None
+
+    def _runtime_pending_trigger_signatures(self) -> dict[str, tuple[str | None, str | None]]:
+        pending = getattr(self, "_pending_runtime_trigger_signatures", None)
+        if pending is None:
+            pending = {}
+            self._pending_runtime_trigger_signatures = pending
+        return pending
+
+    def _runtime_pending_trigger_actions(self) -> dict[str, TriggeringAction]:
+        pending = getattr(self, "_pending_runtime_trigger_actions", None)
+        if pending is None:
+            pending = {}
+            self._pending_runtime_trigger_actions = pending
+        return pending
+
+    def _retain_runtime_trigger_summary(
+        self,
+        summary: str,
+        *,
+        triggering_action: TriggeringAction | None = None,
+        replace_existing: bool = True,
+    ) -> None:
+        """Keep every routed runtime reason alive until a runtime pass consumes it."""
+        reasons = list(_runtime_trigger_reasons_from_summary(summary))
+        if summary.lstrip().startswith("Runtime integrity trigger:"):
+            reasons.append("runtime_control_replacement")
+        if not reasons:
+            return
+        pending = self._runtime_pending_trigger_signatures()
+        pending_actions = self._runtime_pending_trigger_actions()
+        action_signature = (
+            _runtime_action_signature(triggering_action)
+            if triggering_action is not None
+            else None
+        )
+        for reason in dict.fromkeys(reasons):
+            if reason == "restart_budget":
+                candidate, restart_reason = kill_restart_candidate(self.store.get_health())
+                signature = (
+                    _restart_budget_signature(self.store.get_health(), restart_reason)
+                    if candidate and restart_reason
+                    else None
+                )
+                entry = (signature, restart_reason)
+            elif reason in {"large_diff", "suspicious_file_touched"} and reason in pending:
+                entry = pending[reason]
+            else:
+                entry = (action_signature, None)
+            is_new_reason = reason not in pending
+            if is_new_reason or (
+                replace_existing
+                and entry[0] is not None
+                and pending[reason] != entry
+            ):
+                pending[reason] = entry
+            if triggering_action is not None and (is_new_reason or replace_existing):
+                pending_actions[reason] = triggering_action
+
+    def _prepare_runtime_trigger_summary(
+        self,
+        summary: str,
+        *,
+        pending: dict[str, tuple[str | None, str | None]],
+    ) -> str:
+        """Describe the exact retained trigger batch included in this runtime pass."""
+        existing_reasons = list(_runtime_trigger_reasons_from_summary(summary))
+        reasons = list(dict.fromkeys((*existing_reasons, *pending.keys())))
+        if not reasons:
+            return summary
+
+        prepared_summary = summary
+        if pending:
+            match = re.match(r"\s*Runtime trigger \([^)]*\):\s*", summary)
+            detail = summary[match.end() :] if match else summary
+            restart_entry = pending.get("restart_budget")
+            if restart_entry is not None and restart_entry[1]:
+                restart_prefix = f"restart candidate because {restart_entry[1]}"
+                if restart_prefix not in detail:
+                    detail = f"{restart_prefix}; {detail}"
+            prepared_summary = f"Runtime trigger ({', '.join(reasons)}): {detail}"
+        return prepared_summary
+
+    def _ack_runtime_trigger_batch(
+        self,
+        pending_batch: dict[str, tuple[str | None, str | None]],
+    ) -> None:
+        """Mark only the trigger batch covered by a successful routing decision as handled."""
+        pending = self._runtime_pending_trigger_signatures()
+        for reason, entry in pending_batch.items():
+            current_entry = pending.get(reason)
+            if current_entry is None:
+                # The condition cleared while this review was in flight. Do not stamp its
+                # old signature as handled; a later recurrence must be treated as new state.
+                continue
+            signature = entry[0]
+            if reason == "large_diff" and signature is not None:
+                self._last_large_diff_signature = signature
+            elif reason == "suspicious_file_touched" and signature is not None:
+                self._last_suspicious_file_signature = signature
+            elif reason == "restart_budget" and signature is not None:
+                self._last_restart_budget_signature = signature
+            if current_entry == entry:
+                pending.pop(reason, None)
+                self._runtime_pending_trigger_actions().pop(reason, None)
+        queued = getattr(self, "_supervisor_next_runtime_check", None)
+        if queued is not None:
+            queued_reasons = _runtime_trigger_reasons_from_summary(queued.summary)
+            remaining_reasons = list(pending)
+            if queued_reasons and not remaining_reasons:
+                self._supervisor_next_runtime_check = None
+                self._supervisor_next_runtime_summary = None
+                self._sync_legacy_supervisor_queue_fields()
+            elif queued_reasons and tuple(remaining_reasons) != queued_reasons:
+                match = re.match(r"\s*Runtime trigger \([^)]*\):\s*", queued.summary)
+                detail = queued.summary[match.end() :] if match else queued.summary
+                updated_summary = f"Runtime trigger ({', '.join(remaining_reasons)}): {detail}"
+                carrier_action = next(
+                    (
+                        self._runtime_pending_trigger_actions().get(reason)
+                        for reason in remaining_reasons
+                        if self._runtime_pending_trigger_actions().get(reason) is not None
+                    ),
+                    queued.triggering_action,
+                )
+                self._supervisor_next_runtime_check = QueuedSupervisorCheck(
+                    summary=updated_summary,
+                    triggering_item_id=queued.triggering_item_id,
+                    triggering_action=carrier_action,
+                    human_message=queued.human_message,
+                    patch_summary=queued.patch_summary,
+                    completion_review=False,
+                )
+                self._supervisor_next_runtime_summary = updated_summary
+                self._sync_legacy_supervisor_queue_fields()
 
     def _update_relevant_edit_state(self, changed_files: list[ChangedFile]) -> None:
         task_contents = self._canonical_task_text()
@@ -1890,11 +2143,16 @@ class BelloController:
             reasons.append("nonzero_exit")
         if _action_timed_out(action):
             reasons.append("timeout")
-        if validation is not None and validation.trusted_validation_outcome == "masked_or_unknown":
-            reasons.append("masked_validation")
         large_diff_signature = _large_diff_signature(changed_files) if _has_large_diff(changed_files) else None
-        if large_diff_signature is not None and not read_only_action:
+        large_diff_is_new = bool(
+            large_diff_signature is not None
+            and large_diff_signature != getattr(self, "_last_large_diff_signature", None)
+            and large_diff_signature
+            != self._runtime_pending_trigger_signatures().get("large_diff", (None, None))[0]
+        )
+        if large_diff_is_new and not read_only_action:
             reasons.append("large_diff")
+            self._runtime_pending_trigger_signatures()["large_diff"] = (large_diff_signature, None)
         suspicious_file_hash_cache = getattr(self, "_suspicious_file_hash_cache", None)
         if suspicious_file_hash_cache is None:
             suspicious_file_hash_cache = self._suspicious_file_hash_cache = {}
@@ -1905,27 +2163,49 @@ class BelloController:
         )
         if suspicious_file_signature is None:
             self._last_suspicious_file_signature = None
+            self._runtime_pending_trigger_signatures().pop("suspicious_file_touched", None)
+            self._runtime_pending_trigger_actions().pop("suspicious_file_touched", None)
         elif suspicious_file_signature != getattr(self, "_last_suspicious_file_signature", None):
-            reasons.append("suspicious_file_touched")
-            self._last_suspicious_file_signature = suspicious_file_signature
+            pending_suspicious = self._runtime_pending_trigger_signatures().get(
+                "suspicious_file_touched", (None, None)
+            )[0]
+            if suspicious_file_signature != pending_suspicious:
+                reasons.append("suspicious_file_touched")
+                self._runtime_pending_trigger_signatures()["suspicious_file_touched"] = (
+                    suspicious_file_signature,
+                    None,
+                )
         restart_candidate, restart_reason = kill_restart_candidate(self.store.get_health())
-        if restart_candidate and restart_reason and not read_only_action:
+        restart_signature = (
+            _restart_budget_signature(self.store.get_health(), restart_reason)
+            if restart_candidate and restart_reason
+            else None
+        )
+        if restart_signature is None:
+            self._last_restart_budget_signature = None
+            self._runtime_pending_trigger_signatures().pop("restart_budget", None)
+            self._runtime_pending_trigger_actions().pop("restart_budget", None)
+        if (
+            restart_signature is not None
+            and restart_signature != getattr(self, "_last_restart_budget_signature", None)
+            and restart_signature
+            != self._runtime_pending_trigger_signatures().get("restart_budget", (None, None))[0]
+        ):
             reasons.append("restart_budget")
+            self._runtime_pending_trigger_signatures()["restart_budget"] = (
+                restart_signature,
+                restart_reason,
+            )
         reasons = list(dict.fromkeys(reasons))
         if self._deterministic_runtime_noop_reason(
-            action=action,
             reasons=reasons,
         ):
             return RuntimeTriggerDecision(should_wake=False, reasons=())
-        if (
-            reasons == ["large_diff"]
-            and large_diff_signature is not None
-            and getattr(self, "_last_large_diff_signature", None) == large_diff_signature
-        ):
-            reasons = []
-        elif large_diff_signature is not None and "large_diff" in reasons:
-            self._last_large_diff_signature = large_diff_signature
-        return RuntimeTriggerDecision(should_wake=bool(reasons), reasons=tuple(reasons))
+        return RuntimeTriggerDecision(
+            should_wake=bool(reasons),
+            reasons=tuple(reasons),
+            restart_reason=restart_reason if "restart_budget" in reasons else None,
+        )
 
     def _record_runtime_trigger_trace(
         self,
@@ -1949,6 +2229,7 @@ class BelloController:
             "cwd": action.cwd if action is not None else None,
             "exit_code": action.exit_code if action is not None else None,
             "status": action.status if action is not None else None,
+            "timed_out": action.timed_out if action is not None else False,
             "changed_files_count": len(changed_files),
             "changed_files": [changed.path for changed in changed_files[:20]],
             "changed_lines": additions + deletions,
@@ -1961,7 +2242,9 @@ class BelloController:
             "masking_reason": validation.masking_reason if validation is not None else None,
             "should_wake_runtime_supervisor": decision.should_wake,
             "trigger_reasons": list(decision.reasons),
-            "skipped_noop": not decision.should_wake,
+            "restart_reason": decision.restart_reason,
+            "deterministic_action": decision.deterministic_action,
+            "skipped_noop": not decision.should_wake and decision.deterministic_action is None,
         }
         self.store.append_runtime_trace(trace)
         self._update_runtime_metrics(trace)
@@ -2003,6 +2286,10 @@ class BelloController:
                 current["runtime_wakes_total"] = int(current.get("runtime_wakes_total") or 0) + 1
             if trace.get("skipped_noop"):
                 current["runtime_skipped_noop_total"] = int(current.get("runtime_skipped_noop_total") or 0) + 1
+            if trace.get("deterministic_action"):
+                current["runtime_deterministic_action_total"] = int(
+                    current.get("runtime_deterministic_action_total") or 0
+                ) + 1
             counts = current.get("runtime_trigger_reason_counts")
             if not isinstance(counts, dict):
                 counts = {}
@@ -2057,6 +2344,7 @@ class BelloController:
     ) -> None:
         while True:
             self._supervisor_dirty = False
+            self._runtime_decision_invalidated_completion = False
             await self._run_supervisor_check(
                 summary,
                 triggering_item_id,
@@ -2066,18 +2354,44 @@ class BelloController:
                 completion_review,
             )
             self._mark_controller_activity()
-            if not self._supervisor_dirty:
+            if not self.running or getattr(self, "paused", False):
                 return
-            if not self.running:
+            if not completion_review and getattr(
+                self,
+                "_runtime_decision_invalidated_completion",
+                False,
+            ):
+                self._cancel_queued_completion_review()
+            runtime_summary = getattr(self, "_supervisor_next_runtime_summary", None)
+            completion_summary = getattr(self, "_supervisor_next_completion_summary", None)
+            if runtime_summary is not None:
+                queued = getattr(self, "_supervisor_next_runtime_check", None) or QueuedSupervisorCheck(
+                    summary=runtime_summary,
+                    completion_review=False,
+                )
+                self._supervisor_next_runtime_check = None
+                self._supervisor_next_runtime_summary = None
+            elif completion_summary is not None:
+                queued = getattr(
+                    self,
+                    "_supervisor_next_completion_check",
+                    None,
+                ) or QueuedSupervisorCheck(
+                    summary=completion_summary,
+                    completion_review=True,
+                )
+                self._supervisor_next_completion_check = None
+                self._supervisor_next_completion_summary = None
+            else:
+                self._sync_legacy_supervisor_queue_fields()
                 return
-            summary = self._supervisor_next_summary or "Supervisor check was dirty; reviewing latest state"
-            completion_review = getattr(self, "_supervisor_next_completion_review", False)
-            self._supervisor_next_summary = None
-            self._supervisor_next_completion_review = False
-            triggering_item_id = None
-            triggering_action = None
-            human_message = None
-            patch_summary = None
+            self._sync_legacy_supervisor_queue_fields()
+            summary = queued.summary
+            triggering_item_id = queued.triggering_item_id
+            triggering_action = queued.triggering_action
+            human_message = queued.human_message
+            patch_summary = queued.patch_summary
+            completion_review = queued.completion_review
 
     async def _run_supervisor_check(
         self,
@@ -2088,6 +2402,20 @@ class BelloController:
         patch_summary: str | None,
         completion_review: bool = False,
     ) -> None:
+        runtime_trigger_batch: dict[str, tuple[str | None, str | None]] = {}
+        if not completion_review:
+            self._retain_runtime_trigger_summary(
+                summary,
+                triggering_action=triggering_action,
+                replace_existing=False,
+            )
+            runtime_trigger_batch = dict(self._runtime_pending_trigger_signatures())
+            runtime_trigger_actions = _unique_runtime_trigger_actions(
+                self._runtime_pending_trigger_actions().get(reason)
+                for reason in runtime_trigger_batch
+            )
+        else:
+            runtime_trigger_actions = []
         agent = self._completion_supervisor_agent() if completion_review else self.supervisor
         if agent is None:
             return
@@ -2095,6 +2423,11 @@ class BelloController:
         cfg = self.store.get_bello_config()
         wake_sequence = cfg.last_event_sequence + 1
         changed_files = await self.changed_files()
+        if not completion_review:
+            summary = self._prepare_runtime_trigger_summary(
+                summary,
+                pending=runtime_trigger_batch,
+            )
         latest_change_sequence = _latest_relevant_change_sequence(changed_files)
         freshness_summary = _validation_freshness_summary(
             validations=list(self.validations),
@@ -2125,6 +2458,7 @@ class BelloController:
             triggering_item_id=triggering_item_id,
             pending_approvals=[_approval_wake_context(pending) for pending in self.pending_approvals.values()],
             triggering_action=triggering_action,
+            runtime_triggering_actions=runtime_trigger_actions,
             last_coder_message=self.last_coder_message,
             validations=list(self.validations),
             inspections=list(getattr(self, "inspections", [])),
@@ -2187,6 +2521,7 @@ class BelloController:
                 ):
                     cheap = await self._cheap_runtime_route(packet)
                     if cheap is not None and cheap.decision == "noop":
+                        self._ack_runtime_trigger_batch(runtime_trigger_batch)
                         return
                 decision = await agent.decide(packet)
         except SupervisorAgentError as exc:
@@ -2200,6 +2535,14 @@ class BelloController:
                     completion_review=completion_review,
                 )
                 if recovered:
+                    if (
+                        not completion_review
+                        and getattr(self, "_supervisor_next_runtime_summary", None) is None
+                    ):
+                        # Runtime no_message has exhausted its bounded retry and the existing
+                        # policy explicitly skips this runtime-only review. Acknowledge that
+                        # terminal skip so a retained trigger cannot strand the queue forever.
+                        self._ack_runtime_trigger_batch(runtime_trigger_batch)
                     return
             if completion_review and failure_kind == "tool_timeout":
                 recovered = await self._handle_completion_review_timeout_failure(
@@ -2208,7 +2551,42 @@ class BelloController:
                 )
                 if recovered:
                     return
-            if not completion_review and getattr(self, "_supervisor_dirty", False):
+            if not completion_review:
+                queued_runtime = getattr(self, "_supervisor_next_runtime_summary", None)
+                queued_completion = getattr(self, "_supervisor_next_completion_summary", None)
+                legacy_queued_completion = bool(
+                    getattr(self, "_supervisor_next_completion_review", False)
+                )
+                if (
+                    queued_runtime is None
+                    and queued_completion is None
+                    and not legacy_queued_completion
+                ):
+                    await self.finalize(message, status=BelloStatus.PROVIDER_FAILURE)
+                    return
+                counts = getattr(self, "provider_failure_recovery_counts", None)
+                if counts is None:
+                    counts = {}
+                    self.provider_failure_recovery_counts = counts
+                retry_key = f"runtime_monitor_{failure_kind}"
+                attempts = int(counts.get(retry_key) or 0)
+                if attempts < 1:
+                    counts[retry_key] = attempts + 1
+                    if queued_runtime is None:
+                        self._queue_supervisor_check(
+                            f"Retry runtime review after {failure_kind}: {summary}",
+                            triggering_item_id=triggering_item_id,
+                            triggering_action=triggering_action,
+                            human_message=human_message,
+                            patch_summary=patch_summary,
+                            completion_review=False,
+                        )
+                    self.store.append_text_locked(
+                        PROGRESS,
+                        f"- Runtime supervisor failed with {failure_kind}; retrying the retained runtime trigger before completion.\n",
+                    )
+                    return
+                self._cancel_queued_completion_review()
                 patch_health(
                     self.store,
                     HealthDelta(
@@ -2219,10 +2597,17 @@ class BelloController:
                 )
                 self.store.append_text_locked(
                     PROGRESS,
-                    "- Runtime supervisor check timed out after newer coder activity; continuing with the latest queued review.\n",
+                    f"- Runtime supervisor failed repeatedly with {failure_kind}; refusing to run a stale completion review.\n",
                 )
+                await self.finalize(message, status=BelloStatus.PROVIDER_FAILURE)
                 return
             await self.finalize(message, status=BelloStatus.PROVIDER_FAILURE)
+            return
+        if getattr(self, "paused", False):
+            # A user pause may race an in-flight model call. Its result belongs to the
+            # pre-pause state and must not steer, restart, or complete the paused run.
+            if completion_review:
+                await self._close_completion_review_session()
             return
         # Successful supervisor decision: reset the transient provider no_message budget so it
         # counts CONSECUTIVE empty-completion failures, not lifetime ones (a recovered provider
@@ -2230,13 +2615,75 @@ class BelloController:
         if getattr(self, "provider_failure_recovery_counts", None):
             self.provider_failure_recovery_counts = {}
         if completion_review:
+            if getattr(self, "_supervisor_next_runtime_summary", None) is not None:
+                # Runtime evidence arrived while this completion snapshot was in flight.
+                # Do not apply a now-stale accept/return/restart decision; requeue completion
+                # behind the pending runtime pass, which may steer or restart the coder. Close
+                # the review session now so a later readiness review cannot reuse this frozen
+                # verification copy after the coder has acted on runtime steering.
+                await self._close_completion_review_session()
+                self._queue_supervisor_check(
+                    summary,
+                    triggering_item_id=triggering_item_id,
+                    triggering_action=triggering_action,
+                    human_message=human_message,
+                    patch_summary=patch_summary,
+                    completion_review=True,
+                )
+                return
             await self.apply_completion_decision(decision, packet_thread_id=packet.coder_thread_id, packet=packet)
         else:
-            await self.apply_supervisor_decision(
-                decision,
-                packet_thread_id=packet.coder_thread_id,
-                packet=packet,
-            )
+            try:
+                applied = await self.apply_supervisor_decision(
+                    decision,
+                    packet_thread_id=packet.coder_thread_id,
+                    packet=packet,
+                )
+            except Exception as exc:
+                self._cancel_queued_completion_review()
+                attempts = int(getattr(self, "_runtime_apply_retry_count", 0) or 0)
+                if attempts < 1:
+                    self._runtime_apply_retry_count = attempts + 1
+                    self._queue_supervisor_check(
+                        f"Runtime trigger (runtime_apply_retry): retry decision after apply failure; {summary}",
+                        triggering_item_id=triggering_item_id,
+                        triggering_action=triggering_action,
+                        human_message=human_message,
+                        patch_summary=patch_summary,
+                        completion_review=False,
+                    )
+                    self.store.append_text_locked(
+                        PROGRESS,
+                        f"- Runtime decision application failed ({exc.__class__.__name__}); retrying once before completion.\n",
+                    )
+                    return
+                await self.finalize(
+                    f"runtime decision application failed after retry: {exc}",
+                    status=BelloStatus.PROVIDER_FAILURE,
+                )
+                return
+            self._runtime_apply_retry_count = 0
+            if applied and self.store.get_bello_config().generation == packet.generation:
+                self._runtime_decision_retry_count = 0
+                self._ack_runtime_trigger_batch(runtime_trigger_batch)
+            elif not applied:
+                attempts = int(getattr(self, "_runtime_decision_retry_count", 0) or 0)
+                if attempts < 1:
+                    self._runtime_decision_retry_count = attempts + 1
+                    self._queue_supervisor_check(
+                        f"Runtime trigger (runtime_decision_retry): refresh stale runtime decision; {summary}",
+                        triggering_item_id=triggering_item_id,
+                        triggering_action=triggering_action,
+                        human_message=human_message,
+                        patch_summary=patch_summary,
+                        completion_review=False,
+                    )
+                    return
+                self._cancel_queued_completion_review()
+                await self.finalize(
+                    "runtime supervisor returned a stale or mismatched decision after retry",
+                    status=BelloStatus.PROVIDER_FAILURE,
+                )
 
     async def _handle_completion_review_timeout_failure(self, *, message: str, summary: str) -> bool:
         """One fresh-thread retry when a completion-review turn times out.
@@ -2280,12 +2727,11 @@ class BelloController:
             decision="retry",
             reason=message,
         )
-        self._supervisor_dirty = True
-        self._supervisor_next_summary = (
+        retry_summary = (
             "Retry completion review on a fresh thread after the previous review turn timed out. "
             f"Previous review summary: {summary}"
         )
-        self._supervisor_next_completion_review = True
+        self._queue_supervisor_check(retry_summary, completion_review=True)
         return True
 
     async def _handle_supervisor_no_message_failure(
@@ -2345,15 +2791,13 @@ class BelloController:
             )
             if backoff > 0:
                 await asyncio.sleep(backoff)
-            self._supervisor_dirty = True
-            self._supervisor_next_summary = (
+            retry_summary = (
                 "Retry supervisor review from the latest stable controller state after provider no_message. "
                 f"Previous review summary: {summary}"
             )
-            self._supervisor_next_completion_review = completion_review or getattr(
-                self,
-                "_supervisor_next_completion_review",
-                False,
+            self._queue_supervisor_check(
+                retry_summary,
+                completion_review=completion_review,
             )
             return True
         counts[count_key] = attempts + 1
@@ -2430,18 +2874,14 @@ class BelloController:
         *,
         packet_thread_id: str | None,
         packet: SupervisorWakePacket | None = None,
-    ) -> None:
+    ) -> bool:
         cfg = self.store.get_bello_config()
         if decision.generation is not None and decision.generation != cfg.generation:
-            return
+            return False
         if packet_thread_id != cfg.coder_thread_id:
-            return
+            return False
         if decision.wake_sequence is not None and decision.wake_sequence <= cfg.last_applied_supervisor_sequence:
-            return
-        self.store.update_bello_config(
-            lambda current: current.model_copy(update={"last_applied_supervisor_sequence": decision.wake_sequence or current.last_applied_supervisor_sequence})
-        )
-        self._record_supervisor_decision_metric(use_case="runtime", decision=decision.decision.value)
+            return False
         health = self.store.get_health()
         issue = (
             _runtime_restart_issue(
@@ -2460,9 +2900,40 @@ class BelloController:
                 issue_key=issue.key if issue is not None else None,
                 issue_sequence=issue.sequence if issue is not None else None,
             )
+        apply_restart_metadata = decision.decision != SupervisorDecisionKind.RESTART or restart_candidate
+
+        intervention: tuple[str, str] | None = None
+        if decision.decision == SupervisorDecisionKind.INTERVENE and decision.message_to_coder and self.coder:
+            self.tui.render("SUPERVISOR", f"steering coder: {decision.reason}")
+            await self.coder.steer_or_start(decision.message_to_coder)
+            intervention = (decision.reason, decision.message_to_coder)
+        elif decision.decision == SupervisorDecisionKind.RESTART:
+            if not restart_candidate:
+                message = decision.message_to_coder or _restart_rejection_steering(decision.handoff)
+                self.tui.render("SUPERVISOR", f"restart rejected without health evidence: {decision.reason}")
+                if self.coder:
+                    await self.coder.steer_or_start(message)
+                intervention = (decision.reason, message)
+            else:
+                if restart_candidate_reason:
+                    self.tui.render("SUPERVISOR", f"restart candidate: {restart_candidate_reason}")
+                await self.restart(decision.reason or "supervisor requested restart", handoff=decision.handoff)
+        elif decision.decision == SupervisorDecisionKind.PAUSE:
+            await self.pause()
+
+        # Commit the decision only after its externally visible action succeeds. In
+        # particular, a failed steer must remain retryable with the same wake sequence.
+        if intervention is not None:
+            intervention_reason, intervention_message = intervention
+            self._record_runtime_intervention(
+                reason=intervention_reason,
+                message=intervention_message,
+                sequence=decision.wake_sequence or cfg.last_event_sequence,
+                generation=cfg.generation,
+                issue=issue,
+            )
         if decision.persistent_decision:
             self.store.append_text_locked(DECISIONS, f"- {decision.persistent_decision}\n")
-        apply_restart_metadata = decision.decision != SupervisorDecisionKind.RESTART or restart_candidate
         if decision.progress_update and apply_restart_metadata:
             self.store.append_text_locked(PROGRESS, f"- {decision.progress_update}\n")
             if decision.decision != SupervisorDecisionKind.RESTART:
@@ -2474,40 +2945,21 @@ class BelloController:
             self.store.write_text_locked(HANDOFF, "")
         if decision.display_message and apply_restart_metadata:
             self.tui.render("SUPERVISOR", decision.display_message)
-        if decision.decision == SupervisorDecisionKind.NOOP:
-            return
-        if decision.decision == SupervisorDecisionKind.INTERVENE and decision.message_to_coder and self.coder:
-            self.tui.render("SUPERVISOR", f"steering coder: {decision.reason}")
-            self._record_runtime_intervention(
-                reason=decision.reason,
-                message=decision.message_to_coder,
-                sequence=decision.wake_sequence or cfg.last_event_sequence,
-                generation=cfg.generation,
-                issue=issue,
+        if decision.decision != SupervisorDecisionKind.NOOP:
+            self._runtime_decision_invalidated_completion = True
+        self._record_supervisor_decision_metric(use_case="runtime", decision=decision.decision.value)
+        self.store.update_bello_config(
+            lambda current: current.model_copy(
+                update={
+                    "last_applied_supervisor_sequence": (
+                        decision.wake_sequence
+                        if decision.wake_sequence is not None
+                        else current.last_applied_supervisor_sequence
+                    )
+                }
             )
-            await self.coder.steer_or_start(decision.message_to_coder)
-            return
-        if decision.decision == SupervisorDecisionKind.RESTART:
-            if not restart_candidate:
-                message = decision.message_to_coder or _restart_rejection_steering(decision.handoff)
-                self.tui.render("SUPERVISOR", f"restart rejected without health evidence: {decision.reason}")
-                self._record_runtime_intervention(
-                    reason=decision.reason,
-                    message=message,
-                    sequence=decision.wake_sequence or cfg.last_event_sequence,
-                    generation=cfg.generation,
-                    issue=issue,
-                )
-                if self.coder:
-                    await self.coder.steer_or_start(message)
-                return
-            if restart_candidate_reason:
-                self.tui.render("SUPERVISOR", f"restart candidate: {restart_candidate_reason}")
-            await self.restart(decision.reason or "supervisor requested restart", handoff=decision.handoff)
-            return
-        if decision.decision == SupervisorDecisionKind.PAUSE:
-            await self.pause()
-            return
+        )
+        return True
 
     async def apply_completion_decision(
         self,
@@ -2574,7 +3026,6 @@ class BelloController:
             return
         if decision.decision == CompletionReviewDecisionKind.RETURN:
             self._pending_completion_gate_rejection = None
-            decision = self._attach_adversary_report_to_return(decision, packet=packet)
             await self._return_completion_to_coder(decision)
             return
         if decision.decision == CompletionReviewDecisionKind.RESTART:
@@ -2713,43 +3164,168 @@ class BelloController:
                 "turn_id": report.turn_id,
                 "adversary_run_count": adversary_run_count,
                 "max_adversary_runs": max_adversary_runs,
-                "report_text": report.report_text,
+                "report_chars": len(report.report_text),
+                "report_sha256": hashlib.sha256(
+                    report.report_text.encode("utf-8")
+                ).hexdigest(),
             }
         )
-        if not report.candidate_finding:
-            self.store.append_text_locked(
-                PROGRESS,
-                "- Adversarial tester completed without a candidate finding; finalizing.\n",
-            )
-            if decision is None:
-                self._accepted_adversary_report = report
-                await self._finalize_bounded_completion(
-                    reason="completion review budget reached and adversary reported no candidate finding",
-                )
-            else:
-                await self._finalize_accepted_completion(
-                    decision,
-                    adversary_report=report,
-                    result=(
-                        "accepted by completion_review after clean adversary report: "
-                        f"{decision.reason or 'task complete'}"
-                    ),
-                )
-            return
         self.store.append_text_locked(
             PROGRESS,
-            "- Adversarial tester completed with a candidate finding; rerunning completion_review with its report before complete.\n",
+            "- Adversarial tester completed; adv_report_controller is normalizing findings and observations.\n",
         )
         self._append_event(
             AppEventSource.SUPERVISOR,
             "adversary/report_ready",
-            decision="review",
-            reason="pre-complete adversarial report available",
+            decision="normalize",
+            reason="pre-complete adversarial report is ready for normalization",
         )
-        self._schedule_supervisor_check(
-            "Adversarial tester report is available. Rerun completion_review; weigh the report as input, "
-            "return only for a real reproduced required-behavior defect, otherwise accept.",
-            completion_review=True,
+        await self._run_adv_report_controller(
+            report,
+            packet=packet,
+            accepted_completion_decision=decision,
+        )
+
+    async def _run_adv_report_controller(
+        self,
+        report: AdversaryReport,
+        *,
+        packet: SupervisorWakePacket,
+        accepted_completion_decision: CompletionReviewDecision | None,
+    ) -> None:
+        agent = self._adv_report_controller_agent()
+        if agent is None:
+            await self._fail_adv_report_controller(
+                "adv_report_controller agent is unavailable"
+            )
+            return
+        review_packet = packet.model_copy(
+            update={
+                "current_summary": "Normalize the completed adversary report for the coder.",
+                "adversary_report": report,
+            }
+        )
+        self.tui.render(
+            "ADVERSARY", "normalizing adversary findings and observations"
+        )
+        try:
+            normalized = await agent.decide_adv_report(review_packet)
+        except SupervisorAgentError:
+            await self._fail_adv_report_controller(
+                "agent or structured-output failure"
+            )
+            return
+
+        stale_reason = self._adv_report_controller_staleness_reason(report)
+        if stale_reason is not None:
+            await self._fail_adv_report_controller(stale_reason)
+            return
+
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "adv_report_controller_decision",
+                "generation": packet.generation,
+                "completion_wake_sequence": report.completion_wake_sequence,
+                "forward_to_coder": normalized.forward_to_coder,
+                "reason": normalized.reason,
+                "report_to_coder": normalized.report_to_coder,
+            }
+        )
+        if normalized.forward_to_coder:
+            report_to_coder = _adversary_report_with_definitions(
+                normalized.report_to_coder or ""
+            )
+            self._append_event(
+                AppEventSource.SUPERVISOR,
+                "adversary/report_normalized",
+                decision="return",
+                reason=normalized.reason,
+            )
+            return_decision = CompletionReviewDecision(
+                decision=CompletionReviewDecisionKind.RETURN,
+                reason=normalized.reason,
+                uncovered_behaviors=[
+                    "Normalized adversary findings or observations require coder follow-up."
+                ],
+                message_to_coder=report_to_coder,
+                persistent_decision=None,
+                progress_update=None,
+                clear_handoff=False,
+                display_message=None,
+                handoff=None,
+                wake_sequence=packet.wake_sequence,
+                generation=packet.generation,
+            )
+            await self._return_completion_to_coder(
+                return_decision,
+                source="adversary_report_controller",
+            )
+            return
+
+        self.store.append_text_locked(
+            PROGRESS,
+            "- adv_report_controller found no findings or observations to send to the coder; finalizing.\n",
+        )
+        self._append_event(
+            AppEventSource.SUPERVISOR,
+            "adversary/report_normalized",
+            decision="complete",
+            reason=normalized.reason,
+        )
+        if accepted_completion_decision is None:
+            self._accepted_adversary_report = report
+            await self._finalize_bounded_completion(
+                reason=(
+                    "completion review budget reached and the normalized adversary "
+                    "report had nothing for the coder"
+                ),
+            )
+            return
+        await self._finalize_accepted_completion(
+            accepted_completion_decision,
+            adversary_report=report,
+            result=(
+                "accepted by completion_review after adversary report normalization: "
+                f"{accepted_completion_decision.reason or 'task complete'}"
+            ),
+        )
+
+    def _adv_report_controller_staleness_reason(
+        self,
+        report: AdversaryReport,
+    ) -> str | None:
+        cfg = self.store.get_bello_config()
+        if report.generation != cfg.generation:
+            return "adversary normalization became stale because the generation changed"
+        task_integrity_issue = self._task_integrity_issue()
+        if task_integrity_issue is not None:
+            return f"adversary normalization detected task integrity failure: {task_integrity_issue}"
+        if not report.workspace_state_id:
+            return "adversary report is not bound to a workspace state"
+        if report.workspace_state_id != _workspace_state_id(
+            self._active_workspace_root()
+        ):
+            return "adversary normalization became stale because the workspace changed"
+        return None
+
+    async def _fail_adv_report_controller(self, error_summary: str) -> None:
+        self.tui.render(
+            "ADVERSARY", f"adv_report_controller failed: {error_summary}"
+        )
+        self.store.append_text_locked(
+            PROGRESS,
+            f"- adv_report_controller failed ({error_summary}); the raw adversary report was not sent to the coder.\n",
+        )
+        self._append_event(
+            AppEventSource.SUPERVISOR,
+            "adversary/report_controller_failed",
+            reason=error_summary,
+        )
+        await self.finalize(
+            f"adv_report_controller failed: {error_summary}",
+            status=BelloStatus.PROVIDER_FAILURE,
+            completion_review_accepted=False,
         )
 
     def _completion_review_budget_action(
@@ -2767,16 +3343,6 @@ class BelloController:
             limit = cfg.max_completion_returns_before_adversary
             if review_limit_reached(limit, cfg.completion_return_count):
                 return "adversary"
-            return None
-        adversary_report = packet.adversary_report if packet is not None else None
-        if (
-            cfg.completion_returns_since_adversary == 0
-            and adversary_report is not None
-            and self._packet_has_fresh_adversary_report(packet)
-            and adversary_report.candidate_finding
-        ):
-            # Candidate findings always receive one independent adjudication. Optional
-            # post-adversary return budgets apply after that required check.
             return None
         limit = cfg.max_completion_returns_after_adversary
         if not review_limit_reached(limit, cfg.completion_returns_since_adversary):
@@ -3047,23 +3613,6 @@ class BelloController:
         if report.workspace_state_id and report.workspace_state_id != _workspace_state_id(self._active_workspace_root()):
             return False
         return True
-
-    def _attach_adversary_report_to_return(
-        self,
-        decision: CompletionReviewDecision,
-        *,
-        packet: SupervisorWakePacket | None,
-    ) -> CompletionReviewDecision:
-        report = packet.adversary_report if packet is not None else None
-        if report is None or not report.report_text.strip():
-            return decision
-        marker = "Adversarial tester report:"
-        if decision.message_to_coder and marker in decision.message_to_coder:
-            return decision
-        report_text = _bounded_adversary_report_text(report.report_text)
-        message = (decision.message_to_coder or "").rstrip()
-        message = f"{message}\n\n{marker}\n{report_text}".strip()
-        return decision.model_copy(update={"message_to_coder": message})
 
     def _mark_adversary_thread_started(self, thread_id: str) -> None:
         self._active_adversary_thread_id = thread_id
@@ -3434,10 +3983,7 @@ class BelloController:
             validation.validation_id
             for validation in packet.validations
             if validation.sequence > since_sequence
-            and _is_behavior_proving_validation(validation)
-            and validation.outcome == "pass"
-            and validation.passed
-            and validation.trusted_validation_outcome == "passed"
+            and _validation_is_usable_behavioral_pass(validation)
         ]
         fresh_inspection_ids = [
             inspection.inspection_id
@@ -3543,8 +4089,22 @@ class BelloController:
                 return True
         return False
 
-    async def _return_completion_to_coder(self, decision: CompletionReviewDecision) -> None:
+    async def _return_completion_to_coder(
+        self,
+        decision: CompletionReviewDecision,
+        *,
+        source: Literal[
+            "completion_review", "accept_gate", "adversary_report_controller"
+        ] = "completion_review",
+    ) -> None:
+        return_source = (
+            "accept_gate"
+            if source == "completion_review"
+            and getattr(self, "_current_accept_gate_rejection", None)
+            else source
+        )
         record = CompletionReturnRecord(
+            source=return_source,
             reason=decision.reason,
             uncovered_behaviors=decision.uncovered_behaviors,
             validation_gaps=decision.validation_gaps,
@@ -3564,27 +4124,40 @@ class BelloController:
         self.completion_review_return_validation_sequence = max(validation_sequences) if validation_sequences else None
         if not decision.progress_update:
             details = _completion_return_summary(decision)
-            self.store.append_text_locked(PROGRESS, f"- Completion review returned: {details}\n")
+            source_label = (
+                "Adversary report controller"
+                if return_source == "adversary_report_controller"
+                else "Completion review"
+            )
+            self.store.append_text_locked(
+                PROGRESS, f"- {source_label} returned: {details}\n"
+            )
         self.prior_interventions.append(
             PriorIntervention(
-                reason=f"Completion review returned: {decision.reason}",
+                reason=(
+                    "Adversary report controller returned: "
+                    if return_source == "adversary_report_controller"
+                    else "Completion review returned: "
+                )
+                + decision.reason,
                 message_to_coder=decision.message_to_coder or "",
                 sequence=decision.wake_sequence,
             )
         )
         self.prior_interventions = self.prior_interventions[-20:]
-        self.store.update_bello_config(
-            lambda current: current.model_copy(
-                update={
-                    "completion_return_count": current.completion_return_count + 1,
-                    "completion_returns_since_adversary": (
-                        current.completion_returns_since_adversary + 1
-                        if current.adversary_run_count > 0
-                        else 0
-                    ),
-                }
+        if return_source != "adversary_report_controller":
+            self.store.update_bello_config(
+                lambda current: current.model_copy(
+                    update={
+                        "completion_return_count": current.completion_return_count + 1,
+                        "completion_returns_since_adversary": (
+                            current.completion_returns_since_adversary + 1
+                            if current.adversary_run_count > 0
+                            else 0
+                        ),
+                    }
+                )
             )
-        )
         if self.coder and decision.message_to_coder:
             await self.coder.steer_or_start(decision.message_to_coder)
         # Fresh completion-review thread per review: close the session after each return so
@@ -4136,7 +4709,11 @@ def _runtime_trigger_reasons_from_summary(summary: str | None) -> tuple[str, ...
     match = re.match(r"\s*Runtime trigger \(([^)]*)\):", summary)
     if not match:
         return ()
-    return tuple(reason.strip() for reason in match.group(1).split(",") if reason.strip())
+    return tuple(
+        reason
+        for reason in (part.strip() for part in match.group(1).split(","))
+        if reason and reason != "masked_validation"
+    )
 
 
 _RESTART_SHELL_NAMES = frozenset({"bash", "dash", "ksh", "sh", "zsh"})
@@ -4185,13 +4762,6 @@ def _runtime_validation_restart_issue(validation: ValidationRun) -> RuntimeResta
     if validation.exit_code is None or validation.shell_exit_code is None:
         return RuntimeRestartIssue(
             key=_runtime_unresolved_execution_key(validation.command, validation.cwd),
-            sequence=validation.sequence,
-            validation_id=validation.validation_id,
-        )
-    if validation.trusted_validation_outcome == "masked_or_unknown":
-        masking_reason = validation.masking_reason or "unknown"
-        return RuntimeRestartIssue(
-            key=f"masked-validation:{masking_reason}",
             sequence=validation.sequence,
             validation_id=validation.validation_id,
         )
@@ -4279,6 +4849,10 @@ def _runtime_restart_issue(
 ) -> RuntimeRestartIssue | None:
     validation = _runtime_triggering_validation(packet)
     if validation is not None:
+        if validation.trusted_validation_outcome == "masked_or_unknown":
+            # Backward-compatible schema values from older runs must not recreate the
+            # retired masked-validation restart gate.
+            return None
         issue = _runtime_validation_restart_issue(validation)
         if issue is not None:
             return issue
@@ -4313,7 +4887,6 @@ def _runtime_triggering_validation(packet: SupervisorWakePacket) -> ValidationRu
         if matches:
             return max(matches, key=lambda validation: validation.sequence)
     validation_reasons = {
-        "masked_validation",
         "repeated_same_failing_validation",
         "validation_regression",
     }
@@ -4361,8 +4934,19 @@ def _triggering_action_from_item(item: Any, *, item_id: str | None, summary: str
         paths=_paths_from_item(item),
         exit_code=exit_code if isinstance(exit_code, int) else None,
         status=item.get("status") if isinstance(item.get("status"), str) else "completed",
+        timed_out=_item_explicitly_timed_out(item),
         summary=summary,
     )
+
+
+def _item_explicitly_timed_out(item: dict[str, Any]) -> bool:
+    if item.get("timedOut") is True or item.get("timed_out") is True:
+        return True
+    explicit_statuses = {
+        str(item.get(key) or "").strip().lower().replace("_", "")
+        for key in ("status", "terminationReason", "termination_reason", "errorType", "error_type")
+    }
+    return bool({"timeout", "timedout"} & explicit_statuses)
 
 
 def _validation_from_action(
@@ -4385,23 +4969,15 @@ def _validation_from_action(
     outcome = "pass" if action.exit_code == 0 else "fail"
     if validation_type == "behavioral" and outcome == "pass" and not _tests_executed(action.command, output):
         outcome = "fail"
-    masking_reason = _validation_masking_reason(
-        action.command,
-        validation_type=validation_type,
-        changed_paths=changed_paths or [],
-    )
-    if masking_reason is None and validation_type == "behavior_demo" and outcome == "pass":
-        if not output.strip():
-            masking_reason = "behavior_demo_missing_output"
-        else:
-            masking_reason = _behavior_demo_output_masking_reason(output)
     trusted_outcome = "passed" if outcome == "pass" else "failed"
     passed = outcome == "pass"
-    if masking_reason is not None:
-        trusted_outcome = "masked_or_unknown"
-        outcome = "fail"
-        passed = False
     passed_count, failed_count = _test_count_summary(output)
+    # Trust the test runner's factual result over the enclosing shell status. This preserves
+    # real failures without reviving the removed shell-shape/masking classifier.
+    if validation_type == "behavioral" and failed_count is not None and failed_count > 0:
+        outcome = "fail"
+        trusted_outcome = "failed"
+        passed = False
     summary = _validation_summary(action.summary, output)
     return ValidationRun(
         validation_id=_stable_validation_id(
@@ -4421,7 +4997,7 @@ def _validation_from_action(
         outcome=outcome,
         passed=passed,
         trusted_validation_outcome=trusted_outcome,
-        masking_reason=masking_reason,
+        masking_reason=None,
         summary=summary,
         captured_output=output,
         captured_output_truncated=output.endswith("...<truncated>"),
@@ -4946,59 +5522,6 @@ def _inspection_exit_is_usable(command: str, exit_code: int | None) -> bool:
     return False
 
 
-def _validation_masking_reason(
-    command: str,
-    *,
-    validation_type: str | None = None,
-    changed_paths: list[str] | None = None,
-) -> str | None:
-    if (
-        validation_type == "behavior_demo"
-        and _has_behavior_demo_marker(command)
-        and _marked_behavior_demo_command_is_plausible(command, changed_paths or [])
-    ):
-        return _marked_behavior_demo_masking_reason(command)
-    return _generic_validation_masking_reason(command)
-
-
-def _marked_behavior_demo_masking_reason(command: str) -> str | None:
-    lowered = command.lower()
-    pipeline_probe = lowered.replace("||", "")
-    if "|" in pipeline_probe and "pipefail" not in lowered:
-        return "pipeline_without_pipefail"
-    if "||" in lowered and not re.search(r"\|\|\s*exit\s+1(\s|$)", lowered):
-        return "logical_or_may_mask_validation_failure"
-    if ("$(" in command or "`" in command) and not _shell_errexit_is_enabled(command):
-        return "command_substitution_may_mask_failure"
-    return None
-
-
-def _generic_validation_masking_reason(command: str) -> str | None:
-    lowered = command.lower()
-    pipeline_probe = lowered.replace("||", "")
-    if "|" in pipeline_probe and "pipefail" not in lowered:
-        return "pipeline_without_pipefail"
-    if "$(" in command or "`" in command:
-        return "command_substitution_may_mask_failure"
-    if "||" in lowered and not re.search(r"\|\|\s*exit\s+1(\s|$)", lowered):
-        return "logical_or_may_mask_validation_failure"
-    if ";" in lowered:
-        return "command_separator_may_mask_validation_failure"
-    return None
-
-
-def _behavior_demo_output_masking_reason(output: str) -> str | None:
-    if _captured_output_is_self_verdict_only(output):
-        return "behavior_demo_self_verdict_only"
-    if _captured_output_looks_like_test_runner(output):
-        return "behavior_demo_looks_like_test_runner_output"
-    return None
-
-
-def _shell_errexit_is_enabled(command: str) -> bool:
-    return bool(re.search(r"(^|[\s;&|()'\"])(?:set\s+-[a-z]*e[a-z]*|set\s+-o\s+errexit)\b", command.lower()))
-
-
 def _command_was_filtered(command: str) -> bool:
     return _raw_validation_selector(command) is not None
 
@@ -5180,17 +5703,27 @@ def _collect_output_strings(value: Any, parts: list[str], *, depth: int) -> None
 
 
 def _has_passing_behavioral_validation(validations: list[ValidationRun]) -> bool:
-    return any(
-        _is_behavior_proving_validation(validation)
-        and validation.outcome == "pass"
-        and validation.passed
-        and validation.trusted_validation_outcome == "passed"
-        for validation in validations
-    )
+    return any(_validation_is_usable_behavioral_pass(validation) for validation in validations)
 
 
 def _is_behavior_proving_validation(validation: ValidationRun) -> bool:
     return validation.type in {"behavioral", "behavior_demo"}
+
+
+def _validation_is_usable_behavioral_pass(validation: ValidationRun) -> bool:
+    if (
+        not _is_behavior_proving_validation(validation)
+        or validation.outcome != "pass"
+        or not validation.passed
+        or validation.trusted_validation_outcome != "passed"
+    ):
+        return False
+    if validation.type != "behavior_demo":
+        return True
+    return _validation_output_kind(
+        validation,
+        captured_output_present=bool(validation.captured_output.strip()),
+    ) == "factual_observation_candidate"
 
 
 def _has_readiness_marker(text: str) -> bool:
@@ -5352,10 +5885,7 @@ def _validation_freshness_summary(
     passing_behavioral = [
         validation.sequence
         for validation in validations
-        if validation.type in {"behavioral", "behavior_demo"}
-        and validation.outcome == "pass"
-        and validation.passed
-        and validation.trusted_validation_outcome == "passed"
+        if _validation_is_usable_behavioral_pass(validation)
     ]
     last_behavioral = max(passing_behavioral) if passing_behavioral else None
     if last_behavioral is None:
@@ -5719,17 +6249,13 @@ def _ledger_id_sequence(value: str | None) -> int | None:
 
 
 def _validation_is_fresh_behavioral_pass(validation: ValidationRun, latest_change: int) -> bool:
-    return (
-        validation.type in {"behavioral", "behavior_demo"}
-        and validation.outcome == "pass"
-        and validation.passed
-        and validation.trusted_validation_outcome == "passed"
-        and validation.sequence > latest_change
-    )
+    return _validation_is_usable_behavioral_pass(validation) and validation.sequence > latest_change
 
 
 def _validation_is_fresh_pass(validation: ValidationRun, latest_change: int | None) -> bool:
     if validation.outcome != "pass" or not validation.passed or validation.trusted_validation_outcome != "passed":
+        return False
+    if _is_behavior_proving_validation(validation) and not _validation_is_usable_behavioral_pass(validation):
         return False
     if latest_change is None:
         return True
@@ -7304,11 +7830,48 @@ def _large_diff_signature(changed_files: list[ChangedFile]) -> str:
             "status": changed.status,
             "additions": changed.additions,
             "deletions": changed.deletions,
+            "sequence": changed.sequence,
         }
         for changed in sorted(changed_files, key=lambda item: item.path)
     ]
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
     return digest[:16]
+
+
+def _restart_budget_signature(health: HealthState, reason: str) -> str:
+    payload = {
+        "generation": health.generation,
+        "reason": reason,
+        # A continuing threshold breach is one state even if its counter keeps rising.
+        # A different tracked issue is a genuinely new restart candidate.
+        "restart_issue_key": (
+            health.restart_issue_key
+            if reason == "same issue repeated after two interventions"
+            else None
+        ),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def _runtime_action_signature(action: TriggeringAction) -> str:
+    payload = action.model_dump(mode="json")
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def _unique_runtime_trigger_actions(
+    actions: Any,
+) -> list[TriggeringAction]:
+    selected: list[TriggeringAction] = []
+    seen: set[str] = set()
+    for action in actions:
+        if action is None:
+            continue
+        signature = _runtime_action_signature(action)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        selected.append(action)
+    return selected
 
 
 def _suspicious_changed_file_signature(
@@ -7397,18 +7960,7 @@ def _workspace_path_fingerprint(
 
 
 def _action_timed_out(action: TriggeringAction) -> bool:
-    text = " ".join(part for part in (action.status, action.summary) if part).lower()
-    return "timeout" in text or "timed out" in text
-
-
-def _is_file_change_activity(action: TriggeringAction) -> bool:
-    if action.command:
-        return False
-    kind = action.kind.lower()
-    summary = action.summary.lower()
-    return kind in {"filechange", "file_change", "file-change"} or (
-        bool(action.paths) and "file" in summary and "change" in summary
-    )
+    return action.timed_out
 
 
 def _change_kind(status: str) -> str:
@@ -8425,11 +8977,14 @@ def _latest_validation_sequence(validations: list[ValidationRun]) -> int | None:
     return max((validation.sequence for validation in validations), default=None)
 
 
-def _bounded_adversary_report_text(text: str, *, limit: int = 20_000) -> str:
-    stripped = text.strip()
-    if len(stripped) <= limit:
-        return stripped
-    return stripped[:limit].rstrip() + "\n\n[adversary report truncated by controller for coder message]"
+_ADVERSARY_REPORT_DEFINITIONS = (
+    "Finding: a confirmed defect that requires correction.\n"
+    "Observation: a concern that is not yet confirmed; investigate it and fix it only if confirmed."
+)
+
+
+def _adversary_report_with_definitions(report_to_coder: str) -> str:
+    return f"{_ADVERSARY_REPORT_DEFINITIONS}\n\n{report_to_coder.strip()}"
 
 
 def _final_adversary_report_summary(report: AdversaryReport | None) -> list[str]:

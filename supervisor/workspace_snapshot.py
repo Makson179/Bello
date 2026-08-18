@@ -7,6 +7,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -58,6 +59,45 @@ GENERATED_ARTIFACT_SUFFIXES = {
     ".tsbuildinfo",
 }
 
+VERIFICATION_MUTABLE_ARTIFACT_DIR_NAMES = GENERATED_ARTIFACT_DIR_NAMES | {".cache"}
+
+VERIFICATION_BUILD_ARTIFACT_DIR_NAMES = VERIFICATION_MUTABLE_ARTIFACT_DIR_NAMES | {
+    ".gradle",
+    ".next",
+    "build",
+    "coverage",
+    "dist",
+    "target",
+}
+
+VERIFICATION_BUILD_ARTIFACT_SUFFIXES = GENERATED_ARTIFACT_SUFFIXES | {
+    ".a",
+    ".class",
+    ".dll",
+    ".dylib",
+    ".exe",
+    ".jar",
+    ".lib",
+    ".log",
+    ".o",
+    ".obj",
+    ".so",
+    ".wasm",
+}
+
+VERIFICATION_SAFE_GIT_CONFIG: dict[str, set[str] | None] = {
+    "core.filemode": {"true", "false"},
+    "core.ignorecase": {"true", "false"},
+    "core.symlinks": {"true", "false"},
+    "core.precomposeunicode": {"true", "false"},
+    "core.autocrlf": {"true", "false", "input"},
+    "core.eol": {"lf", "crlf", "native"},
+    "core.safecrlf": {"true", "false", "warn"},
+    "core.sparsecheckout": {"true", "false"},
+    "core.sparsecheckoutcone": {"true", "false"},
+    "index.sparse": {"true", "false"},
+}
+
 
 class WorkspaceSnapshotError(RuntimeError):
     pass
@@ -65,6 +105,66 @@ class WorkspaceSnapshotError(RuntimeError):
 
 class SnapshotPatchError(WorkspaceSnapshotError):
     pass
+
+
+@dataclass(frozen=True)
+class VerificationWorkspaceSnapshot:
+    """Disposable writable copy used only for review-time command execution."""
+
+    original_root: Path
+    snapshot_root: Path
+    temp_root: Path
+    submitted_manifest: tuple[tuple[str, SnapshotPathState], ...] = ()
+    git_manifest: tuple[tuple[str, str], ...] = ()
+    git_control_manifest: tuple[tuple[str, SnapshotPathState], ...] = ()
+    mutable_submitted_paths: tuple[str, ...] = ()
+
+    def cleanup(self) -> None:
+        if self.temp_root.exists() or self.temp_root.is_symlink():
+            try:
+                shutil.rmtree(self.temp_root)
+            except OSError:
+                _make_tree_owner_writable(self.temp_root)
+                shutil.rmtree(self.temp_root)
+        if self.temp_root.exists() or self.temp_root.is_symlink():
+            raise WorkspaceSnapshotError(
+                f"failed to remove verification snapshot: {self.temp_root}"
+            )
+
+    def assert_submission_unchanged(self) -> None:
+        before = dict(self.submitted_manifest)
+        after = dict(_verification_worktree_manifest(self.snapshot_root))
+        changed = [
+            path
+            for path in sorted(before)
+            if before.get(path) != after.get(path)
+            and path not in self.mutable_submitted_paths
+        ]
+        # Existing submitted paths are always immutable, even when they live under a
+        # conventional build/cache directory. Only newly created, clearly generated paths
+        # may remain as incidental outputs of a check.
+        changed.extend(
+            path
+            for path in sorted(after.keys() - before.keys())
+            if not _is_verification_mutable_artifact_path(path)
+            and not _verification_path_is_git_ignored(self.snapshot_root, path)
+        )
+        if self.git_manifest:
+            current_git = _verification_git_manifest(self.snapshot_root)
+            if current_git != self.git_manifest:
+                changed.append(".git verification metadata")
+        if self.git_control_manifest:
+            current_control = _verification_git_control_manifest(self.snapshot_root)
+            if current_control != self.git_control_manifest:
+                changed.append(".git verification control files")
+        if not changed:
+            return
+        detail = ", ".join(changed[:12])
+        if len(changed) > 12:
+            detail += f", ... (+{len(changed) - 12} more)"
+        raise WorkspaceSnapshotError(
+            "completion verification modified submitted workspace paths: " + detail
+        )
 
 
 @dataclass(frozen=True)
@@ -220,13 +320,20 @@ def create_workspace_snapshot(
         snapshot_task = snapshot_root / task_relative
         _create_readonly_link(snapshot_task, original_task)
         state_source = original_root / ".supervisor"
-        if state_source.is_dir():
-            _create_readonly_link(snapshot_root / ".supervisor", state_source)
         readonly_dependency_paths: list[str] = []
         for source, relative in readonly_dependencies:
             _create_readonly_link(snapshot_root / relative, source)
             readonly_dependency_paths.append(relative)
         baseline_commit = _init_snapshot_git(snapshot_root)
+        if state_source.is_dir():
+            # Runtime state must be mounted for the controller but must never enter the
+            # coder snapshot's Git history/index: Completion is intentionally blind to the
+            # checklist and could otherwise recover the absolute mount target via git show.
+            info_exclude = snapshot_root / ".git" / "info" / "exclude"
+            info_exclude.parent.mkdir(parents=True, exist_ok=True)
+            with info_exclude.open("a", encoding="utf-8") as handle:
+                handle.write("\n/.supervisor\n")
+            _create_readonly_link(snapshot_root / ".supervisor", state_source)
         git_config_bytes, git_config_mode = _read_regular_file(snapshot_root / ".git" / "config")
         worktree_config = snapshot_root / ".git" / "config.worktree"
         if worktree_config.exists() or worktree_config.is_symlink():
@@ -257,6 +364,128 @@ def create_workspace_snapshot(
     except Exception as exc:
         shutil.rmtree(temp_root, ignore_errors=True)
         raise WorkspaceSnapshotError(f"failed to create coder workspace snapshot: {exc}") from exc
+
+
+def create_verification_workspace_snapshot(
+    project_root: Path,
+    *,
+    source_snapshot: WorkspaceSnapshot | None = None,
+    prefix: str = "bello-completion-",
+) -> VerificationWorkspaceSnapshot:
+    """Copy the submitted state without making review artifacts part of the submission.
+
+    Unlike the coder snapshot, this snapshot preserves the submitted repository's HEAD,
+    index, worktree changes, and untracked files.  Completion Review can therefore run
+    existing checks and inspect the real diff while any caches, temporary files, or other
+    incidental writes remain disposable.
+    """
+
+    if shutil.which("git") is None:
+        raise WorkspaceSnapshotError("git executable is required for verification snapshots")
+    try:
+        original_root = project_root.resolve()
+        if not original_root.is_dir():
+            raise WorkspaceSnapshotError(
+                f"verification snapshot source is not a directory: {original_root}"
+            )
+    except OSError as exc:
+        raise WorkspaceSnapshotError(f"failed to resolve verification snapshot source: {exc}") from exc
+
+    trusted_mounts = _verification_trusted_mounts(original_root, source_snapshot)
+    source_is_git = _is_top_level_git_repository(original_root)
+    if source_is_git:
+        _reject_verification_git_alternates(original_root)
+    gitlink_paths = _verification_gitlink_paths(original_root) if source_is_git else ()
+    if gitlink_paths:
+        joined = ", ".join(gitlink_paths[:8])
+        if len(gitlink_paths) > 8:
+            joined += f", ... (+{len(gitlink_paths) - 8} more)"
+        raise WorkspaceSnapshotError(
+            "verification snapshots do not yet support Git submodules; "
+            f"gitlink paths: {joined}"
+        )
+
+    try:
+        temp_root = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
+    except OSError as exc:
+        raise WorkspaceSnapshotError(
+            f"failed to create temporary verification snapshot directory: {exc}"
+        ) from exc
+    snapshot_root = temp_root / "workspace"
+    try:
+        history_preserved = _clone_git_metadata(
+            original_root,
+            snapshot_root,
+            fail_on_clone_error=True,
+        )
+        if history_preserved:
+            _clear_snapshot_worktree(snapshot_root)
+        shutil.copytree(
+            original_root,
+            snapshot_root,
+            dirs_exist_ok=history_preserved,
+            symlinks=True,
+            ignore=_verification_snapshot_ignore,
+        )
+        # The reviewer may write inside this copy while running existing checks. Rewrite
+        # links that point back into the submitted workspace and remove links that escape it,
+        # so a check cannot read or mutate host paths through a copied symlink.
+        _sanitize_copied_workspace_symlinks(
+            original_root,
+            snapshot_root,
+            trusted_external_symlinks=trusted_mounts,
+        )
+        if history_preserved:
+            _sanitize_verification_snapshot_git(snapshot_root)
+            _copy_verification_safe_git_config(original_root, snapshot_root)
+            _copy_verification_git_file(original_root, snapshot_root, "info/exclude")
+            if _git_config_bool(snapshot_root, "core.sparsecheckout"):
+                _copy_verification_git_file(
+                    original_root,
+                    snapshot_root,
+                    "info/sparse-checkout",
+                    required=True,
+                )
+            _copy_snapshot_git_index(original_root, snapshot_root)
+            _hide_verification_runtime_state(snapshot_root)
+        verification = VerificationWorkspaceSnapshot(
+            original_root=original_root,
+            snapshot_root=snapshot_root.resolve(),
+            temp_root=temp_root,
+        )
+        object.__setattr__(
+            verification,
+            "submitted_manifest",
+            _verification_worktree_manifest(verification.snapshot_root),
+        )
+        object.__setattr__(
+            verification,
+            "mutable_submitted_paths",
+            _verification_mutable_submitted_paths(
+                verification.snapshot_root,
+                verification.submitted_manifest,
+            ),
+        )
+        if history_preserved:
+            object.__setattr__(
+                verification,
+                "git_manifest",
+                _verification_git_manifest(verification.snapshot_root),
+            )
+            object.__setattr__(
+                verification,
+                "git_control_manifest",
+                _verification_git_control_manifest(verification.snapshot_root),
+            )
+        return verification
+    except WorkspaceSnapshotError:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise
+    except Exception as exc:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise WorkspaceSnapshotError(
+            f"failed to create verification workspace snapshot: {exc}"
+        ) from exc
 
 
 def apply_snapshot_patch(snapshot: WorkspaceSnapshot) -> SnapshotPatchResult:
@@ -320,6 +549,7 @@ def _restore_runtime_links(snapshot: WorkspaceSnapshot) -> tuple[str, ...]:
 def _snapshot_patch_selection(snapshot: WorkspaceSnapshot) -> SnapshotPatchSelection:
     snapshot_root = snapshot.snapshot_root
     _run_git(snapshot_root, ["add", "-f", "-A", "--"])
+    _run_git(snapshot_root, ["reset", "-q", snapshot.baseline_commit, "--", ".supervisor"])
     raw = _run_git(
         snapshot_root,
         [
@@ -572,7 +802,12 @@ def _atomic_replace_bytes(path: Path, content: bytes, mode: int) -> None:
             os.unlink(temporary)
 
 
-def _clone_git_metadata(original_root: Path, snapshot_root: Path) -> bool:
+def _clone_git_metadata(
+    original_root: Path,
+    snapshot_root: Path,
+    *,
+    fail_on_clone_error: bool = False,
+) -> bool:
     probe = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
         cwd=original_root,
@@ -600,7 +835,371 @@ def _clone_git_metadata(original_root: Path, snapshot_root: Path) -> bool:
     if cloned.returncode == 0:
         return True
     shutil.rmtree(snapshot_root, ignore_errors=True)
+    if fail_on_clone_error:
+        detail = cloned.stderr.decode("utf-8", errors="replace").strip()
+        raise WorkspaceSnapshotError(
+            "failed to clone Git metadata for verification snapshot"
+            + (f": {detail}" if detail else "")
+        )
     return False
+
+
+def _is_top_level_git_repository(root: Path) -> bool:
+    probe = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=root,
+        env=_isolated_git_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        text=True,
+    )
+    if probe.returncode != 0:
+        return False
+    try:
+        return Path(probe.stdout.strip()).resolve() == root.resolve()
+    except OSError:
+        return False
+
+
+def _verification_snapshot_ignore(directory: str, names: list[str]) -> set[str]:
+    # Runtime state is not part of the submitted artifact and must not become writable
+    # review input.  Keep every other path, including caches and untracked files, so the
+    # copied worktree and its Git status retain the candidate state exactly.
+    return {name for name in names if name in {".git", ".supervisor"}}
+
+
+def _verification_trusted_mounts(
+    original_root: Path,
+    source_snapshot: WorkspaceSnapshot | None,
+) -> dict[str, Path]:
+    if source_snapshot is None:
+        return {}
+    if source_snapshot.snapshot_root.resolve() != original_root:
+        raise WorkspaceSnapshotError(
+            "verification source snapshot does not match the submitted workspace"
+        )
+    mounts: dict[str, Path] = {
+        source_snapshot.task_relative_path: (
+            source_snapshot.original_root / source_snapshot.task_relative_path
+        ),
+    }
+    for relative in source_snapshot.readonly_dependency_paths:
+        mounts[relative] = source_snapshot.original_root / relative
+    for relative, target in mounts.items():
+        link = original_root / relative
+        if not _symlink_points_to(link, target):
+            raise WorkspaceSnapshotError(
+                f"trusted verification mount is missing or redirected: {relative}"
+            )
+    return mounts
+
+
+def _verification_gitlink_paths(root: Path) -> tuple[str, ...]:
+    probe = subprocess.run(
+        ["git", "ls-files", "--stage", "-z"],
+        cwd=root,
+        env=_isolated_git_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if probe.returncode != 0:
+        return ()
+    paths: list[str] = []
+    for record in probe.stdout.split(b"\0"):
+        if not record:
+            continue
+        metadata, separator, raw_path = record.partition(b"\t")
+        if separator and metadata.startswith(b"160000 "):
+            paths.append(raw_path.decode("utf-8", errors="surrogateescape"))
+    return tuple(paths)
+
+
+def _git_metadata_path(root: Path, relative: str, *, required: bool) -> Path | None:
+    raw = str(_run_git(root, ["rev-parse", "--git-path", relative])).strip()
+    path = Path(raw)
+    if not path.is_absolute():
+        path = root / path
+    common_raw = str(_run_git(root, ["rev-parse", "--git-common-dir"])).strip()
+    common = Path(common_raw)
+    if not common.is_absolute():
+        common = root / common
+    if not path.exists() and not path.is_symlink():
+        if required:
+            raise WorkspaceSnapshotError(f"required Git metadata file is missing: {relative}")
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise WorkspaceSnapshotError(f"Git metadata file is not a regular file: {relative}")
+    try:
+        common_resolved = common.resolve(strict=True)
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(common_resolved)
+    except (OSError, ValueError) as exc:
+        raise WorkspaceSnapshotError(
+            f"Git metadata path escapes the repository common directory: {relative}"
+        ) from exc
+    return resolved
+
+
+def _copy_verification_git_file(
+    original_root: Path,
+    snapshot_root: Path,
+    relative: str,
+    *,
+    required: bool = False,
+) -> None:
+    source = _git_metadata_path(original_root, relative, required=required)
+    target_raw = str(_run_git(snapshot_root, ["rev-parse", "--git-path", relative])).strip()
+    target = Path(target_raw)
+    if not target.is_absolute():
+        target = snapshot_root / target
+    if source is None:
+        _remove_path(target)
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _remove_path(target)
+    shutil.copy2(source, target, follow_symlinks=False)
+
+
+def _git_config_file_values(path: Path, key: str) -> list[str]:
+    completed = subprocess.run(
+        ["git", "config", "--file", str(path), "--get-all", key],
+        env=_isolated_git_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        text=True,
+    )
+    if completed.returncode not in {0, 1}:
+        raise WorkspaceSnapshotError(
+            f"failed to read safe Git config key {key}: {completed.stderr.strip()}"
+        )
+    return completed.stdout.splitlines() if completed.returncode == 0 else []
+
+
+def _git_config_has_include(path: Path) -> bool:
+    completed = subprocess.run(
+        ["git", "config", "--file", str(path), "--name-only", "--get-regexp", r"^include(if)?\..*"],
+        env=_isolated_git_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        text=True,
+    )
+    if completed.returncode not in {0, 1}:
+        raise WorkspaceSnapshotError(
+            f"failed to inspect Git config includes: {completed.stderr.strip()}"
+        )
+    return completed.returncode == 0 and bool(completed.stdout.strip())
+
+
+def _copy_verification_safe_git_config(original_root: Path, snapshot_root: Path) -> None:
+    config_files: list[Path] = []
+    for relative in ("config", "config.worktree"):
+        path = _git_metadata_path(original_root, relative, required=relative == "config")
+        if path is not None:
+            if _git_config_has_include(path):
+                raise WorkspaceSnapshotError(
+                    "verification snapshot refuses repository-local Git config includes"
+                )
+            config_files.append(path)
+    for key, allowed in VERIFICATION_SAFE_GIT_CONFIG.items():
+        values: list[str] = []
+        for config_file in config_files:
+            values.extend(_git_config_file_values(config_file, key))
+        if not values:
+            continue
+        value = values[-1].strip().lower()
+        if allowed is not None and value not in allowed:
+            raise WorkspaceSnapshotError(
+                f"unsupported value for safe Git config key {key}: {value}"
+            )
+        _run_git(snapshot_root, ["config", "--local", key, value])
+
+
+def _git_config_bool(root: Path, key: str) -> bool:
+    values = _optional_git_lines(root, ["config", "--local", "--bool", "--get", key])
+    return bool(values and values[-1].strip().lower() == "true")
+
+
+def _reject_verification_git_alternates(root: Path) -> None:
+    alternates = _git_metadata_path(root, "objects/info/alternates", required=False)
+    if alternates is None:
+        return
+    if alternates.stat().st_size > 0:
+        raise WorkspaceSnapshotError(
+            "verification snapshot refuses external Git object alternates"
+        )
+
+
+def _copy_snapshot_git_index(original_root: Path, snapshot_root: Path) -> None:
+    source = _git_metadata_path(original_root, "index", required=False)
+    target_raw = str(_run_git(snapshot_root, ["rev-parse", "--git-path", "index"])).strip()
+    target = Path(target_raw)
+    if not target.is_absolute():
+        target = snapshot_root / target
+    if source is None:
+        # An unborn or empty repository may legitimately have no index yet.  The cloned
+        # repository is still useful for inspection, and copied files remain visible as
+        # untracked state.
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target, follow_symlinks=False)
+    # A split index contains only a delta and refers to a sibling sharedindex.<hash> file.
+    # Local clone does not reliably carry that unreferenced file, so copy exactly the
+    # referenced shared index before asking Git to materialize a standalone target index.
+    shared_raw = str(_run_git(original_root, ["rev-parse", "--shared-index-path"])).strip()
+    if shared_raw:
+        shared_index = Path(shared_raw)
+        if not shared_index.is_absolute():
+            shared_index = original_root / shared_index
+        if (
+            shared_index.is_symlink()
+            or not shared_index.is_file()
+            or shared_index.parent.resolve() != source.parent.resolve()
+            or re.fullmatch(r"sharedindex\.[0-9a-fA-F]{40,64}", shared_index.name) is None
+        ):
+            raise WorkspaceSnapshotError(
+                "verification snapshot source shared index is not a regular file"
+            )
+        shutil.copy2(
+            shared_index,
+            target.parent / shared_index.name,
+            follow_symlinks=False,
+        )
+    _run_git(snapshot_root, ["update-index", "--no-split-index"])
+    _run_git(snapshot_root, ["ls-files", "--stage", "-z"])
+
+
+def _hide_verification_runtime_state(snapshot_root: Path) -> None:
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "--", ".supervisor"],
+        cwd=snapshot_root,
+        env=_isolated_git_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if tracked.returncode == 0:
+        raise WorkspaceSnapshotError(
+            "verification source unexpectedly tracks private .supervisor runtime state"
+        )
+    history = subprocess.run(
+        ["git", "log", "--all", "--format=%H", "--", ".supervisor"],
+        cwd=snapshot_root,
+        env=_isolated_git_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        text=True,
+    )
+    if history.returncode != 0 or history.stdout.strip():
+        raise WorkspaceSnapshotError(
+            "verification source Git history exposes private .supervisor runtime state"
+        )
+
+
+def _verification_git_manifest(snapshot_root: Path) -> tuple[tuple[str, str], ...]:
+    """Capture review-relevant Git semantics without hashing mutable object storage.
+
+    Commands run during review may legitimately populate object/cache files, but they must
+    not change which submitted revision/index/config the reviewer is judging.
+    """
+
+    entries: list[tuple[str, str]] = []
+    for label, args in (
+        ("head", ["rev-parse", "--verify", "-q", "HEAD"]),
+        ("symbolic_head", ["symbolic-ref", "-q", "HEAD"]),
+        ("refs", ["for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)"]),
+        ("index", ["ls-files", "--stage", "-v", "-z"]),
+        ("safe_config", ["config", "--local", "--list", "--null"]),
+    ):
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=snapshot_root,
+            env=_isolated_git_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if label in {"head", "symbolic_head"} and completed.returncode in {1, 128}:
+            value = ""
+        elif completed.returncode != 0:
+            detail = completed.stderr.decode("utf-8", errors="replace").strip()
+            raise WorkspaceSnapshotError(
+                f"failed to capture verification Git {label}: {detail or completed.returncode}"
+            )
+        else:
+            value = hashlib.sha256(completed.stdout).hexdigest()
+        entries.append((label, value))
+    for relative in ("info/exclude", "info/sparse-checkout"):
+        path = _git_metadata_path(snapshot_root, relative, required=False)
+        entries.append((relative, _sha256_file(path) if path is not None else ""))
+    return tuple(entries)
+
+
+def _verification_git_control_manifest(
+    snapshot_root: Path,
+) -> tuple[tuple[str, SnapshotPathState], ...]:
+    git_dir = snapshot_root / ".git"
+    entries: list[tuple[str, SnapshotPathState]] = []
+    for current, dirs, files in os.walk(git_dir, followlinks=False):
+        current_path = Path(current)
+        relative_dir = current_path.relative_to(git_dir)
+        kept_dirs: list[str] = []
+        for name in sorted(dirs):
+            path = current_path / name
+            relative = (relative_dir / name).as_posix()
+            if relative == "logs" or relative.startswith("logs/"):
+                continue
+            if path.is_symlink():
+                entries.append((relative, _snapshot_path_state(path)))
+                continue
+            kept_dirs.append(name)
+        dirs[:] = kept_dirs
+        for name in sorted(files):
+            path = current_path / name
+            relative = (relative_dir / name).as_posix()
+            if relative in {
+                "HEAD",
+                "config",
+                "config.worktree",
+                "index",
+                "index.lock",
+                "ORIG_HEAD",
+                "FETCH_HEAD",
+                "COMMIT_EDITMSG",
+                "info/exclude",
+                "info/sparse-checkout",
+            }:
+                continue
+            state = _snapshot_path_state(path)
+            if state.kind in {"file", "symlink"}:
+                entries.append((relative, state))
+    return tuple(sorted(entries, key=lambda item: item[0]))
+
+
+def _sanitize_verification_snapshot_git(snapshot_root: Path) -> None:
+    git_dir = snapshot_root / ".git"
+    if git_dir.is_symlink() or not git_dir.is_dir():
+        raise WorkspaceSnapshotError("verification snapshot Git directory is not a regular directory")
+    hooks = git_dir / "hooks"
+    _remove_path(hooks)
+    hooks.mkdir(mode=0o700)
+    _remove_path(git_dir / "objects" / "info" / "alternates")
+    for key, value in (
+        ("core.hooksPath", os.devnull),
+        ("core.fsmonitor", "false"),
+        ("commit.gpgsign", "false"),
+        ("tag.gpgsign", "false"),
+    ):
+        _run_git(snapshot_root, ["config", "--local", key, value])
+    # A local clone adds an origin pointing at the submitted workspace.  Completion has
+    # no need for it, and removing it prevents a review command from addressing the
+    # candidate through a Git remote even though network access is disabled.
+    for name in _optional_git_lines(snapshot_root, ["remote"]):
+        _run_git(snapshot_root, ["remote", "remove", name])
 
 
 def _sync_snapshot_remotes(original_root: Path, snapshot_root: Path) -> None:
@@ -645,7 +1244,10 @@ def _clear_snapshot_worktree(snapshot_root: Path) -> None:
 def _sanitize_copied_workspace_symlinks(
     original_root: Path,
     snapshot_root: Path,
+    *,
+    trusted_external_symlinks: dict[str, Path] | None = None,
 ) -> tuple[tuple[SnapshotSymlinkRewrite, ...], tuple[str, ...]]:
+    trusted_external_symlinks = trusted_external_symlinks or {}
     rewrites: list[SnapshotSymlinkRewrite] = []
     excluded: list[str] = []
     for current, dirs, files in os.walk(snapshot_root, followlinks=False):
@@ -662,6 +1264,12 @@ def _sanitize_copied_workspace_symlinks(
             target_candidate = raw_target_path if raw_target_path.is_absolute() else original_link.parent / raw_target_path
             try:
                 resolved_target = target_candidate.resolve(strict=False)
+                trusted_target = trusted_external_symlinks.get(relative)
+                if (
+                    trusted_target is not None
+                    and resolved_target == trusted_target.resolve(strict=False)
+                ):
+                    continue
                 target_relative = resolved_target.relative_to(original_root)
             except (OSError, ValueError):
                 destination.unlink()
@@ -681,6 +1289,114 @@ def _sanitize_copied_workspace_symlinks(
                 )
             )
     return tuple(rewrites), tuple(excluded)
+
+
+def _verification_worktree_manifest(
+    snapshot_root: Path,
+) -> tuple[tuple[str, SnapshotPathState], ...]:
+    entries: list[tuple[str, SnapshotPathState]] = []
+    for current, dirs, files in os.walk(snapshot_root, followlinks=False):
+        current_path = Path(current)
+        relative_dir = current_path.relative_to(snapshot_root)
+        kept_dirs: list[str] = []
+        for name in sorted(dirs):
+            path = current_path / name
+            relative = (relative_dir / name).as_posix()
+            if name == ".git":
+                continue
+            if path.is_symlink():
+                entries.append((relative, _snapshot_path_state(path)))
+                continue
+            kept_dirs.append(name)
+        dirs[:] = kept_dirs
+        for name in sorted(files):
+            relative = (relative_dir / name).as_posix()
+            path = current_path / name
+            state = _snapshot_path_state(path)
+            if state.kind in {"file", "symlink"}:
+                entries.append((relative, state))
+    return tuple(sorted(entries, key=lambda item: item[0]))
+
+
+def _is_verification_mutable_artifact_path(raw_path: str) -> bool:
+    relative = Path(raw_path)
+    parts = tuple(part.lower() for part in relative.parts)
+    if any(part in VERIFICATION_MUTABLE_ARTIFACT_DIR_NAMES for part in parts):
+        return True
+    lowered_name = relative.name.lower()
+    if lowered_name in GENERATED_ARTIFACT_FILE_NAMES:
+        return True
+    return any(lowered_name.endswith(suffix) for suffix in GENERATED_ARTIFACT_SUFFIXES)
+
+
+def _verification_path_is_git_ignored(snapshot_root: Path, raw_path: str) -> bool:
+    completed = subprocess.run(
+        ["git", "check-ignore", "-q", "--", raw_path],
+        cwd=snapshot_root,
+        env=_isolated_git_env(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return completed.returncode == 0
+
+
+def _verification_mutable_submitted_paths(
+    snapshot_root: Path,
+    manifest: tuple[tuple[str, SnapshotPathState], ...],
+) -> tuple[str, ...]:
+    tracked: set[str] = set()
+    if _is_top_level_git_repository(snapshot_root):
+        raw = _run_git(snapshot_root, ["ls-files", "-z"], capture_bytes=True)
+        assert isinstance(raw, bytes)
+        tracked = {
+            part.decode("utf-8", errors="surrogateescape")
+            for part in raw.split(b"\0")
+            if part
+        }
+    mutable: list[str] = []
+    for raw_path, state in manifest:
+        if raw_path in tracked or state.kind != "file":
+            continue
+        if _verification_path_is_git_ignored(snapshot_root, raw_path) or _looks_like_build_artifact(
+            snapshot_root / raw_path,
+            raw_path,
+        ):
+            mutable.append(raw_path)
+    return tuple(sorted(mutable))
+
+
+def _looks_like_build_artifact(path: Path, raw_path: str) -> bool:
+    relative = Path(raw_path)
+    parts = tuple(part.lower() for part in relative.parts)
+    if any(part in VERIFICATION_BUILD_ARTIFACT_DIR_NAMES for part in parts):
+        return True
+    lowered_name = relative.name.lower()
+    if lowered_name in GENERATED_ARTIFACT_FILE_NAMES or any(
+        lowered_name.endswith(suffix) for suffix in VERIFICATION_BUILD_ARTIFACT_SUFFIXES
+    ):
+        return True
+    try:
+        descriptor = _open_regular_file_no_follow(path)
+    except OSError:
+        return False
+    try:
+        prefix = os.read(descriptor, 8)
+    finally:
+        os.close(descriptor)
+    return (
+        prefix.startswith(b"\x7fELF")
+        or prefix.startswith(b"MZ")
+        or prefix.startswith(b"\x00asm")
+        or prefix.startswith(b"!<arch>\n")
+        or prefix[:4] in {
+            b"\xca\xfe\xba\xbe",
+            b"\xce\xfa\xed\xfe",
+            b"\xcf\xfa\xed\xfe",
+            b"\xfe\xed\xfa\xce",
+            b"\xfe\xed\xfa\xcf",
+        }
+    )
 
 
 def _create_readonly_link(destination: Path, source: Path) -> None:
@@ -795,6 +1511,21 @@ def _remove_path(path: Path) -> None:
         shutil.rmtree(path)
     else:
         path.unlink(missing_ok=True)
+
+
+def _make_tree_owner_writable(path: Path) -> None:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(mode):
+        return
+    if stat.S_ISDIR(mode):
+        os.chmod(path, stat.S_IMODE(mode) | stat.S_IRWXU)
+        for child in path.iterdir():
+            _make_tree_owner_writable(child)
+        return
+    os.chmod(path, stat.S_IMODE(mode) | stat.S_IRUSR | stat.S_IWUSR)
 
 
 def _sha256_file(path: Path) -> str:

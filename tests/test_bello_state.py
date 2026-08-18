@@ -41,6 +41,7 @@ from supervisor.coder import CODEX_FAST_SERVICE_TIER, CoderSession, coder_thread
 from supervisor.main import _run_async_cleanly
 from supervisor.project_config import DEFAULT_MODEL, MODEL_GPT_5_5, MODEL_GPT_5_6_SOL
 from supervisor.schemas import (
+    AdvReportControllerDecision,
     AppEvent,
     AppEventSource,
     AdversaryReport,
@@ -51,6 +52,7 @@ from supervisor.schemas import (
     CoderMessage,
     CompletionReviewDecision,
     FinalReport,
+    HumanMessage,
     PriorIntervention,
     RestartHandoff,
     BelloConfig,
@@ -987,6 +989,48 @@ async def test_command_output_delta_is_attached_to_validation_ledger(tmp_path: P
     assert controller._command_output_chunks == {}
 
 
+async def test_non_coder_command_output_is_not_retained_or_added_to_ledger(
+    tmp_path: Path,
+) -> None:
+    controller, _store, _fake = _runtime_controller(tmp_path)
+
+    await controller.handle_notification(
+        AppServerMessage(
+            {
+                "method": "item/commandExecution/outputDelta",
+                "params": {
+                    "threadId": "completion-thread",
+                    "turnId": "completion-turn",
+                    "itemId": "completion-command",
+                    "delta": "large review output",
+                },
+            }
+        )
+    )
+    await controller.handle_notification(
+        AppServerMessage(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "completion-thread",
+                    "turnId": "completion-turn",
+                    "itemId": "completion-command",
+                    "item": {
+                        "type": "commandExecution",
+                        "command": "pytest tests/test_target.py",
+                        "exitCode": 0,
+                        "status": "completed",
+                    },
+                },
+            }
+        )
+    )
+
+    assert controller._command_output_chunks == {}
+    assert controller.validations == []
+    assert controller.inspections == []
+
+
 async def test_camelcase_stdout_delta_is_attached_to_validation_ledger(tmp_path: Path) -> None:
     controller, _store, _fake = _runtime_controller(tmp_path)
 
@@ -1419,7 +1463,7 @@ async def test_runtime_noop_action_skips_supervisor_and_records_trace(tmp_path: 
     assert metrics["runtime_skipped_noop_total"] == 1
 
 
-async def test_runtime_nonzero_action_wakes_supervisor(tmp_path: Path) -> None:
+async def test_first_isolated_nonzero_action_is_deterministic_noop(tmp_path: Path) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
 
     await controller.handle_notification(
@@ -1439,13 +1483,37 @@ async def test_runtime_nonzero_action_wakes_supervisor(tmp_path: Path) -> None:
             }
         )
     )
-    await controller._supervisor_task
-
-    assert len(fake.runtime_packets) == 1
-    assert fake.runtime_packets[0].triggering_action.exit_code == 1
+    assert controller._supervisor_task is None
+    assert fake.runtime_packets == []
     trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
-    assert trace["should_wake_runtime_supervisor"] is True
-    assert "nonzero_exit" in trace["trigger_reasons"]
+    assert trace["should_wake_runtime_supervisor"] is False
+    assert trace["trigger_reasons"] == []
+
+
+def test_sole_nonzero_is_noop_even_with_an_older_unresolved_failure(tmp_path: Path) -> None:
+    controller, _store, _fake = _runtime_controller(tmp_path)
+    controller.validation_runtime_state = {
+        "older-validation": {
+            "trusted_validation_outcome": "failed",
+            "consecutive_failed_count": 2,
+            "sequence": 2,
+        }
+    }
+
+    decision = controller.should_wake_runtime_supervisor(
+        action=TriggeringAction(
+            kind="commandExecution",
+            command="python3 -c 'raise SystemExit(1)'",
+            exit_code=1,
+            status="completed",
+            summary="command completed",
+        ),
+        validation=None,
+        changed_files=[],
+    )
+
+    assert decision.should_wake is False
+    assert decision.reasons == ()
 
 
 async def test_runtime_restart_budget_wakes_supervisor(tmp_path: Path) -> None:
@@ -1472,8 +1540,85 @@ async def test_runtime_restart_budget_wakes_supervisor(tmp_path: Path) -> None:
     await controller._supervisor_task
 
     assert len(fake.runtime_packets) == 1
+    assert "restart candidate because restart cap reached" in fake.runtime_packets[0].current_summary
     trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
     assert "restart_budget" in trace["trigger_reasons"]
+    assert trace["restart_reason"] == "restart cap reached"
+
+
+def test_restart_budget_wakes_once_per_health_state(tmp_path: Path) -> None:
+    controller, store, _fake = _runtime_controller(tmp_path)
+    store.patch_health(lambda health: health.model_copy(update={"restart_count": 100}))
+    action = TriggeringAction(
+        kind="commandExecution",
+        command="python3 -c 'print(1)'",
+        exit_code=0,
+        status="completed",
+        summary="command completed",
+    )
+
+    first = controller.should_wake_runtime_supervisor(
+        action=action,
+        validation=None,
+        changed_files=[],
+    )
+    duplicate = controller.should_wake_runtime_supervisor(
+        action=action,
+        validation=None,
+        changed_files=[],
+    )
+    store.patch_health(
+        lambda health: health.model_copy(
+            update={"restart_count": 0, "risk_signals": ["bypass_after_denial"]}
+        )
+    )
+    changed = controller.should_wake_runtime_supervisor(
+        action=action,
+        validation=None,
+        changed_files=[],
+    )
+
+    assert first.reasons == ("restart_budget",)
+    assert first.restart_reason == "restart cap reached"
+    assert duplicate.should_wake is False
+    assert changed.reasons == ("restart_budget",)
+    assert changed.restart_reason == "bypass/rephrase attempt after denial"
+
+
+def test_restart_budget_recurrence_after_clearing_is_new_state(tmp_path: Path) -> None:
+    controller, store, _fake = _runtime_controller(tmp_path)
+    action = TriggeringAction(
+        kind="commandExecution",
+        command="python3 -c 'print(1)'",
+        exit_code=0,
+        status="completed",
+        summary="command completed",
+    )
+    store.patch_health(lambda health: health.model_copy(update={"restart_count": 100}))
+    first = controller.should_wake_runtime_supervisor(
+        action=action,
+        validation=None,
+        changed_files=[],
+    )
+    first_batch = dict(controller._runtime_pending_trigger_signatures())
+
+    store.patch_health(lambda health: health.model_copy(update={"restart_count": 0}))
+    controller.should_wake_runtime_supervisor(
+        action=action,
+        validation=None,
+        changed_files=[],
+    )
+    controller._ack_runtime_trigger_batch(first_batch)
+    store.patch_health(lambda health: health.model_copy(update={"restart_count": 100}))
+    recurring = controller.should_wake_runtime_supervisor(
+        action=action,
+        validation=None,
+        changed_files=[],
+    )
+
+    assert first.reasons == ("restart_budget",)
+    assert controller._last_restart_budget_signature is None
+    assert recurring.reasons == ("restart_budget",)
 
 
 def _runtime_failure_validation(
@@ -1551,7 +1696,7 @@ def _runtime_unresolved_validation(
     )
 
 
-def test_runtime_restart_issue_distinguishes_failures_but_groups_same_masking_reason() -> None:
+def test_runtime_restart_issue_distinguishes_failures_and_ignores_legacy_masking() -> None:
     first = _runtime_failure_validation(sequence=1, output="AssertionError: expected 1, got 2")
     different = _runtime_failure_validation(sequence=2, output="ValueError: malformed header")
 
@@ -1586,9 +1731,8 @@ def test_runtime_restart_issue_distinguishes_failures_but_groups_same_masking_re
         _runtime_validation_packet(masked_b, wake_sequence=4, reason="masked_validation")
     )
 
-    assert masked_a_issue is not None
-    assert masked_b_issue is not None
-    assert masked_a_issue.key == masked_b_issue.key
+    assert masked_a_issue is None
+    assert masked_b_issue is None
 
 
 def test_runtime_restart_issue_groups_nested_shells_for_same_unresolved_command() -> None:
@@ -1867,12 +2011,10 @@ def test_trusted_pass_clears_unresolved_issue_through_equivalent_shell_wrapper(
 @pytest.mark.parametrize(
     "reason",
     [
-        "masked_validation",
         "validation_regression",
         "repeated_same_failing_validation",
         "timeout",
         "suspicious_file_touched",
-        "restart_budget",
         "unknown_signal",
     ],
 )
@@ -1914,8 +2056,10 @@ def test_cheap_runtime_switch_reads_persisted_runtime_config(tmp_path: Path) -> 
 @pytest.mark.parametrize(
     "summary",
     [
-        "Runtime trigger (done_without_fresh_validation): readiness claim lacks trusted validation",
+        "Runtime trigger (restart_budget): restart candidate because restart cap reached; command completed",
+        "Runtime trigger (runtime_apply_retry): retry decision after apply failure",
         "Runtime trigger (runtime_control_replacement): coder workspace runtime links were restored",
+        "Runtime trigger (runtime_decision_retry): refresh stale runtime decision",
         "Runtime integrity trigger: coder workspace runtime links were replaced and restored.",
     ],
 )
@@ -2037,7 +2181,7 @@ def test_suspicious_file_trigger_wakes_once_per_file_state(tmp_path: Path) -> No
     assert changed_after_clean.reasons == ("suspicious_file_touched",)
 
 
-def test_unchanged_suspicious_file_does_not_hide_another_runtime_reason(tmp_path: Path) -> None:
+def test_unchanged_suspicious_file_does_not_defeat_isolated_nonzero_noop(tmp_path: Path) -> None:
     controller, _store, _fake = _runtime_controller(tmp_path)
     test_path = tmp_path / "tests" / "test_parser.py"
     test_path.parent.mkdir()
@@ -2063,11 +2207,11 @@ def test_unchanged_suspicious_file_does_not_hide_another_runtime_reason(tmp_path
         changed_files=changed_files,
     )
 
-    assert decision.should_wake is True
-    assert decision.reasons == ("nonzero_exit",)
+    assert decision.should_wake is False
+    assert decision.reasons == ()
 
 
-def test_file_change_large_diff_noops_without_runtime_model(tmp_path: Path) -> None:
+def test_file_change_large_diff_wakes_runtime_triage_once(tmp_path: Path) -> None:
     controller, _store, _fake = _runtime_controller(tmp_path)
 
     decision = controller.should_wake_runtime_supervisor(
@@ -2081,8 +2225,8 @@ def test_file_change_large_diff_noops_without_runtime_model(tmp_path: Path) -> N
         changed_files=[ChangedFile(path="src/app.py", status="M", additions=600, deletions=0, sequence=2)],
     )
 
-    assert decision.should_wake is False
-    assert decision.reasons == ()
+    assert decision.should_wake is True
+    assert decision.reasons == ("large_diff",)
 
 
 def test_project_execution_large_diff_wakes_runtime_supervisor(tmp_path: Path) -> None:
@@ -2104,7 +2248,39 @@ def test_project_execution_large_diff_wakes_runtime_supervisor(tmp_path: Path) -
     assert decision.reasons == ("large_diff",)
 
 
-def test_project_execution_nonzero_wakes_runtime_supervisor(tmp_path: Path) -> None:
+def test_timeout_trigger_requires_explicit_structured_signal(tmp_path: Path) -> None:
+    controller, _store, _fake = _runtime_controller(tmp_path)
+    textual = controller.should_wake_runtime_supervisor(
+        action=TriggeringAction(
+            kind="commandExecution",
+            command="python -c 'subprocess.run(cmd, timeout=30)'",
+            exit_code=0,
+            status="completed",
+            summary="command mentions timeout but completed",
+        ),
+        validation=None,
+        changed_files=[],
+    )
+    explicit = controller.should_wake_runtime_supervisor(
+        action=TriggeringAction(
+            kind="commandExecution",
+            command="python worker.py",
+            exit_code=None,
+            status="failed",
+            timed_out=True,
+            summary="command failed",
+        ),
+        validation=None,
+        changed_files=[],
+    )
+
+    assert textual.should_wake is False
+    assert textual.reasons == ()
+    assert explicit.should_wake is True
+    assert explicit.reasons == ("timeout",)
+
+
+def test_project_execution_first_nonzero_is_deterministic_noop(tmp_path: Path) -> None:
     controller, _store, _fake = _runtime_controller(tmp_path)
     action = TriggeringAction(
         kind="commandExecution",
@@ -2128,8 +2304,8 @@ def test_project_execution_nonzero_wakes_runtime_supervisor(tmp_path: Path) -> N
         changed_files=[],
     )
 
-    assert decision.should_wake is True
-    assert decision.reasons == ("nonzero_exit",)
+    assert decision.should_wake is False
+    assert decision.reasons == ()
 
 
 def test_protected_runtime_reason_stays_visible_for_project_execution(tmp_path: Path) -> None:
@@ -2186,7 +2362,7 @@ def test_unresolved_masked_validation_still_wakes_for_project_execution(tmp_path
     assert decision.reasons == ("large_diff",)
 
 
-def test_read_only_action_does_not_wake_only_for_restart_budget(tmp_path: Path) -> None:
+def test_read_only_action_still_wakes_for_restart_budget(tmp_path: Path) -> None:
     controller, store, _fake = _runtime_controller(tmp_path)
     store.patch_health(lambda health: health.model_copy(update={"restart_count": 100}))
 
@@ -2202,11 +2378,679 @@ def test_read_only_action_does_not_wake_only_for_restart_budget(tmp_path: Path) 
         changed_files=[ChangedFile(path="src/app.py", status="M", additions=600, deletions=0, sequence=2)],
     )
 
-    assert decision.should_wake is False
-    assert decision.reasons == ()
+    assert decision.should_wake is True
+    assert decision.reasons == ("restart_budget",)
+    assert decision.restart_reason == "restart cap reached"
 
 
-async def test_masked_validation_wakes_and_is_not_trusted(tmp_path: Path) -> None:
+def test_pending_large_diff_trigger_survives_coalesced_turn_boundary(tmp_path: Path) -> None:
+    controller, _store, _fake = _runtime_controller(tmp_path)
+    changed_files = [
+        ChangedFile(path="src/app.py", status="M", additions=600, deletions=0, sequence=2)
+    ]
+    action = TriggeringAction(
+        kind="fileChange",
+        paths=["src/app.py"],
+        status="completed",
+        summary="file change completed",
+    )
+
+    first = controller.should_wake_runtime_supervisor(
+        action=action,
+        validation=None,
+        changed_files=changed_files,
+    )
+    duplicate_while_queued = controller.should_wake_runtime_supervisor(
+        action=action,
+        validation=None,
+        changed_files=changed_files,
+    )
+    pending_batch = dict(controller._runtime_pending_trigger_signatures())
+    prepared = controller._prepare_runtime_trigger_summary(
+        "Coder turn completed",
+        pending=pending_batch,
+    )
+    controller._ack_runtime_trigger_batch(pending_batch)
+    after_review_started = controller.should_wake_runtime_supervisor(
+        action=action,
+        validation=None,
+        changed_files=changed_files,
+    )
+
+    assert first.reasons == ("large_diff",)
+    assert duplicate_while_queued.should_wake is False
+    assert prepared.startswith("Runtime trigger (large_diff):")
+    assert "Coder turn completed" in prepared
+    assert after_review_started.should_wake is False
+
+
+def test_validation_regression_trigger_survives_coalesced_turn_boundary(tmp_path: Path) -> None:
+    controller, _store, _fake = _runtime_controller(tmp_path)
+
+    controller._retain_runtime_trigger_summary(
+        "Runtime trigger (validation_regression, nonzero_exit): pytest exited 1"
+    )
+    pending_batch = dict(controller._runtime_pending_trigger_signatures())
+    prepared = controller._prepare_runtime_trigger_summary(
+        "Coder turn completed",
+        pending=pending_batch,
+    )
+
+    assert prepared.startswith("Runtime trigger (validation_regression, nonzero_exit):")
+    assert "Coder turn completed" in prepared
+
+
+async def test_runtime_intervention_cancels_queued_completion_review(tmp_path: Path) -> None:
+    controller, _store, fake = _runtime_controller(tmp_path)
+
+    class FakeCoder:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def steer_or_start(self, message: str) -> str:
+            self.messages.append(message)
+            return "turn"
+
+    coder = FakeCoder()
+    controller.coder = coder
+
+    async def intervene(packet):
+        fake.runtime_packets.append(packet)
+        return SupervisorDecision(
+            decision=SupervisorDecisionKind.INTERVENE,
+            reason="concrete runtime correction",
+            message_to_coder="Correct the runtime issue before declaring readiness.",
+            wake_sequence=packet.wake_sequence,
+            generation=packet.generation,
+        )
+
+    fake.decide = intervene
+    controller._queue_supervisor_check(
+        "Coder provided exact readiness marker; running completion_review.",
+        completion_review=True,
+    )
+
+    await controller._supervisor_check_loop(
+        "Runtime trigger (validation_regression): pytest regressed",
+        None,
+        None,
+        None,
+        None,
+        False,
+    )
+
+    assert len(fake.runtime_packets) == 1
+    assert fake.completion_packets == []
+    assert coder.messages == ["Correct the runtime issue before declaring readiness."]
+    assert controller._supervisor_next_completion_summary is None
+
+
+async def test_pause_closes_completion_review_session(tmp_path: Path) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+
+    await controller.pause()
+
+    assert controller.paused is True
+    assert fake.closed_completion_reviews == 1
+    assert store.get_bello_config().status == BelloStatus.PAUSED
+
+
+async def test_runtime_no_message_retry_keeps_runtime_and_completion_in_separate_slots(
+    tmp_path: Path,
+) -> None:
+    controller, _store, _fake = _runtime_controller(tmp_path)
+    controller._queue_supervisor_check(
+        "Coder provided exact readiness marker; running completion_review.",
+        completion_review=True,
+    )
+
+    recovered = await controller._handle_supervisor_no_message_failure(
+        message="supervisor did not produce an agent message",
+        summary="Runtime trigger (timeout): command timed out",
+        completion_review=False,
+    )
+
+    assert recovered is True
+    assert "Retry supervisor review" in (controller._supervisor_next_runtime_summary or "")
+    assert controller._supervisor_next_completion_summary is not None
+    assert controller._supervisor_next_completion_review is False
+    assert controller._supervisor_next_summary == controller._supervisor_next_runtime_summary
+
+
+async def test_repeated_runtime_timeout_blocks_stale_queued_completion(tmp_path: Path) -> None:
+    controller, store, _fake = _runtime_controller(tmp_path)
+
+    class AlwaysTimeoutSupervisor:
+        def __init__(self, state_store: StateStore, task: Path) -> None:
+            self.agent = StatelessSupervisorAgent(None, state_store, task)  # type: ignore[arg-type]
+            self.calls = 0
+
+        def build_packet(self, **kwargs):
+            return self.agent.build_packet(**kwargs)
+
+        async def decide(self, packet):
+            self.calls += 1
+            raise SupervisorAgentError("runtime supervisor timed out")
+
+    supervisor = AlwaysTimeoutSupervisor(store, controller.task_path)
+    controller.supervisor = supervisor
+    controller._queue_supervisor_check(
+        "Coder provided exact readiness marker; running completion_review.",
+        completion_review=True,
+    )
+
+    await controller._supervisor_check_loop(
+        "Runtime trigger (timeout): command execution timed out",
+        "cmd-timeout",
+        TriggeringAction(
+            item_id="cmd-timeout",
+            kind="commandExecution",
+            command="pytest",
+            status="failed",
+            timed_out=True,
+            summary="command execution timed out",
+        ),
+        None,
+        None,
+        False,
+    )
+
+    assert supervisor.calls == 2
+    assert store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE
+    assert controller._supervisor_next_completion_summary is None
+    assert "refusing to run a stale completion review" in store.path(PROGRESS).read_text(encoding="utf-8")
+
+
+async def test_queued_human_runtime_wake_preserves_full_context_and_bypasses_cheap(
+    tmp_path: Path,
+) -> None:
+    controller, _store, fake = _runtime_controller(tmp_path)
+    cheap = _CheapRuntimeNoopReviewer()
+    controller.runtime_triage_reviewer = cheap
+    controller.runtime_triage_config = SimpleNamespace(model=cheap.model)
+    human = HumanMessage(text="Discussion only; do not change files.", sequence=9)
+    action = TriggeringAction(
+        item_id="cmd-9",
+        kind="commandExecution",
+        command="pwd",
+        exit_code=0,
+        status="completed",
+        summary="command completed",
+    )
+    controller._queue_supervisor_check(
+        "Human message received",
+        triggering_item_id="message-9",
+        triggering_action=action,
+        human_message=human,
+        patch_summary="queued patch context",
+        completion_review=False,
+    )
+    controller._queue_supervisor_check(
+        "Coder turn completed",
+        completion_review=False,
+    )
+
+    await controller._supervisor_check_loop(
+        "Runtime trigger (large_diff): initial event",
+        None,
+        None,
+        None,
+        None,
+        False,
+    )
+
+    assert len(cheap.calls) == 1
+    assert len(fake.runtime_packets) == 1
+    packet = fake.runtime_packets[0]
+    assert packet.current_summary == "Human message received"
+    assert packet.human_message == human
+    assert packet.triggering_item_id == "message-9"
+    assert packet.triggering_action == action
+    assert packet.patch_summary == "queued patch context"
+
+
+async def test_stale_runtime_decision_does_not_ack_trigger_signature(tmp_path: Path) -> None:
+    controller, _store, fake = _runtime_controller(tmp_path)
+    changed_files = [
+        ChangedFile(path="src/app.py", status="M", additions=600, deletions=0, sequence=2)
+    ]
+    decision = controller.should_wake_runtime_supervisor(
+        action=TriggeringAction(
+            kind="fileChange",
+            paths=["src/app.py"],
+            status="completed",
+            summary="file change completed",
+        ),
+        validation=None,
+        changed_files=changed_files,
+    )
+    signature = controller._runtime_pending_trigger_signatures()["large_diff"][0]
+
+    async def stale_decision(packet):
+        fake.runtime_packets.append(packet)
+        return SupervisorDecision(
+            decision=SupervisorDecisionKind.NOOP,
+            reason="stale generation",
+            wake_sequence=packet.wake_sequence,
+            generation=packet.generation + 1,
+        )
+
+    fake.decide = stale_decision
+    await controller._run_supervisor_check(
+        "Runtime trigger (large_diff): file change completed",
+        None,
+        None,
+        None,
+        None,
+        False,
+    )
+
+    assert decision.reasons == ("large_diff",)
+    assert controller._last_large_diff_signature is None
+    assert controller._runtime_pending_trigger_signatures()["large_diff"][0] == signature
+    assert controller._supervisor_next_runtime_summary is not None
+
+
+async def test_runtime_wake_arriving_during_completion_defers_completion_decision(
+    tmp_path: Path,
+) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    original_completion = fake.decide_completion
+    action = TriggeringAction(
+        item_id="cmd-regression",
+        kind="commandExecution",
+        command="pytest",
+        exit_code=1,
+        status="failed",
+        summary="pytest regressed",
+    )
+
+    async def completion_with_concurrent_runtime(packet):
+        controller._queue_supervisor_check(
+            "Runtime trigger (validation_regression): pytest regressed",
+            triggering_item_id="cmd-regression",
+            triggering_action=action,
+            completion_review=False,
+        )
+        return await original_completion(packet)
+
+    fake.decide_completion = completion_with_concurrent_runtime
+    await controller._run_supervisor_check(
+        "Coder provided exact readiness marker; running completion_review.",
+        "message-ready",
+        None,
+        None,
+        None,
+        True,
+    )
+
+    assert store.get_bello_config().last_applied_supervisor_sequence == 0
+    assert controller._supervisor_next_runtime_summary is not None
+    assert controller._supervisor_next_runtime_check.triggering_action == action
+    assert controller._supervisor_next_completion_summary is not None
+    assert controller._supervisor_next_completion_check.completion_review is True
+    assert fake.closed_completion_reviews == 1
+
+
+async def test_coalesced_runtime_reasons_retain_each_trigger_action_for_luna(
+    tmp_path: Path,
+) -> None:
+    from supervisor.approval_triage import cheap_runtime_packet
+
+    controller, _store, fake = _runtime_controller(tmp_path)
+    cheap = _CheapRuntimeNoopReviewer()
+    controller.runtime_triage_reviewer = cheap
+    controller.runtime_triage_config = SimpleNamespace(model=cheap.model)
+    regression = TriggeringAction(
+        item_id="pytest-1",
+        kind="commandExecution",
+        command="pytest tests/test_parser.py",
+        exit_code=1,
+        status="failed",
+        summary="parser regression",
+    )
+    suspicious_edit = TriggeringAction(
+        item_id="edit-2",
+        kind="fileChange",
+        paths=["tests/fixtures/parser.json"],
+        status="completed",
+        summary="fixture changed",
+    )
+    controller.validations = [
+        ValidationRun(
+            validation_id="parser-tests",
+            command="pytest tests/test_parser.py",
+            normalized_command="pytest tests/test_parser.py",
+            exit_code=1,
+            shell_exit_code=1,
+            passed=False,
+            trusted_validation_outcome="failed",
+            summary="parser test failed",
+            sequence=1,
+        )
+    ]
+    controller._retain_runtime_trigger_summary(
+        "Runtime trigger (validation_regression): parser regression",
+        triggering_action=regression,
+    )
+    controller._queue_supervisor_check(
+        "Runtime trigger (suspicious_file_touched): fixture changed",
+        triggering_action=suspicious_edit,
+        completion_review=False,
+    )
+
+    await controller._run_supervisor_check(
+        "Runtime trigger (validation_regression): parser regression",
+        "pytest-1",
+        regression,
+        None,
+        None,
+        False,
+    )
+
+    assert fake.runtime_packets == []
+    assert len(cheap.calls) == 1
+    packet = cheap.calls[0]
+    assert set(packet.current_summary.split("(", 1)[1].split(")", 1)[0].split(", ")) == {
+        "validation_regression",
+        "suspicious_file_touched",
+    }
+    assert {action.item_id for action in packet.runtime_triggering_actions} == {
+        "pytest-1",
+        "edit-2",
+    }
+    slim = cheap_runtime_packet(packet)
+    events = {event["action"]["item_id"]: event for event in slim["triggering_events"]}
+    assert events["pytest-1"]["validation"]["validation_id"] == "parser-tests"
+    assert events["edit-2"]["action"]["paths"] == ["tests/fixtures/parser.json"]
+    assert controller._supervisor_next_runtime_summary is None
+
+
+def test_ack_keeps_new_same_reason_trigger_when_other_queued_reason_is_covered(
+    tmp_path: Path,
+) -> None:
+    controller, _store, _fake = _runtime_controller(tmp_path)
+    old_a = TriggeringAction(
+        item_id="a-old",
+        kind="commandExecution",
+        command="pytest tests/test_a.py",
+        exit_code=1,
+        status="failed",
+        summary="old A regression",
+    )
+    old_b = TriggeringAction(
+        item_id="b-old",
+        kind="commandExecution",
+        command="pytest tests/test_b.py",
+        exit_code=1,
+        status="failed",
+        summary="old B regression",
+    )
+    new_a = old_a.model_copy(update={"item_id": "a-new", "summary": "new A regression"})
+    controller._retain_runtime_trigger_summary(
+        "Runtime trigger (validation_regression): old A regression",
+        triggering_action=old_a,
+    )
+    controller._retain_runtime_trigger_summary(
+        "Runtime trigger (repeated_same_failing_validation): old B regression",
+        triggering_action=old_b,
+    )
+    old_batch = dict(controller._runtime_pending_trigger_signatures())
+    controller._queue_supervisor_check(
+        "Runtime trigger (validation_regression): new A regression",
+        triggering_action=new_a,
+        completion_review=False,
+    )
+    controller._queue_supervisor_check(
+        "Runtime trigger (repeated_same_failing_validation): old B duplicate",
+        triggering_action=old_b,
+        completion_review=False,
+    )
+
+    controller._ack_runtime_trigger_batch(old_batch)
+
+    assert list(controller._runtime_pending_trigger_signatures()) == ["validation_regression"]
+    assert controller._runtime_pending_trigger_actions()["validation_regression"].item_id == "a-new"
+    assert controller._supervisor_next_runtime_summary is not None
+    assert "validation_regression" in controller._supervisor_next_runtime_summary
+    assert controller._supervisor_next_runtime_check.triggering_action.item_id == "a-new"
+
+
+async def test_failed_runtime_apply_requeues_trigger_and_cancels_stale_completion(
+    tmp_path: Path,
+) -> None:
+    controller, _store, fake = _runtime_controller(tmp_path)
+
+    class FailingCoder:
+        async def steer_or_start(self, message: str) -> str:
+            raise RuntimeError("steering failed")
+
+    controller.coder = FailingCoder()
+    controller._queue_supervisor_check(
+        "Coder provided exact readiness marker; running completion_review.",
+        completion_review=True,
+    )
+
+    async def intervene(packet):
+        fake.runtime_packets.append(packet)
+        return SupervisorDecision(
+            decision=SupervisorDecisionKind.INTERVENE,
+            reason="runtime correction",
+            message_to_coder="Correct the regression.",
+            wake_sequence=packet.wake_sequence,
+            generation=packet.generation,
+        )
+
+    fake.decide = intervene
+    await controller._run_supervisor_check(
+        "Runtime trigger (validation_regression): pytest regressed",
+        "cmd-regression",
+        None,
+        None,
+        None,
+        False,
+    )
+
+    assert controller._supervisor_next_runtime_summary is not None
+    assert controller._supervisor_next_completion_summary is None
+    assert "validation_regression" in controller._runtime_pending_trigger_signatures()
+    assert controller._runtime_apply_retry_count == 1
+
+
+async def test_failed_runtime_steer_retries_same_wake_sequence_then_commits(
+    tmp_path: Path,
+) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+
+    class InitialEscalatingCheapReviewer(_CheapRuntimeNoopReviewer):
+        async def review(self, packet):
+            self.calls.append(packet)
+            return CheapRuntimeDecision(
+                decision="escalate",
+                reason_code="needs_supervisor_judgment",
+            )
+
+    cheap = InitialEscalatingCheapReviewer()
+    controller.runtime_triage_reviewer = cheap
+    controller.runtime_triage_config = SimpleNamespace(model=cheap.model)
+
+    class FlakyCoder:
+        def __init__(self) -> None:
+            self.attempts = 0
+            self.messages: list[str] = []
+
+        async def steer_or_start(self, message: str) -> str:
+            self.attempts += 1
+            self.messages.append(message)
+            if self.attempts == 1:
+                raise RuntimeError("transient steering failure")
+            return "turn"
+
+    coder = FlakyCoder()
+    controller.coder = coder
+    controller._queue_supervisor_check(
+        "Coder provided exact readiness marker; running completion_review.",
+        completion_review=True,
+    )
+
+    async def intervene(packet):
+        fake.runtime_packets.append(packet)
+        return SupervisorDecision(
+            decision=SupervisorDecisionKind.INTERVENE,
+            reason="runtime correction",
+            message_to_coder="Correct the regression.",
+            wake_sequence=packet.wake_sequence,
+            generation=packet.generation,
+        )
+
+    fake.decide = intervene
+    await controller._supervisor_check_loop(
+        "Runtime trigger (validation_regression): pytest regressed",
+        "cmd-regression",
+        None,
+        None,
+        None,
+        False,
+    )
+
+    assert len(fake.runtime_packets) == 2
+    assert [packet.wake_sequence for packet in fake.runtime_packets] == [1, 1]
+    assert coder.attempts == 2
+    assert coder.messages == ["Correct the regression.", "Correct the regression."]
+    assert store.get_bello_config().last_applied_supervisor_sequence == 1
+    assert controller._runtime_pending_trigger_signatures() == {}
+    assert controller._supervisor_next_completion_summary is None
+    assert controller._runtime_apply_retry_count == 0
+    assert len(cheap.calls) == 1
+
+
+async def test_repeated_stale_runtime_decision_fails_bounded_without_completion(
+    tmp_path: Path,
+) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+
+    class InitialEscalatingCheapReviewer(_CheapRuntimeNoopReviewer):
+        async def review(self, packet):
+            self.calls.append(packet)
+            return CheapRuntimeDecision(
+                decision="escalate",
+                reason_code="needs_supervisor_judgment",
+            )
+
+    cheap = InitialEscalatingCheapReviewer()
+    controller.runtime_triage_reviewer = cheap
+    controller.runtime_triage_config = SimpleNamespace(model=cheap.model)
+    controller._queue_supervisor_check(
+        "Coder provided exact readiness marker; running completion_review.",
+        completion_review=True,
+    )
+
+    async def stale(packet):
+        fake.runtime_packets.append(packet)
+        return SupervisorDecision(
+            decision=SupervisorDecisionKind.NOOP,
+            reason="stale generation",
+            wake_sequence=packet.wake_sequence,
+            generation=packet.generation + 1,
+        )
+
+    fake.decide = stale
+    await controller._supervisor_check_loop(
+        "Runtime trigger (large_diff): file change completed",
+        "file-1",
+        None,
+        None,
+        None,
+        False,
+    )
+
+    assert len(fake.runtime_packets) == 2
+    assert len(cheap.calls) == 1
+    assert controller._runtime_decision_retry_count == 1
+    assert controller._supervisor_next_completion_summary is None
+    assert store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE
+
+
+async def test_runtime_pause_discards_queued_reviews_and_stops_queue_loop(tmp_path: Path) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    controller._queue_supervisor_check(
+        "Coder provided exact readiness marker; running completion_review.",
+        completion_review=True,
+    )
+
+    async def pause(packet):
+        fake.runtime_packets.append(packet)
+        return SupervisorDecision(
+            decision=SupervisorDecisionKind.PAUSE,
+            reason="human-only input required",
+            wake_sequence=packet.wake_sequence,
+            generation=packet.generation,
+        )
+
+    fake.decide = pause
+    await controller._supervisor_check_loop(
+        "Human message to supervisor: wait for credentials",
+        None,
+        None,
+        HumanMessage(text="wait for credentials", sequence=1),
+        None,
+        False,
+    )
+
+    assert len(fake.runtime_packets) == 1
+    assert fake.completion_packets == []
+    assert controller.paused is True
+    assert controller._supervisor_next_runtime_summary is None
+    assert controller._supervisor_next_completion_summary is None
+    assert store.get_bello_config().status == BelloStatus.PAUSED
+
+
+async def test_external_pause_discards_inflight_runtime_decision(tmp_path: Path) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+
+    class FakeCoder:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+            self.interrupted = False
+
+        async def steer_or_start(self, message: str) -> str:
+            self.messages.append(message)
+            return "turn"
+
+        async def interrupt(self) -> None:
+            self.interrupted = True
+
+    coder = FakeCoder()
+    controller.coder = coder
+
+    async def intervene_after_external_pause(packet):
+        fake.runtime_packets.append(packet)
+        await controller.pause()
+        return SupervisorDecision(
+            decision=SupervisorDecisionKind.INTERVENE,
+            reason="late pre-pause correction",
+            message_to_coder="This must not be delivered after pause.",
+            wake_sequence=packet.wake_sequence,
+            generation=packet.generation,
+        )
+
+    fake.decide = intervene_after_external_pause
+    await controller._supervisor_check_loop(
+        "Human message to supervisor: inspect current state",
+        None,
+        None,
+        HumanMessage(text="inspect current state", sequence=1),
+        None,
+        False,
+    )
+
+    assert coder.interrupted is True
+    assert coder.messages == []
+    assert store.get_bello_config().last_applied_supervisor_sequence == 0
+    assert store.get_bello_config().status == BelloStatus.PAUSED
+
+
+async def test_shell_command_shape_does_not_create_masked_validation_wake(tmp_path: Path) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
 
     await controller.handle_notification(
@@ -2227,13 +3071,45 @@ async def test_masked_validation_wakes_and_is_not_trusted(tmp_path: Path) -> Non
             }
         )
     )
-    await controller._supervisor_task
-
-    assert len(fake.runtime_packets) == 1
-    assert controller.validations[0].trusted_validation_outcome == "masked_or_unknown"
-    assert controller.validations[0].masking_reason == "pipeline_without_pipefail"
+    assert controller._supervisor_task is None
+    assert fake.runtime_packets == []
+    assert controller.validations[0].trusted_validation_outcome == "passed"
+    assert controller.validations[0].masking_reason is None
     trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
-    assert "masked_validation" in trace["trigger_reasons"]
+    assert "masked_validation" not in trace["trigger_reasons"]
+
+
+async def test_test_runner_failure_output_is_failed_without_masked_gate(tmp_path: Path) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+
+    await controller.handle_notification(
+        AppServerMessage(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread",
+                    "itemId": "cmd-failed",
+                    "item": {
+                        "type": "commandExecution",
+                        "command": "pytest tests/test_app.py | cat",
+                        "exitCode": 0,
+                        "status": "completed",
+                        "stdout": "tests/test_app.py::test_app FAILED\n1 failed in 0.01s\n",
+                    },
+                },
+            }
+        )
+    )
+
+    assert controller._supervisor_task is None
+    assert fake.runtime_packets == []
+    validation = controller.validations[0]
+    assert validation.outcome == "fail"
+    assert validation.passed is False
+    assert validation.trusted_validation_outcome == "failed"
+    assert validation.masking_reason is None
+    trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
+    assert trace["trigger_reasons"] == []
 
 
 async def test_repeated_same_failing_validation_uses_command_identity(tmp_path: Path) -> None:
@@ -2249,20 +3125,23 @@ async def test_repeated_same_failing_validation_uses_command_identity(tmp_path: 
     await controller.handle_notification(
         AppServerMessage({"method": "item/completed", "params": {"threadId": "thread", "itemId": "cmd-1", "item": item}})
     )
-    await controller._supervisor_task
+    assert controller._supervisor_task is None
     await controller.handle_notification(
         AppServerMessage({"method": "item/completed", "params": {"threadId": "thread", "itemId": "cmd-2", "item": item}})
     )
     await controller._supervisor_task
 
-    assert len(fake.runtime_packets) == 2
+    assert len(fake.runtime_packets) == 1
     assert controller.validations[0].validation_id == controller.validations[1].validation_id
     trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
     assert "repeated_same_failing_validation" in trace["trigger_reasons"]
 
 
-async def test_done_without_fresh_validation_wakes_runtime_not_completion(tmp_path: Path) -> None:
+async def test_done_without_fresh_validation_wakes_full_runtime_not_completion(tmp_path: Path) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
+    cheap = _CheapRuntimeNoopReviewer()
+    controller.runtime_triage_reviewer = cheap
+    controller.runtime_triage_config = SimpleNamespace(model=cheap.model)
     controller.last_coder_message = CoderMessage(text="Summary\nBELLO_READY_FOR_REVIEW", sequence=3)
     controller.observed_changed_files = {
         "src/app.py": ChangedFile(path="src/app.py", status="modified", sequence=2)
@@ -2282,10 +3161,17 @@ async def test_done_without_fresh_validation_wakes_runtime_not_completion(tmp_pa
     await controller._supervisor_task
 
     assert len(fake.runtime_packets) == 1
+    assert fake.runtime_packets[0].current_summary.startswith(
+        "Runtime trigger (done_without_fresh_validation):"
+    )
+    assert cheap.calls == []
     assert fake.completion_packets == []
     assert store.get_bello_config().last_relevant_edit_sequence == 2
     trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
     assert trace["trigger_reasons"] == ["done_without_fresh_validation"]
+    assert trace["should_wake_runtime_supervisor"] is True
+    assert trace["deterministic_action"] is None
+    assert trace["skipped_noop"] is False
 
 
 async def test_completion_packet_details_can_send_delta_after_return(tmp_path: Path) -> None:
@@ -2545,7 +3431,7 @@ def test_marked_behavior_demo_allows_honest_shell_sequence() -> None:
     assert validation.masking_reason is None
 
 
-def test_marked_behavior_demo_does_not_unmask_status_manipulation() -> None:
+def test_shell_shape_is_not_masked_but_output_quality_still_controls_evidence() -> None:
     logical_or = _validation_from_action(
         TriggeringAction(
             kind="commandExecution",
@@ -2584,14 +3470,17 @@ def test_marked_behavior_demo_does_not_unmask_status_manipulation() -> None:
     )
 
     assert logical_or is not None
-    assert logical_or.trusted_validation_outcome == "masked_or_unknown"
-    assert logical_or.masking_reason == "logical_or_may_mask_validation_failure"
+    assert logical_or.trusted_validation_outcome == "passed"
+    assert logical_or.masking_reason is None
+    assert _has_passing_behavioral_validation([logical_or]) is False
     assert pipeline is not None
-    assert pipeline.trusted_validation_outcome == "masked_or_unknown"
-    assert pipeline.masking_reason == "pipeline_without_pipefail"
+    assert pipeline.trusted_validation_outcome == "passed"
+    assert pipeline.masking_reason is None
+    assert _has_passing_behavioral_validation([pipeline]) is True
     assert bare_pass is not None
-    assert bare_pass.trusted_validation_outcome == "masked_or_unknown"
-    assert bare_pass.masking_reason == "behavior_demo_self_verdict_only"
+    assert bare_pass.trusted_validation_outcome == "passed"
+    assert bare_pass.masking_reason is None
+    assert _has_passing_behavioral_validation([bare_pass]) is False
 
 
 def test_validation_ledger_reads_aggregated_output_field() -> None:
@@ -2634,7 +3523,7 @@ def test_command_output_aliases_are_attached_to_validation_ledger() -> None:
     assert validation.captured_output == "scenario=smoke state=requested\n"
 
 
-def test_behavior_demo_without_real_output_is_not_passed() -> None:
+def test_behavior_demo_without_real_output_is_recorded_but_not_usable_evidence() -> None:
     validation = _validation_from_action(
         TriggeringAction(
             kind="commandExecution",
@@ -2650,10 +3539,18 @@ def test_behavior_demo_without_real_output_is_not_passed() -> None:
 
     assert validation is not None
     assert validation.type == "behavior_demo"
-    assert validation.outcome == "fail"
-    assert validation.passed is False
-    assert validation.trusted_validation_outcome == "masked_or_unknown"
-    assert validation.masking_reason == "behavior_demo_missing_output"
+    assert validation.outcome == "pass"
+    assert validation.passed is True
+    assert validation.trusted_validation_outcome == "passed"
+    assert validation.masking_reason is None
+    assert _has_passing_behavioral_validation([validation]) is False
+    provenance = _evidence_provenance_summary(
+        validations=[validation],
+        changed_files=[ChangedFile(path="bin/app", status="M", sequence=2)],
+        latest_change_sequence=2,
+    ).validations[0]
+    assert provenance.output_kind == "missing"
+    assert provenance.independence_class == "not_independent"
 
 
 def test_non_python_behavior_demo_commands_are_classified() -> None:
@@ -3657,7 +4554,7 @@ async def test_adversary_remaining_limit_runs_before_completion_finalize(
     assert seen_snapshot_roots and not seen_snapshot_roots[0].exists()
     progress = store.path(PROGRESS).read_text(encoding="utf-8")
     assert "Adversarial tester completed" in progress
-    assert "without a candidate finding" in progress
+    assert "adv_report_controller found no findings or observations" in progress
 
 
 async def test_adversary_run_limit_skips_additional_run_and_finalizes(
@@ -3799,7 +4696,7 @@ async def test_adversary_fresh_report_allows_completion_finalize(tmp_path: Path)
     assert "## Adversary Reports" in final_report
 
 
-async def test_adversary_candidate_finding_reruns_completion_review_with_report(
+async def test_adversary_report_controller_routes_schema_valid_normalized_report_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3826,6 +4723,19 @@ async def test_adversary_candidate_finding_reruns_completion_review_with_report(
     controller.adversary_intelligence = "ultra"
     controller.running = True
     controller.observed_changed_files = {"src/app.py": ChangedFile(path="src/app.py", status="M", sequence=2)}
+    normalized = _FakeAdvReportController(
+        [
+            AdvReportControllerDecision(
+                forward_to_coder=True,
+                reason="kept one reworded finding",
+                report_to_coder=(
+                    "## Findings requiring correction\n"
+                    "- invoking with seven positional arguments crashes"
+                ),
+            )
+        ]
+    )
+    controller.adv_report_controller = normalized
 
     class FakeAdversary:
         def __init__(
@@ -3862,15 +4772,95 @@ async def test_adversary_candidate_finding_reruns_completion_review_with_report(
         packet_thread_id="thread",
         packet=_gate_packet(task, validations=validations),
     )
-    assert controller._supervisor_task is not None
-    await controller._supervisor_task
+    assert store.get_bello_config().status == BelloStatus.STARTING
+    assert fake.completion_packets == []
+    assert len(normalized.packets) == 1
+    assert normalized.packets[0].adversary_report is not None
+    assert normalized.packets[0].adversary_report.candidate_finding is True
+    assert store.get_bello_config().adversary_run_count == 1
+    assert coder.messages == [
+        "Finding: a confirmed defect that requires correction.\n"
+        "Observation: a concern that is not yet confirmed; investigate it and fix it only if confirmed.\n\n"
+        "## Findings requiring correction\n"
+        "- invoking with seven positional arguments crashes"
+    ]
+    assert "attacked:" not in coder.messages[0]
+    assert "overall:" not in coder.messages[0]
+    assert controller.completion_returns[0].source == "adversary_report_controller"
+    assert store.get_bello_config().completion_return_count == 0
+    coder_readable_log = store.path(LOG).read_text(encoding="utf-8")
+    assert "attacked: stack args" not in coder_readable_log
+    assert "overall: broke" not in coder_readable_log
+
+
+async def test_adversary_observations_are_routed_when_candidate_finding_is_false(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validations = [
+        ValidationRun(
+            command="pytest tests/test_app.py",
+            exit_code=0,
+            passed=True,
+            summary="1 passed",
+            captured_output="1 passed\n",
+            executed_test_files=["tests/test_app.py"],
+            sequence=3,
+        )
+    ]
+    controller, store, task, coder = _completion_gate_controller(
+        tmp_path,
+        validations=validations,
+    )
+    controller.adversary_enabled = True
+    controller.client = object()
+    controller.running = True
+    controller.adv_report_controller = _FakeAdvReportController(
+        [
+            AdvReportControllerDecision(
+                forward_to_coder=True,
+                reason="carried one observation",
+                report_to_coder=(
+                    "## Observations requiring investigation\n"
+                    "- cache count changed without the expected header"
+                ),
+            )
+        ]
+    )
+
+    class ObservingAdversary:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def run(self, packet, *, previous_adversary_report=None):
+            return SimpleNamespace(
+                report_text=(
+                    "candidate_finding: false\n"
+                    "attacked: cache behavior\n"
+                    "findings: none\n"
+                    "observations:\n"
+                    "- cache count changed without the expected header\n"
+                    "held: ordinary cache path\n"
+                    "overall: I believe no defects remain in the submitted solution"
+                ),
+                thread_id="adv-thread",
+                turn_id="adv-turn",
+                candidate_finding=False,
+            )
+
+    monkeypatch.setattr("supervisor.controller.AdversaryAgent", ObservingAdversary)
+
+    await controller.apply_completion_decision(
+        _covered_accept_decision(wake_sequence=1, validation_id="validation-3"),
+        packet_thread_id="thread",
+        packet=_gate_packet(task, validations=validations),
+    )
 
     assert store.get_bello_config().status == BelloStatus.STARTING
-    assert fake.completion_packets
-    assert fake.completion_packets[0].adversary_report is not None
-    assert fake.completion_packets[0].adversary_report.candidate_finding is True
-    assert store.get_bello_config().adversary_run_count == 1
-    assert "Adversarial tester report:" in coder.messages[0]
+    assert len(coder.messages) == 1
+    assert "## Observations requiring investigation" in coder.messages[0]
+    assert "cache count changed without the expected header" in coder.messages[0]
+    assert "attacked:" not in coder.messages[0]
 
 
 async def test_completion_return_budget_waits_for_coder_readiness_before_forcing_adversary(
@@ -4013,7 +5003,7 @@ def test_zero_post_adversary_review_budget_completes(tmp_path: Path) -> None:
     assert controller._completion_review_budget_action() == "complete"
 
 
-def test_zero_post_adversary_budget_allows_one_candidate_adjudication(tmp_path: Path) -> None:
+def test_zero_post_adversary_budget_has_no_legacy_completion_adjudication(tmp_path: Path) -> None:
     controller, store, task, _ = _completion_gate_controller(tmp_path, validations=[])
     controller.adversary_enabled = True
     store.update_bello_config(
@@ -4036,11 +5026,6 @@ def test_zero_post_adversary_budget_allows_one_candidate_adjudication(tmp_path: 
         created_at=datetime.now(timezone.utc).isoformat(),
     )
 
-    assert controller._completion_review_budget_action(packet=packet) is None
-
-    store.update_bello_config(
-        lambda cfg: cfg.model_copy(update={"completion_returns_since_adversary": 1})
-    )
     assert controller._completion_review_budget_action(packet=packet) == "complete"
 
 
@@ -4098,7 +5083,7 @@ async def test_pre_adversary_return_budget_runs_adversary_without_an_extra_compl
     assert cfg.completion_returns_since_adversary == 0
     assert finalized == [
         (
-            "completed by bounded review policy: completion review budget reached and adversary reported no candidate finding",
+            "completed by bounded review policy: completion review budget reached and the normalized adversary report had nothing for the coder",
             BelloStatus.COMPLETE,
             False,
         )
@@ -4268,7 +5253,7 @@ async def test_adversary_receives_previous_report_as_regression_context(
     assert coder.messages == []
 
 
-async def test_completion_return_after_adversary_includes_report_for_coder(tmp_path: Path) -> None:
+async def test_completion_return_never_appends_raw_adversary_report(tmp_path: Path) -> None:
     validations = [
         ValidationRun(
             command="pytest tests/test_app.py",
@@ -4313,9 +5298,9 @@ async def test_completion_return_after_adversary_includes_report_for_coder(tmp_p
     await controller.apply_completion_decision(decision, packet_thread_id="thread", packet=packet)
 
     assert len(controller.completion_returns) == 1
-    assert "Fix the reproduced stack-argument crash." in coder.messages[0]
-    assert "Adversarial tester report:" in coder.messages[0]
-    assert "SIGSEGV" in coder.messages[0]
+    assert coder.messages == ["Fix the reproduced stack-argument crash."]
+    assert "Adversarial tester report:" not in coder.messages[0]
+    assert "SIGSEGV" not in coder.messages[0]
 
 
 async def test_completion_accept_gate_returns_for_vacuous_changed_test_masking(tmp_path: Path) -> None:
@@ -4660,7 +5645,7 @@ async def test_supervisor_turn_start_timeout_writes_provider_failure_final_repor
     assert "supervisor turn/start response timed out after 0.01s" in audit["error"]
 
 
-async def test_stale_runtime_supervisor_timeout_keeps_queued_completion_review(tmp_path: Path) -> None:
+async def test_stale_runtime_supervisor_timeout_retries_before_queued_completion(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
@@ -4694,19 +5679,20 @@ async def test_stale_runtime_supervisor_timeout_keeps_queued_completion_review(t
         task,
         timeout_seconds=0.01,
     )  # type: ignore[arg-type]
-    controller._supervisor_dirty = True
-    controller._supervisor_next_completion_review = True
+    controller._queue_supervisor_check(
+        "Coder provided exact readiness marker; running completion_review.",
+        completion_review=True,
+    )
 
     await controller._run_supervisor_check("stale runtime check", None, None, None, None)
 
     text = store.path(FINAL_REPORT).read_text(encoding="utf-8")
-    health = store.get_health()
     assert store.get_bello_config().status == BelloStatus.STARTING
     assert text == ""
     assert controller.running is True
-    assert health.timeout_fallback_count == 1
-    assert "stale_runtime_supervisor_timeout" in health.risk_signals
-    assert "continuing with the latest queued review" in store.path(PROGRESS).read_text(encoding="utf-8")
+    assert controller._supervisor_next_runtime_summary is not None
+    assert controller._supervisor_next_completion_summary is not None
+    assert "retrying the retained runtime trigger before completion" in store.path(PROGRESS).read_text(encoding="utf-8")
     assert any("supervisor check failed" in message for _, message in controller.tui.messages)
 
 
@@ -4776,6 +5762,52 @@ async def test_repeated_runtime_supervisor_no_message_skips_current_review(tmp_p
     progress = store.path(PROGRESS).read_text(encoding="utf-8")
     assert "retrying review from latest stable state" in progress
     assert "skipping this runtime-only review" in progress
+
+
+async def test_runtime_no_message_exhaustion_explicitly_skips_and_acks_pending_large_diff(
+    tmp_path: Path,
+) -> None:
+    controller, store, _ = _runtime_controller(tmp_path)
+
+    class AlwaysNoMessageRuntimeSupervisor:
+        def __init__(self, state_store: StateStore, task: Path) -> None:
+            self.agent = StatelessSupervisorAgent(None, state_store, task)  # type: ignore[arg-type]
+
+        def build_packet(self, **kwargs):
+            return self.agent.build_packet(**kwargs)
+
+        async def decide(self, packet):
+            raise SupervisorAgentError("supervisor did not produce an agent message")
+
+    changed_files = [
+        ChangedFile(path="src/app.py", status="M", additions=600, deletions=0, sequence=2)
+    ]
+    decision = controller.should_wake_runtime_supervisor(
+        action=TriggeringAction(
+            kind="fileChange",
+            paths=["src/app.py"],
+            status="completed",
+            summary="file change completed",
+        ),
+        validation=None,
+        changed_files=changed_files,
+    )
+    pending_signature = controller._runtime_pending_trigger_signatures()["large_diff"][0]
+    controller.supervisor = AlwaysNoMessageRuntimeSupervisor(store, controller.task_path)
+
+    await controller._supervisor_check_loop(
+        "Runtime trigger (large_diff): file change completed",
+        None,
+        None,
+        None,
+        None,
+        False,
+    )
+
+    assert decision.reasons == ("large_diff",)
+    assert controller._last_large_diff_signature == pending_signature
+    assert "large_diff" not in controller._runtime_pending_trigger_signatures()
+    assert "skipping this runtime-only review" in store.path(PROGRESS).read_text(encoding="utf-8")
 
 
 async def test_repeated_supervisor_no_message_marks_infra_invalid_provider_failure(tmp_path: Path) -> None:
@@ -5882,6 +6914,10 @@ async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path:
     assert controller.completion_supervisor is not controller.supervisor
     assert controller.completion_supervisor.model == "gpt-completion"
     assert controller.completion_supervisor.intelligence == "high"
+    assert controller.adv_report_controller is not None
+    assert controller.adv_report_controller is not controller.completion_supervisor
+    assert controller.adv_report_controller.model == "gpt-completion"
+    assert controller.adv_report_controller.intelligence == "high"
     assert client.stopped is True
     assert controller.running is False
 
@@ -5931,6 +6967,28 @@ class _GateFakeCoder:
         return "turn"
 
 
+class _FakeAdvReportController:
+    def __init__(
+        self,
+        decisions: list[AdvReportControllerDecision] | None = None,
+    ) -> None:
+        self.decisions = list(decisions or [])
+        self.packets: list[SupervisorWakePacket] = []
+
+    async def decide_adv_report(
+        self,
+        packet: SupervisorWakePacket,
+    ) -> AdvReportControllerDecision:
+        self.packets.append(packet)
+        if self.decisions:
+            return self.decisions.pop(0)
+        return AdvReportControllerDecision(
+            forward_to_coder=False,
+            reason="no findings or observations remained",
+            report_to_coder=None,
+        )
+
+
 def _completion_gate_controller(
     tmp_path: Path,
     *,
@@ -5950,6 +7008,7 @@ def _completion_gate_controller(
     controller.task_path = task
     controller.store = store
     controller.supervisor = None
+    controller.adv_report_controller = _FakeAdvReportController()
     controller.coder = coder
     controller.pending_approvals = {}
     controller.last_coder_message = None
@@ -5981,6 +7040,7 @@ def _completion_gate_controller(
     controller._terminal_cleanup_started = False
     controller._command_output_chunks = {}
     controller._last_large_diff_signature = None
+    controller._last_restart_budget_signature = None
     controller._pending_adversary_report = None
     controller._active_adversary_thread_id = None
     controller._active_adversary_workspace_root = None
@@ -6058,6 +7118,7 @@ def _runtime_controller(tmp_path: Path) -> tuple[BelloController, StateStore, _R
     controller.task_path = task
     controller.store = store
     controller.supervisor = fake
+    controller.adv_report_controller = _FakeAdvReportController()
     controller.coder = None
     controller.pending_approvals = {}
     controller.last_coder_message = None
@@ -6090,6 +7151,7 @@ def _runtime_controller(tmp_path: Path) -> tuple[BelloController, StateStore, _R
     controller._terminal_cleanup_started = False
     controller._command_output_chunks = {}
     controller._last_large_diff_signature = None
+    controller._last_restart_budget_signature = None
     controller._pending_adversary_report = None
     controller._active_adversary_thread_id = None
     controller._active_adversary_workspace_root = None

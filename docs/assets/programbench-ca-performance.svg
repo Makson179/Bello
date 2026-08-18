@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560" role="img" aria-labelledby="ca-title ca-desc">
+<title id="ca-title">C+A performance on ProgramBench</title>
+<desc id="ca-desc">Two grouped-bar panels compare Raw Codex and C+A completion scores and runtimes on Solar, Samtools, and Rumdl.</desc>
+<rect width="1200" height="560" fill="#FFFFFF"/>
+<text x="48.0" y="38.0" font-family="Georgia, 'Times New Roman', serif" font-size="22" font-weight="bold" font-style="normal" text-anchor="start" fill="#1B1B1B">C+A performance on ProgramBench</text>
+<text x="48.0" y="62.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="normal" font-style="normal" text-anchor="start" fill="#5B5B5B">GPT-5.6 Sol · ultra · matched task-level results</text>
+<rect x="846.0" y="35.0" width="25.0" height="17.0" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.5"/>
+<text x="882.0" y="49.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="normal" font-style="normal" text-anchor="start" fill="#1B1B1B">Raw Codex</text>
+<rect x="1000.0" y="35.0" width="25.0" height="17.0" fill="#C7654D" stroke="#B24A33" stroke-width="1.5"/>
+<text x="1036.0" y="49.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="normal" font-style="normal" text-anchor="start" fill="#1B1B1B">C+A</text>
+<text x="82.0" y="103.0" font-family="Georgia, 'Times New Roman', serif" font-size="16" font-weight="bold" font-style="normal" text-anchor="start" fill="#1B1B1B">(a)  Completion score (%)</text>
+<text x="650.0" y="103.0" font-family="Georgia, 'Times New Roman', serif" font-size="16" font-weight="bold" font-style="normal" text-anchor="start" fill="#1B1B1B">(b)  Runtime (hours)</text>
+<line x1="82.0" y1="430.0" x2="552.0" y2="430.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="70.0" y="434.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">0</text>
+<line x1="82.0" y1="369.6" x2="552.0" y2="369.6" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="70.0" y="373.6" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">20</text>
+<line x1="82.0" y1="309.2" x2="552.0" y2="309.2" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="70.0" y="313.2" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">40</text>
+<line x1="82.0" y1="248.8" x2="552.0" y2="248.8" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="70.0" y="252.8" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">60</text>
+<line x1="82.0" y1="188.4" x2="552.0" y2="188.4" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="70.0" y="192.4" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">80</text>
+<line x1="82.0" y1="128.0" x2="552.0" y2="128.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="70.0" y="132.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">100</text>
+<line x1="650.0" y1="430.0" x2="1120.0" y2="430.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="638.0" y="434.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">0</text>
+<line x1="650.0" y1="379.7" x2="1120.0" y2="379.7" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="638.0" y="383.7" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">0.5</text>
+<line x1="650.0" y1="329.3" x2="1120.0" y2="329.3" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="638.0" y="333.3" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">1</text>
+<line x1="650.0" y1="279.0" x2="1120.0" y2="279.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="638.0" y="283.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">1.5</text>
+<line x1="650.0" y1="228.7" x2="1120.0" y2="228.7" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="638.0" y="232.7" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">2</text>
+<line x1="650.0" y1="178.3" x2="1120.0" y2="178.3" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="638.0" y="182.3" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">2.5</text>
+<line x1="650.0" y1="128.0" x2="1120.0" y2="128.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="638.0" y="132.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">3</text>
+<line x1="82.0" y1="128.0" x2="82.0" y2="430.0" stroke="#1B1B1B" stroke-width="1.2"/>
+<line x1="82.0" y1="430.0" x2="552.0" y2="430.0" stroke="#1B1B1B" stroke-width="1.2"/>
+<line x1="650.0" y1="128.0" x2="650.0" y2="430.0" stroke="#1B1B1B" stroke-width="1.2"/>
+<line x1="650.0" y1="430.0" x2="1120.0" y2="430.0" stroke="#1B1B1B" stroke-width="1.2"/>
+<rect x="119.0" y="269.5" width="42.0" height="160.5" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.7"/>
+<text x="140.0" y="261.5" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#355F8A">53.13%</text>
+<rect x="169.0" y="251.8" width="42.0" height="178.2" fill="#C7654D" stroke="#B24A33" stroke-width="1.7"/>
+<text x="190.0" y="243.8" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#B24A33">59.00%</text>
+<rect x="687.0" y="359.1" width="42.0" height="70.9" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.7"/>
+<text x="708.0" y="351.1" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#355F8A">0.70h</text>
+<rect x="737.0" y="198.9" width="42.0" height="231.1" fill="#C7654D" stroke="#B24A33" stroke-width="1.7"/>
+<text x="758.0" y="190.9" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#B24A33">2.30h</text>
+<text x="165.0" y="455.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#1B1B1B">Solar</text>
+<text x="733.0" y="455.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#1B1B1B">Solar</text>
+<rect x="269.0" y="273.4" width="42.0" height="156.6" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.7"/>
+<text x="290.0" y="265.4" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#355F8A">51.86%</text>
+<rect x="319.0" y="239.7" width="42.0" height="190.3" fill="#C7654D" stroke="#B24A33" stroke-width="1.7"/>
+<text x="340.0" y="231.7" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#B24A33">63.00%</text>
+<rect x="837.0" y="350.9" width="42.0" height="79.1" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.7"/>
+<text x="858.0" y="342.9" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#355F8A">0.79h</text>
+<rect x="887.0" y="204.1" width="42.0" height="225.9" fill="#C7654D" stroke="#B24A33" stroke-width="1.7"/>
+<text x="908.0" y="196.1" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#B24A33">2.24h</text>
+<text x="315.0" y="455.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#1B1B1B">Samtools</text>
+<text x="883.0" y="455.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#1B1B1B">Samtools</text>
+<rect x="419.0" y="262.1" width="42.0" height="167.9" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.7"/>
+<text x="440.0" y="254.1" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#355F8A">55.60%</text>
+<rect x="469.0" y="185.4" width="42.0" height="244.6" fill="#C7654D" stroke="#B24A33" stroke-width="1.7"/>
+<text x="490.0" y="177.4" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#B24A33">81.00%</text>
+<rect x="987.0" y="211.9" width="42.0" height="218.1" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.7"/>
+<text x="1008.0" y="203.9" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#355F8A">2.17h</text>
+<rect x="1037.0" y="168.8" width="42.0" height="261.2" fill="#C7654D" stroke="#B24A33" stroke-width="1.7"/>
+<text x="1058.0" y="160.8" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#B24A33">2.59h</text>
+<text x="465.0" y="455.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#1B1B1B">Rumdl</text>
+<text x="1033.0" y="455.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#1B1B1B">Rumdl</text>
+<text x="48.0" y="522.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="start" fill="#5B5B5B">Completion uses a common 0–100% scale; runtime uses a common 0–3 hour scale.</text>
+</svg>
