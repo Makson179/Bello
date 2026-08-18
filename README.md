@@ -141,7 +141,7 @@ task is often described by a normal colleague at work.**
 
 | Task | Raw Codex score | `runtime-only` score | Difference | Raw Codex time | `runtime-only` time |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Marl | 32.91% | **37.91%** | **+5.00 pp** | 00:58:49 | 00:46:09 |
+| Marl (weighted spec completeness) | 32.91% | **37.91%** | **+5.00 pp** | 00:58:49 | 00:46:09 |
 | Slab | 81.08% | **85.69%** | **+4.61 pp** | 00:57:26 | 01:04:11 |
 | Pinch | 89.25% | **98.00%** | **+8.75 pp** | 00:40:09 | 00:43:34 |
 
