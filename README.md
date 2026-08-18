@@ -17,6 +17,20 @@
   <img src="./bello_pixel_intro.gif" alt="Bello pixel intro" width="100%">
 </p>
 
+## Contents
+
+- [Motivation](#motivation)
+- [How Bello solves tasks](#how-bello-solves-tasks)
+- [Relationship to existing LLM research](#relationship-to-existing-llm-research)
+- [Choose your supervision depth](#choose-your-supervision-depth)
+- [Results](#results)
+- [Requirements](#requirements)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [Command reference](#command-reference)
+- [License](#license)
+
 ---
 
 # Motivation
