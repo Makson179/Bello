@@ -906,6 +906,68 @@ def test_cheap_runtime_packet_reconstructs_legacy_action_and_keeps_binding_conte
     assert slim["routing_signals"]["failed_after_validation_request"] is True
 
 
+def test_cheap_runtime_packet_preserves_structured_timeout_and_coalesced_events(
+    tmp_path: Path,
+) -> None:
+    from supervisor.approval_triage import cheap_runtime_packet
+    from supervisor.schemas import SupervisorWakePacket, TriggeringAction, ValidationRun
+
+    regression = TriggeringAction(
+        item_id="pytest-10",
+        kind="commandExecution",
+        command="pytest tests/test_parser.py",
+        exit_code=1,
+        status="failed",
+        summary="parser regression",
+    )
+    timeout = TriggeringAction(
+        item_id="build-11",
+        kind="commandExecution",
+        command="./compile.sh",
+        exit_code=1,
+        status="failed",
+        timed_out=True,
+        summary="build timed out",
+    )
+    packet = SupervisorWakePacket(
+        wake_sequence=12,
+        latest_event_sequence=11,
+        generation=0,
+        restart_count=0,
+        task_path=str(tmp_path / "TASK.md"),
+        task_contents="task",
+        current_summary="Runtime trigger (validation_regression, timeout): build timed out",
+        triggering_action=timeout,
+        runtime_triggering_actions=[regression, timeout],
+        recent_events=[
+            {"item_id": "pytest-10", "sequence": 10},
+            {"item_id": "build-11", "sequence": 11},
+        ],
+        validations=[
+            ValidationRun(
+                validation_id="parser-tests",
+                command="pytest tests/test_parser.py",
+                normalized_command="pytest tests/test_parser.py",
+                exit_code=1,
+                shell_exit_code=1,
+                passed=False,
+                trusted_validation_outcome="failed",
+                summary="parser test failed",
+                sequence=10,
+            )
+        ],
+    )
+
+    slim = cheap_runtime_packet(packet)
+
+    assert slim["triggering_action"]["timed_out"] is True
+    assert [event["action"]["item_id"] for event in slim["triggering_events"]] == [
+        "build-11",
+        "pytest-10",
+    ]
+    assert slim["triggering_events"][1]["validation"]["validation_id"] == "parser-tests"
+
+
 def test_cheap_runtime_packet_exposes_stale_edit_after_stop_and_validate(tmp_path: Path) -> None:
     from supervisor.approval_triage import cheap_runtime_packet
     from supervisor.schemas import ChangedFile, PriorIntervention, SupervisorWakePacket, TriggeringAction
@@ -943,7 +1005,7 @@ def test_cheap_runtime_packet_exposes_stale_edit_after_stop_and_validate(tmp_pat
     assert slim["latest_validation_request"]["sequence"] == 25
 
 
-def test_cheap_runtime_packet_flags_masked_nonzero_after_validation_request(tmp_path: Path) -> None:
+def test_cheap_runtime_packet_does_not_emit_retired_masked_routing_signals(tmp_path: Path) -> None:
     from supervisor.approval_triage import cheap_runtime_packet
     from supervisor.schemas import PriorIntervention, SupervisorWakePacket, TriggeringAction
 
@@ -978,7 +1040,8 @@ def test_cheap_runtime_packet_flags_masked_nonzero_after_validation_request(tmp_
     slim = cheap_runtime_packet(packet)
 
     assert slim["triggering_validation"] is None
-    assert slim["routing_signals"]["masked_nonzero_after_validation_request"] is True
+    assert "masked_result_after_validation_request" not in slim["routing_signals"]
+    assert "masked_nonzero_after_validation_request" not in slim["routing_signals"]
 
 
 @pytest.mark.asyncio

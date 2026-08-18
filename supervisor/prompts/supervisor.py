@@ -58,11 +58,25 @@ def build_completion_review_prompt(packet: SupervisorWakePacket) -> str:
             "decisions_path",
             "decisions_total_entries",
             "decisions_omitted_entries",
+            "adversary_report",
         },
     )
     section_names = _completion_review_section_names(packet)
     payload["prompt_sections"] = section_names
     payload["instructions"] = [_stateless_supervisor_section_text(name) for name in section_names]
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def build_adv_report_controller_prompt(
+    *,
+    task_path: Path,
+    raw_adversary_report_path: Path,
+) -> str:
+    payload = {
+        "instructions": [_adv_report_controller_prompt_text()],
+        "task_path": str(task_path.resolve()),
+        "raw_adversary_report_path": str(raw_adversary_report_path.resolve()),
+    }
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
@@ -144,6 +158,13 @@ def _adversary_prompt_text() -> str:
     value = _section("adversary").get("text")
     if not isinstance(value, str) or not value.strip():
         raise RuntimeError("[adversary] must define non-empty text")
+    return value.strip()
+
+
+def _adv_report_controller_prompt_text() -> str:
+    value = _section("adv_report_controller").get("text")
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError("[adv_report_controller] must define non-empty text")
     return value.strip()
 
 

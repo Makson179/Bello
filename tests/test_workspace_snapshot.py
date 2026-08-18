@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from supervisor.workspace_snapshot import (
     SnapshotPatchError,
     WorkspaceSnapshotError,
     apply_snapshot_patch,
+    create_verification_workspace_snapshot,
     create_workspace_snapshot,
 )
 
@@ -36,6 +38,368 @@ def _init_repo(root: Path) -> None:
         cwd=root,
         check=True,
     )
+
+
+def test_verification_snapshot_preserves_candidate_git_state_and_is_disposable(
+    tmp_path: Path,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    source = tmp_path / "app.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    staged = tmp_path / "staged.txt"
+    staged.write_text("before\n", encoding="utf-8")
+    _init_repo(tmp_path)
+
+    source.write_text("value = 2\n", encoding="utf-8")
+    staged.write_text("after\n", encoding="utf-8")
+    subprocess.run(["git", "add", "staged.txt"], cwd=tmp_path, check=True)
+    (tmp_path / "untracked.txt").write_text("candidate\n", encoding="utf-8")
+
+    def git_output(root: Path, *args: str) -> bytes:
+        return subprocess.run(
+            ["git", *args],
+            cwd=root,
+            check=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+
+    expected_status = git_output(tmp_path, "status", "--porcelain=v1", "-z")
+    expected_diff = git_output(tmp_path, "diff", "--binary")
+    expected_cached_diff = git_output(tmp_path, "diff", "--cached", "--binary")
+
+    snapshot = create_verification_workspace_snapshot(tmp_path)
+    snapshot_root = snapshot.snapshot_root
+    try:
+        assert snapshot_root != tmp_path.resolve()
+        assert git_output(snapshot_root, "status", "--porcelain=v1", "-z") == expected_status
+        assert git_output(snapshot_root, "diff", "--binary") == expected_diff
+        assert git_output(snapshot_root, "diff", "--cached", "--binary") == expected_cached_diff
+
+        (snapshot_root / "app.py").write_text("review artifact\n", encoding="utf-8")
+        (snapshot_root / "review-cache.tmp").write_text("discard me\n", encoding="utf-8")
+        completed = subprocess.run(
+            [
+                "python3",
+                "-c",
+                "import tempfile; p=tempfile.TemporaryDirectory(); assert p.name; p.cleanup()",
+            ],
+            cwd=snapshot_root,
+            check=False,
+        )
+        assert completed.returncode == 0
+        assert source.read_text(encoding="utf-8") == "value = 2\n"
+        assert not (tmp_path / "review-cache.tmp").exists()
+    finally:
+        snapshot.cleanup()
+
+    assert not snapshot.temp_root.exists()
+
+
+def test_verification_snapshot_materializes_split_git_index(tmp_path: Path) -> None:
+    first = tmp_path / "first.txt"
+    first.write_text("before\n", encoding="utf-8")
+    second = tmp_path / "second.txt"
+    second.write_text("before\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    subprocess.run(["git", "update-index", "--split-index"], cwd=tmp_path, check=True)
+
+    first.write_text("unstaged\n", encoding="utf-8")
+    second.write_text("staged\n", encoding="utf-8")
+    subprocess.run(["git", "add", "second.txt"], cwd=tmp_path, check=True)
+
+    def git_output(root: Path, *args: str) -> bytes:
+        return subprocess.run(
+            ["git", *args],
+            cwd=root,
+            check=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+
+    expected_status = git_output(tmp_path, "status", "--porcelain=v1", "-z")
+    expected_diff = git_output(tmp_path, "diff", "--binary")
+    expected_cached_diff = git_output(tmp_path, "diff", "--cached", "--binary")
+
+    snapshot = create_verification_workspace_snapshot(tmp_path)
+    try:
+        assert git_output(snapshot.snapshot_root, "status", "--porcelain=v1", "-z") == expected_status
+        assert git_output(snapshot.snapshot_root, "diff", "--binary") == expected_diff
+        assert git_output(snapshot.snapshot_root, "diff", "--cached", "--binary") == expected_cached_diff
+    finally:
+        snapshot.cleanup()
+
+
+def test_verification_snapshot_does_not_preserve_escaping_symlink(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "external.txt"
+    external.write_text("host data\n", encoding="utf-8")
+    (workspace / "escape").symlink_to(external)
+
+    snapshot = create_verification_workspace_snapshot(workspace)
+    try:
+        copied_link = snapshot.snapshot_root / "escape"
+        assert not copied_link.exists()
+        assert not copied_link.is_symlink()
+        assert external.read_text(encoding="utf-8") == "host data\n"
+    finally:
+        snapshot.cleanup()
+
+
+def test_verification_snapshot_preserves_production_runtime_mounts_without_state_access(
+    tmp_path: Path,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    dependency = tmp_path / ".venv" / "bin"
+    dependency.mkdir(parents=True)
+    (dependency / "tool").write_text("available\n", encoding="utf-8")
+    node_dependency = tmp_path / "node_modules" / "pkg"
+    node_dependency.mkdir(parents=True)
+    (node_dependency / "index.js").write_text("module.exports = 1;\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    state = tmp_path / ".supervisor"
+    state.mkdir()
+    (state / "PROGRESS.md").write_text("private checklist\n", encoding="utf-8")
+
+    coder = create_workspace_snapshot(tmp_path, task)
+    try:
+        assert (coder.snapshot_root / "TASK.md").is_symlink()
+        assert (coder.snapshot_root / ".venv").is_symlink()
+        assert (coder.snapshot_root / "node_modules").is_symlink()
+
+        verification = create_verification_workspace_snapshot(
+            coder.snapshot_root,
+            source_snapshot=coder,
+        )
+        try:
+            root = verification.snapshot_root
+            assert (root / "TASK.md").read_text(encoding="utf-8") == "# Task\n"
+            assert (root / ".venv" / "bin" / "tool").read_text(encoding="utf-8") == "available\n"
+            assert (root / "node_modules" / "pkg" / "index.js").is_file()
+            assert not (root / ".supervisor").exists()
+            assert subprocess.run(
+                ["git", "status", "--porcelain=v1"],
+                cwd=root,
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            ).stdout == ""
+            assert subprocess.run(
+                ["git", "diff", "--binary"],
+                cwd=root,
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            ).stdout == ""
+            index_entry = subprocess.run(
+                ["git", "show", ":.supervisor"],
+                cwd=root,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            assert index_entry.returncode != 0
+            assert str(state.resolve()) not in index_entry.stdout
+            history_entry = subprocess.run(
+                ["git", "show", "HEAD:.supervisor"],
+                cwd=root,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            assert history_entry.returncode != 0
+            assert str(state.resolve()) not in history_entry.stdout
+            verification.assert_submission_unchanged()
+        finally:
+            verification.cleanup()
+    finally:
+        coder.cleanup()
+
+
+def test_verification_snapshot_preserves_info_exclude_and_filemode_semantics(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "app.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    subprocess.run(["git", "config", "--local", "core.filemode", "false"], cwd=tmp_path, check=True)
+    source.chmod(0o755)
+    (tmp_path / ".git" / "info" / "exclude").write_text("ignored-local\n", encoding="utf-8")
+    (tmp_path / "ignored-local").write_text("ignored\n", encoding="utf-8")
+    (tmp_path / "visible-local").write_text("visible\n", encoding="utf-8")
+
+    expected = subprocess.run(
+        ["git", "status", "--porcelain=v1", "-z"],
+        cwd=tmp_path,
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    snapshot = create_verification_workspace_snapshot(tmp_path)
+    try:
+        actual = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z"],
+            cwd=snapshot.snapshot_root,
+            check=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+        assert actual == expected
+        assert b"ignored-local" not in actual
+        assert subprocess.run(
+            ["git", "config", "--local", "--bool", "core.filemode"],
+            cwd=snapshot.snapshot_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        ).stdout.strip() == "false"
+    finally:
+        snapshot.cleanup()
+
+
+def test_verification_snapshot_detects_existing_artifact_and_git_metadata_mutation(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "app.py"
+    source.write_text("before\n", encoding="utf-8")
+    deliverable = tmp_path / "dist" / "app.js"
+    deliverable.parent.mkdir()
+    deliverable.write_text("submitted\n", encoding="utf-8")
+    _init_repo(tmp_path)
+
+    snapshot = create_verification_workspace_snapshot(tmp_path)
+    try:
+        deliverable_copy = snapshot.snapshot_root / "dist" / "app.js"
+        deliverable_copy.write_text("review mutation\n", encoding="utf-8")
+        with pytest.raises(
+            WorkspaceSnapshotError,
+            match=r"completion verification modified submitted workspace paths: dist/app\.js",
+        ):
+            snapshot.assert_submission_unchanged()
+    finally:
+        snapshot.cleanup()
+
+    source.write_text("candidate\n", encoding="utf-8")
+    snapshot = create_verification_workspace_snapshot(tmp_path)
+    try:
+        subprocess.run(["git", "add", "app.py"], cwd=snapshot.snapshot_root, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.email=review@example.com",
+                "-c",
+                "user.name=Review",
+                "commit",
+                "-q",
+                "-m",
+                "hide submitted diff",
+            ],
+            cwd=snapshot.snapshot_root,
+            check=True,
+        )
+        with pytest.raises(
+            WorkspaceSnapshotError,
+            match="completion verification modified submitted workspace paths: .git verification metadata",
+        ):
+            snapshot.assert_submission_unchanged()
+    finally:
+        snapshot.cleanup()
+
+
+def test_verification_snapshot_rejects_external_git_object_alternates(tmp_path: Path) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "secret.txt").write_text("secret\n", encoding="utf-8")
+    _init_repo(external)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("value = 1\n", encoding="utf-8")
+    _init_repo(workspace)
+    alternates = workspace / ".git" / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(parents=True, exist_ok=True)
+    alternates.write_text(str((external / ".git" / "objects").resolve()) + "\n", encoding="utf-8")
+
+    with pytest.raises(
+        WorkspaceSnapshotError,
+        match="verification snapshot refuses external Git object alternates",
+    ):
+        create_verification_workspace_snapshot(workspace)
+
+
+def test_verification_snapshot_detects_git_object_store_mutation(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("candidate\n", encoding="utf-8")
+    _init_repo(tmp_path)
+
+    snapshot = create_verification_workspace_snapshot(tmp_path)
+    try:
+        objects = snapshot.snapshot_root / ".git" / "objects"
+        injected = objects / "aa" / ("b" * 38)
+        injected.parent.mkdir(parents=True, exist_ok=True)
+        injected.write_bytes(b"review-created object")
+        with pytest.raises(
+            WorkspaceSnapshotError,
+            match="completion verification modified submitted workspace paths: .git verification control files",
+        ):
+            snapshot.assert_submission_unchanged()
+    finally:
+        snapshot.cleanup()
+
+
+def test_verification_snapshot_supports_unborn_git_repository(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "new.txt").write_text("untracked\n", encoding="utf-8")
+
+    snapshot = create_verification_workspace_snapshot(tmp_path)
+    try:
+        assert (snapshot.snapshot_root / "new.txt").read_text(encoding="utf-8") == "untracked\n"
+        snapshot.assert_submission_unchanged()
+    finally:
+        snapshot.cleanup()
+
+
+def test_verification_snapshot_cleanup_recovers_from_unreadable_directory(tmp_path: Path) -> None:
+    snapshot = create_verification_workspace_snapshot(tmp_path)
+    locked = snapshot.snapshot_root / "locked"
+    locked.mkdir()
+    (locked / "artifact.txt").write_text("temporary\n", encoding="utf-8")
+    locked.chmod(0)
+
+    snapshot.cleanup()
+
+    assert not snapshot.temp_root.exists()
+
+
+@pytest.mark.skipif(shutil.which("cc") is None, reason="C compiler is unavailable")
+def test_verification_snapshot_allows_rebuilding_untracked_binary_not_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    program = tmp_path / "program"
+    subprocess.run(["cc", "main.c", "-o", "program"], cwd=tmp_path, check=True)
+
+    snapshot = create_verification_workspace_snapshot(tmp_path)
+    try:
+        assert "program" in snapshot.mutable_submitted_paths
+        (snapshot.snapshot_root / "program").write_bytes(b"rebuilt binary output")
+        snapshot.assert_submission_unchanged()
+
+        (snapshot.snapshot_root / "main.c").write_text(
+            "int main(void) { return 1; }\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(
+            WorkspaceSnapshotError,
+            match="completion verification modified submitted workspace paths: main.c",
+        ):
+            snapshot.assert_submission_unchanged()
+    finally:
+        snapshot.cleanup()
 
 
 def test_snapshot_patch_applies_after_accept_and_real_repo_is_unchanged_beforehand(tmp_path: Path) -> None:
