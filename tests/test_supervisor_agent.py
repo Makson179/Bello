@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import subprocess
+import sys
+import threading
 from pathlib import Path
+
+import pytest
 
 from supervisor.appserver import AppServerError, AppServerMessage
 from supervisor.prompts import build_completion_review_prompt
@@ -18,7 +24,276 @@ from supervisor.schemas import (
     ValidationRun,
 )
 from supervisor.state import DECISIONS, LOG, PROGRESS, SUPERVISOR_WAKES, StateStore
-from supervisor.supervisor_agent import StatelessSupervisorAgent
+import supervisor.supervisor_agent as supervisor_agent_module
+from supervisor.supervisor_agent import StatelessSupervisorAgent, SupervisorAgentError
+
+
+def test_completion_prompt_keeps_tool_use_neutral_and_non_adversarial(
+    tmp_path: Path,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    agent = StatelessSupervisorAgent(object(), store, task)  # type: ignore[arg-type]
+    packet = agent.build_packet(wake_sequence=7, current_summary="completion review")
+
+    payload = json.loads(build_completion_review_prompt(packet))
+    instructions = "\n".join(payload["instructions"])
+
+    assert (
+        "Use workspace tools only when necessary to resolve a concrete material uncertainty "
+        "blocking the accept-or-return decision"
+    ) in instructions
+    assert "Do not perform exploratory or adversarial probing" in instructions
+    assert "smallest existing repository test or check" not in instructions
+    assert "existing repository test that is not already in the ledger" not in instructions
+    assert "do not fuzz, randomize, stress-test" not in instructions
+
+
+async def test_completion_review_uses_disposable_workspace_write_snapshot(
+    tmp_path: Path,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    source = tmp_path / "app.py"
+    source.write_text("candidate\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "__init__.py").write_text("", encoding="utf-8")
+    (tests_dir / "test_tempfile.py").write_text(
+        "import tempfile\n"
+        "import unittest\n\n"
+        "class TempfileTest(unittest.TestCase):\n"
+        "    def test_tempfile(self):\n"
+        "        with tempfile.TemporaryDirectory() as path:\n"
+        "            self.assertTrue(path)\n",
+        encoding="utf-8",
+    )
+    store = StateStore(tmp_path)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.thread_params: dict | None = None
+            self.turn_params: dict | None = None
+            self.archived: list[str] = []
+
+        async def thread_start(self, params, *, timeout):
+            self.thread_params = params
+            return {"thread": {"id": "completion-thread"}}
+
+        async def turn_start(self, params, *, timeout):
+            self.turn_params = params
+            review_root = Path(params["cwd"])
+            assert review_root != tmp_path.resolve()
+            completed = subprocess.run(
+                [sys.executable, "-m", "unittest", "-v"],
+                cwd=review_root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert completed.returncode == 0, completed.stdout + completed.stderr
+            cache = review_root / ".pytest_cache"
+            cache.mkdir(exist_ok=True)
+            (cache / "review").write_text("discard\n", encoding="utf-8")
+            return {
+                "turn": {
+                    "id": "completion-turn",
+                    "status": "completed",
+                    "items": [
+                        {
+                            "type": "agentMessage",
+                            "text": json.dumps(
+                                {
+                                    "decision": "accept",
+                                    "reason": "validated",
+                                    "validation_gaps": [],
+                                    "message_to_coder": None,
+                                    "persistent_decision": None,
+                                    "progress_update": None,
+                                    "clear_handoff": False,
+                                    "display_message": None,
+                                    "handoff": None,
+                                    "wake_sequence": 7,
+                                    "generation": 0,
+                                }
+                            ),
+                        }
+                    ],
+                }
+            }
+
+        async def thread_archive(self, thread_id, *, timeout):
+            self.archived.append(thread_id)
+            return {}
+
+    client = FakeClient()
+    agent = StatelessSupervisorAgent(
+        client,  # type: ignore[arg-type]
+        store,
+        task,
+        completion_workspace_write=True,
+    )
+    assert agent._thread_params()["sandbox"] == "read-only"
+    packet = agent.build_packet(wake_sequence=7, current_summary="completion review")
+
+    decision = await agent.decide_completion(packet)
+
+    assert decision.decision == "accept"
+    assert client.thread_params is not None
+    review_root = Path(client.thread_params["cwd"])
+    assert client.thread_params["sandbox"] == "workspace-write"
+    assert client.thread_params["runtimeWorkspaceRoots"] == [str(review_root)]
+    assert client.turn_params is not None
+    assert client.turn_params["sandboxPolicy"] == {
+        "type": "workspaceWrite",
+        "writableRoots": [str(review_root)],
+        "networkAccess": False,
+    }
+    assert client.turn_params["approvalPolicy"] == "never"
+    assert source.read_text(encoding="utf-8") == "candidate\n"
+    assert not (tmp_path / ".pytest_cache").exists()
+    assert review_root.exists()
+
+    await agent.close_completion_review()
+
+    assert client.archived == ["completion-thread"]
+    assert not review_root.exists()
+    assert agent.completion_workspace_snapshot is None
+
+
+async def test_completion_review_rejects_submitted_file_mutation(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    source = tmp_path / "app.py"
+    source.write_text("candidate\n", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.review_root: Path | None = None
+
+        async def thread_start(self, params, *, timeout):
+            self.review_root = Path(params["cwd"])
+            return {"thread": {"id": "completion-thread"}}
+
+        async def turn_start(self, params, *, timeout):
+            Path(params["cwd"], "app.py").write_text("review mutation\n", encoding="utf-8")
+            return {
+                "turn": {
+                    "id": "completion-turn",
+                    "status": "completed",
+                    "items": [{"type": "agentMessage", "text": "{}"}],
+                }
+            }
+
+        async def thread_archive(self, thread_id, *, timeout):
+            return {}
+
+    client = FakeClient()
+    agent = StatelessSupervisorAgent(
+        client,  # type: ignore[arg-type]
+        store,
+        task,
+        completion_workspace_write=True,
+    )
+
+    with pytest.raises(
+        SupervisorAgentError,
+        match="completion verification modified submitted workspace paths: app.py",
+    ):
+        await agent.decide_completion(
+            agent.build_packet(wake_sequence=7, current_summary="completion review")
+        )
+
+    assert source.read_text(encoding="utf-8") == "candidate\n"
+    assert client.review_root is not None
+    assert not client.review_root.exists()
+    assert agent.completion_workspace_snapshot is None
+
+
+async def test_completion_review_cleans_disposable_snapshot_when_start_fails(
+    tmp_path: Path,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.review_root: Path | None = None
+
+        async def thread_start(self, params, *, timeout):
+            self.review_root = Path(params["cwd"])
+            raise RuntimeError("thread start failed")
+
+    client = FakeClient()
+    agent = StatelessSupervisorAgent(
+        client,  # type: ignore[arg-type]
+        store,
+        task,
+        completion_workspace_write=True,
+    )
+    packet = agent.build_packet(wake_sequence=7, current_summary="completion review")
+
+    with pytest.raises(SupervisorAgentError, match="thread start failed"):
+        await agent.decide_completion(packet)
+
+    assert client.review_root is not None
+    assert not client.review_root.exists()
+    assert agent.completion_workspace_snapshot is None
+
+
+async def test_completion_snapshot_creation_cleans_up_when_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    started = threading.Event()
+    release = threading.Event()
+    created = []
+    real_create = supervisor_agent_module.create_verification_workspace_snapshot
+
+    def slow_create(project_root, **kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        snapshot = real_create(project_root, **kwargs)
+        created.append(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(
+        supervisor_agent_module,
+        "create_verification_workspace_snapshot",
+        slow_create,
+    )
+    agent = StatelessSupervisorAgent(
+        object(),  # type: ignore[arg-type]
+        store,
+        task,
+        completion_workspace_write=True,
+    )
+    decision_task = asyncio.create_task(
+        agent.decide_completion(
+            agent.build_packet(wake_sequence=7, current_summary="completion review")
+        )
+    )
+    assert await asyncio.to_thread(started.wait, 2)
+
+    decision_task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await decision_task
+
+    assert len(created) == 1
+    assert not created[0].temp_root.exists()
+    assert agent.completion_workspace_snapshot is None
 
 
 async def test_stateless_supervisor_persists_wake_packet_and_decision(tmp_path: Path) -> None:

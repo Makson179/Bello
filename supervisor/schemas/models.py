@@ -4,10 +4,12 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from copy import deepcopy
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from supervisor.markdown_fences import advance_markdown_fence
 from supervisor.review_limits import (
     EXPLICIT_REVIEW_LIMIT_FORMAT,
     REVIEW_LIMIT_FIELDS,
@@ -87,7 +89,7 @@ class CheapRuntimeDecision(BaseModel):
         "benign_diff",
         "expected_test_iteration",
         "needs_supervisor_judgment",
-        "failed_or_masked_validation",
+        "failed_validation",
         "drift_or_risk",
         "uncertain",
     ]
@@ -388,6 +390,104 @@ class CompletionReviewDecision(BaseModel):
         return self
 
 
+class AdvReportControllerDecision(BaseModel):
+    """A normalized adversary report whose factual content is safe to route."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    forward_to_coder: bool
+    reason: str
+    report_to_coder: str | None = None
+
+    @model_validator(mode="after")
+    def validate_forward_shape(self) -> "AdvReportControllerDecision":
+        if self.forward_to_coder:
+            if not self.report_to_coder or not self.report_to_coder.strip():
+                raise ValueError("forward_to_coder=true requires report_to_coder")
+            _validate_adv_report_to_coder(self.report_to_coder)
+        elif self.report_to_coder is not None:
+            raise ValueError("forward_to_coder=false requires report_to_coder=null")
+        return self
+
+
+_ADV_CODER_REPORT_SECTIONS = {
+    "findings requiring correction",
+    "observations requiring investigation",
+}
+_ADV_CODER_REPORT_FORBIDDEN_LABELS = {
+    "candidate_finding",
+    "attacked",
+    "previous_findings_checked",
+    "held",
+    "not_reached",
+    "overall",
+    "rejected_findings",
+    "adjudication_mechanics",
+    "patch_suggestions",
+}
+
+
+def _validate_adv_report_to_coder(report: str) -> None:
+    """Allow only the two routed sections outside quoted adversary evidence."""
+
+    seen_sections: set[str] = set()
+    current_section: str | None = None
+    fence_state = None
+    for raw_line in report.splitlines():
+        line = raw_line.strip()
+        before_fence = fence_state
+        fence_state, is_fence_marker = advance_markdown_fence(raw_line, fence_state)
+        if is_fence_marker or before_fence is not None or not line:
+            continue
+
+        is_top_level = raw_line == raw_line.lstrip()
+        heading = (
+            re.fullmatch(r"(#{1,6})\s+(.+?)(?:\s+#+)?", line)
+            if is_top_level
+            else None
+        )
+        if heading is not None:
+            level = len(heading.group(1))
+            title = heading.group(2).strip().lower()
+            canonical_title = re.sub(r"[\s-]+", "_", title)
+            if canonical_title in _ADV_CODER_REPORT_FORBIDDEN_LABELS:
+                raise ValueError(
+                    f"report_to_coder contains forbidden section {title!r}"
+                )
+            if level <= 2 and title not in _ADV_CODER_REPORT_SECTIONS:
+                raise ValueError(
+                    f"report_to_coder contains unsupported top-level section {title!r}"
+                )
+            if title in _ADV_CODER_REPORT_SECTIONS:
+                if level != 2:
+                    raise ValueError(
+                        f"report_to_coder section {title!r} must use a level-2 heading"
+                    )
+                if title in seen_sections:
+                    raise ValueError(f"report_to_coder repeats section {title!r}")
+                seen_sections.add(title)
+                current_section = title
+            continue
+
+        if current_section is None:
+            raise ValueError("report_to_coder must begin with an allowed section")
+        if not is_top_level:
+            continue
+        label = re.match(r"^([a-z][a-z0-9_ -]*):", line, flags=re.IGNORECASE)
+        if label is not None:
+            canonical_label = re.sub(r"[\s-]+", "_", label.group(1).strip().lower())
+            if canonical_label in _ADV_CODER_REPORT_FORBIDDEN_LABELS:
+                raise ValueError(
+                    f"report_to_coder contains forbidden label {label.group(1)!r}"
+                )
+
+    if not seen_sections:
+        raise ValueError(
+            "report_to_coder requires a Findings requiring correction or "
+            "Observations requiring investigation section"
+        )
+
+
 def _completion_review_has_return_issue(decision: CompletionReviewDecision) -> bool:
     if (
         decision.uncovered_behaviors
@@ -428,6 +528,9 @@ class TriggeringAction(BaseModel):
     paths: list[str] = Field(default_factory=list)
     exit_code: int | None = None
     status: str | None = None
+    # Only an explicit app-server field/status may set this. Command or output text is not
+    # evidence that the execution itself timed out.
+    timed_out: bool = False
     summary: str
 
 
@@ -551,6 +654,9 @@ class PriorIntervention(BaseModel):
 
 
 class CompletionReturnRecord(BaseModel):
+    source: Literal[
+        "completion_review", "accept_gate", "adversary_report_controller"
+    ] = "completion_review"
     reason: str
     uncovered_behaviors: list[str] = Field(default_factory=list)
     validation_gaps: list[str] = Field(default_factory=list)
@@ -742,6 +848,7 @@ class SupervisorWakePacket(BaseModel):
     approval_context: ApprovalWakeContext | None = None
     pending_approvals: list[ApprovalWakeContext] = Field(default_factory=list)
     triggering_action: TriggeringAction | None = None
+    runtime_triggering_actions: list[TriggeringAction] = Field(default_factory=list)
     last_coder_message: CoderMessage | None = None
     validations: list[ValidationRun] = Field(default_factory=list)
     inspections: list[InspectionRun] = Field(default_factory=list)
@@ -853,6 +960,14 @@ def json_schema_for_completion_review_decision() -> dict[str, Any]:
 
 def openai_strict_json_schema_for_completion_review_decision() -> dict[str, Any]:
     return openai_strict_json_schema(json_schema_for_completion_review_decision())
+
+
+def json_schema_for_adv_report_controller_decision() -> dict[str, Any]:
+    return AdvReportControllerDecision.model_json_schema()
+
+
+def openai_strict_json_schema_for_adv_report_controller_decision() -> dict[str, Any]:
+    return openai_strict_json_schema(json_schema_for_adv_report_controller_decision())
 
 
 def json_schema_for_cheap_runtime_decision() -> dict[str, Any]:

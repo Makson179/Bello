@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="430" viewBox="0 0 1100 430" role="img" aria-labelledby="runtime-title runtime-desc">
+<title id="runtime-title">Runtime-only results on custom workplace-style tasks</title>
+<desc id="runtime-desc">Grouped horizontal bars compare Raw Codex and runtime-only scores for Marl, Slab, and Pinch. Runtime-only is higher on all three measures.</desc>
+<rect width="1100" height="430" fill="#FFFFFF"/>
+
+<text x="48" y="38" font-family="Georgia, 'Times New Roman', serif" font-size="22" font-weight="bold" fill="#1B1B1B">Runtime-only on workplace-style tasks</text>
+<text x="48" y="62" font-family="Georgia, 'Times New Roman', serif" font-size="12" fill="#5B5B5B">Comparable task-specific evaluator scores · common 0–100 scale</text>
+
+<rect x="758" y="28" width="24" height="17" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.5"/>
+<text x="792" y="41" font-family="Georgia, 'Times New Roman', serif" font-size="11" fill="#1B1B1B">Raw Codex</text>
+<rect x="895" y="28" width="24" height="17" fill="#C7654D" stroke="#B24A33" stroke-width="1.5"/>
+<text x="929" y="41" font-family="Georgia, 'Times New Roman', serif" font-size="11" fill="#1B1B1B">runtime-only</text>
+
+<line x1="230" y1="88" x2="230" y2="362" stroke="#1B1B1B" stroke-width="1.2"/>
+<line x1="230" y1="362" x2="950" y2="362" stroke="#1B1B1B" stroke-width="1.2"/>
+
+<line x1="374" y1="88" x2="374" y2="362" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<line x1="518" y1="88" x2="518" y2="362" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<line x1="662" y1="88" x2="662" y2="362" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<line x1="806" y1="88" x2="806" y2="362" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<line x1="950" y1="88" x2="950" y2="362" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+
+<text x="230" y="383" font-family="Georgia, 'Times New Roman', serif" font-size="11" text-anchor="middle" fill="#5B5B5B">0</text>
+<text x="374" y="383" font-family="Georgia, 'Times New Roman', serif" font-size="11" text-anchor="middle" fill="#5B5B5B">20</text>
+<text x="518" y="383" font-family="Georgia, 'Times New Roman', serif" font-size="11" text-anchor="middle" fill="#5B5B5B">40</text>
+<text x="662" y="383" font-family="Georgia, 'Times New Roman', serif" font-size="11" text-anchor="middle" fill="#5B5B5B">60</text>
+<text x="806" y="383" font-family="Georgia, 'Times New Roman', serif" font-size="11" text-anchor="middle" fill="#5B5B5B">80</text>
+<text x="950" y="383" font-family="Georgia, 'Times New Roman', serif" font-size="11" text-anchor="middle" fill="#5B5B5B">100</text>
+
+<text x="208" y="140" font-family="Georgia, 'Times New Roman', serif" font-size="13" font-weight="bold" text-anchor="end" fill="#1B1B1B">Marl</text>
+<rect x="230" y="108" width="236.95" height="24" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.5"/>
+<text x="458.95" y="125" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" text-anchor="end" fill="#355F8A">32.91%</text>
+<rect x="230" y="138" width="272.95" height="24" fill="#C7654D" stroke="#B24A33" stroke-width="1.5"/>
+<text x="494.95" y="155" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" text-anchor="end" fill="#FFFFFF">37.91%</text>
+<text x="980" y="139" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" fill="#B24A33">+5.00 pp</text>
+
+<text x="208" y="235" font-family="Georgia, 'Times New Roman', serif" font-size="13" font-weight="bold" text-anchor="end" fill="#1B1B1B">Slab</text>
+<rect x="230" y="203" width="583.79" height="24" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.5"/>
+<text x="805.79" y="220" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" text-anchor="end" fill="#355F8A">81.08</text>
+<rect x="230" y="233" width="617.00" height="24" fill="#C7654D" stroke="#B24A33" stroke-width="1.5"/>
+<text x="839.00" y="250" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" text-anchor="end" fill="#FFFFFF">85.69</text>
+<text x="980" y="234" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" fill="#B24A33">+4.61 pp</text>
+
+<text x="208" y="330" font-family="Georgia, 'Times New Roman', serif" font-size="13" font-weight="bold" text-anchor="end" fill="#1B1B1B">Pinch</text>
+<rect x="230" y="298" width="642.60" height="24" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.5"/>
+<text x="864.60" y="315" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" text-anchor="end" fill="#355F8A">89.25</text>
+<rect x="230" y="328" width="705.60" height="24" fill="#C7654D" stroke="#B24A33" stroke-width="1.5"/>
+<text x="927.60" y="345" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" text-anchor="end" fill="#FFFFFF">98.00</text>
+<text x="980" y="329" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" fill="#B24A33">+8.75 pp</text>
+
+<text x="590" y="414" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" text-anchor="middle" fill="#1B1B1B">Evaluator score</text>
+</svg>
