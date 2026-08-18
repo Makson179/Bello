@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -10,8 +11,13 @@ from pydantic import ValidationError
 
 from supervisor.appserver import AppServerClient, AppServerError, last_agent_message_text, text_input
 from supervisor.coder import DEFAULT_INTELLIGENCE, apply_intelligence, codex_service_tier
-from supervisor.prompts import build_completion_review_prompt, build_stateless_supervisor_prompt
+from supervisor.prompts import (
+    build_adv_report_controller_prompt,
+    build_completion_review_prompt,
+    build_stateless_supervisor_prompt,
+)
 from supervisor.schemas import (
+    AdvReportControllerDecision,
     AdversaryReport,
     ApprovalContext,
     ApprovalWakeContext,
@@ -37,10 +43,16 @@ from supervisor.schemas import (
     ValidationRun,
 )
 from supervisor.schemas.models import (
+    openai_strict_json_schema_for_adv_report_controller_decision,
     openai_strict_json_schema_for_completion_review_decision,
     openai_strict_json_schema_for_supervisor_decision,
 )
 from supervisor.state import DECISIONS, HANDOFF, PROGRESS, STATE_DIR_NAME, StateStore
+from supervisor.workspace_snapshot import (
+    VerificationWorkspaceSnapshot,
+    WorkspaceSnapshot,
+    create_verification_workspace_snapshot,
+)
 
 
 DEFAULT_SUPERVISOR_TIMEOUT_SECONDS = 360.0
@@ -83,6 +95,8 @@ class StatelessSupervisorAgent:
         intelligence: str | None = DEFAULT_INTELLIGENCE,
         timeout_seconds: float = DEFAULT_SUPERVISOR_TIMEOUT_SECONDS,
         completion_timeout_seconds: float = DEFAULT_COMPLETION_REVIEW_TIMEOUT_SECONDS,
+        completion_workspace_write: bool = False,
+        completion_source_snapshot: WorkspaceSnapshot | None = None,
     ):
         self.client = client
         self.store = store
@@ -94,7 +108,10 @@ class StatelessSupervisorAgent:
         self.intelligence = intelligence
         self.timeout_seconds = timeout_seconds
         self.completion_timeout_seconds = completion_timeout_seconds
+        self.completion_workspace_write = completion_workspace_write
+        self.completion_source_snapshot = completion_source_snapshot
         self.completion_thread_id: str | None = None
+        self.completion_workspace_snapshot: VerificationWorkspaceSnapshot | None = None
 
     async def decide(self, packet: SupervisorWakePacket) -> SupervisorDecision:
         packet = _prepare_runtime_packet(packet)
@@ -162,6 +179,51 @@ class StatelessSupervisorAgent:
                 use_case="completion_review_minimal_retry",
             )
 
+    async def decide_adv_report(
+        self,
+        packet: SupervisorWakePacket,
+    ) -> AdvReportControllerDecision:
+        report = packet.adversary_report
+        if report is None or not report.report_text.strip():
+            raise SupervisorAgentError(
+                "adv_report_controller requires a non-empty adversary_report"
+            )
+        try:
+            task_contents = (
+                self.task_contents
+                if self.task_contents is not None
+                else self.task_path.read_text(encoding="utf-8")
+            )
+            with tempfile.TemporaryDirectory(
+                prefix="bello-adv-report-controller-"
+            ) as raw_input_root:
+                input_root = Path(raw_input_root)
+                task_path = input_root / "TASK.md"
+                report_path = input_root / "raw_adversary_report.md"
+                task_path.write_text(task_contents, encoding="utf-8")
+                report_path.write_text(report.report_text, encoding="utf-8")
+                decision = await self._decide(
+                    packet,
+                    prompt=build_adv_report_controller_prompt(
+                        task_path=task_path,
+                        raw_adversary_report_path=report_path,
+                    ),
+                    schema=openai_strict_json_schema_for_adv_report_controller_decision(),
+                    model_cls=AdvReportControllerDecision,
+                    use_case="adv_report_controller",
+                    timeout_seconds=self.completion_timeout_seconds,
+                    additional_runtime_roots=[input_root],
+                )
+        except OSError as exc:
+            raise SupervisorAgentError(
+                "failed to prepare isolated adv_report_controller inputs"
+            ) from exc
+        if not isinstance(decision, AdvReportControllerDecision):
+            raise SupervisorAgentError(
+                "adversary report controller returned a different decision type"
+            )
+        return decision
+
     async def _decide_completion_with_prompt(
         self,
         packet: SupervisorWakePacket,
@@ -188,23 +250,48 @@ class StatelessSupervisorAgent:
         *,
         prompt: str,
         schema: dict[str, Any],
-        model_cls: type[SupervisorDecision] | type[CompletionReviewDecision],
+        model_cls: type[SupervisorDecision]
+        | type[CompletionReviewDecision]
+        | type[AdvReportControllerDecision],
         use_case: str,
         timeout_seconds: float,
         persistent_completion_thread: bool = False,
-    ) -> SupervisorDecision | CompletionReviewDecision:
+        additional_runtime_roots: list[Path] | None = None,
+    ) -> SupervisorDecision | CompletionReviewDecision | AdvReportControllerDecision:
         thread_id: str | None = None
         turn_id: str | None = None
         raw_text: str | None = None
-        decision: SupervisorDecision | CompletionReviewDecision | None = None
+        decision: (
+            SupervisorDecision | CompletionReviewDecision | AdvReportControllerDecision | None
+        ) = None
         audit_error: str | None = None
+        decision_workspace_root = self.workspace_root
         try:
+            if persistent_completion_thread and self.completion_workspace_write:
+                if self.completion_workspace_snapshot is None:
+                    self.completion_workspace_snapshot = (
+                        await self._create_completion_workspace_snapshot()
+                    )
+                decision_workspace_root = self.completion_workspace_snapshot.snapshot_root
+            runtime_workspace_roots: list[Path] = [decision_workspace_root]
+            for root in additional_runtime_roots or []:
+                resolved = root.resolve()
+                if resolved not in runtime_workspace_roots:
+                    runtime_workspace_roots.append(resolved)
             if persistent_completion_thread and self.completion_thread_id:
                 thread_id = self.completion_thread_id
             else:
                 thread_response = await self._await_rpc(
                     "supervisor thread/start response",
-                    self.client.thread_start(self._thread_params(), timeout=timeout_seconds),
+                    self.client.thread_start(
+                        self._thread_params(
+                            workspace_root=decision_workspace_root,
+                            writable=persistent_completion_thread
+                            and self.completion_workspace_write,
+                            runtime_workspace_roots=runtime_workspace_roots,
+                        ),
+                        timeout=timeout_seconds,
+                    ),
                     timeout=timeout_seconds,
                 )
                 thread = thread_response.get("thread", {})
@@ -222,8 +309,21 @@ class StatelessSupervisorAgent:
                             {
                                 "threadId": thread_id,
                                 "input": [text_input(turn_prompt)],
+                                "cwd": str(decision_workspace_root),
+                                "runtimeWorkspaceRoots": [
+                                    str(root) for root in runtime_workspace_roots
+                                ],
                                 "approvalPolicy": "never",
-                                "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
+                                "sandboxPolicy": (
+                                    {
+                                        "type": "workspaceWrite",
+                                        "writableRoots": [str(decision_workspace_root)],
+                                        "networkAccess": False,
+                                    }
+                                    if persistent_completion_thread
+                                    and self.completion_workspace_write
+                                    else {"type": "readOnly", "networkAccess": False}
+                                ),
                                 "outputSchema": schema,
                                 "serviceTier": codex_service_tier(fast=self.fast),
                                 **({"model": self.model} if self.model else {}),
@@ -275,6 +375,10 @@ class StatelessSupervisorAgent:
                     )
                     data = turns.get("data", [])
                     text = _agent_message_text_from_turns(data, turn_id=turn_id)
+                if persistent_completion_thread and self.completion_workspace_snapshot is not None:
+                    await asyncio.to_thread(
+                        self.completion_workspace_snapshot.assert_submission_unchanged
+                    )
                 if text is None:
                     audit_error = "supervisor did not produce an agent message"
                     if attempt == 0:
@@ -343,15 +447,49 @@ class StatelessSupervisorAgent:
                         await self._cleanup_thread(thread_id, turn_id, timeout_seconds)
                         if self.completion_thread_id == thread_id:
                             self.completion_thread_id = None
+                        await self._cleanup_completion_workspace_snapshot()
                 else:
                     await self._cleanup_thread(thread_id, turn_id, timeout_seconds)
+            elif persistent_completion_thread and audit_error is not None:
+                await self._cleanup_completion_workspace_snapshot()
+
+    async def _create_completion_workspace_snapshot(self) -> VerificationWorkspaceSnapshot:
+        creation = asyncio.create_task(
+            asyncio.to_thread(
+                create_verification_workspace_snapshot,
+                self.workspace_root,
+                source_snapshot=self.completion_source_snapshot,
+            )
+        )
+        try:
+            return await asyncio.shield(creation)
+        except asyncio.CancelledError:
+            # A worker thread cannot be cancelled once copytree has started. Wait for its
+            # result and remove it before propagating cancellation so no ownerless temp tree
+            # is left behind during pause/shutdown.
+            try:
+                abandoned = await creation
+            except Exception:
+                pass
+            else:
+                await asyncio.to_thread(abandoned.cleanup)
+            raise
 
     async def close_completion_review(self) -> None:
         thread_id = self.completion_thread_id
-        if not thread_id:
-            return
         self.completion_thread_id = None
-        await self._cleanup_thread(thread_id, None, self.completion_timeout_seconds)
+        try:
+            if thread_id:
+                await self._cleanup_thread(thread_id, None, self.completion_timeout_seconds)
+        finally:
+            await self._cleanup_completion_workspace_snapshot()
+
+    async def _cleanup_completion_workspace_snapshot(self) -> None:
+        snapshot = self.completion_workspace_snapshot
+        if snapshot is not None:
+            await asyncio.to_thread(snapshot.cleanup)
+            if self.completion_workspace_snapshot is snapshot:
+                self.completion_workspace_snapshot = None
 
     async def _await_rpc(
         self,
@@ -462,6 +600,7 @@ class StatelessSupervisorAgent:
         approval_context: ApprovalWakeContext | None = None,
         pending_approvals: list[ApprovalWakeContext] | None = None,
         triggering_action: TriggeringAction | None = None,
+        runtime_triggering_actions: list[TriggeringAction] | None = None,
         last_coder_message: CoderMessage | None = None,
         validations: list[ValidationRun] | None = None,
         inspections: list[InspectionRun] | None = None,
@@ -523,6 +662,7 @@ class StatelessSupervisorAgent:
             approval_context=approval_context,
             pending_approvals=pending_approvals or [],
             triggering_action=triggering_action,
+            runtime_triggering_actions=runtime_triggering_actions or [],
             last_coder_message=last_coder_message,
             validations=validations or [],
             inspections=inspections or [],
@@ -555,13 +695,21 @@ class StatelessSupervisorAgent:
             prior_uncovered_edge_candidates=prior_uncovered_edge_candidates or [],
         )
 
-    def _thread_params(self) -> dict[str, Any]:
+    def _thread_params(
+        self,
+        *,
+        workspace_root: Path | None = None,
+        writable: bool = False,
+        runtime_workspace_roots: list[Path] | None = None,
+    ) -> dict[str, Any]:
+        active_root = (workspace_root or self.workspace_root).resolve()
+        active_runtime_roots = runtime_workspace_roots or [active_root]
         params: dict[str, Any] = {
-            "cwd": str(self.workspace_root),
-            "runtimeWorkspaceRoots": [str(self.workspace_root)],
+            "cwd": str(active_root),
+            "runtimeWorkspaceRoots": [str(root.resolve()) for root in active_runtime_roots],
             "approvalPolicy": "never",
             "approvalsReviewer": "user",
-            "sandbox": "read-only",
+            "sandbox": "workspace-write" if writable else "read-only",
             "serviceTier": codex_service_tier(fast=self.fast),
             "ephemeral": False,
             "experimentalRawEvents": False,
@@ -577,11 +725,20 @@ class StatelessSupervisorAgent:
         *,
         thread_id: str | None,
         turn_id: str | None,
-        decision: SupervisorDecision | CompletionReviewDecision | None,
+        decision: (
+            SupervisorDecision | CompletionReviewDecision | AdvReportControllerDecision | None
+        ),
         raw_text: str | None,
         error: str | None,
         use_case: str = "runtime_monitor",
     ) -> None:
+        if use_case.startswith("adv_report_controller"):
+            audit_packet: dict[str, Any] = {
+                "task_path": packet.task_path,
+                "latest_event_sequence": packet.latest_event_sequence,
+            }
+        else:
+            audit_packet = packet.model_dump(mode="json", exclude={"adversary_report"})
         entry: dict[str, Any] = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "use_case": use_case,
@@ -590,17 +747,23 @@ class StatelessSupervisorAgent:
             "restart_count": packet.restart_count,
             "thread_id": thread_id,
             "turn_id": turn_id,
-            "packet": packet.model_dump(mode="json"),
+            # Controller inputs live only in isolated temporary files. Its audit keeps
+            # routing identity, not the raw report or the unrelated accumulated ledger.
+            "packet": audit_packet,
         }
         if decision is not None:
             entry["status"] = "decision"
             entry["decision"] = decision.model_dump(mode="json")
         elif error is not None:
             entry["status"] = "error"
-            entry["error"] = error
+            entry["error"] = (
+                "adv_report_controller decision failed"
+                if use_case.startswith("adv_report_controller")
+                else error
+            )
         else:
             entry["status"] = "aborted"
-        if raw_text is not None:
+        if raw_text is not None and not use_case.startswith("adv_report_controller"):
             entry["raw_text"] = raw_text
         self.store.append_supervisor_wake(entry)
 
@@ -656,9 +819,17 @@ def _repair_json_prompt(
     raw_text: str,
     error: str,
     packet: SupervisorWakePacket,
-    model_cls: type[SupervisorDecision] | type[CompletionReviewDecision],
+    model_cls: type[SupervisorDecision]
+    | type[CompletionReviewDecision]
+    | type[AdvReportControllerDecision],
 ) -> str:
-    decision_name = "completion-review" if model_cls is CompletionReviewDecision else "runtime supervisor"
+    decision_name = (
+        "completion-review"
+        if model_cls is CompletionReviewDecision
+        else "adversary-report controller"
+        if model_cls is AdvReportControllerDecision
+        else "runtime supervisor"
+    )
     if model_cls is CompletionReviewDecision:
         return _completion_review_repair_json_prompt(raw_text=raw_text, error=error, packet=packet)
     excerpt = raw_text
@@ -902,10 +1073,12 @@ def _prepare_runtime_packet(packet: SupervisorWakePacket) -> SupervisorWakePacke
             "validations": _select_runtime_validations(
                 packet.validations,
                 triggering_action=packet.triggering_action,
+                triggering_actions=packet.runtime_triggering_actions,
             ),
             "inspections": _select_runtime_inspections(
                 packet.inspections,
                 triggering_action=packet.triggering_action,
+                triggering_actions=packet.runtime_triggering_actions,
             ),
             "prior_interventions": [
                 _compact_runtime_intervention(value)
@@ -955,6 +1128,7 @@ def _select_runtime_validations(
     validations: list[ValidationRun],
     *,
     triggering_action: TriggeringAction | None,
+    triggering_actions: list[TriggeringAction],
 ) -> list[ValidationRun]:
     if not validations:
         return []
@@ -968,8 +1142,15 @@ def _select_runtime_validations(
         selected_keys.add(key)
         selected.append(value)
 
-    command_key = _normalized_command_key(triggering_action.command if triggering_action else None)
-    if command_key:
+    command_keys = list(
+        dict.fromkeys(
+            key
+            for action in ([triggering_action] if triggering_action is not None else [])
+            + list(triggering_actions)
+            if (key := _normalized_command_key(action.command))
+        )
+    )
+    for command_key in command_keys:
         matching = [
             value
             for value in reversed(validations)
@@ -1004,6 +1185,7 @@ def _select_runtime_inspections(
     inspections: list[InspectionRun],
     *,
     triggering_action: TriggeringAction | None,
+    triggering_actions: list[TriggeringAction],
 ) -> list[InspectionRun]:
     if not inspections:
         return []
@@ -1017,8 +1199,15 @@ def _select_runtime_inspections(
         selected_keys.add(key)
         selected.append(value)
 
-    command_key = _normalized_command_key(triggering_action.command if triggering_action else None)
-    if command_key:
+    command_keys = list(
+        dict.fromkeys(
+            key
+            for action in ([triggering_action] if triggering_action is not None else [])
+            + list(triggering_actions)
+            if (key := _normalized_command_key(action.command))
+        )
+    )
+    for command_key in command_keys:
         matching = [
             value
             for value in reversed(inspections)

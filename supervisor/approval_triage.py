@@ -187,6 +187,21 @@ def _trigger_sequence(
     return None
 
 
+def _action_snapshot(action: TriggeringAction, *, sequence: int | None) -> dict[str, Any]:
+    return {
+        "sequence": sequence,
+        "item_id": action.item_id,
+        "kind": action.kind,
+        "command": _bounded(action.command or "", 200),
+        "summary": _bounded(action.summary or "", 300),
+        "cwd": _bounded(action.cwd or "", 160),
+        "paths": [_bounded(path, 160) for path in action.paths[:12]],
+        "exit_code": action.exit_code,
+        "status": action.status,
+        "timed_out": action.timed_out,
+    }
+
+
 def _intervention_snapshot(intervention: PriorIntervention) -> dict[str, Any]:
     return {
         "sequence": intervention.sequence,
@@ -212,6 +227,27 @@ def cheap_runtime_packet(packet: SupervisorWakePacket) -> dict[str, Any]:
     validations = list(packet.validations or [])
     triggering_validation = _triggering_validation_from_ledger(action, validations)
     trigger_sequence = _trigger_sequence(packet, action, triggering_validation)
+    trigger_events: list[dict[str, Any]] = []
+    seen_actions: set[str] = set()
+    for retained_action in ([action] if action is not None else []) + list(
+        packet.runtime_triggering_actions
+    ):
+        action_key = retained_action.model_dump_json()
+        if action_key in seen_actions:
+            continue
+        seen_actions.add(action_key)
+        retained_validation = _triggering_validation_from_ledger(retained_action, validations)
+        retained_sequence = _trigger_sequence(packet, retained_action, retained_validation)
+        trigger_events.append(
+            {
+                "action": _action_snapshot(retained_action, sequence=retained_sequence),
+                "validation": (
+                    _validation_snapshot(retained_validation)
+                    if retained_validation is not None
+                    else None
+                ),
+            }
+        )
     followups = (
         [validation for validation in validations if validation.sequence > trigger_sequence][-2:]
         if trigger_sequence is not None
@@ -235,10 +271,6 @@ def cheap_runtime_packet(packet: SupervisorWakePacket) -> dict[str, Any]:
     coder_text = coder_message.text if coder_message is not None else ""
     validation_request = _latest_matching_intervention(packet, _VALIDATION_REQUEST_RE)
     stop_and_validate = _latest_matching_intervention(packet, _STOP_AND_VALIDATE_RE)
-    current_masked = (
-        triggering_validation is not None
-        and triggering_validation.trusted_validation_outcome == "masked_or_unknown"
-    )
     trigger_reasons = _runtime_trigger_reasons(packet.current_summary)
     behavioral_validation_is_fresh = bool(
         latest_relevant_change is None
@@ -254,16 +286,7 @@ def cheap_runtime_packet(packet: SupervisorWakePacket) -> dict[str, Any]:
         "wake_reason": packet.current_summary,
         "trigger_reasons": trigger_reasons,
         "triggering_action": (
-            {
-                "sequence": trigger_sequence,
-                "kind": action.kind,
-                "command": _bounded(action.command or "", 200),
-                "summary": _bounded(action.summary or "", 300),
-                "cwd": _bounded(action.cwd or "", 160),
-                "paths": [_bounded(path, 160) for path in action.paths[:12]],
-                "exit_code": action.exit_code,
-                "status": action.status,
-            }
+            _action_snapshot(action, sequence=trigger_sequence)
             if action is not None
             else None
         ),
@@ -271,6 +294,7 @@ def cheap_runtime_packet(packet: SupervisorWakePacket) -> dict[str, Any]:
             _validation_snapshot(triggering_validation) if triggering_validation is not None else None
         ),
         "followup_validations": [_validation_snapshot(validation) for validation in followups],
+        "triggering_events": trigger_events,
         "context_validations": (
             [_validation_snapshot(validation) for validation in validations[-2:]] if action is None else []
         ),
@@ -300,15 +324,6 @@ def cheap_runtime_packet(packet: SupervisorWakePacket) -> dict[str, Any]:
                 action_after_stop_instruction
                 and action is not None
                 and action.kind == "fileChange"
-                and not behavioral_validation_is_fresh
-            ),
-            "masked_result_after_validation_request": bool(
-                validation_request is not None and current_masked and not behavioral_validation_is_fresh
-            ),
-            "masked_nonzero_after_validation_request": bool(
-                validation_request is not None
-                and "masked_validation" in trigger_reasons
-                and "nonzero_exit" in trigger_reasons
                 and not behavioral_validation_is_fresh
             ),
             "build_only_after_validation_request": bool(
