@@ -208,6 +208,7 @@ def test_config_editor_default_surface_is_everyday() -> None:
     keys = {param.key for param in params}
 
     assert next(param for param in params if param.key == "completion_review").value == "false"
+    assert next(param for param in params if param.key == "start_over").value == "false"
     assert {"coder_mod", "runtime_mod", "cheap_runtime", "completion_review"}.issubset(keys)
     assert {
         "completion_mod",

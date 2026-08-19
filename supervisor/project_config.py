@@ -69,7 +69,7 @@ class ProjectConfig:
     adversary_intelligence: str = DEFAULT_INTELLIGENCE
     speed: str = "usual"
     cheap_runtime: bool = True
-    start_over: bool = True
+    start_over: bool = False
     completion_review: bool = False
     adversary: bool = False
     adversary_runs: int = 1
