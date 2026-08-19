@@ -86,7 +86,7 @@ an **adversarial pass**. Runtime supervision remains active in every mode.
 
 | Mode | Best for | What you get |
 | --- | --- | --- |
-| `runtime-only` | Everyday autonomous work | Spots when the coder takes a wrong turn and steers the run back toward the task. |
+| `runtime-only` | Routine autonomous work | Spots when the coder takes a wrong turn and steers the run back toward the task. |
 | `C+A` | High-quality work on a practical budget | Captures 69% of the full schedule's gain while keeping every runtime safeguard. |
 | `4C+A+2C` | Flagship, high-stakes work | The deepest review schedule, delivering about 40% higher benchmark completion than Raw Codex. |
 
@@ -377,7 +377,7 @@ bello config
 It creates and edits `.supervisor/config.json`. Every value is saved as you
 press Enter; future runs in this folder use these settings automatically.
 
-The editor starts in Everyday mode for a new project and only shows settings
+The editor starts in `runtime-only` mode for a new project and only shows settings
 that can affect the selected pipeline. Turning on `completion-review` reveals
 the completion reviewer and review budget. Turning on `adversary` then reveals
 the adversary model and the complete `C+A` schedule.
@@ -400,19 +400,19 @@ runtime and review budgets, are changed through `bello config`.
 | `runtime-mod` | GPT-5.6 | Model family for fresh-context runtime checks, including risky-action judgment and drift detection. |
 | `runtime-5.6-variant` | Sol | GPT-5.6 variant for the full runtime supervisor. |
 | `runtime-intelligence` | `xhigh` | Full runtime supervisor reasoning effort. |
-| `completion-mod` | GPT-5.6 | Model family for the independent read-only completion reviewer. Hidden in Everyday mode. |
-| `completion-5.6-variant` | Sol | GPT-5.6 variant for completion review. Hidden in Everyday mode. |
-| `completion-intelligence` | `xhigh` | Completion reviewer reasoning effort. Hidden in Everyday mode. |
+| `completion-mod` | GPT-5.6 | Model family for the independent read-only completion reviewer. Hidden in `runtime-only` mode. |
+| `completion-5.6-variant` | Sol | GPT-5.6 variant for completion review. Hidden in `runtime-only` mode. |
+| `completion-intelligence` | `xhigh` | Completion reviewer reasoning effort. Hidden in `runtime-only` mode. |
 | `adversary-mod` | GPT-5.6 | Adversarial tester model family. Visible only when the adversary is enabled. |
 | `adversary-5.6-variant` | Sol | GPT-5.6 variant for the adversary. Visible only when the adversary is enabled. |
 | `adversary-intelligence` | `xhigh` | Adversary reasoning effort. Visible only when the adversary is enabled. |
 | `speed` | `usual` | `fast` uses the Codex Fast service tier for coder, runtime-supervisor, and completion-review turns. Adversary turns are unchanged. |
 | `cheap-runtime` | `true` | Let Luna dismiss routine runtime checks before invoking the full runtime supervisor. Human messages, approvals, and mandatory checks bypass triage. |
-| `start-over` | `true` | `true` removes prior Bello logs, archived runs, and recovery data; `false` preserves them. Both start fresh active state and leave project files unchanged. |
-| `completion-review` | `false` | `false` is Everyday. `true` enables the independent completion-review loop and reveals its settings. |
+| `start-over` | `false` | `true` removes prior Bello logs, archived runs, and recovery data; `false` preserves them. Both start fresh active state and leave project files unchanged. |
+| `completion-review` | `false` | `false` selects `runtime-only`. `true` enables the independent completion-review loop and reveals its settings. |
 | `adversary` | `false` | Enable the adversarial tester before completion. Requires completion review. |
 | `max-reviews` / `max-reviews-before-adversary` | `1` | Completion-return budget. Without an adversary it is shown as `max-reviews`; with an adversary it limits returns before the first pass. An earlier accept starts the adversary immediately. `0` skips these rounds; `Unlimited` removes the cap. |
-| `max-adversary-runs` | `1` | Maximum adversary passes in Deep Work. `0` disables the adversary. |
+| `max-adversary-runs` | `1` | Maximum adversary passes when the adversary is enabled. `0` disables the adversary. |
 | `max-reviews-after-adversary` | `0` | Maximum additional completion-review rounds after each adversary pass. At the limit Bello starts the next pass or completes after the final one. `0` schedules none; `Unlimited` removes the cap. A candidate adversary finding is still adjudicated once. |
 | `clean` | `false` | **Warning:** deletes **everything** in the folder except the task file and configured protected paths before starting. Only for disposable folders where you want a from-scratch build. |
 | `protected-path` | absent | Paths the coder must never write to, such as golden tests, fixtures, or production configs. They are also preserved by `clean`. |
@@ -444,7 +444,7 @@ Run flags (each overrides the saved config for one run):
 | `--adversary-intelligence V` | Adversarial tester reasoning effort. |
 | <code>--fast[=true&#124;false]</code> | Codex Fast service tier. |
 | <code>--start-over[=true&#124;false]</code> | Fresh `.supervisor/` state. |
-| <code>--completion-review[=true&#124;false]</code> | Completion-review loop on/off (`false` = Everyday and disables the adversary). |
+| <code>--completion-review[=true&#124;false]</code> | Completion-review loop on/off (`false` selects `runtime-only` and disables the adversary). |
 | <code>--adversary[=true&#124;false]</code> | Adversarial tester on/off. |
 | `--adversary-runs N` | Adversary pass budget; `0` disables. |
 | <code>--clean[=true&#124;false]</code> | **Warning:** wipe the folder except the task file and protected paths before starting. |

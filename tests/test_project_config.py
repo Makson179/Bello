@@ -47,7 +47,7 @@ def test_first_load_creates_default_project_config(tmp_path: Path) -> None:
     assert config.runtime_intelligence == DEFAULT_INTELLIGENCE
     assert config.completion_intelligence == DEFAULT_INTELLIGENCE
     assert config.adversary_intelligence == DEFAULT_INTELLIGENCE
-    assert config.start_over is True
+    assert config.start_over is False
     assert config.completion_review is False
     assert config.adversary is False
     assert config.adversary_runs == 1
@@ -86,7 +86,7 @@ def test_project_config_missing_fields_are_defaulted(tmp_path: Path) -> None:
     assert config.runtime_mod == DEFAULT_MODEL
     assert config.completion_mod == DEFAULT_MODEL
     assert config.adversary_mod == DEFAULT_MODEL
-    assert config.start_over is True
+    assert config.start_over is False
     assert config.completion_returns_before_adversary == 4
     assert config.completion_returns_after_adversary == 2
 

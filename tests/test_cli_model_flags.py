@@ -427,6 +427,7 @@ def test_fresh_project_uses_everyday_defaults() -> None:
     assert settings.runtime_model == MODEL_GPT_5_6_SOL
     assert settings.coder_intelligence == "xhigh"
     assert settings.runtime_intelligence == "xhigh"
+    assert settings.start_over is False
     assert settings.completion_review is False
     assert settings.adversary is False
 

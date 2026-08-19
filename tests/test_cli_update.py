@@ -407,7 +407,7 @@ def test_cli_fast_flag_reaches_runner(monkeypatch: pytest.MonkeyPatch, tmp_path)
             DEFAULT_INTELLIGENCE,
             DEFAULT_INTELLIGENCE,
             True,
-            True,
+            False,
             (),
             False,
             False,
