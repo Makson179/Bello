@@ -51,13 +51,16 @@ reduces the context problem, but compression can drop a rule, a decision, or a
 prohibition that still applies. A confident report from the model is also not
 evidence that the task was actually completed.
 
-Bello moves the management of complex work outside the language model.
+Bello moves the orchestration, the state, and the control of complex work
+outside the language model.
 
-We treat a language model as a strong but limited executor of single cognitive
-steps, and we keep planning, role assignment, memory, evaluation, and the final
-readiness decision in a separate system. Bello runs a repeatable loop in which a
-solution is written, reviewed, attacked, corrected, and accepted only after an
-independent check confirms it.
+The coder still plans its own work and derives the requirements from the task,
+because a language model is good at exactly that. What Bello keeps outside the
+model is everything around it: which role runs when, what state survives a
+restart, what the coder is allowed to do, and who decides that the work is
+finished. With completion review and the adversary enabled, Bello runs a
+repeatable loop in which a solution is written, reviewed, attacked, corrected,
+and accepted only after an independent check confirms it.
 
 ## How Bello solves tasks
 
@@ -67,10 +70,11 @@ a working prototype. While the coder works, a runtime supervisor with a fresh
 context watches the execution, blocks risky actions before they happen, and
 steers the coder back on track when it detects drift, repeated mistakes, or
 unsafe behavior. The supervisor can also deny an action or restart a failing
-generation while preserving verified progress, so the run stays autonomous and
-still under control.
+generation, and a restart keeps the coder's current workspace, so the run stays
+autonomous and still under control.
 
-The result then goes to **completion review**. The reviewer does not continue
+When completion review is enabled and a review opportunity remains, the result
+then goes to an independent **completion review**. The reviewer does not continue
 development, and it does not accept the coder's report as evidence. It
 reconstructs the mandatory requirements of the task on its own and checks:
 
@@ -81,27 +85,34 @@ reconstructs the mandatory requirements of the task on its own and checks:
 * whether fresh validation was performed after the latest substantial changes.
 
 When the reviewer finds a problem, the work goes back to the coder. After the
-fix, the reviewer runs a full review again, because a local change can affect
-other parts of the system.
+fix, the reviewer runs a full review again while the budget still holds a review
+opportunity, because a local change can affect other parts of the system. Once
+the budget is spent, Bello moves on to the adversary, or finishes the run when
+the adversary is off.
 
-Once the solution has passed several development and review cycles, Bello starts
-the **adversary**. The adversary tries to break the result. It explores invalid
-inputs, unexpected action sequences, interactions between features, boundary
-states, and assumptions that the coder and the reviewer may have overlooked.
+Bello starts the **adversary** when the reviewer accepts the result, or when the
+review budget before the attack runs out. With
+`max-reviews-before-adversary` set to `0` the adversary runs on the first
+solution, without any review before it. The adversary tries to break the result.
+It explores invalid inputs, unexpected action sequences, interactions between
+features, boundary states, and assumptions that the coder and the reviewer may
+have overlooked.
 
 The adversary works without the development history of the solution. It judges
-the final artifact rather than the author's explanation. When it finds a possible
-defect, the finding goes to completion review, which decides whether the observed
-behavior violates the requirements.
+the final artifact rather than the author's explanation. Its report goes to a
+separate report controller, which checks every finding, keeps the confirmed ones,
+rejects the incorrect ones, and downgrades the doubtful ones to observations. The
+coder then receives the surviving findings together with all observations.
 
 If a run ends unexpectedly after the coder has started working, for example
 because of a usage limit, a provider error, or an interrupted process, Bello
-preserves the coder's current workspace under `.supervisor/`. To keep that
-recovery state available on the next run, leave Start over disabled
-(`start-over: false`). If a security policy interrupted the run, restart it with
-`--start-over=false`. Enabling Start over discards previous recovery data.
+preserves the coder's current workspace under `.supervisor/`, including changes
+that were never validated. To keep that recovery state available on the next
+run, leave Start over disabled (`start-over: false`, the default). If a security
+policy interrupted the run, restart it with `--start-over=false`. Enabling Start
+over discards previous recovery data.
 
-Bello therefore implements the following cycle:
+With every stage enabled, Bello therefore implements the following cycle:
 
 **build a solution → independently review completeness → fix defects → perform adversarial testing → reassess → accept the result.**
 
@@ -139,10 +150,12 @@ signals. Taken together, the studies above and the 2026 preprint
 Bello's attacker role. In AdverMCTS, targeted corner cases reduced
 pseudo-correctness caused by sparse static tests, in a setting of programming
 problems. Bello accordingly separates implementation, counterexample generation,
-and adjudication. The adversary searches beyond the existing suite, but its tests
-are candidate evidence rather than ground truth. The completion reviewer decides
-whether a finding violates the specification, and relevant edits invalidate
-earlier acceptance evidence.
+and acceptance. The adversary searches beyond the existing suite, but its tests
+are candidate evidence rather than ground truth. A separate report controller
+checks each finding and drops the ones it cannot confirm before the coder sees
+the report, acceptance stays with the completion reviewer whenever review rounds
+are scheduled after the attack, and relevant edits invalidate earlier acceptance
+evidence.
 
 The [AgentCoder](https://arxiv.org/abs/2312.13010) preprint is the closest prior
 architecture. It separates a programmer, an implementation-independent test
@@ -150,8 +163,8 @@ designer, and a test executor, and its ablations support separating test
 construction from code generation. Its evaluation is limited to function-level
 synthesis, and it treats a task as complete when the generated tests pass. It
 therefore supports Bello's role separation without covering long-running runtime
-supervision, a separate completion gate, adversarial adjudication, or restart
-state. The additional controls in Bello target failures identified by
+supervision, a separate completion gate, a separate handler for adversary
+findings, or restart state. The additional controls in Bello target failures identified by
 [MAST](https://arxiv.org/abs/2503.13657) across more than 1,600 multi-agent
 traces, including role violations, history loss, task derailment, premature
 termination, and absent or incorrect verification. Bello maps them to fixed role
@@ -171,9 +184,9 @@ capability model or formal guarantees.
 
 Bello can be used as a light safety layer or as a full quality pipeline. In the
 schedules below, `C` is an independent **completion review** and `A` is an
-**adversarial pass**. Runtime supervision stays active in every mode.
+**adversarial pass**. Runtime supervision stays active in every schedule.
 
-| Mode | Best for | What you get |
+| Schedule | Best for | What you get |
 | --- | --- | --- |
 | `runtime-only` | Any everyday task | Costs and takes about as much as Raw Codex, blocks harmful actions, and keeps a drifting coder on the task. |
 | `C+A` | A heavy task you start in the evening | 69% of the full schedule's quality gain, at about 2.5 times the runtime and about 2 times the cost. |
@@ -184,8 +197,8 @@ schedules below, `C` is an independent **completion review** and `A` is an
 The coder works as usual while a supervisor with a clean context watches the
 live trajectory. The supervisor stops abrupt, irreversible actions, such as
 dropping a database or cancelling a paid subscription, and it redirects a coder
-that has drifted away from the task. On average the mode matches Raw Codex on
-both time and cost, and on individual tasks it is sometimes faster and cheaper,
+that has drifted away from the task. On average it matches Raw Codex on both
+time and cost, and on individual tasks it is sometimes faster and cheaper,
 because a coder that is kept on track does less useless work.
 
 Use `runtime-only` as the default for any task. It removes most of the risk that
@@ -198,8 +211,9 @@ understate the effect, and there the mean gain was about 2%.
 
 ### `C+A`, for heavy overnight work
 
-The schedule adds one independent completion review followed by an adversarial
-attempt to break the result, and it keeps every `runtime-only` protection. On
+The schedule adds up to one independent completion-review round followed by an
+adversarial attempt to break the result, and it keeps every `runtime-only`
+protection. On
 ProgramBench it raised macro completion from 53.53% to 67.67%, which is **69% of
 the improvement** delivered by the full `4C+A+2C` schedule in our shorter-run
 comparison. The price is time and money. The three-task run took about 2.5 times
@@ -214,11 +228,11 @@ result is clearly better than what Raw Codex produces on the same task.
 
 ### `4C+A+2C`, for maximum quality
 
-Four completion-review opportunities refine the implementation before the
-adversary probes its assumptions, and two further reviews resolve what the attack
-uncovers. We built the schedule to see how high Bello can score on a benchmark
-with every stage enabled, and the measured completion was the highest of the
-three modes. Averaged over the nine reported benchmark runs it improved
+The schedule allows up to four completion-review rounds to refine the
+implementation before the adversary probes its assumptions, and up to two further
+rounds to resolve what the attack uncovers. We built it to see how high Bello can
+score on a benchmark with every stage enabled, and the measured completion was
+the highest of the three schedules. Averaged over the nine reported benchmark runs it improved
 completion by **36.4% over Raw Codex**, and in the GPT-5.6 Sol `ultra`
 comparison by 38.30%.
 
@@ -234,6 +248,24 @@ Configure these schedules with `bello config`. For `runtime-only`, set
 `max-reviews-after-adversary` to `1`, `1`, and `0`. For `4C+A+2C`, use `4`, `1`,
 and `2`. The fields, defaults, and one-run CLI overrides are documented in the
 [Configuration section](#configuration).
+
+### Custom schedules
+
+Bello has no built-in list of modes to pick from. The three schedules above are
+configuration recipes, and the budget fields are independent numbers, so you can
+assemble whatever schedule your task needs: a single `C` with the adversary off,
+`2C+A`, `C+A+C`, `4C+2A`, and so on. Set `max-reviews-before-adversary` for the
+review rounds before the first attack, `max-adversary-runs` for the number of
+adversary passes, and `max-reviews-after-adversary` for the review rounds that
+follow each pass. Both review budgets also accept `Unlimited`, which removes the
+cap and lets the loop keep going until the reviewer accepts the result.
+
+The numbers are upper limits rather than a fixed sequence. A run can end before
+it uses them, because the reviewer can accept early and the schedule completes
+once nothing further is scheduled, so a name like `4C+2A` describes the most the
+run may do rather than what it will do. The adversary also requires
+`completion-review` to be enabled, and setting `max-reviews-before-adversary` to
+`0` is allowed, which sends the first solution straight to the attack.
 
 ## Results
 
@@ -492,7 +524,8 @@ bello config
 It creates and edits `.supervisor/config.json`. Every value is saved as you
 press Enter, and future runs in this folder use these settings automatically.
 
-The editor starts in Everyday mode for a new project and only shows settings
+For a new project the editor starts with `completion-review` and `adversary`
+turned off, which is the `runtime-only` schedule, and it only shows settings
 that can affect the selected pipeline. Turning on `completion-review` reveals
 the completion reviewer and review budget. Turning on `adversary` then reveals
 the adversary model and the complete `C+A` schedule.
@@ -515,19 +548,19 @@ runtime and review budgets, are changed through `bello config`.
 | `runtime-mod` | GPT-5.6 | Model family for fresh-context runtime checks, including risky-action judgment and drift detection. |
 | `runtime-5.6-variant` | Sol | GPT-5.6 variant for the full runtime supervisor. |
 | `runtime-intelligence` | `xhigh` | Full runtime supervisor reasoning effort. |
-| `completion-mod` | GPT-5.6 | Model family for the independent completion reviewer. Hidden in Everyday mode. |
-| `completion-5.6-variant` | Sol | GPT-5.6 variant for completion review. Hidden in Everyday mode. |
-| `completion-intelligence` | `xhigh` | Completion reviewer reasoning effort. Hidden in Everyday mode. |
+| `completion-mod` | GPT-5.6 | Model family for the independent completion reviewer. Hidden unless `completion-review` is enabled. |
+| `completion-5.6-variant` | Sol | GPT-5.6 variant for completion review. Hidden unless `completion-review` is enabled. |
+| `completion-intelligence` | `xhigh` | Completion reviewer reasoning effort. Hidden unless `completion-review` is enabled. |
 | `adversary-mod` | GPT-5.6 | Adversarial tester model family. Visible only when the adversary is enabled. |
 | `adversary-5.6-variant` | Sol | GPT-5.6 variant for the adversary. Visible only when the adversary is enabled. |
 | `adversary-intelligence` | `xhigh` | Adversary reasoning effort. Visible only when the adversary is enabled. |
 | `speed` | `usual` | `fast` uses the Codex Fast service tier for coder, runtime-supervisor, and completion-review turns. Adversary turns are unchanged. |
 | `cheap-runtime` | `true` | Let Luna dismiss routine runtime checks before invoking the full runtime supervisor. Human messages, approvals, and mandatory checks bypass triage. |
-| `start-over` | `true` | `true` removes prior Bello logs, archived runs, and recovery data, and `false` preserves them. Both start fresh active state and leave project files unchanged. |
-| `completion-review` | `false` | `false` is Everyday. `true` enables the independent completion-review loop and reveals its settings. |
+| `start-over` | `false` | `true` removes prior Bello logs, archived runs, and recovery data, and `false` preserves them. Both start fresh active state and leave project files unchanged. |
+| `completion-review` | `false` | `false` runs the `runtime-only` schedule. `true` enables the independent completion-review loop and reveals its settings. |
 | `adversary` | `false` | Enable the adversarial tester before completion. Requires completion review. |
 | `max-reviews` / `max-reviews-before-adversary` | `1` | Completion-return budget. Without an adversary it is shown as `max-reviews`, and with an adversary it limits returns before the first pass. An earlier accept starts the adversary immediately. `0` skips these rounds, and `Unlimited` removes the cap. |
-| `max-adversary-runs` | `1` | Maximum adversary passes in Deep Work. `0` disables the adversary. |
+| `max-adversary-runs` | `1` | Maximum adversary passes when the adversary is enabled. `0` disables the adversary. |
 | `max-reviews-after-adversary` | `0` | Maximum additional completion-review rounds after each adversary pass. At the limit Bello starts the next pass, or completes after the final one. `0` schedules none, and `Unlimited` removes the cap. A candidate adversary finding is still adjudicated once. |
 | `clean` | `false` | **Warning:** deletes everything in the folder except the task file and configured protected paths before starting. Only for disposable folders where you want a build from scratch. |
 | `protected-path` | absent | Paths the coder must never write to, such as golden tests, fixtures, or production configs. They are also preserved by `clean`. |
@@ -559,7 +592,7 @@ Run flags (each overrides the saved config for one run):
 | `--adversary-intelligence V` | Adversarial tester reasoning effort. |
 | <code>--fast[=true&#124;false]</code> | Codex Fast service tier. |
 | <code>--start-over[=true&#124;false]</code> | Fresh `.supervisor/` state. |
-| <code>--completion-review[=true&#124;false]</code> | Completion-review loop on or off (`false` = Everyday and disables the adversary). |
+| <code>--completion-review[=true&#124;false]</code> | Completion-review loop on or off (`false` runs `runtime-only` and disables the adversary). |
 | <code>--adversary[=true&#124;false]</code> | Adversarial tester on or off. |
 | `--adversary-runs N` | Adversary pass budget, and `0` disables it. |
 | <code>--clean[=true&#124;false]</code> | **Warning:** wipe the folder except the task file and protected paths before starting. |
