@@ -19,6 +19,7 @@
 
 ## Contents
 
+- [TL;DR](#tldr)
 - [Motivation](#motivation)
 - [How Bello solves tasks](#how-bello-solves-tasks)
 - [Relationship to existing LLM research](#relationship-to-existing-llm-research)
@@ -30,6 +31,27 @@
 - [Configuration](#configuration)
 - [Command reference](#command-reference)
 - [License](#license)
+
+---
+
+## TL;DR
+
+Bello runs the Codex coder inside a disposable sandbox and puts separate roles
+around it: a supervisor that watches the live run, an independent completion
+reviewer, and an adversary that tries to break the result. You choose how many
+of those roles a task gets. In the names below, `C` is one completion review and
+`A` is one adversarial pass.
+
+| Schedule | What it does | Measured result | When to use |
+| --- | --- | --- | --- |
+| `runtime-only` | A supervisor with a fresh context watches the live run, blocks dangerous actions, and pulls the coder back when it drifts. | Time and cost match Raw Codex, and scores run about 9% higher on messy tasks with many requirements. | The everyday default, on any task. |
+| `C+A` | Adds one independent completion review and one adversarial pass on top of runtime supervision. | ProgramBench macro completion 53.53% to 67.67%. Runs about 2.5 times longer and costs about 2 times more than Raw Codex, and one benchmark task still used only about 1% of a weekly Codex limit. | A hard task you start in the evening and collect in the morning. |
+| `4C+A+2C` | Allows up to four review rounds before the attack and two after it. | The higher score in all nine matched runs, and 36.4% higher completion than Raw Codex on average. Significantly more expensive than Raw Codex. | The hardest tasks, where quality is the priority and cost does not matter. |
+
+Runtime supervision stays active in every schedule. The three rows are
+configuration recipes rather than built-in modes, and
+[Choose your supervision depth](#choose-your-supervision-depth) explains the
+fields and how to build your own.
 
 ---
 
@@ -91,9 +113,9 @@ the budget is spent, Bello moves on to the adversary, or finishes the run when
 the adversary is off.
 
 Bello starts the **adversary** when the reviewer accepts the result, or when the
-review budget before the attack runs out. With
-`max-reviews-before-adversary` set to `0` the adversary runs on the first
-solution, without any review before it. The adversary tries to break the result.
+review budget before the attack runs out. With `max-reviews-before-adversary`
+set to `0` the adversary runs on the first solution, without any review before
+it. The adversary tries to break the result.
 It explores invalid inputs, unexpected action sequences, interactions between
 features, boundary states, and assumptions that the coder and the reviewer may
 have overlooked.
@@ -164,9 +186,9 @@ construction from code generation. Its evaluation is limited to function-level
 synthesis, and it treats a task as complete when the generated tests pass. It
 therefore supports Bello's role separation without covering long-running runtime
 supervision, a separate completion gate, a separate handler for adversary
-findings, or restart state. The additional controls in Bello target failures identified by
-[MAST](https://arxiv.org/abs/2503.13657) across more than 1,600 multi-agent
-traces, including role violations, history loss, task derailment, premature
+findings, or restart state. The additional controls in Bello target failures
+identified by [MAST](https://arxiv.org/abs/2503.13657) across more than 1,600
+multi-agent traces, including role violations, history loss, task derailment, premature
 termination, and absent or incorrect verification. Bello maps them to fixed role
 contracts, durable handoffs, live drift detection, explicit stage transitions,
 and a separate final acceptance decision. Multi-agent specialization is prior
@@ -184,13 +206,8 @@ capability model or formal guarantees.
 
 Bello can be used as a light safety layer or as a full quality pipeline. In the
 schedules below, `C` is an independent **completion review** and `A` is an
-**adversarial pass**. Runtime supervision stays active in every schedule.
-
-| Schedule | Best for | What you get |
-| --- | --- | --- |
-| `runtime-only` | Any everyday task | Costs and takes about as much as Raw Codex, blocks harmful actions, and keeps a drifting coder on the task. |
-| `C+A` | A heavy task you start in the evening | 69% of the full schedule's quality gain, at about 2.5 times the runtime and about 2 times the cost. |
-| `4C+A+2C` | Rare, difficult tasks where quality outweighs cost | The deepest review schedule, about 36% higher benchmark completion than Raw Codex. A single run can take most of a day. |
+**adversarial pass**. Runtime supervision stays active in every schedule, and
+the [TL;DR table](#tldr) summarizes the three of them.
 
 ### `runtime-only`, for everyday work
 
@@ -205,7 +222,7 @@ Use `runtime-only` as the default for any task. It removes most of the risk that
 the coder starts hallucinating and doing damage, and the quality gain is largest
 when the task is written the way people normally write tasks at work: long,
 messy, and full of requirements added in passing. On our three custom tasks of
-that kind, `runtime-only` scored 4.61 to 8.75 points above Raw Codex, because it
+that kind, `runtime-only` scored about 9% higher than Raw Codex, because it
 catches drift and hallucination early. The ProgramBench tasks are short, so they
 understate the effect, and there the mean gain was about 2%.
 
@@ -213,14 +230,15 @@ understate the effect, and there the mean gain was about 2%.
 
 The schedule adds up to one independent completion-review round followed by an
 adversarial attempt to break the result, and it keeps every `runtime-only`
-protection. On
-ProgramBench it raised macro completion from 53.53% to 67.67%, which is **69% of
-the improvement** delivered by the full `4C+A+2C` schedule in our shorter-run
-comparison. The price is time and money. The three-task run took about 2.5 times
-longer than Raw Codex, and it cost roughly 1.8 to 2.3 times more.
+protection. On ProgramBench it raised macro completion from 53.53% to 67.67%,
+which is **69% of the improvement** delivered by the full `4C+A+2C` schedule in
+our shorter-run comparison. The gain costs time and money. The three-task run
+took about 2.5 times longer than Raw Codex, and it cost roughly 1.8 to 2.3 times
+more.
 
-The absolute cost is still small. One ProgramBench task consumed about 0.3% to
-0.4% of a weekly Codex limit under Raw Codex, and up to 1.2% under `C+A`.
+The absolute numbers stay small. One ProgramBench task consumed about 0.3% to
+0.4% of a weekly Codex limit under Raw Codex, and up to 1.2% under `C+A`, so a
+weekly quota still covers dozens of runs.
 
 Use `C+A` when you want to hand over a hard task at the end of the day and need
 serious quality with a real review behind it. The run finishes overnight, and the
@@ -232,15 +250,15 @@ The schedule allows up to four completion-review rounds to refine the
 implementation before the adversary probes its assumptions, and up to two further
 rounds to resolve what the attack uncovers. We built it to see how high Bello can
 score on a benchmark with every stage enabled, and the measured completion was
-the highest of the three schedules. Averaged over the nine reported benchmark runs it improved
-completion by **36.4% over Raw Codex**, and in the GPT-5.6 Sol `ultra`
-comparison by 38.30%.
+the highest of the three schedules. Bello scored higher in all nine matched
+runs. Averaged over them it improved completion by **36.4% over Raw Codex**, and
+in the GPT-5.6 Sol `ultra` comparison by 38.30%.
 
-The schedule is far slower and far more expensive than Raw Codex, so use it
-deliberately. It fits a genuinely awkward task with many cases and nuances, where
-you want the best result you can get and the price does not decide. Plan for a
-long run, because in our `ultra` runs a single task took between 7 hours 39
-minutes and 19 hours 25 minutes.
+The schedule is significantly more expensive than Raw Codex and takes much
+longer, so it is worth choosing deliberately. It fits a genuinely awkward task
+with many cases and nuances, where quality is the priority and cost is not a
+constraint. Plan for a long run, because in our `ultra` runs a single task took
+between 7 hours 39 minutes and 19 hours 25 minutes.
 
 Configure these schedules with `bello config`. For `runtime-only`, set
 `completion-review` and `adversary` to `false`. For `C+A`, enable both and set
