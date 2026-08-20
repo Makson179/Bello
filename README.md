@@ -2,7 +2,7 @@
 
 <p align="center">
   <strong>An autonomous coding loop with independent verification.</strong><br>
-  You write the task in a file and leave. Bello keeps the coder inside a disposable sandbox while a separate supervisor, running on a fresh context, reviews risky actions, catches drift, and handles recovery. On ProgramBench, averaged over nine matched runs with GPT-5.5 and GPT-5.6 Sol, the deepest schedule raised completion by 36.4% relative to Raw Codex. <br>
+  You write the task in a file and leave. Bello keeps the coder inside a disposable sandbox while a separate supervisor, running on a fresh context, reviews risky actions, catches drift, and handles recovery. On ProgramBench, averaged over nine matched runs with GPT-5.5 and GPT-5.6 Sol, the highest-effort setup raised completion by 36.4% relative to Raw Codex. <br>
 </p>
 
 <p align="center">
@@ -42,13 +42,13 @@ reviewer, and an adversary that tries to break the result. You choose how many
 of those roles a task gets. In the names below, `C` is one completion review and
 `A` is one adversarial pass.
 
-| Schedule | What it does | Measured result | When to use |
+| Effort | What it does | Measured result | When to use |
 | --- | --- | --- | --- |
 | `runtime-only` | A supervisor with a fresh context watches the live run, blocks dangerous actions, and pulls the coder back when it drifts. | Time and cost match Raw Codex, and scores run about 9% higher on messy tasks with many requirements. | The everyday default, on any task. |
 | `C+A` | Adds one independent completion review and one adversarial pass on top of runtime supervision. | ProgramBench macro completion 53.53% to 67.67%. Runs about 2.5 times longer and costs about 2 times more than Raw Codex, and one benchmark task still used only about 1% of a weekly Codex limit. | A hard task you start in the evening and collect in the morning. |
 | `4C+A+2C` | Allows up to four review rounds before the attack and two after it. | The higher score in all nine matched runs, and 36.4% higher completion than Raw Codex on average. Significantly more expensive than Raw Codex. | The hardest tasks, where quality is the priority and cost does not matter. |
 
-Runtime supervision stays active in every schedule. The three rows are
+Runtime supervision stays active at every effort level. The three rows are
 configuration recipes rather than built-in modes, and
 [Choose your supervision depth](#choose-your-supervision-depth) explains the
 fields and how to build your own.
@@ -205,8 +205,8 @@ capability model or formal guarantees.
 ## Choose your supervision depth
 
 Bello can be used as a light safety layer or as a full quality pipeline. In the
-schedules below, `C` is an independent **completion review** and `A` is an
-**adversarial pass**. Runtime supervision stays active in every schedule, and
+effort levels below, `C` is an independent **completion review** and `A` is an
+**adversarial pass**. Runtime supervision stays active at every effort level, and
 the [TL;DR table](#tldr) summarizes the three of them.
 
 ### `runtime-only`, for everyday work
@@ -228,10 +228,10 @@ understate the effect, and there the mean gain was about 2%.
 
 ### `C+A`, for heavy overnight work
 
-The schedule adds up to one independent completion-review round followed by an
+This effort level adds up to one independent completion-review round followed by an
 adversarial attempt to break the result, and it keeps every `runtime-only`
 protection. On ProgramBench it raised macro completion from 53.53% to 67.67%,
-which is **69% of the improvement** delivered by the full `4C+A+2C` schedule in
+which is **69% of the improvement** delivered by the full `4C+A+2C` setup in
 our shorter-run comparison. The gain costs time and money. The three-task run
 took about 2.5 times longer than Raw Codex, and it cost roughly 1.8 to 2.3 times
 more.
@@ -246,32 +246,32 @@ result is clearly better than what Raw Codex produces on the same task.
 
 ### `4C+A+2C`, for maximum quality
 
-The schedule allows up to four completion-review rounds to refine the
+This effort level allows up to four completion-review rounds to refine the
 implementation before the adversary probes its assumptions, and up to two further
 rounds to resolve what the attack uncovers. We built it to see how high Bello can
 score on a benchmark with every stage enabled, and the measured completion was
-the highest of the three schedules. Bello scored higher in all nine matched
+the highest of the three effort levels. Bello scored higher in all nine matched
 runs. Averaged over them it improved completion by **36.4% over Raw Codex**, and
 in the GPT-5.6 Sol `ultra` comparison by 38.30%.
 
-The schedule is significantly more expensive than Raw Codex and takes much
+This effort level is significantly more expensive than Raw Codex and takes much
 longer, so it is worth choosing deliberately. It fits a genuinely awkward task
 with many cases and nuances, where quality is the priority and cost is not a
 constraint. Plan for a long run, because in our `ultra` runs a single task took
 between 7 hours 39 minutes and 19 hours 25 minutes.
 
-Configure these schedules with `bello config`. For `runtime-only`, set
+Configure these effort levels with `bello config`. For `runtime-only`, set
 `completion-review` and `adversary` to `false`. For `C+A`, enable both and set
 `max-reviews-before-adversary`, `max-adversary-runs`, and
 `max-reviews-after-adversary` to `1`, `1`, and `0`. For `4C+A+2C`, use `4`, `1`,
 and `2`. The fields, defaults, and one-run CLI overrides are documented in the
 [Configuration section](#configuration).
 
-### Custom schedules
+### Custom effort levels
 
-Bello has no built-in list of modes to pick from. The three schedules above are
+Bello has no built-in list of modes to pick from. The three effort levels above are
 configuration recipes, and the budget fields are independent numbers, so you can
-assemble whatever schedule your task needs: a single `C` with the adversary off,
+choose whatever effort level your task needs: a single `C` with the adversary off,
 `2C+A`, `C+A+C`, `4C+2A`, and so on. Set `max-reviews-before-adversary` for the
 review rounds before the first attack, `max-adversary-runs` for the number of
 adversary passes, and `max-reviews-after-adversary` for the review rounds that
@@ -279,7 +279,7 @@ follow each pass. Both review budgets also accept `Unlimited`, which removes the
 cap and lets the loop keep going until the reviewer accepts the result.
 
 The numbers are upper limits rather than a fixed sequence. A run can end before
-it uses them, because the reviewer can accept early and the schedule completes
+it uses them, because the reviewer can accept early and the run completes
 once nothing further is scheduled, so a name like `4C+2A` describes the most the
 run may do rather than what it will do. The adversary also requires
 `completion-review` to be enabled, and setting `max-reviews-before-adversary` to
@@ -339,7 +339,7 @@ The corresponding Bello solutions are available in the
 *Figure C1. ProgramBench completion and runtime for the three matched GPT-5.6
 Sol `ultra` task configurations.*
 
-### 3. `4C+A+2C`, the full schedule
+### 3. `4C+A+2C`, maximum effort
 
 #### Key findings
 
@@ -543,10 +543,10 @@ It creates and edits `.supervisor/config.json`. Every value is saved as you
 press Enter, and future runs in this folder use these settings automatically.
 
 For a new project the editor starts with `completion-review` and `adversary`
-turned off, which is the `runtime-only` schedule, and it only shows settings
+turned off, which is the `runtime-only` setup, and it only shows settings
 that can affect the selected pipeline. Turning on `completion-review` reveals
 the completion reviewer and review budget. Turning on `adversary` then reveals
-the adversary model and the complete `C+A` schedule.
+the adversary model and the complete `C+A` setup.
 
 For each visible role, select GPT-5.6 and then choose Sol, Terra, or Luna in
 the variant row. Sol and Terra support reasoning effort from `low` through
@@ -575,11 +575,11 @@ runtime and review budgets, are changed through `bello config`.
 | `speed` | `usual` | `fast` uses the Codex Fast service tier for coder, runtime-supervisor, and completion-review turns. Adversary turns are unchanged. |
 | `cheap-runtime` | `true` | Let Luna dismiss routine runtime checks before invoking the full runtime supervisor. Human messages, approvals, and mandatory checks bypass triage. |
 | `start-over` | `false` | `true` removes prior Bello logs, archived runs, and recovery data, and `false` preserves them. Both start fresh active state and leave project files unchanged. |
-| `completion-review` | `false` | `false` runs the `runtime-only` schedule. `true` enables the independent completion-review loop and reveals its settings. |
+| `completion-review` | `false` | `false` runs the `runtime-only` setup. `true` enables the independent completion-review loop and reveals its settings. |
 | `adversary` | `false` | Enable the adversarial tester before completion. Requires completion review. |
 | `max-reviews` / `max-reviews-before-adversary` | `1` | Completion-return budget. Without an adversary it is shown as `max-reviews`, and with an adversary it limits returns before the first pass. An earlier accept starts the adversary immediately. `0` skips these rounds, and `Unlimited` removes the cap. |
 | `max-adversary-runs` | `1` | Maximum adversary passes when the adversary is enabled. `0` disables the adversary. |
-| `max-reviews-after-adversary` | `0` | Maximum additional completion-review rounds after each adversary pass. At the limit Bello starts the next pass, or completes after the final one. `0` schedules none, and `Unlimited` removes the cap. A candidate adversary finding is still adjudicated once. |
+| `max-reviews-after-adversary` | `0` | Maximum additional completion-review rounds after each adversary pass. At the limit Bello starts the next pass, or completes after the final one. `0` adds no rounds, and `Unlimited` removes the cap. A candidate adversary finding is still adjudicated once. |
 | `clean` | `false` | **Warning:** deletes everything in the folder except the task file and configured protected paths before starting. Only for disposable folders where you want a build from scratch. |
 | `protected-path` | absent | Paths the coder must never write to, such as golden tests, fixtures, or production configs. They are also preserved by `clean`. |
 
