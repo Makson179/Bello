@@ -36,13 +36,16 @@
 
 ## TL;DR
 
-Bello runs the Codex coder inside a disposable sandbox while a supervisor
-watches the live run. `C` is a completion review: a fresh-context reviewer
-checks the current solution against the task and sends it back for fixes if
-anything is missing or incorrect. `A` is an adversarial pass: another
-independent agent actively tries to break the current solution and uncover edge
-cases or hidden failures before the run is accepted. You choose how much review
-a task gets.
+Bello runs the Codex coder inside a disposable sandbox and puts separate roles
+around it: a supervisor that watches the live run, an independent completion
+reviewer, and an adversary that tries to break the result. You choose how many
+of those roles a task gets.
+
+`C` is a completion review: a fresh-context reviewer checks the current solution
+against the task and sends it back for fixes if anything is missing or incorrect.
+`A` is an adversarial pass: another independent agent actively tries to break the
+current solution and uncover edge cases or hidden failures before the run is
+accepted. You choose how much review a task gets.
 
 | Effort | What it does | Measured result | When to use |
 | --- | --- | --- | --- |
