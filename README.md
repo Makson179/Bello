@@ -36,27 +36,34 @@
 
 ## TL;DR
 
-Bello runs the Codex coder inside a disposable sandbox and puts separate roles
-around it: a supervisor that watches the live run, an independent completion
-reviewer, and an adversary that tries to break the result. You choose how many
-of those roles a task gets.
+You hand a coding agent a long task, close the laptop, and come back to a
+confident report that the work is done. Often it is not. On the benchmark tasks
+in [Results](#results), Codex on its own averaged a completion score of 44.87%
+across nine runs, which means more than half of what those tasks asked for was
+missing from the code it finished with. Now and then an agent also does
+something you cannot undo, such as dropping a database.
 
-`C` is a completion review: a fresh-context reviewer checks the current solution
-against the task and sends it back for fixes if anything is missing or incorrect.
-`A` is an adversarial pass: another independent agent actively tries to break the
-current solution and uncover edge cases or hidden failures before the run is
-accepted. You choose how much review a task gets.
+Bello runs the Codex coder for you and does not take its word for the result.
+The coder works inside a disposable sandbox. A second model watches the run from
+the outside, blocks dangerous commands, and pulls the coder back when it drifts
+away from the task.
 
-| Effort | What it does | Measured result | When to use |
-| --- | --- | --- | --- |
-| `runtime-only` | A supervisor with a fresh context watches the live run, blocks dangerous actions, and pulls the coder back when it drifts. | Time and cost match Raw Codex, and scores run about 9% higher on messy tasks with many requirements. | The everyday default, on any task. |
-| `C+A` | Adds one independent completion review and one adversarial pass on top of runtime supervision. | ProgramBench macro completion 53.53% to 67.67%. Runs about 2.5 times longer and costs about 2 times more than Raw Codex, and one benchmark task still used only about 1% of a weekly Codex limit. | A hard task you start in the evening and collect in the morning. |
-| `4C+A+2C` | Allows up to four review rounds before the attack and two after it. | The higher score in all nine matched runs, and 36.4% higher completion than Raw Codex on average. Significantly more expensive than Raw Codex. | The hardest tasks, where quality is the priority and cost does not matter. |
+The deeper settings add two more roles, which you turn on in
+[Configuration](#configuration). An independent reviewer reads the task, the
+code, and the diff, runs its own checks, and keeps sending the work back until
+the result holds up. An attacker then goes after the finished code without
+seeing how it was written, looking for cases nobody tested, such as invalid
+input or two features breaking each other. Confirmed findings go back to the
+coder. [Choose your supervision depth](#choose-your-supervision-depth) covers
+the three settings we recommend and how to build your own.
 
-Runtime supervision stays active at every effort level. The three rows are
-configuration recipes rather than built-in modes, and
-[Choose your supervision depth](#choose-your-supervision-depth) explains the
-fields and how to build your own.
+Set Bello up as a Codex plugin or as a standalone command in [Install](#install),
+then hand it a task file the way [Quick start](#quick-start) shows. Bello runs
+until the work is finished and writes `.supervisor/FINAL_REPORT.md` with the
+status, the changed files, the checks that ran, and the risks that are left.
+
+The cheapest setting costs about what Codex costs on its own, and the deepest
+scored 36.4% higher than Codex on the [benchmark runs](#results).
 
 ---
 
@@ -211,8 +218,13 @@ capability model or formal guarantees.
 
 Bello can be used as a light safety layer or as a full quality pipeline. In the
 effort levels below, `C` is an independent **completion review** and `A` is an
-**adversarial pass**. Runtime supervision stays active at every effort level, and
-the [TL;DR table](#tldr) summarizes the three of them.
+**adversarial pass**. Runtime supervision stays active at every effort level.
+
+| Effort | What it does | Measured result | When to use |
+| --- | --- | --- | --- |
+| `runtime-only` | A supervisor with a fresh context watches the live run, blocks dangerous actions, and pulls the coder back when it drifts. | Time and cost match Raw Codex, and scores run about 9% higher on messy tasks with many requirements. | The everyday default, on any task. |
+| `C+A` | Adds one independent completion review and one adversarial pass on top of runtime supervision. | ProgramBench macro completion 53.53% to 67.67%. Runs about 2.5 times longer and costs about 2 times more than Raw Codex, and one benchmark task still used only about 1% of a weekly Codex limit. | A hard task you start in the evening and collect in the morning. |
+| `4C+A+2C` | Allows up to four review rounds before the attack and two after it. | The higher score in all nine matched runs, and 36.4% higher completion than Raw Codex on average. Significantly more expensive than Raw Codex. | The hardest tasks, where quality is the priority and cost does not matter. |
 
 ### `runtime-only`, for everyday work
 
