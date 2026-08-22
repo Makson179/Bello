@@ -2,7 +2,7 @@
 
 <p align="center">
   <strong>An autonomous coding loop with independent verification.</strong><br>
-  You write the task in a file and leave. Bello keeps the coder inside a disposable sandbox while a separate supervisor, running on a fresh context, reviews risky actions, catches drift, and handles recovery. On ProgramBench, averaged over nine matched runs with GPT-5.5 and GPT-5.6 Sol, the highest-effort setup raised completion by 36.4% relative to Raw Codex. <br>
+  You write the task in a file and leave. Bello keeps the coder inside a disposable sandbox while a separate supervisor, running on a fresh context, reviews risky actions, catches drift, and handles recovery. On ProgramBench, averaged over nine matched runs with GPT-5.5 and GPT-5.6 Sol, the highest-effort setup raised completion by 36.4% relative to Raw Codex.<br>
 </p>
 
 <p align="center">
