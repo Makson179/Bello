@@ -1559,7 +1559,7 @@ class BelloController:
         result: str,
         *,
         status: BelloStatus = BelloStatus.COMPLETE,
-        completion_review_accepted: bool = False,
+        completion_review_accepted: bool | None = False,
     ) -> None:
         self._reconcile_intervention_accounting()
         diff = await self.diff_summary()
@@ -3372,9 +3372,9 @@ class BelloController:
         )
         self._accepted_completion_decision = None
         await self.finalize(
-            f"completed by bounded review policy: {reason}",
+            "completed normally",
             status=BelloStatus.COMPLETE,
-            completion_review_accepted=False,
+            completion_review_accepted=None,
         )
 
     async def _fail_required_adversary(

@@ -542,6 +542,27 @@ def test_final_report_rendering(tmp_path: Path) -> None:
     assert "- a.py" in text
 
 
+def test_final_report_omits_completion_review_status_when_not_applicable(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+
+    store.write_final_report(
+        FinalReport(
+            task_path=str(task),
+            status="complete",
+            result="completed normally",
+            completion_review_accepted=None,
+        )
+    )
+
+    text = store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert "- Status: complete" in text
+    assert "- Result: completed normally" in text
+    assert "Completion review accepted" not in text
+
+
 async def test_final_report_non_git_omits_git_usage_and_includes_validations(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
@@ -1215,7 +1236,9 @@ async def test_exact_marker_triggers_completion_review_accept(tmp_path: Path) ->
     assert len(fake.completion_packets) == 1
     assert fake.completion_packets[0].last_coder_message.text.endswith("BELLO_READY_FOR_REVIEW")
     assert store.get_bello_config().status == BelloStatus.COMPLETE
-    assert "accepted by completion_review" in store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert "accepted by completion_review" in report
+    assert "- Completion review accepted: true" in report
 
 
 async def test_summary_done_without_marker_steers_for_exact_marker_not_completion(tmp_path: Path) -> None:
@@ -4915,13 +4938,13 @@ async def test_completion_only_review_budget_finalizes_without_restart_or_extra_
             }
         )
     )
-    finalized: list[tuple[str, BelloStatus, bool]] = []
+    finalized: list[tuple[str, BelloStatus, bool | None]] = []
 
     async def capture_finalize(
         result: str,
         *,
         status: BelloStatus = BelloStatus.COMPLETE,
-        completion_review_accepted: bool = False,
+        completion_review_accepted: bool | None = False,
     ) -> None:
         finalized.append((result, status, completion_review_accepted))
 
@@ -4933,9 +4956,9 @@ async def test_completion_only_review_budget_finalizes_without_restart_or_extra_
     assert controller.completion_restarts == 0
     assert finalized == [
         (
-            "completed by bounded review policy: completion review budget exhausted",
+            "completed normally",
             BelloStatus.COMPLETE,
-            False,
+            None,
         )
     ]
 
@@ -5049,13 +5072,13 @@ async def test_pre_adversary_return_budget_runs_adversary_without_an_extra_compl
             }
         )
     )
-    finalized: list[tuple[str, BelloStatus, bool]] = []
+    finalized: list[tuple[str, BelloStatus, bool | None]] = []
 
     async def capture_finalize(
         result: str,
         *,
         status: BelloStatus = BelloStatus.COMPLETE,
-        completion_review_accepted: bool = False,
+        completion_review_accepted: bool | None = False,
     ) -> None:
         finalized.append((result, status, completion_review_accepted))
 
@@ -5083,9 +5106,9 @@ async def test_pre_adversary_return_budget_runs_adversary_without_an_extra_compl
     assert cfg.completion_returns_since_adversary == 0
     assert finalized == [
         (
-            "completed by bounded review policy: completion review budget reached and the normalized adversary report had nothing for the coder",
+            "completed normally",
             BelloStatus.COMPLETE,
-            False,
+            None,
         )
     ]
 
@@ -5107,13 +5130,13 @@ async def test_post_adversary_return_budget_finalizes_on_next_readiness_without_
             }
         )
     )
-    finalized: list[tuple[str, BelloStatus, bool]] = []
+    finalized: list[tuple[str, BelloStatus, bool | None]] = []
 
     async def capture_finalize(
         result: str,
         *,
         status: BelloStatus = BelloStatus.COMPLETE,
-        completion_review_accepted: bool = False,
+        completion_review_accepted: bool | None = False,
     ) -> None:
         finalized.append((result, status, completion_review_accepted))
 
@@ -5124,14 +5147,15 @@ async def test_post_adversary_return_budget_finalizes_on_next_readiness_without_
     assert fake.completion_packets == []
     assert finalized == [
         (
-            "completed by bounded review policy: post-adversary completion review budget exhausted",
+            "completed normally",
             BelloStatus.COMPLETE,
-            False,
+            None,
         )
     ]
     events = [json.loads(line) for line in store.path(EVENTS).read_text(encoding="utf-8").splitlines()]
     assert events[-1]["event_type"] == "completion/budget_finalize"
     assert events[-1]["decision"]["completion_return_count"] == 9
+    assert events[-1]["reason"] == "post-adversary completion review budget exhausted"
 
 
 async def test_required_budget_adversary_failure_is_not_reported_as_success(

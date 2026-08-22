@@ -890,7 +890,7 @@ class FinalReport(BaseModel):
     denied_actions: list[str] = Field(default_factory=list)
     interventions: int = 0
     restarts: int = 0
-    completion_review_accepted: bool = False
+    completion_review_accepted: bool | None = False
     completion_returns: int = 0
     completion_restarts: int = 0
     no_marker_idle_nudges: int = 0

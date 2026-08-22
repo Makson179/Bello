@@ -316,11 +316,18 @@ class StateStore:
                 f"- Result: {report.result}",
                 f"- Restarts: {report.restarts}",
                 f"- Interventions: {report.interventions}",
-                f"- Completion review accepted: {str(report.completion_review_accepted).lower()}",
-                f"- Completion returns: {report.completion_returns}",
-                f"- Completion restarts: {report.completion_restarts}",
-                f"- No-marker idle nudges: {report.no_marker_idle_nudges}",
             ]
+            if report.completion_review_accepted is not None:
+                lines.append(
+                    f"- Completion review accepted: {str(report.completion_review_accepted).lower()}"
+                )
+            lines.extend(
+                [
+                    f"- Completion returns: {report.completion_returns}",
+                    f"- Completion restarts: {report.completion_restarts}",
+                    f"- No-marker idle nudges: {report.no_marker_idle_nudges}",
+                ]
+            )
             if report.files_changed:
                 lines.extend(["", "## Files Changed", *[f"- {path}" for path in report.files_changed]])
             if report.validations:
