@@ -131,7 +131,7 @@ stream), and `FINAL_REPORT.md` (the result).
 
 ## Bello in 57 seconds
 
-https://github.com/user-attachments/assets/2e4feb56-35ed-49de-a700-b973af979187
+https://github.com/user-attachments/assets/f0324432-f616-45f6-beca-9bd8282f06ef
 
 ---
 
