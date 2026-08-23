@@ -20,6 +20,8 @@
 ## Contents
 
 - [TL;DR](#tldr)
+- [Install](#install)
+- [Quick start](#quick-start)
 - [Bello in 57 seconds](#bello-in-57-seconds)
 - [Motivation](#motivation)
 - [How Bello solves tasks](#how-bello-solves-tasks)
@@ -27,8 +29,6 @@
 - [Choose your supervision depth](#choose-your-supervision-depth)
 - [Results](#results)
 - [Requirements](#requirements)
-- [Install](#install)
-- [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [Command reference](#command-reference)
 - [License](#license)
@@ -65,6 +65,59 @@ status, the changed files, the checks that ran, and the risks that are left.
 
 The cheapest setting costs about what Codex costs on its own, and the deepest
 scored 36.4% higher than Codex on the [benchmark runs](#results).
+
+---
+
+## Install
+
+**Option A: Codex plugin** (recommended if you work inside Codex):
+
+```bash
+pipx install bello
+codex plugin marketplace add AlexeyKulaev/Bello-codex-marketplace --ref main
+codex plugin add bello@bello-marketplace
+```
+
+Then open Codex in your project folder and ask it to run Bello on your task
+file. The plugin checks for updates and launches the run for you.
+
+**Option B: standalone CLI**
+
+```bash
+pipx install bello
+bello doctor
+```
+
+Bello checks for updates at startup and offers to install them. Run
+`bello update` to update explicitly.
+
+## Quick start
+
+```bash
+cd your-project
+echo "Build a CLI tool that ..." > task.md
+bello --task task.md
+```
+
+Bello starts the coder, supervises the run, and writes
+`.supervisor/FINAL_REPORT.md` when it finishes. The report lists the status, the
+changed files, the validations that were run, and the remaining risks.
+
+While a run is active you can type into the terminal, and your message is routed
+to the supervisor rather than the coder:
+
+| Control | Action |
+| --- | --- |
+| `/status` | Show task, generation, active turn, pending approvals, health. |
+| `/pause` / `/resume` | Pause and resume the autonomous loop. |
+| `/restart` | Request a supervised restart. |
+| `/quit` | Write state and exit. |
+| any text | Delivered to the supervisor as an instruction or constraint. |
+
+Everything the run does is written to inspectable files under `.supervisor/`
+in your project: `PROGRESS.md` (what has happened), `DECISIONS.md` (standing
+decisions), `HANDOFF.md` (restart context), `events.jsonl` (full event
+stream), and `FINAL_REPORT.md` (the result).
 
 ---
 
@@ -503,57 +556,6 @@ lowest to highest.*
 - macOS or Linux.
 
 Verify your environment at any time with `bello doctor`.
-
-## Install
-
-**Option A: Codex plugin** (recommended if you work inside Codex):
-
-```bash
-pipx install bello
-codex plugin marketplace add AlexeyKulaev/Bello-codex-marketplace --ref main
-codex plugin add bello@bello-marketplace
-```
-
-Then open Codex in your project folder and ask it to run Bello on your task
-file. The plugin checks for updates and launches the run for you.
-
-**Option B: standalone CLI**
-
-```bash
-pipx install bello
-bello doctor
-```
-
-Bello checks for updates at startup and offers to install them. Run
-`bello update` to update explicitly.
-
-## Quick start
-
-```bash
-cd your-project
-echo "Build a CLI tool that ..." > task.md
-bello --task task.md
-```
-
-Bello starts the coder, supervises the run, and writes
-`.supervisor/FINAL_REPORT.md` when it finishes. The report lists the status, the
-changed files, the validations that were run, and the remaining risks.
-
-While a run is active you can type into the terminal, and your message is routed
-to the supervisor rather than the coder:
-
-| Control | Action |
-| --- | --- |
-| `/status` | Show task, generation, active turn, pending approvals, health. |
-| `/pause` / `/resume` | Pause and resume the autonomous loop. |
-| `/restart` | Request a supervised restart. |
-| `/quit` | Write state and exit. |
-| any text | Delivered to the supervisor as an instruction or constraint. |
-
-Everything the run does is written to inspectable files under `.supervisor/`
-in your project: `PROGRESS.md` (what has happened), `DECISIONS.md` (standing
-decisions), `HANDOFF.md` (restart context), `events.jsonl` (full event
-stream), and `FINAL_REPORT.md` (the result).
 
 ## Configuration
 
