@@ -28,7 +28,6 @@
 - [Relationship to existing LLM research](#relationship-to-existing-llm-research)
 - [Choose your supervision depth](#choose-your-supervision-depth)
 - [Results](#results)
-- [Requirements](#requirements)
 - [Configuration](#configuration)
 - [Command reference](#command-reference)
 - [License](#license)
@@ -69,6 +68,15 @@ scored 36.4% higher than Codex on the [benchmark runs](#results).
 ---
 
 ## Install
+
+**Requirements:**
+
+- **Codex CLI** installed and authenticated. Bello drives `codex app-server`,
+  and your Codex account provides the models.
+- **Python 3.11+** and **git**.
+- macOS or Linux.
+
+Verify your environment at any time with `bello doctor`.
 
 **Option A: Codex plugin** (recommended if you work inside Codex):
 
@@ -547,15 +555,6 @@ lowest to highest.*
 
 *Figure 3c. Rumdl completion scores for the six configurations, sorted from
 lowest to highest.*
-
-## Requirements
-
-- **Codex CLI** installed and authenticated. Bello drives `codex app-server`,
-  and your Codex account provides the models.
-- **Python 3.11+** and **git**.
-- macOS or Linux.
-
-Verify your environment at any time with `bello doctor`.
 
 ## Configuration
 
