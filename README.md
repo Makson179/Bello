@@ -20,6 +20,7 @@
 ## Contents
 
 - [TL;DR](#tldr)
+- [Bello in 57 seconds](#bello-in-57-seconds)
 - [Motivation](#motivation)
 - [How Bello solves tasks](#how-bello-solves-tasks)
 - [Relationship to existing LLM research](#relationship-to-existing-llm-research)
@@ -64,6 +65,12 @@ status, the changed files, the checks that ran, and the risks that are left.
 
 The cheapest setting costs about what Codex costs on its own, and the deepest
 scored 36.4% higher than Codex on the [benchmark runs](#results).
+
+---
+
+## Bello in 57 seconds
+
+https://github.com/user-attachments/assets/2e4feb56-35ed-49de-a700-b973af979187
 
 ---
 
