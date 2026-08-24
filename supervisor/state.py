@@ -233,8 +233,10 @@ class StateStore:
         run_dir = self._next_previous_run_dir(previous_runs)
         run_dir.mkdir()
         task_source = require_inside_workspace(self.workspace, task_path)
+        config_source = self.path(CONFIG)
         final_report_source = self.path(FINAL_REPORT)
         shutil.copyfile(task_source, run_dir / "task.md")
+        shutil.copyfile(config_source, run_dir / CONFIG)
         shutil.copyfile(final_report_source, run_dir / FINAL_REPORT)
         return run_dir
 
