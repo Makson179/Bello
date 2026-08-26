@@ -1368,9 +1368,6 @@ class BelloController:
                     completion_review=True,
                 )
             return
-        if message is not None and _reports_material_limitation(message.text):
-            await self._handle_coder_material_limitation(message)
-            return
         if message is not None and _has_malformed_readiness_marker(message.text):
             await self._steer_for_marker(
                 "Coder used a malformed readiness marker; require exact marker only after validation.",
@@ -1390,27 +1387,6 @@ class BelloController:
             await self._handle_no_marker_idle()
             return
         self._schedule_supervisor_check("Coder turn completed", triggering_item_id=item_id)
-
-    async def _handle_coder_material_limitation(self, message: CoderMessage) -> None:
-        cfg = self.store.get_bello_config()
-        summary = _material_limitation_summary(message.text)
-        self.store.append_text_locked(
-            PROGRESS,
-            f"- Coder reported material limitation without readiness marker: {summary}\n",
-        )
-        self._append_event(
-            AppEventSource.SUPERVISOR,
-            "coder/material_limitation",
-            reason=summary,
-        )
-        patch_health(
-            self.store,
-            HealthDelta(generation=cfg.generation, add_risk_signals=["coder_material_limitation"]),
-        )
-        await self.finalize(
-            f"escalated: coder reported material validation limitation without readiness marker: {summary}",
-            status=BelloStatus.ESCALATED,
-        )
 
     async def _done_without_fresh_behavioral_validation(self) -> str | None:
         changed_files = await self.changed_files()
@@ -6346,53 +6322,8 @@ def _readiness_reference_is_negated(text: str) -> bool:
     return bool(re.search(rf"\b{negator}\b.{{0,120}}\b{marker}\b", lowered))
 
 
-def _reports_material_limitation(text: str) -> bool:
-    lowered = " ".join(text.lower().split())
-    markers = (
-        "material limitation",
-        "validation limitation",
-        "independent behavioral evidence is still missing",
-        "independent behavioral evidence is missing",
-        "independent evidence is still missing",
-        "independent evidence is missing",
-        "no untouched output-identified",
-        "no compliant next validation step",
-        "no compliant validation step",
-        "cannot provide independent",
-        "can't provide independent",
-        "not ready under the independent-evidence requirement",
-    )
-    return any(marker in lowered for marker in markers)
-
-
-def _material_limitation_summary(text: str) -> str:
-    lines = [line.strip(" `\t\r\n-*") for line in text.splitlines()]
-    candidates = [line for line in lines if line]
-    preferred_prefixes = ("material limitation", "validation limitation")
-    for line in candidates:
-        if line.lower().startswith(preferred_prefixes):
-            return _truncate_summary(line)
-    for line in candidates:
-        lowered = line.lower()
-        if (
-            "independent" in lowered
-            or "no untouched" in lowered
-            or "no compliant" in lowered
-            or "not ready" in lowered
-        ):
-            return _truncate_summary(line)
-    return _truncate_summary(candidates[0] if candidates else "coder reported a material limitation")
-
-
-def _truncate_summary(text: str, *, limit: int = 280) -> str:
-    collapsed = " ".join(text.split())
-    if len(collapsed) <= limit:
-        return collapsed
-    return collapsed[: limit - 1].rstrip() + "..."
-
-
 def _appears_to_claim_readiness(text: str) -> bool:
-    if _reports_material_limitation(text) or _readiness_reference_is_negated(text):
+    if _readiness_reference_is_negated(text):
         return False
     lowered = " ".join(text.lower().split())
     phrases = (

@@ -1330,68 +1330,57 @@ async def test_summary_done_without_marker_steers_for_exact_marker_not_completio
     assert store.get_bello_config().status == BelloStatus.STARTING
 
 
-async def test_material_limitation_without_marker_escalates_instead_of_marker_nudge(tmp_path: Path) -> None:
-    task = tmp_path / "TASK.md"
-    task.write_text("# Task", encoding="utf-8")
-    store = StateStore(tmp_path)
-    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task), coder_thread_id="thread"), overwrite=True)
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "material limitation",
+        "validation limitation",
+        "independent behavioral evidence is still missing",
+        "independent behavioral evidence is missing",
+        "independent evidence is still missing",
+        "independent evidence is missing",
+        "no untouched output-identified",
+        "no compliant next validation step",
+        "no compliant validation step",
+        "cannot provide independent",
+        "can't provide independent",
+        "not ready under the independent-evidence requirement",
+    ],
+)
+async def test_former_material_limitation_phrases_are_not_terminal(tmp_path: Path, phrase: str) -> None:
+    controller, store, _ = _runtime_controller(tmp_path)
 
     class FakeCoder:
         def __init__(self) -> None:
-            self.messages = []
+            self.messages: list[str] = []
             self.interrupted = False
 
-        async def steer_or_start(self, message):
+        async def steer_or_start(self, message: str) -> str:
             self.messages.append(message)
             return "turn"
 
-        async def interrupt(self):
+        async def interrupt(self) -> None:
             self.interrupted = True
 
-    controller = BelloController.__new__(BelloController)
-    controller.project_root = tmp_path
-    controller.task_path = task
-    controller.store = store
-    controller.supervisor = None
-    controller.coder = FakeCoder()
-    controller.pending_approvals = {}
+    coder = FakeCoder()
+    controller.coder = coder
     controller.last_coder_message = CoderMessage(
-        text=(
-            "I do not believe the task is ready.\n\n"
-            "Validation: changed focused Jest coverage passed earlier.\n\n"
-            "Material limitation: Independent behavioral evidence is still missing. "
-            "Current instructions prohibit adding a temporary behavior test, so there is "
-            "no compliant next validation step. Therefore I am not emitting "
-            "`BELLO_READY_FOR_REVIEW`."
-        ),
+        text=f"I am not ready for review. Current constraint: {phrase}.",
         sequence=7,
     )
-    controller.validations = []
-    controller.prior_interventions = []
-    controller.observed_changed_files = {}
-    controller.use_git_diff = False
-    controller.adversary_enabled = False
-    controller.tui = _FakeTUI()
-    controller.running = True
-    controller.client = None
-    controller.event_queue = asyncio.Queue()
-    controller._sequence = 0
-    controller._supervisor_dirty = False
-    controller._supervisor_next_summary = None
-    controller._supervisor_next_completion_review = False
-    controller._supervisor_task = None
-    controller.paused = False
-    controller.no_marker_idle_nudge_count = 0
-    controller.completion_returns = []
-    controller.completion_restarts = 0
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(
+            update={"active_coder_turn_id": None, "completion_review_enabled": False}
+        )
+    )
 
     await controller._handle_coder_turn_completed(item_id="message-item")
 
-    assert store.get_bello_config().status == BelloStatus.ESCALATED
-    assert controller.coder.messages == []
-    assert controller.coder.interrupted is True
-    assert "Coder reported material limitation" in store.path(PROGRESS).read_text(encoding="utf-8")
-    assert "material validation limitation" in store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert store.get_bello_config().status == BelloStatus.STARTING
+    assert coder.messages == [NO_MARKER_IDLE_NUDGE]
+    assert coder.interrupted is False
+    assert "coder/material_limitation" not in store.path(EVENTS).read_text(encoding="utf-8")
+    assert store.path(FINAL_REPORT).read_text(encoding="utf-8") == ""
 
 
 async def test_no_marker_idle_forces_completion_review_once(tmp_path: Path) -> None:
