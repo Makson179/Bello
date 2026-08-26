@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -80,7 +82,7 @@ def test_verification_snapshot_preserves_candidate_git_state_and_is_disposable(
         (snapshot_root / "review-cache.tmp").write_text("discard me\n", encoding="utf-8")
         completed = subprocess.run(
             [
-                "python3",
+                sys.executable,
                 "-c",
                 "import tempfile; p=tempfile.TemporaryDirectory(); assert p.name; p.cleanup()",
             ],
@@ -129,6 +131,7 @@ def test_verification_snapshot_materializes_split_git_index(tmp_path: Path) -> N
         snapshot.cleanup()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink sanitization")
 def test_verification_snapshot_does_not_preserve_escaping_symlink(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -165,9 +168,14 @@ def test_verification_snapshot_preserves_production_runtime_mounts_without_state
 
     coder = create_workspace_snapshot(tmp_path, task)
     try:
-        assert (coder.snapshot_root / "TASK.md").is_symlink()
-        assert (coder.snapshot_root / ".venv").is_symlink()
-        assert (coder.snapshot_root / "node_modules").is_symlink()
+        if coder.runtime_exposure_mode == workspace_snapshot_module.RUNTIME_EXPOSURE_SYMLINK:
+            assert (coder.snapshot_root / "TASK.md").is_symlink()
+            assert (coder.snapshot_root / ".venv").is_symlink()
+            assert (coder.snapshot_root / "node_modules").is_symlink()
+        else:
+            assert (coder.snapshot_root / "TASK.md").is_file()
+            assert (coder.snapshot_root / ".venv").is_dir()
+            assert (coder.snapshot_root / "node_modules").is_dir()
 
         verification = create_verification_workspace_snapshot(
             coder.snapshot_root,
@@ -380,13 +388,13 @@ def test_verification_snapshot_allows_rebuilding_untracked_binary_not_source(
     source = tmp_path / "main.c"
     source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
     _init_repo(tmp_path)
-    program = tmp_path / "program"
-    subprocess.run(["cc", "main.c", "-o", "program"], cwd=tmp_path, check=True)
+    program = "program.exe" if os.name == "nt" else "program"
+    subprocess.run(["cc", "main.c", "-o", program], cwd=tmp_path, check=True)
 
     snapshot = create_verification_workspace_snapshot(tmp_path)
     try:
-        assert "program" in snapshot.mutable_submitted_paths
-        (snapshot.snapshot_root / "program").write_bytes(b"rebuilt binary output")
+        assert program in snapshot.mutable_submitted_paths
+        (snapshot.snapshot_root / program).write_bytes(b"rebuilt binary output")
         snapshot.assert_submission_unchanged()
 
         (snapshot.snapshot_root / "main.c").write_text(
@@ -522,14 +530,24 @@ def test_snapshot_mounts_runtime_state_read_only_and_excludes_secret_files(tmp_p
     snapshot = create_workspace_snapshot(tmp_path, task)
     try:
         assert not (snapshot.snapshot_root / ".env").exists()
-        assert (snapshot.snapshot_root / ".supervisor").is_symlink()
+        state_exposure = snapshot.snapshot_root / ".supervisor"
+        assert state_exposure.is_dir()
+        assert state_exposure.is_symlink() == (
+            snapshot.runtime_exposure_mode == workspace_snapshot_module.RUNTIME_EXPOSURE_SYMLINK
+        )
         assert (snapshot.snapshot_root / ".supervisor" / "CONFIG.json").read_text(encoding="utf-8") == "{}"
         handoff.write_text("updated handoff\n", encoding="utf-8")
+        if snapshot.runtime_exposure_mode == workspace_snapshot_module.RUNTIME_EXPOSURE_COPY:
+            assert snapshot.restore_runtime_links() == ()
         assert (snapshot.snapshot_root / ".supervisor" / "HANDOFF.md").read_text(encoding="utf-8") == (
             "updated handoff\n"
         )
-        assert snapshot.task_path.is_symlink()
-        assert snapshot.task_path.resolve() == task.resolve()
+        if snapshot.runtime_exposure_mode == workspace_snapshot_module.RUNTIME_EXPOSURE_SYMLINK:
+            assert snapshot.task_path.is_symlink()
+            assert snapshot.task_path.resolve() == task.resolve()
+        else:
+            assert snapshot.task_path.is_file()
+            assert snapshot.task_path.read_text(encoding="utf-8") == "# Task\n"
         assert (snapshot.snapshot_root / ".git").is_dir()
     finally:
         snapshot.cleanup()
@@ -582,6 +600,7 @@ def test_snapshot_patch_rejects_declared_protected_paths(tmp_path: Path) -> None
         snapshot.cleanup()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink patch behavior")
 def test_snapshot_patch_rejects_escaping_symlink(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
@@ -598,10 +617,18 @@ def test_snapshot_patch_rejects_escaping_symlink(tmp_path: Path) -> None:
         snapshot.cleanup()
 
 
-def test_snapshot_patch_rejects_task_file_replacement(tmp_path: Path) -> None:
+def test_snapshot_patch_rejects_task_file_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("STRICT TASK\n", encoding="utf-8")
     _init_repo(tmp_path)
+    monkeypatch.setattr(
+        workspace_snapshot_module,
+        "_native_windows_runtime_controls_enabled",
+        lambda: False,
+    )
     snapshot = create_workspace_snapshot(tmp_path, task)
     try:
         snapshot.task_path.unlink()
@@ -615,6 +642,7 @@ def test_snapshot_patch_rejects_task_file_replacement(tmp_path: Path) -> None:
         snapshot.cleanup()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink patch behavior")
 def test_snapshot_patch_rejects_absolute_symlink_into_snapshot(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
@@ -633,6 +661,7 @@ def test_snapshot_patch_rejects_absolute_symlink_into_snapshot(tmp_path: Path) -
         snapshot.cleanup()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink patch behavior")
 def test_snapshot_patch_preserves_safe_relative_symlink(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
@@ -652,6 +681,7 @@ def test_snapshot_patch_preserves_safe_relative_symlink(tmp_path: Path) -> None:
         snapshot.cleanup()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink sanitization")
 def test_snapshot_excludes_preexisting_symlink_that_escapes_project(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -680,6 +710,7 @@ def test_snapshot_excludes_preexisting_symlink_that_escapes_project(tmp_path: Pa
         snapshot.cleanup()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink rewrite behavior")
 def test_snapshot_rewrites_absolute_internal_symlink_without_changing_original(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
@@ -708,6 +739,7 @@ def test_snapshot_rewrites_absolute_internal_symlink_without_changing_original(t
         snapshot.cleanup()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink rewrite behavior")
 def test_snapshot_patch_can_replace_rewritten_absolute_internal_symlink(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
@@ -735,6 +767,7 @@ def test_snapshot_patch_can_replace_rewritten_absolute_internal_symlink(tmp_path
         snapshot.cleanup()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink rollback behavior")
 def test_snapshot_patch_rollback_restores_original_absolute_symlink(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -770,6 +803,7 @@ def test_snapshot_patch_rollback_restores_original_absolute_symlink(
         snapshot.cleanup()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable-bit semantics")
 def test_snapshot_patch_preserves_executable_mode(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
@@ -944,7 +978,7 @@ def test_snapshot_git_plumbing_ignores_user_filters(tmp_path: Path, monkeypatch:
         snapshot.cleanup()
 
 
-def test_snapshot_mounts_existing_dependencies_without_copying(tmp_path: Path) -> None:
+def test_snapshot_exposes_existing_dependencies_read_only(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
     dependency = tmp_path / ".venv" / "bin" / "tool"
@@ -955,14 +989,19 @@ def test_snapshot_mounts_existing_dependencies_without_copying(tmp_path: Path) -
     snapshot = create_workspace_snapshot(tmp_path, task)
     try:
         mounted = snapshot.snapshot_root / ".venv"
-        assert mounted.is_symlink()
+        assert mounted.is_symlink() == (
+            snapshot.runtime_exposure_mode == workspace_snapshot_module.RUNTIME_EXPOSURE_SYMLINK
+        )
         assert (mounted / "bin" / "tool").read_text(encoding="utf-8") == "dependency\n"
         assert snapshot.readonly_dependency_paths == (".venv",)
     finally:
         snapshot.cleanup()
 
 
-def test_snapshot_restores_replaced_runtime_links(tmp_path: Path) -> None:
+def test_snapshot_restores_replaced_runtime_links(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
     state = tmp_path / ".supervisor"
@@ -972,21 +1011,36 @@ def test_snapshot_restores_replaced_runtime_links(tmp_path: Path) -> None:
     dependency.parent.mkdir(parents=True)
     dependency.write_text("dependency\n", encoding="utf-8")
     _init_repo(tmp_path)
+    monkeypatch.setattr(
+        workspace_snapshot_module,
+        "_native_windows_runtime_controls_enabled",
+        lambda: False,
+    )
 
     snapshot = create_workspace_snapshot(tmp_path, task)
     try:
         snapshot.task_path.unlink()
         snapshot.task_path.write_text("weakened\n", encoding="utf-8")
-        (snapshot.snapshot_root / ".supervisor").unlink()
+        state_exposure = snapshot.snapshot_root / ".supervisor"
+        dependency_exposure = snapshot.snapshot_root / ".venv"
+        if state_exposure.is_symlink():
+            state_exposure.unlink()
+        else:
+            shutil.rmtree(state_exposure)
         (snapshot.snapshot_root / ".supervisor").mkdir()
         (snapshot.snapshot_root / ".supervisor" / "HANDOFF.md").write_text("forged\n", encoding="utf-8")
-        (snapshot.snapshot_root / ".venv").unlink()
+        if dependency_exposure.is_symlink():
+            dependency_exposure.unlink()
+        else:
+            shutil.rmtree(dependency_exposure)
         (snapshot.snapshot_root / ".venv").mkdir()
 
         repaired = snapshot.restore_runtime_links()
 
         assert repaired == ("task", "supervisor_state", "dependency:.venv")
-        assert snapshot.task_path.is_symlink()
+        assert snapshot.task_path.is_symlink() == (
+            snapshot.runtime_exposure_mode == workspace_snapshot_module.RUNTIME_EXPOSURE_SYMLINK
+        )
         assert snapshot.task_path.read_text(encoding="utf-8") == "# Task\n"
         assert (snapshot.snapshot_root / ".supervisor" / "HANDOFF.md").read_text(encoding="utf-8") == "canonical\n"
         assert (snapshot.snapshot_root / ".venv" / "bin" / "tool").read_text(encoding="utf-8") == "dependency\n"
@@ -994,6 +1048,7 @@ def test_snapshot_restores_replaced_runtime_links(tmp_path: Path) -> None:
         snapshot.cleanup()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink repair path")
 def test_snapshot_runtime_link_repair_wraps_filesystem_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1016,6 +1071,7 @@ def test_snapshot_runtime_link_repair_wraps_filesystem_errors(
         snapshot.cleanup()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO/symlink repair path")
 def test_snapshot_runtime_link_repair_replaces_fifo(tmp_path: Path) -> None:
     if not hasattr(os, "mkfifo"):
         pytest.skip("FIFO files are not supported on this platform")
@@ -1127,5 +1183,566 @@ def test_snapshot_patch_rejects_real_workspace_conflict(tmp_path: Path) -> None:
             apply_snapshot_patch(snapshot)
 
         assert source.read_text(encoding="utf-8") == "value = 3\n"
+    finally:
+        snapshot.cleanup()
+
+
+def test_windows_copy_runtime_exposures_refresh_and_preserve_isolation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    source = tmp_path / "app.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    dependency = tmp_path / ".venv" / "Scripts" / "tool.exe"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_bytes(b"MZdependency")
+    _init_repo(tmp_path)
+    state = tmp_path / ".supervisor"
+    state.mkdir()
+    handoff = state / "HANDOFF.md"
+    handoff.write_text("initial\n", encoding="utf-8")
+
+    monkeypatch.setattr(workspace_snapshot_module, "_is_windows_platform", lambda: True)
+    monkeypatch.setattr(
+        workspace_snapshot_module,
+        "_native_windows_runtime_controls_enabled",
+        lambda: False,
+    )
+    snapshot = create_workspace_snapshot(tmp_path, task)
+    try:
+        assert snapshot.runtime_exposure_mode == workspace_snapshot_module.RUNTIME_EXPOSURE_COPY
+        assert snapshot.task_path.is_file() and not snapshot.task_path.is_symlink()
+        assert (snapshot.snapshot_root / ".supervisor").is_dir()
+        assert not (snapshot.snapshot_root / ".supervisor").is_symlink()
+        assert (snapshot.snapshot_root / ".venv" / "Scripts" / "tool.exe").read_bytes() == (
+            b"MZdependency"
+        )
+        assert subprocess.run(
+            ["git", "status", "--porcelain=v1"],
+            cwd=snapshot.snapshot_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        ).stdout == ""
+
+        handoff.write_text("controller update\n", encoding="utf-8")
+        assert snapshot.restore_runtime_links() == ()
+        assert (snapshot.snapshot_root / ".supervisor" / "HANDOFF.md").read_text(
+            encoding="utf-8"
+        ) == "controller update\n"
+
+        snapshot.task_path.write_text("weakened\n", encoding="utf-8")
+        copied_state = snapshot.snapshot_root / ".supervisor" / "HANDOFF.md"
+        copied_state.write_text("forged\n", encoding="utf-8")
+        copied_tool = snapshot.snapshot_root / ".venv" / "Scripts" / "tool.exe"
+        copied_tool.write_bytes(b"MZpoisoned")
+        injected_dependency = snapshot.snapshot_root / ".venv" / "injected.txt"
+        injected_dependency.write_text("poisoned\n", encoding="utf-8")
+
+        assert snapshot.task_integrity_issue() == (
+            "the coder workspace replaced or modified the isolated task copy"
+        )
+        assert snapshot.restore_runtime_links() == (
+            "task",
+            "supervisor_state",
+            "dependency:.venv",
+        )
+        assert snapshot.task_integrity_issue() is None
+        assert task.read_text(encoding="utf-8") == "# Task\n"
+        assert handoff.read_text(encoding="utf-8") == "controller update\n"
+        assert dependency.read_bytes() == b"MZdependency"
+        assert copied_tool.read_bytes() == b"MZdependency"
+        assert not injected_dependency.exists()
+
+        verification = create_verification_workspace_snapshot(
+            snapshot.snapshot_root,
+            source_snapshot=snapshot,
+        )
+        try:
+            assert verification.snapshot_root.joinpath("TASK.md").read_text(
+                encoding="utf-8"
+            ) == "# Task\n"
+            assert verification.snapshot_root.joinpath(
+                ".venv", "Scripts", "tool.exe"
+            ).read_bytes() == b"MZdependency"
+            assert not verification.snapshot_root.joinpath(".supervisor").exists()
+            verification.assert_submission_unchanged()
+        finally:
+            verification.cleanup()
+
+        (snapshot.snapshot_root / "app.py").write_text("value = 2\n", encoding="utf-8")
+        result = apply_snapshot_patch(snapshot)
+        assert result.changed_paths == ("app.py",)
+        assert source.read_text(encoding="utf-8") == "value = 2\n"
+    finally:
+        snapshot.cleanup()
+
+
+def test_windows_dependency_watcher_records_even_transient_runtime_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    dependency = tmp_path / ".venv" / "dependency.txt"
+    dependency.parent.mkdir()
+    dependency.write_text("trusted\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    monkeypatch.setattr(workspace_snapshot_module, "_is_windows_platform", lambda: True)
+    monkeypatch.setattr(
+        workspace_snapshot_module,
+        "_native_windows_runtime_controls_enabled",
+        lambda: False,
+    )
+    snapshot = create_workspace_snapshot(tmp_path, task)
+
+    class FakeWatcher:
+        closed = False
+
+        def consume_changes(self) -> bool:
+            return True
+
+        def close(self) -> None:
+            self.closed = True
+
+    watcher = FakeWatcher()
+    snapshot.windows_dependency_watchers["dependency:.venv"] = watcher  # type: ignore[assignment]
+    try:
+        # The manifest still matches: this models modify -> test -> restore in
+        # one command, which a post-command hash alone cannot observe.
+        assert snapshot.restore_runtime_links() == ()
+        assert snapshot.runtime_integrity_issue() == (
+            "the coder modified the read-only Windows dependency exposure "
+            "during an action: .venv"
+        )
+    finally:
+        snapshot.cleanup()
+
+    assert watcher.closed is True
+
+
+def test_windows_dependency_watcher_filter_ignores_sandbox_acl_refresh() -> None:
+    notify_filter = (
+        workspace_snapshot_module._WINDOWS_DEPENDENCY_CONTENT_NOTIFY_FILTER
+    )
+
+    assert notify_filter & 0x00000100 == 0  # FILE_NOTIFY_CHANGE_SECURITY
+    assert notify_filter & 0x00000001  # FILE_NOTIFY_CHANGE_FILE_NAME
+    assert notify_filter & 0x00000002  # FILE_NOTIFY_CHANGE_DIR_NAME
+    assert notify_filter & 0x00000004  # FILE_NOTIFY_CHANGE_ATTRIBUTES
+    assert notify_filter & 0x00000008  # FILE_NOTIFY_CHANGE_SIZE
+    assert notify_filter & 0x00000010  # FILE_NOTIFY_CHANGE_LAST_WRITE
+
+
+def test_windows_dependency_copy_materializes_project_internal_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    package = tmp_path / "packages" / "local-package"
+    package.mkdir(parents=True)
+    (package / "index.js").write_text("module.exports = 1;\n", encoding="utf-8")
+    node_modules = tmp_path / "node_modules"
+    node_modules.mkdir()
+    link = node_modules / "local-package"
+    try:
+        link.symlink_to(package, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"could not create dependency link fixture: {exc}")
+    _init_repo(tmp_path)
+    monkeypatch.setattr(workspace_snapshot_module, "_is_windows_platform", lambda: True)
+    monkeypatch.setattr(
+        workspace_snapshot_module,
+        "_native_windows_runtime_controls_enabled",
+        lambda: False,
+    )
+
+    snapshot = create_workspace_snapshot(tmp_path, task)
+    try:
+        copied = snapshot.snapshot_root / "node_modules" / "local-package"
+        assert copied.is_dir()
+        assert not copied.is_symlink()
+        assert (copied / "index.js").read_text(encoding="utf-8") == (
+            "module.exports = 1;\n"
+        )
+    finally:
+        snapshot.cleanup()
+
+
+def test_windows_dependency_copy_rejects_link_outside_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    task = project / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    outside = tmp_path / "outside-package"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("outside\n", encoding="utf-8")
+    node_modules = project / "node_modules"
+    node_modules.mkdir()
+    try:
+        (node_modules / "outside-package").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"could not create dependency link fixture: {exc}")
+    _init_repo(project)
+    monkeypatch.setattr(workspace_snapshot_module, "_is_windows_platform", lambda: True)
+    monkeypatch.setattr(
+        workspace_snapshot_module,
+        "_native_windows_runtime_controls_enabled",
+        lambda: False,
+    )
+
+    with pytest.raises(WorkspaceSnapshotError, match="target escapes the project"):
+        create_workspace_snapshot(project, task)
+
+    assert (outside / "secret.txt").read_text(encoding="utf-8") == "outside\n"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows sharing and change APIs")
+def test_native_windows_runtime_file_guard_blocks_write_and_replacement(tmp_path: Path) -> None:
+    protected = tmp_path / "TASK.md"
+    protected.write_text("trusted\n", encoding="utf-8")
+    replacement = tmp_path / "replacement.md"
+    replacement.write_text("replacement\n", encoding="utf-8")
+    guard = workspace_snapshot_module._WindowsRuntimeFileGuard.open(protected)
+    try:
+        write_attempt = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from pathlib import Path; import sys; Path(sys.argv[1]).write_text('changed')",
+                str(protected),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        replace_attempt = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import os, sys; os.replace(sys.argv[1], sys.argv[2])",
+                str(replacement),
+                str(protected),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert write_attempt.returncode != 0
+        assert replace_attempt.returncode != 0
+        assert protected.read_text(encoding="utf-8") == "trusted\n"
+        assert replacement.read_text(encoding="utf-8") == "replacement\n"
+        assert guard.integrity_issue() is None
+    finally:
+        guard.close()
+
+    os.replace(replacement, protected)
+    protected.write_text("changed after close\n", encoding="utf-8")
+    assert protected.read_text(encoding="utf-8") == "changed after close\n"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native ReadDirectoryChangesW")
+def test_native_windows_dependency_watcher_detects_change_and_blocks_root_swap(
+    tmp_path: Path,
+) -> None:
+    dependency = tmp_path / "node_modules"
+    dependency.mkdir()
+    watcher = workspace_snapshot_module._WindowsDirectoryChangeWatcher.open(dependency)
+    replacement = tmp_path / "node_modules-replaced"
+    try:
+        (dependency / "changed.txt").write_text("changed\n", encoding="utf-8")
+        assert watcher.consume_changes() is True
+        with pytest.raises(OSError):
+            os.replace(dependency, replacement)
+    finally:
+        watcher.close()
+
+    os.replace(dependency, replacement)
+    assert replacement.is_dir()
+
+
+@pytest.mark.skipif(
+    os.name != "nt", reason="requires native Windows ACL and directory change APIs"
+)
+def test_native_windows_dependency_watcher_ignores_acl_only_change(
+    tmp_path: Path,
+) -> None:
+    dependency = tmp_path / "node_modules"
+    dependency.mkdir()
+    protected = dependency / "dependency.txt"
+    protected.write_text("trusted\n", encoding="utf-8")
+    watcher = workspace_snapshot_module._WindowsDirectoryChangeWatcher.open(dependency)
+    try:
+        acl_update = subprocess.run(
+            ["icacls.exe", str(dependency), "/inheritance:d"],
+            capture_output=True,
+            check=False,
+        )
+        if acl_update.returncode != 0:
+            pytest.skip(
+                "could not update fixture ACL: "
+                + acl_update.stderr.decode(errors="replace")
+            )
+        assert watcher.consume_changes() is False
+
+        protected.write_text("changed\n", encoding="utf-8")
+        assert watcher.consume_changes() is True
+    finally:
+        watcher.close()
+        subprocess.run(
+            ["icacls.exe", str(dependency), "/inheritance:e"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+
+def test_windows_snapshot_rejects_external_hardlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    task = project / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("shared\n", encoding="utf-8")
+    os.link(outside, project / "shared.txt")
+    _init_repo(project)
+    monkeypatch.setattr(workspace_snapshot_module, "_is_windows_platform", lambda: True)
+
+    with pytest.raises(WorkspaceSnapshotError, match="hardlink outside the audited project"):
+        create_workspace_snapshot(project, task)
+
+    assert outside.read_text(encoding="utf-8") == "shared\n"
+
+
+def test_windows_cleanup_never_chmods_through_hardlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_text("shared\n", encoding="utf-8")
+    alias = tmp_path / "alias.txt"
+    os.link(outside, alias)
+    outside.chmod(0o444)
+    before = stat.S_IMODE(outside.stat().st_mode)
+    monkeypatch.setattr(workspace_snapshot_module, "_is_windows_platform", lambda: True)
+
+    try:
+        with pytest.raises(OSError, match="hardlink"):
+            workspace_snapshot_module._make_regular_entry_owner_writable(
+                alias,
+                alias.lstat(),
+            )
+        assert stat.S_IMODE(outside.stat().st_mode) == before
+    finally:
+        outside.chmod(0o600)
+
+
+def test_windows_snapshot_accepts_internal_hardlinks_but_rejects_patching_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    first = tmp_path / "first.txt"
+    first.write_text("shared\n", encoding="utf-8")
+    os.link(first, tmp_path / "second.txt")
+    ordinary = tmp_path / "ordinary.txt"
+    ordinary.write_text("before\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    monkeypatch.setattr(workspace_snapshot_module, "_is_windows_platform", lambda: True)
+
+    snapshot = create_workspace_snapshot(tmp_path, task)
+    try:
+        (snapshot.snapshot_root / "ordinary.txt").write_text("after\n", encoding="utf-8")
+        assert apply_snapshot_patch(snapshot).changed_paths == ("ordinary.txt",)
+        assert ordinary.read_text(encoding="utf-8") == "after\n"
+    finally:
+        snapshot.cleanup()
+
+    snapshot = create_workspace_snapshot(tmp_path, task)
+    try:
+        (snapshot.snapshot_root / "first.txt").write_text("unsafe\n", encoding="utf-8")
+        with pytest.raises(SnapshotPatchError, match="hardlinked Windows workspace file"):
+            apply_snapshot_patch(snapshot)
+        assert first.read_text(encoding="utf-8") == "shared\n"
+        assert (tmp_path / "second.txt").read_text(encoding="utf-8") == "shared\n"
+    finally:
+        snapshot.cleanup()
+
+
+def test_windows_snapshot_rejects_simulated_directory_reparse_point(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    junction = tmp_path / "junction"
+    junction.mkdir()
+    (junction / "outside.txt").write_text("must not traverse\n", encoding="utf-8")
+    real_is_link = workspace_snapshot_module.is_link_or_reparse
+    monkeypatch.setattr(workspace_snapshot_module, "_is_windows_platform", lambda: True)
+    monkeypatch.setattr(
+        workspace_snapshot_module,
+        "is_link_or_reparse",
+        lambda path, stat_result=None: path == junction
+        or real_is_link(path, stat_result=stat_result),
+    )
+
+    with pytest.raises(WorkspaceSnapshotError, match="reparse entries"):
+        create_workspace_snapshot(tmp_path, task)
+
+    assert (junction / "outside.txt").read_text(encoding="utf-8") == "must not traverse\n"
+
+
+def test_windows_patch_rejects_coder_hardlink_before_invoking_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    task = project / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    (project / "app.py").write_text("before\n", encoding="utf-8")
+    _init_repo(project)
+    monkeypatch.setattr(workspace_snapshot_module, "_is_windows_platform", lambda: True)
+
+    snapshot = create_workspace_snapshot(project, task)
+    try:
+        outside = tmp_path / "outside-secret.txt"
+        outside.write_text("secret\n", encoding="utf-8")
+        os.link(outside, snapshot.snapshot_root / "leak.txt")
+        calls = 0
+
+        def forbidden_git(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise AssertionError("Git must not run before topology audit")
+
+        monkeypatch.setattr(workspace_snapshot_module, "_run_git", forbidden_git)
+        with pytest.raises(SnapshotPatchError, match="hardlinked file before Git"):
+            apply_snapshot_patch(snapshot)
+
+        assert calls == 0
+        assert outside.read_text(encoding="utf-8") == "secret\n"
+    finally:
+        snapshot.cleanup()
+
+
+def test_windows_patch_rejects_reparse_inside_git_before_invoking_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("before\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    monkeypatch.setattr(workspace_snapshot_module, "_is_windows_platform", lambda: True)
+
+    snapshot = create_workspace_snapshot(tmp_path, task)
+    try:
+        objects = snapshot.snapshot_root / ".git" / "objects"
+        workspace_snapshot_module._remove_path(objects)
+        outside = tmp_path / "outside-objects"
+        outside.mkdir()
+        marker = outside / "marker"
+        marker.write_text("untouched\n", encoding="utf-8")
+        try:
+            objects.symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable: {exc}")
+
+        calls = 0
+
+        def forbidden_git(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise AssertionError("Git must not run before topology audit")
+
+        monkeypatch.setattr(workspace_snapshot_module, "_run_git", forbidden_git)
+        with pytest.raises(SnapshotPatchError, match="link/reparse entry before Git"):
+            apply_snapshot_patch(snapshot)
+
+        assert calls == 0
+        assert marker.read_text(encoding="utf-8") == "untouched\n"
+    finally:
+        snapshot.cleanup()
+
+
+def test_windows_snapshot_rejects_linked_git_directory_before_git_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    task = project / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    _init_repo(project)
+    real_git = tmp_path / "external-git"
+    (project / ".git").rename(real_git)
+    try:
+        (project / ".git").symlink_to(real_git, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    monkeypatch.setattr(workspace_snapshot_module, "_is_windows_platform", lambda: True)
+
+    with pytest.raises(WorkspaceSnapshotError, match="require .git to be a regular directory"):
+        create_workspace_snapshot(project, task)
+
+
+def test_windows_snapshot_path_matching_is_case_and_separator_insensitive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(workspace_snapshot_module, "_is_windows_platform", lambda: True)
+
+    assert workspace_snapshot_module._path_is_at_or_below(
+        r"Tasks\Nested\TASK.md", "tasks/nested"
+    )
+    assert not workspace_snapshot_module._path_is_at_or_below(
+        r"Tasks\Nestedness\TASK.md", "tasks/nested"
+    )
+    with pytest.raises(WorkspaceSnapshotError, match="case-colliding names"):
+        workspace_snapshot_module._validate_windows_directory_names(
+            Path("C:/workspace"), ["Readme.md", "README.MD"]
+        )
+    with pytest.raises(WorkspaceSnapshotError, match="reserved Windows device name"):
+        workspace_snapshot_module._validate_windows_directory_names(
+            Path("C:/workspace"), ["CON.txt"]
+        )
+    executable = tmp_path / "tool.cmd"
+    executable.write_text("@echo off\n", encoding="utf-8")
+    executable.chmod(0o755)
+    assert workspace_snapshot_module._snapshot_path_state(executable).executable is False
+
+
+def test_windows_snapshot_patch_rejects_replaced_workspace_root_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    source = tmp_path / "app.py"
+    source.write_text("before\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    monkeypatch.setattr(workspace_snapshot_module, "_is_windows_platform", lambda: True)
+
+    snapshot = create_workspace_snapshot(tmp_path, task)
+    try:
+        (snapshot.snapshot_root / "app.py").write_text("after\n", encoding="utf-8")
+        object.__setattr__(snapshot, "original_root_identity", (-1, -1))
+
+        with pytest.raises(SnapshotPatchError, match="root was replaced or redirected"):
+            apply_snapshot_patch(snapshot)
+
+        assert source.read_text(encoding="utf-8") == "before\n"
     finally:
         snapshot.cleanup()

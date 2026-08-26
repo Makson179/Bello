@@ -6,9 +6,10 @@ on:
   pull_request:
 
 jobs:
-  tests:
-    name: Python ${{ matrix.python-version }}
+  linux:
+    name: Linux / Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -19,6 +20,50 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install
-        run: pip install -e ".[test]"
+        run: python -m pip install -e ".[test]"
       - name: Run tests
-        run: pytest -q
+        run: python -m pytest -q
+
+  native-platforms:
+    name: ${{ matrix.name }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-latest
+            python-version: "3.13"
+          - name: Windows Server 2022
+            os: windows-2022
+            python-version: "3.11"
+          - name: Windows Server 2025
+            os: windows-2025
+            python-version: "3.14"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: python -m pip install ".[test]"
+      - name: Run full applicable test suite
+        run: python -m pytest -q
+      - name: Exercise installed CLI help
+        run: bello --help
+      - name: Report Windows runner image
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Write-Output "$env:ImageOS $env:ImageVersion"
+      - name: Exercise doctor with deterministic Codex app-server
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          BELLO_SKIP_UPDATE_CHECK: "1"
+        run: |
+          $fixtureBin = Join-Path $env:RUNNER_TEMP "bello-fixture-bin"
+          New-Item -ItemType Directory -Force -Path $fixtureBin | Out-Null
+          Copy-Item "tests/windows_fixtures/*" $fixtureBin
+          $env:PATH = "$fixtureBin;$env:PATH"
+          bello doctor

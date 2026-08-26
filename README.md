@@ -22,6 +22,7 @@
 - [TL;DR](#tldr)
 - [Install](#install)
 - [Quick start](#quick-start)
+- [Native Windows and WSL](#native-windows-and-wsl)
 - [Bello in 42 seconds](#bello-in-42-seconds)
 - [Motivation](#motivation)
 - [How Bello solves tasks](#how-bello-solves-tasks)
@@ -74,7 +75,9 @@ scored 36.4% higher than Codex on the [benchmark runs](#results).
 - **Codex CLI** installed and authenticated. Bello drives `codex app-server`,
   and your Codex account provides the models.
 - **Python 3.11+** and **git**.
-- macOS or Linux.
+- macOS, Linux, or a supported native Windows installation. See
+  [Native Windows and WSL](#native-windows-and-wsl) for the tested baseline and
+  filesystem guidance.
 
 Verify your environment at any time with `bello doctor`.
 
@@ -98,6 +101,23 @@ bello doctor
 
 Bello checks for updates at startup and offers to install them. Run
 `bello update` to update explicitly.
+
+### Native Windows install
+
+Use a 64-bit Windows 11 or Windows Server installation with native Windows
+builds of Python, Git, and Codex. In PowerShell:
+
+```powershell
+py -m pip install --user pipx
+py -m pipx ensurepath
+pipx install bello
+bello doctor
+```
+
+Restart the terminal after `ensurepath` if `pipx` or `bello` is not found. Bello
+does not require Administrator privileges, Developer Mode, or permission to
+create symbolic links. Install and authenticate the native Codex CLI before
+starting a run.
 
 ## Quick start
 
@@ -126,6 +146,39 @@ Everything the run does is written to inspectable files under `.supervisor/`
 in your project: `PROGRESS.md` (what has happened), `DECISIONS.md` (standing
 decisions), `HANDOFF.md` (restart context), `events.jsonl` (full event
 stream), and `FINAL_REPORT.md` (the result).
+
+## Native Windows and WSL
+
+Bello supports native 64-bit Windows 11 and Windows Server 2022/2025. The full
+applicable suite runs on Windows Server 2022 with Python 3.11 and Windows Server
+2025 with Python 3.14; the workflow also records the exact GitHub runner image.
+Python 3.11+ is supported. Windows on ARM, Windows 10, and older Windows Server
+releases are not in the supported or tested matrix.
+
+Keep active projects on a local NTFS volume. Drive-letter paths and paths on a
+different local volume are supported. Bello recognizes UNC paths, but network
+share and cloud-sync reparse semantics vary by provider and are not part of the
+tested configuration; move the project to local NTFS if `bello doctor` or
+snapshot creation cannot establish a safe path. Bello fails closed on ambiguous
+reparse points, hardlinks, reserved device names, and path aliases. Internal
+links inside read-only dependency trees are materialized only when their targets
+remain in the project; external targets are rejected. Linked Git worktrees are
+not currently supported. Cross-volume isolation may copy large dependency
+directories and can therefore be slower.
+
+PowerShell and `cmd.exe` commands are classified using their own quoting and
+composition rules. A Windows command Bello cannot parse unambiguously is sent
+to the supervisor for review or denied; it is never treated as a POSIX command
+and silently approved.
+
+WSL2 remains a supported alternative (WSL1 is not supported by current Codex
+CLI releases). Install Python, Git, Codex, and Bello inside the distribution
+and run against a project in the WSL Linux filesystem
+(for example, under `/home`), rather than mixing a Windows Bello/Codex process
+with a `\\wsl$` path or placing a high-I/O project under `/mnt/c`.
+
+For platform-specific diagnostics and remedies, see
+[Windows installation and troubleshooting](docs/windows.md).
 
 ---
 

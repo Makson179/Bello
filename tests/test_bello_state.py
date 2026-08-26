@@ -11,6 +11,9 @@ from types import SimpleNamespace
 
 import pytest
 
+import supervisor.controller as controller_module
+import supervisor.policy as policy_module
+import supervisor.workspace_snapshot as workspace_snapshot_module
 from supervisor.approvals import ApprovalManager
 from supervisor.controller import (
     ADVERSARY_MODEL,
@@ -18,6 +21,7 @@ from supervisor.controller import (
     POST_RESTART_CONTINUE_NUDGE,
     ControllerEvent,
     BelloController,
+    _canonical_restart_command,
     _ensure_internal_runtime_git_excluded,
     _has_malformed_readiness_marker,
     _has_passing_behavioral_validation,
@@ -80,6 +84,14 @@ from supervisor.state import (
 )
 from supervisor.supervisor_agent import StatelessSupervisorAgent, SupervisorAgentError
 from supervisor.workspace_snapshot import create_workspace_snapshot
+
+
+@pytest.fixture
+def posix_command_semantics(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the legacy POSIX command corpus explicit on native Windows."""
+
+    monkeypatch.setattr(controller_module, "native_shell_kind", lambda: "posix")
+    monkeypatch.setattr(policy_module, "native_shell_kind", lambda: "posix")
 
 
 def test_bello_state_initializes_required_files(tmp_path: Path) -> None:
@@ -686,6 +698,7 @@ async def test_preflight_failure_cleans_unused_snapshot_without_recovery(tmp_pat
     assert store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX task-link integrity path")
 def test_task_integrity_detects_replaced_snapshot_link(tmp_path: Path) -> None:
     controller, _store, _ = _runtime_controller(tmp_path)
     snapshot = create_workspace_snapshot(tmp_path, controller.task_path)
@@ -698,6 +711,37 @@ def test_task_integrity_detects_replaced_snapshot_link(tmp_path: Path) -> None:
         snapshot.task_path.write_text("weakened\n", encoding="utf-8")
 
         assert controller._task_integrity_issue() == "the coder workspace replaced or removed the read-only task link"
+    finally:
+        snapshot.cleanup()
+
+
+def test_task_integrity_detects_replaced_snapshot_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, _store, _ = _runtime_controller(tmp_path)
+    monkeypatch.setattr(
+        workspace_snapshot_module,
+        "_runtime_exposure_mode",
+        lambda: workspace_snapshot_module.RUNTIME_EXPOSURE_COPY,
+    )
+    monkeypatch.setattr(
+        workspace_snapshot_module,
+        "_native_windows_runtime_controls_enabled",
+        lambda: False,
+    )
+    snapshot = create_workspace_snapshot(tmp_path, controller.task_path)
+    controller._coder_snapshot = snapshot
+    controller.workspace_root = snapshot.snapshot_root
+    controller.workspace_task_path = snapshot.task_path
+    try:
+        assert not snapshot.task_path.is_symlink()
+        assert controller._task_integrity_issue() is None
+        snapshot.task_path.write_text("weakened\n", encoding="utf-8")
+
+        assert controller._task_integrity_issue() == (
+            "the coder workspace replaced or modified the isolated task copy"
+        )
     finally:
         snapshot.cleanup()
 
@@ -725,7 +769,9 @@ async def test_runtime_git_inspection_waits_for_trusted_snapshot_config(tmp_path
         snapshot.cleanup()
 
 
-def test_validation_ledger_classifies_static_and_behavioral_commands() -> None:
+def test_validation_ledger_classifies_static_and_behavioral_commands(
+    posix_command_semantics: None,
+) -> None:
     static_commands = [
         "/bin/zsh -lc 'node -c src/user/email.js'",
         "/bin/zsh -lc 'node --check src/user/email.js'",
@@ -2105,7 +2151,10 @@ async def test_mandatory_runtime_wake_bypasses_cheap_runtime_noop(tmp_path: Path
     assert len(fake.runtime_packets) == 1
 
 
-def test_read_only_large_diff_trigger_is_suppressed_but_real_diff_change_wakes(tmp_path: Path) -> None:
+def test_read_only_large_diff_trigger_is_suppressed_but_real_diff_change_wakes(
+    tmp_path: Path,
+    posix_command_semantics: None,
+) -> None:
     controller, _store, _fake = _runtime_controller(tmp_path)
     read_only_action = TriggeringAction(
         kind="commandExecution",
@@ -3073,7 +3122,10 @@ async def test_external_pause_discards_inflight_runtime_decision(tmp_path: Path)
     assert store.get_bello_config().status == BelloStatus.PAUSED
 
 
-async def test_shell_command_shape_does_not_create_masked_validation_wake(tmp_path: Path) -> None:
+async def test_shell_command_shape_does_not_create_masked_validation_wake(
+    tmp_path: Path,
+    posix_command_semantics: None,
+) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
 
     await controller.handle_notification(
@@ -3102,7 +3154,10 @@ async def test_shell_command_shape_does_not_create_masked_validation_wake(tmp_pa
     assert "masked_validation" not in trace["trigger_reasons"]
 
 
-async def test_test_runner_failure_output_is_failed_without_masked_gate(tmp_path: Path) -> None:
+async def test_test_runner_failure_output_is_failed_without_masked_gate(
+    tmp_path: Path,
+    posix_command_semantics: None,
+) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
 
     await controller.handle_notification(
@@ -3356,7 +3411,9 @@ def test_evidence_provenance_classifies_behavior_demo_output() -> None:
     assert wrapped_test.risk_reasons == ["behavior_demo_looks_like_test_runner_output"]
 
 
-def test_heredoc_script_command_is_behavior_demo_validation() -> None:
+def test_heredoc_script_command_is_behavior_demo_validation(
+    posix_command_semantics: None,
+) -> None:
     command = "python - <<'PY'\nfrom app import render\nprint(render())\nPY"
     validation = _validation_from_action(
         TriggeringAction(
@@ -3454,7 +3511,9 @@ def test_marked_behavior_demo_allows_honest_shell_sequence() -> None:
     assert validation.masking_reason is None
 
 
-def test_shell_shape_is_not_masked_but_output_quality_still_controls_evidence() -> None:
+def test_shell_shape_is_not_masked_but_output_quality_still_controls_evidence(
+    posix_command_semantics: None,
+) -> None:
     logical_or = _validation_from_action(
         TriggeringAction(
             kind="commandExecution",
@@ -3696,7 +3755,9 @@ def test_git_inspection_commands_are_not_behavioral_validations() -> None:
     assert check_validation.type == "static"
 
 
-def test_read_only_test_file_commands_are_inspections_not_validations() -> None:
+def test_read_only_test_file_commands_are_inspections_not_validations(
+    posix_command_semantics: None,
+) -> None:
     action = TriggeringAction(
         kind="commandExecution",
         command="sed -n '1,80p' tests/public/test_public.py",
@@ -3717,7 +3778,9 @@ def test_read_only_test_file_commands_are_inspections_not_validations() -> None:
     assert "def test_public" in inspection.captured_output
 
 
-def test_shell_wrapped_read_only_test_file_commands_are_inspections_not_validations() -> None:
+def test_shell_wrapped_read_only_test_file_commands_are_inspections_not_validations(
+    posix_command_semantics: None,
+) -> None:
     action = TriggeringAction(
         kind="commandExecution",
         command="/bin/bash -lc \"sed -n '1,80p' tests/public/test_public.py\"",
@@ -3737,7 +3800,9 @@ def test_shell_wrapped_read_only_test_file_commands_are_inspections_not_validati
     assert "def test_public" in inspection.captured_output
 
 
-def test_forbidden_pattern_scan_with_regex_alternation_records_inspection() -> None:
+def test_forbidden_pattern_scan_with_regex_alternation_records_inspection(
+    posix_command_semantics: None,
+) -> None:
     action = TriggeringAction(
         kind="commandExecution",
         command='rg -n "system\\(|exec\\(|popen\\(" src include',
@@ -3755,6 +3820,425 @@ def test_forbidden_pattern_scan_with_regex_alternation_records_inspection() -> N
     assert inspection.passed is True
     assert inspection.inspection_id.startswith("inspection-")
     assert inspection.inspected_paths == ["src", "include"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'PowerShell.EXE -NoProfile -Command "Write-Output pytest"',
+        'PowerShell.EXE -NoProfile -Command "pytest tests; Write-Output passed"',
+        'CMD.EXE /d /c "pytest tests & echo passed"',
+        'CMD.EXE /d /c "type *"',
+    ],
+)
+def test_ambiguous_windows_wrappers_do_not_become_validation_evidence(command: str) -> None:
+    action = TriggeringAction(
+        kind="commandExecution",
+        command=command,
+        exit_code=0,
+        status="completed",
+        summary="command completed",
+    )
+
+    validation = _validation_from_action(
+        action,
+        sequence=81,
+        item={"type": "commandExecution", "stdout": "1 passed"},
+        changed_paths=["src/app.py"],
+    )
+    inspection = _inspection_from_action(action, sequence=81)
+
+    assert validation is None
+    assert inspection is None
+
+
+def test_simple_powershell_wrapper_records_behavioral_validation() -> None:
+    action = TriggeringAction(
+        kind="commandExecution",
+        command='PowerShell.EXE -NoProfile -Command "pytest tests/test_app.py -q"',
+        exit_code=0,
+        status="completed",
+        summary="command completed",
+    )
+
+    validation = _validation_from_action(
+        action,
+        sequence=82,
+        item={"type": "commandExecution", "stdout": "tests/test_app.py::test_flow PASSED\n1 passed"},
+        changed_paths=["src/app.py"],
+    )
+
+    assert validation is not None
+    assert validation.type == "behavioral"
+    assert validation.trusted_validation_outcome == "passed"
+    assert validation.target_files_or_test_files == ["tests/test_app.py"]
+
+
+async def test_literal_powershell_pythonpath_wrapper_records_usable_validation_and_trace(
+    tmp_path: Path,
+) -> None:
+    # This is the exact quoting shape emitted for the successful Slab pytest
+    # run on native Windows.  Approval remains fail-closed; only the completed
+    # command's runtime-evidence classifier recognizes the literal prefix.
+    command = (
+        '"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" '
+        "-Command '$env:PYTHONPATH='\"'C:\\Users\\BelloSmoke\\AppData\\Local\\Temp\\"
+        "slab-pytest-deps;src'; python -m pytest -q\""
+    )
+    wrapper = policy_module.windows_shell_wrapper_payload(command)
+    assert wrapper is not None
+    assert wrapper[0] == "powershell"
+    assert wrapper[1] is None
+
+    controller, store, _fake = _runtime_controller(tmp_path)
+    await controller.handle_notification(
+        AppServerMessage(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread",
+                    "itemId": "cmd-powershell-pythonpath",
+                    "item": {
+                        "type": "commandExecution",
+                        "command": command,
+                        "exitCode": 0,
+                        "status": "completed",
+                        "stdout": "5340 passed, 2 skipped in 52.01s\n",
+                    },
+                },
+            }
+        )
+    )
+
+    assert len(controller.validations) == 1
+    validation = controller.validations[0]
+    assert validation.type == "behavioral"
+    assert validation.trusted_validation_outcome == "passed"
+    assert validation.passed_count == 5340
+    config = store.get_bello_config()
+    assert config.last_validation_sequence == validation.sequence
+    assert config.last_trusted_behavioral_validation_sequence == validation.sequence
+    assert config.last_trusted_passing_behavioral_validation_sequence == validation.sequence
+    trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
+    assert trace["validation_type"] == "behavioral"
+    assert trace["trusted_validation_outcome"] == "passed"
+
+
+def test_direct_native_powershell_literal_pythonpath_records_behavioral_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(controller_module, "native_shell_kind", lambda: "powershell")
+    action = TriggeringAction(
+        kind="commandExecution",
+        command=r"$env:PYTHONPATH='C:\deps;src'; py -3 -m pytest tests\test_app.py -q",
+        exit_code=1,
+        status="completed",
+        summary="command completed",
+    )
+
+    validation = _validation_from_action(
+        action,
+        sequence=83,
+        item={"type": "commandExecution", "stdout": "1 failed in 0.02s"},
+        changed_paths=["src/app.py"],
+    )
+
+    assert validation is not None
+    assert validation.type == "behavioral"
+    assert validation.trusted_validation_outcome == "failed"
+    assert validation.target_files_or_test_files == ["tests/test_app.py"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r'''PowerShell.EXE -NoProfile -Command "$env:PYTHONPATH='src'; python -m pytest -q; exit 0"''',
+        r'''PowerShell.EXE -NoProfile -Command "$env:PYTHONPATH='src'; pytest | Out-Null"''',
+        r'''PowerShell.EXE -NoProfile -Command "$env:PYTHONPATH='src'; Write-Output '1 passed'"''',
+        r'''PowerShell.EXE -NoProfile -Command "$env:PYTEST_ADDOPTS='--collect-only'; python -m pytest -q"''',
+        r'''PowerShell.EXE -NoProfile -Command "$env:PYTHONPATH='src'; node --version --test"''',
+        r'''PowerShell.EXE -NoProfile -Command "$env:PYTHONPATH=\"src;$env:SECRET\"; python -m pytest -q"''',
+        r'''PowerShell.EXE -NoProfile -Command "$env:PYTHONPATH=$(Get-Content path.txt); python -m pytest -q"''',
+        r'''PowerShell.EXE -NoProfile -Command "$env:PYTHONPATH='src'; $env:OTHER='x'; python -m pytest -q"''',
+        r'''PowerShell.EXE -NoProfile -Command "Write-Output setup; $env:PYTHONPATH='src'; python -m pytest -q"''',
+        r'''PowerShell.EXE -NoProfile -Command "$env:PYTHONPATH='src'; python -m pytest -q"; exit 0''',
+        r'''PowerShell.EXE -Command "$env:PYTHONPATH='src"; exit 0; "'; python -m pytest -q"''',
+    ],
+)
+def test_ambiguous_powershell_pythonpath_invocations_do_not_become_validation_evidence(
+    command: str,
+) -> None:
+    action = TriggeringAction(
+        kind="commandExecution",
+        command=command,
+        exit_code=0,
+        status="completed",
+        summary="command completed",
+    )
+
+    assert _validation_from_action(
+        action,
+        sequence=84,
+        item={"type": "commandExecution", "stdout": "1 passed"},
+        changed_paths=["src/app.py"],
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "--collect-only",
+        "--co",
+        "--help",
+        "-h",
+        "--version",
+        "--version=2",
+        "-V",
+        "-VV",
+        "-hh",
+        "-hV",
+        "-Vh",
+        "-hfoo",
+        "-qh",
+        "-xh",
+        "-vh",
+        "-sh",
+        "-lh",
+        "-fh",
+        "--fixtures",
+        "--markers",
+        "--setup-only",
+        "--setup-plan",
+    ],
+)
+def test_powershell_pythonpath_pytest_no_run_modes_are_not_validation_evidence(
+    option: str,
+) -> None:
+    command = (
+        'PowerShell.EXE -NoProfile -Command '
+        f'"$env:PYTHONPATH=\'C:\\deps;src\'; python -m pytest {option}"'
+    )
+    action = TriggeringAction(
+        kind="commandExecution",
+        command=command,
+        exit_code=0,
+        status="completed",
+        summary="command completed",
+    )
+
+    assert _validation_from_action(
+        action,
+        sequence=85,
+        item={"type": "commandExecution", "stdout": "12 tests collected"},
+        changed_paths=["src/app.py"],
+    ) is None
+
+
+def test_direct_windows_pytest_collect_only_is_not_validation_evidence() -> None:
+    action = TriggeringAction(
+        kind="commandExecution",
+        command='PowerShell.EXE -NoProfile -Command "pytest --collect-only"',
+        exit_code=0,
+        status="completed",
+        summary="command completed",
+    )
+
+    assert _validation_from_action(
+        action,
+        sequence=85,
+        item={"type": "commandExecution", "stdout": "12 tests collected"},
+        changed_paths=["src/app.py"],
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r'''PowerShell.EXE -Command "python -c 'print(1)' -m pytest"''',
+        r'''PowerShell.EXE -Command "python --version -m pytest"''',
+    ],
+)
+def test_python_action_before_module_is_not_usable_test_evidence(command: str) -> None:
+    action = TriggeringAction(
+        kind="commandExecution",
+        command=command,
+        exit_code=0,
+        status="completed",
+        summary="command completed",
+    )
+
+    validation = _validation_from_action(
+        action,
+        sequence=85,
+        item={"type": "commandExecution", "stdout": "1 passed"},
+        changed_paths=[],
+    )
+
+    assert validation is None or validation.type != "behavioral"
+    assert _has_passing_behavioral_validation([validation] if validation is not None else []) is False
+
+
+async def test_literal_powershell_file_wrapper_records_usable_validation_and_trace(tmp_path: Path) -> None:
+    inner_command = (
+        r"PowerShell.EXE -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+        r"-File .\verify.ps1"
+    )
+    command = (
+        r'"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" '
+        rf'-Command "{inner_command}"'
+    )
+    # Approval analysis remains fail-closed for -File. Runtime evidence has a
+    # separate literal-only recognizer after nested wrappers have executed.
+    outer_wrapper = policy_module.windows_shell_wrapper_payload(command)
+    inner_wrapper = policy_module.windows_shell_wrapper_payload(inner_command)
+    assert outer_wrapper is not None
+    assert outer_wrapper[1] == inner_command
+    assert inner_wrapper is not None
+    assert inner_wrapper[1] is None
+
+    controller, store, _fake = _runtime_controller(tmp_path)
+    await controller.handle_notification(
+        AppServerMessage(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread",
+                    "itemId": "cmd-powershell-file",
+                    "item": {
+                        "type": "commandExecution",
+                        "command": command,
+                        "exitCode": 0,
+                        "status": "completed",
+                        "stdout": "VERIFY_OK junction\n",
+                    },
+                },
+            }
+        )
+    )
+
+    assert len(controller.validations) == 1
+    validation = controller.validations[0]
+    assert validation.type == "behavior_demo"
+    assert validation.trusted_validation_outcome == "passed"
+    assert validation.captured_output == "VERIFY_OK junction\n"
+    assert validation.target_files_or_test_files == ["verify.ps1"]
+    assert _has_passing_behavioral_validation([validation]) is True
+    trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
+    assert trace["validation_type"] == "behavior_demo"
+    assert trace["trusted_validation_outcome"] == "passed"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r'PowerShell.EXE -NoProfile -File "$env:TEMP\verify.ps1"',
+        r"PowerShell.EXE -NoProfile -File .\verify.ps1; Write-Output PASS",
+        r"PowerShell.EXE -EncodedCommand AAAA",
+        (
+            r'"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" '
+            r'-Command "powershell.exe -NoProfile -File .\verify.ps1; Write-Output PASS"'
+        ),
+    ],
+)
+def test_ambiguous_powershell_file_invocations_do_not_become_validation_evidence(command: str) -> None:
+    action = TriggeringAction(
+        kind="commandExecution",
+        command=command,
+        exit_code=0,
+        status="completed",
+        summary="command completed",
+    )
+
+    assert _validation_from_action(
+        action,
+        sequence=87,
+        item={"type": "commandExecution", "stdout": "VERIFY_OK junction\n"},
+        changed_paths=["app.py"],
+    ) is None
+
+
+def test_simple_cmd_wrapper_records_read_only_inspection() -> None:
+    action = TriggeringAction(
+        kind="commandExecution",
+        command='CMD.EXE /d /c "git status --short"',
+        exit_code=0,
+        status="completed",
+        summary="command completed",
+    )
+
+    validation = _validation_from_action(action, sequence=83, changed_paths=[])
+    inspection = _inspection_from_action(action, sequence=83)
+
+    assert validation is None
+    assert inspection is not None
+    assert inspection.passed is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'PowerShell.EXE -NoProfile -Command "git branch new-branch"',
+        'CMD.EXE /d /c "git remote add origin https://example.invalid/repo"',
+    ],
+)
+def test_windows_git_mutations_do_not_become_inspection_evidence(command: str) -> None:
+    action = TriggeringAction(
+        kind="commandExecution",
+        command=command,
+        exit_code=0,
+        status="completed",
+        summary="command completed",
+    )
+
+    assert _inspection_from_action(action, sequence=84) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'PowerShell.EXE -NoProfile -Command "py -3 -m pytest tests\\test_app.py -q"',
+        'PowerShell.EXE -NoProfile -Command "python -X dev -m pytest tests\\test_app.py -q"',
+        'PowerShell.EXE -NoProfile -Command "python -m pytest --trace-config tests\\test_app.py -q"',
+        'CMD.EXE /d /c "npx.cmd vitest tests\\app.test.ts"',
+    ],
+)
+def test_windows_python_launcher_and_npx_wrappers_record_behavioral_validation(command: str) -> None:
+    action = TriggeringAction(
+        kind="commandExecution",
+        command=command,
+        exit_code=0,
+        status="completed",
+        summary="command completed",
+    )
+
+    validation = _validation_from_action(
+        action,
+        sequence=85,
+        item={"type": "commandExecution", "stdout": "1 passed"},
+        changed_paths=["src/app.py"],
+    )
+
+    assert validation is not None
+    assert validation.type == "behavioral"
+    assert validation.trusted_validation_outcome == "passed"
+
+
+def test_windows_python_launcher_ambiguous_selector_is_not_validation_evidence() -> None:
+    action = TriggeringAction(
+        kind="commandExecution",
+        command='PowerShell.EXE -NoProfile -Command "py -0p -m pytest tests"',
+        exit_code=0,
+        status="completed",
+        summary="command completed",
+    )
+
+    assert _validation_from_action(action, sequence=86, changed_paths=[]) is None
+
+
+def test_windows_shell_wrapper_restart_key_matches_direct_payload() -> None:
+    wrapped = 'PowerShell.EXE -NoProfile -Command "pytest tests/test_app.py -q"'
+
+    assert _canonical_restart_command(wrapped) == _canonical_restart_command("pytest tests/test_app.py -q")
 
 
 async def test_read_only_command_is_recorded_in_inspection_ledger(tmp_path: Path) -> None:
@@ -3787,7 +4271,10 @@ async def test_read_only_command_is_recorded_in_inspection_ledger(tmp_path: Path
     assert trace["should_wake_runtime_supervisor"] is False
 
 
-async def test_declared_grading_path_completed_command_escalates_integrity_failure(tmp_path: Path) -> None:
+async def test_declared_grading_path_completed_command_escalates_integrity_failure(
+    tmp_path: Path,
+    posix_command_semantics: None,
+) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
     grading_root = tmp_path / "SpecBench" / "examples" / "c_compiler"
     grading_root.mkdir(parents=True)
@@ -6786,7 +7273,10 @@ async def test_approval_accept_does_not_steer_coder(tmp_path: Path) -> None:
     assert controller.coder.messages == []
 
 
-async def test_execpolicy_amendment_approval_is_not_rendered_as_denied(tmp_path: Path) -> None:
+async def test_execpolicy_amendment_approval_is_not_rendered_as_denied(
+    tmp_path: Path,
+    posix_command_semantics: None,
+) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
@@ -6922,11 +7412,15 @@ async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path:
     )
     controller._generate_schema_hash_async = _async_schema_hash
     controller._structured_output_self_test = _async_noop
+    # This test owns a deliberately minimal app-server stub and verifies coder
+    # shutdown, not cheap-runtime startup.  Isolate the unrelated triage probe
+    # so its turn cannot satisfy ``initial_turn_started`` first.
+    controller._configure_runtime_triage = _async_noop
 
     run_task = asyncio.create_task(controller.run())
-    await asyncio.wait_for(client.initial_turn_started.wait(), timeout=1)
+    await asyncio.wait_for(client.initial_turn_started.wait(), timeout=5)
     await controller.finalize("task complete", status=BelloStatus.COMPLETE)
-    await asyncio.wait_for(run_task, timeout=1)
+    await asyncio.wait_for(run_task, timeout=5)
 
     assert controller.coder is not None
     assert controller.coder.model == "gpt-coder"
@@ -7394,6 +7888,30 @@ def test_adversary_snapshot_gets_functional_git_repo(tmp_path: Path) -> None:
         _shutil.rmtree(snapshot.parent, ignore_errors=True)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink sanitization regression")
+def test_adversary_snapshot_drops_link_that_escapes_workspace(tmp_path: Path) -> None:
+    from supervisor.controller import _create_adversary_snapshot
+    from supervisor.workspace_snapshot import remove_isolated_workspace_tree
+
+    project = tmp_path / "project"
+    project.mkdir()
+    external = tmp_path / "external.txt"
+    external.write_text("host data\n", encoding="utf-8")
+    link = project / "escape"
+    try:
+        link.symlink_to(external)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+
+    snapshot = _create_adversary_snapshot(project)
+    try:
+        assert not (snapshot / "escape").exists()
+        assert not (snapshot / "escape").is_symlink()
+        assert external.read_text(encoding="utf-8") == "host data\n"
+    finally:
+        remove_isolated_workspace_tree(snapshot.parent)
+
+
 def test_adversary_snapshot_git_ignores_global_template_hooks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -7411,7 +7929,10 @@ def test_adversary_snapshot_git_ignores_global_template_hooks(
     hook.write_text(f"#!/bin/sh\ntouch '{marker}'\n", encoding="utf-8")
     hook.chmod(0o755)
     global_config = tmp_path / "global-gitconfig"
-    global_config.write_text(f"[init]\n\ttemplateDir = {template}\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "config", "--file", str(global_config), "init.templateDir", str(template)],
+        check=True,
+    )
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
 
     snapshot = _create_adversary_snapshot(project)
@@ -7444,6 +7965,31 @@ def test_workspace_state_id_does_not_open_fifo(tmp_path: Path) -> None:
     file_state = _workspace_state_id(tmp_path)
 
     assert fifo_state != file_state
+
+
+def test_workspace_state_id_does_not_traverse_simulated_junction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from supervisor.controller import _workspace_state_id
+
+    junction = tmp_path / "junction"
+    junction.mkdir()
+    outside_contents = junction / "outside.txt"
+    outside_contents.write_text("first\n", encoding="utf-8")
+    real_is_link = controller_module.is_link_or_reparse
+    monkeypatch.setattr(
+        controller_module,
+        "is_link_or_reparse",
+        lambda path, stat_result=None: path == junction
+        or real_is_link(path, stat_result=stat_result),
+    )
+
+    before = _workspace_state_id(tmp_path)
+    outside_contents.write_text("second\n", encoding="utf-8")
+    after = _workspace_state_id(tmp_path)
+
+    assert before == after
 
 
 def test_workspace_context_reader_and_hasher_reject_fifo(tmp_path: Path) -> None:

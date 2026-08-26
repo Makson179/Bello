@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
 from supervisor import update_check
 from supervisor import doctor
 from supervisor.doctor import DoctorResult, format_result
+
+
+@pytest.fixture(autouse=True)
+def _doctor_update_check_enabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(update_check.SKIP_UPDATE_CHECK_ENV, raising=False)
 
 
 def test_doctor_result_format_is_readable() -> None:
@@ -21,14 +27,18 @@ def test_doctor_collects_required_checks_with_update_warning(monkeypatch: pytest
         version="0.1.0",
         install_mode="pipx",
     )
-    monkeypatch.setattr(doctor.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(doctor, "_doctor_executable", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(
         doctor,
         "_probe_result",
         lambda args, ok_message, fail_message, timeout=10.0: DoctorResult("ok", ok_message, "ok"),
     )
-    monkeypatch.setattr(doctor, "_schema_generation_result", lambda: DoctorResult("ok", "app-server schema generation OK"))
-    monkeypatch.setattr(doctor, "_codex_auth_result", lambda: DoctorResult("ok", "Codex auth OK"))
+    monkeypatch.setattr(
+        doctor,
+        "_schema_generation_result",
+        lambda *_args: DoctorResult("ok", "app-server schema generation OK"),
+    )
+    monkeypatch.setattr(doctor, "_codex_auth_result", lambda *_args: DoctorResult("ok", "Codex auth OK"))
     monkeypatch.setattr(update_check, "read_install_info", lambda: info)
     monkeypatch.setattr(
         update_check,
@@ -77,7 +87,7 @@ def test_doctor_reports_dependent_codex_checks_when_codex_missing(monkeypatch: p
         metadata_available=False,
         warning="package metadata missing",
     )
-    monkeypatch.setattr(doctor.shutil, "which", lambda name: None)
+    monkeypatch.setattr(doctor, "_doctor_executable", lambda name: None)
     monkeypatch.setattr(update_check, "read_install_info", lambda: info)
     monkeypatch.setattr(
         update_check,
@@ -109,14 +119,18 @@ def test_doctor_returns_zero_when_update_check_is_unavailable(
         version="0.1.0",
         install_mode="pipx",
     )
-    monkeypatch.setattr(doctor.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(doctor, "_doctor_executable", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(
         doctor,
         "_probe_result",
         lambda args, ok_message, fail_message, timeout=10.0: DoctorResult("ok", ok_message, "ok"),
     )
-    monkeypatch.setattr(doctor, "_schema_generation_result", lambda: DoctorResult("ok", "app-server schema generation OK"))
-    monkeypatch.setattr(doctor, "_codex_auth_result", lambda: DoctorResult("ok", "Codex auth OK"))
+    monkeypatch.setattr(
+        doctor,
+        "_schema_generation_result",
+        lambda *_args: DoctorResult("ok", "app-server schema generation OK"),
+    )
+    monkeypatch.setattr(doctor, "_codex_auth_result", lambda *_args: DoctorResult("ok", "Codex auth OK"))
     monkeypatch.setattr(update_check, "read_install_info", lambda: info)
     monkeypatch.setattr(
         update_check,
@@ -132,3 +146,150 @@ def test_doctor_returns_zero_when_update_check_is_unavailable(
     output = capsys.readouterr().out
     assert "[WARN] Could not check for Bello updates" in output
     assert "could not reach PyPI" in output
+
+
+def test_windows_platform_check_reports_native_shell_and_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(doctor.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(doctor.platform, "release", lambda: "11")
+    monkeypatch.setattr(doctor.platform, "version", lambda: "10.0.26100")
+    monkeypatch.setattr(doctor.platform, "machine", lambda: "AMD64")
+    monkeypatch.setattr(
+        doctor.sys,
+        "getwindowsversion",
+        lambda: SimpleNamespace(build=26100, product_type=1),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_doctor_executable",
+        lambda name: r"C:\Windows\System32\cmd.exe" if name == "cmd" else None,
+    )
+
+    results = doctor._platform_results()
+
+    assert results[0] == DoctorResult("ok", "Native Windows detected: 11", "build 10.0.26100")
+    assert results[1] == DoctorResult("ok", "Windows architecture: AMD64 (64-bit Python)")
+    assert results[2] == DoctorResult("ok", r"Windows shell found: C:\Windows\System32\cmd.exe")
+
+
+def test_windows_10_is_reported_as_unsupported_with_upgrade_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(doctor.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(doctor.platform, "release", lambda: "10")
+    monkeypatch.setattr(doctor.platform, "version", lambda: "10.0.19045")
+    monkeypatch.setattr(doctor.platform, "machine", lambda: "AMD64")
+    monkeypatch.setattr(
+        doctor.sys,
+        "getwindowsversion",
+        lambda: SimpleNamespace(build=19045, product_type=1),
+        raising=False,
+    )
+    monkeypatch.setattr(doctor, "_doctor_executable", lambda _name: r"C:\Windows\System32\cmd.exe")
+
+    result = doctor._platform_results()[0]
+
+    assert result.level == "fail"
+    assert result.message == "Unsupported native Windows version: 10"
+    assert "Windows 11 or Windows Server 2022/2025" in (result.detail or "")
+    assert "build 19045" in (result.detail or "")
+
+
+def test_non_x64_windows_architecture_is_reported_as_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(doctor.platform, "machine", lambda: "ARM64")
+
+    result = doctor._windows_architecture_result()
+
+    assert result.level == "fail"
+    assert "ARM64" in result.message
+    assert "Windows on ARM" in (result.detail or "")
+
+
+def test_32_bit_windows_python_is_reported_as_unsupported(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(doctor.platform, "machine", lambda: "x86")
+    monkeypatch.setattr(doctor.struct, "calcsize", lambda _format: 4)
+
+    result = doctor._windows_architecture_result()
+
+    assert result.level == "fail"
+    assert "32-bit Python" in result.message
+    assert "64-bit Python" in (result.detail or "")
+
+
+def test_windows_missing_prerequisites_have_actionable_install_steps(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(doctor, "_is_windows", lambda: True)
+    monkeypatch.setattr(doctor, "_doctor_executable", lambda name: None)
+
+    shell = doctor._windows_shell_result()
+
+    assert shell.level == "fail"
+    assert "PowerShell 7" in (shell.detail or "")
+    assert "Git for Windows" in doctor._missing_git_detail()
+    assert "codex login" in doctor._missing_codex_detail()
+
+
+def test_doctor_skip_update_env_avoids_network_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    info = update_check.InstallInfo(package_name="bello", version="0.1.0", install_mode="pipx")
+    monkeypatch.setenv(update_check.SKIP_UPDATE_CHECK_ENV, "1")
+    monkeypatch.setattr(doctor, "_doctor_executable", lambda name: f"/tools/{name}")
+    monkeypatch.setattr(
+        doctor,
+        "_probe_result",
+        lambda args, ok_message, fail_message, timeout=10.0: DoctorResult("ok", ok_message),
+    )
+    monkeypatch.setattr(doctor, "_schema_generation_result", lambda *_args: DoctorResult("ok", "schema OK"))
+    monkeypatch.setattr(doctor, "_codex_auth_result", lambda *_args: DoctorResult("ok", "auth OK"))
+    monkeypatch.setattr(update_check, "read_install_info", lambda: info)
+
+    def unexpected_update_check(_info):
+        raise AssertionError("doctor must not contact PyPI when update checks are disabled")
+
+    monkeypatch.setattr(update_check, "check_for_update", unexpected_update_check)
+
+    results = doctor.collect_doctor_results()
+
+    skipped = next(result for result in results if result.message == "Bello update check skipped")
+    assert skipped.level == "ok"
+    assert skipped.detail == "BELLO_SKIP_UPDATE_CHECK=1"
+
+
+def test_doctor_uses_resolved_codex_executable_for_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    info = update_check.InstallInfo(package_name="bello", version="0.1.0", install_mode="pipx")
+    captured: list[list[str]] = []
+    schema_executables: list[str] = []
+    auth_executables: list[str] = []
+    codex = r"C:\Users\me\AppData\Roaming\npm\codex.cmd"
+
+    def which(name: str):
+        return codex if name == "codex" else f"/tools/{name}"
+
+    def probe(args, ok_message, fail_message, timeout=10.0):
+        captured.append(args)
+        return DoctorResult("ok", ok_message)
+
+    monkeypatch.setattr(doctor, "_doctor_executable", which)
+    monkeypatch.setattr(doctor, "_probe_result", probe)
+    monkeypatch.setattr(
+        doctor,
+        "_schema_generation_result",
+        lambda executable: schema_executables.append(executable) or DoctorResult("ok", "schema OK"),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_codex_auth_result",
+        lambda executable: auth_executables.append(executable) or DoctorResult("ok", "auth OK"),
+    )
+    monkeypatch.setattr(update_check, "read_install_info", lambda: info)
+    monkeypatch.setattr(
+        update_check,
+        "check_for_update",
+        lambda install_info: update_check.UpdateStatus(update_check.UpdateState.CURRENT, install_info),
+    )
+
+    doctor.collect_doctor_results()
+
+    assert captured == [[codex, "--version"], [codex, "app-server", "--help"]]
+    assert schema_executables == [codex]
+    assert auth_executables == [codex]

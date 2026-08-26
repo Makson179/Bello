@@ -5,9 +5,16 @@ from pathlib import Path
 
 import pytest
 
+import supervisor.policy as policy_module
 from supervisor.appserver import AppServerMessage
 from supervisor.approvals import ApprovalManager, normalize_approval_request
 from supervisor.schemas import ApprovalDecisionKind, SupervisorDecision, SupervisorDecisionKind
+
+
+def _approval_manager(*args, shell_kind="posix", **kwargs) -> ApprovalManager:
+    """Build an approval manager with the legacy POSIX contract made explicit."""
+
+    return ApprovalManager(*args, shell_kind=shell_kind, **kwargs)
 
 
 def message(method: str, request_id: int, params: dict) -> AppServerMessage:
@@ -52,6 +59,12 @@ class FakeFullSupervisor:
         return self.decision
 
 
+def test_approval_manager_uses_native_shell_default(tmp_path: Path) -> None:
+    manager = ApprovalManager(tmp_path)
+
+    assert manager.policy.shell_kind == policy_module.native_shell_kind()
+
+
 @pytest.mark.asyncio
 async def test_command_approval_constrained_by_available_decisions(tmp_path: Path) -> None:
     (tmp_path / "TASK.md").write_text("# Task", encoding="utf-8")
@@ -70,7 +83,7 @@ async def test_command_approval_constrained_by_available_decisions(tmp_path: Pat
         )
     )
 
-    decision = await ApprovalManager(tmp_path).decide(ctx)
+    decision = await _approval_manager(tmp_path).decide(ctx)
 
     assert decision.decision in {"decline", "cancel"}
 
@@ -92,7 +105,7 @@ async def test_network_approval_routes_to_supervisor_or_denies(tmp_path: Path) -
         )
     )
 
-    decision = await ApprovalManager(tmp_path).decide(ctx)
+    decision = await _approval_manager(tmp_path).decide(ctx)
 
     assert decision.decision in {"decline", "cancel"}
 
@@ -126,7 +139,7 @@ async def test_accept_with_execpolicy_amendment_only_for_command(tmp_path: Path)
         )
     )
 
-    decision = await ApprovalManager(tmp_path, supervisor=Reviewer()).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=Reviewer()).decide(ctx)
 
     assert isinstance(decision.decision, dict)
     assert "acceptWithExecpolicyAmendment" in decision.decision
@@ -164,7 +177,7 @@ async def test_accept_for_session_with_exact_execpolicy_amendment_uses_offered_p
         )
     )
 
-    decision = await ApprovalManager(tmp_path, supervisor=Reviewer()).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=Reviewer()).decide(ctx)
 
     assert decision.decision == offered_decision
     assert decision.from_supervisor is True
@@ -200,7 +213,7 @@ async def test_accept_for_session_cannot_substitute_unoffered_execpolicy_amendme
         )
     )
 
-    decision = await ApprovalManager(tmp_path, supervisor=Reviewer()).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=Reviewer()).decide(ctx)
 
     assert decision.decision == "cancel"
 
@@ -235,7 +248,7 @@ async def test_network_approval_never_persists_broad_execpolicy_amendment(tmp_pa
         )
     )
 
-    decision = await ApprovalManager(tmp_path, supervisor=supervisor).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=supervisor).decide(ctx)
 
     assert decision.decision == "accept"
     assert decision.persistent_decision is None
@@ -262,7 +275,7 @@ async def test_network_approval_cannot_write_to_immutable_original_workspace(tmp
         }
     )
 
-    decision = await ApprovalManager(
+    decision = await _approval_manager(
         snapshot,
         supervisor=supervisor,
         immutable_paths=(original,),
@@ -302,7 +315,7 @@ async def test_network_command_without_protocol_context_still_cannot_persist_ame
         )
     )
 
-    decision = await ApprovalManager(tmp_path, supervisor=supervisor).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=supervisor).decide(ctx)
 
     assert decision.decision == "accept"
     assert decision.persistent_decision is None
@@ -330,7 +343,7 @@ async def test_network_policy_amendment_cannot_be_accepted_for_session(tmp_path:
         )
     )
 
-    decision = await ApprovalManager(tmp_path, supervisor=supervisor).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=supervisor).decide(ctx)
 
     assert decision.decision in {"decline", "cancel"}
 
@@ -351,7 +364,7 @@ async def test_file_change_to_immutable_task_is_denied(tmp_path: Path) -> None:
         )
     )
 
-    decision = await ApprovalManager(tmp_path, immutable_paths=(task,)).decide(ctx)
+    decision = await _approval_manager(tmp_path, immutable_paths=(task,)).decide(ctx)
 
     assert decision.decision in {"decline", "cancel"}
     assert "immutable path" in decision.reason
@@ -376,7 +389,7 @@ async def test_file_change_does_not_emit_execpolicy_amendment(tmp_path: Path) ->
         )
     )
 
-    decision = await ApprovalManager(tmp_path, supervisor=Reviewer()).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=Reviewer()).decide(ctx)
 
     assert decision.decision == "accept"
 
@@ -391,7 +404,7 @@ async def test_file_change_without_exposed_paths_allows_workspace_edit(tmp_path:
         )
     )
 
-    decision = await ApprovalManager(tmp_path).decide(ctx)
+    decision = await _approval_manager(tmp_path).decide(ctx)
 
     assert decision.decision == "accept"
 
@@ -414,7 +427,7 @@ async def test_supervisor_approve_with_denial_choice_fails_closed(tmp_path: Path
         )
     )
 
-    decision = await ApprovalManager(tmp_path, supervisor=Reviewer()).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=Reviewer()).decide(ctx)
 
     assert decision.decision in {"decline", "cancel"}
 
@@ -437,7 +450,7 @@ async def test_supervisor_deny_with_approval_choice_fails_closed(tmp_path: Path)
         )
     )
 
-    decision = await ApprovalManager(tmp_path, supervisor=Reviewer()).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=Reviewer()).decide(ctx)
 
     assert decision.decision in {"decline", "cancel"}
 
@@ -460,7 +473,7 @@ async def test_accept_for_session_rejected_for_forbidden_classes(tmp_path: Path)
         )
     )
 
-    decision = await ApprovalManager(tmp_path, supervisor=Reviewer()).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=Reviewer()).decide(ctx)
 
     assert decision.decision in {"decline", "cancel"}
 
@@ -491,7 +504,7 @@ async def test_execpolicy_amendment_requires_exact_offer(tmp_path: Path) -> None
         )
     )
 
-    decision = await ApprovalManager(tmp_path, supervisor=Reviewer()).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=Reviewer()).decide(ctx)
 
     assert decision.decision == "accept"
 
@@ -510,7 +523,7 @@ async def test_recursive_delete_of_tracked_path_is_denied(tmp_path: Path) -> Non
         )
     )
 
-    decision = await ApprovalManager(tmp_path).decide(ctx)
+    decision = await _approval_manager(tmp_path).decide(ctx)
 
     assert decision.decision in {"decline", "cancel"}
     assert "git-tracked" in decision.reason
@@ -521,7 +534,7 @@ async def test_deterministic_allow_bypasses_full_review(tmp_path: Path) -> None:
     full = FakeFullSupervisor()
     ctx = command_context(tmp_path, "ls")
 
-    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=full).decide(ctx)
 
     assert decision.decision == "accept"
     assert full.calls == 0
@@ -542,7 +555,7 @@ async def test_project_execution_commands_use_full_supervisor_review(tmp_path: P
     full = FakeFullSupervisor()
     ctx = command_context(tmp_path, command.format(workspace=tmp_path))
 
-    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=full).decide(ctx)
 
     assert decision.decision == "accept"
     assert full.calls == 1
@@ -556,7 +569,7 @@ async def test_shell_heredoc_task_command_still_uses_full_supervisor(tmp_path: P
         "bash -lc 'cat > /tmp/input.c <<EOF\nint main(void){return 0;}\nEOF'",
     )
 
-    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=full).decide(ctx)
 
     assert decision.decision == "accept"
     assert full.calls == 1
@@ -567,7 +580,7 @@ async def test_private_c_compiler_input_still_uses_full_supervisor(tmp_path: Pat
     full = FakeFullSupervisor()
     ctx = command_context(tmp_path, "./c_compiler /tmp/private/input.c -o /tmp/out")
 
-    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=full).decide(ctx)
 
     assert decision.decision == "accept"
     assert full.calls == 1
@@ -578,7 +591,7 @@ async def test_deterministic_denial_bypasses_full_review(tmp_path: Path) -> None
     full = FakeFullSupervisor()
     ctx = command_context(tmp_path, "bello --task TASK.md")
 
-    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=full).decide(ctx)
 
     assert decision.decision in {"decline", "cancel"}
     assert "Bello" in decision.reason
@@ -599,7 +612,7 @@ async def test_commands_requiring_judgment_go_directly_to_full_supervisor(tmp_pa
     full = FakeFullSupervisor()
     ctx = command_context(tmp_path, command)
 
-    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=full).decide(ctx)
 
     assert decision.decision == "accept"
     assert decision.reason == "full supervisor approved"
@@ -618,7 +631,7 @@ async def test_accept_not_offered_uses_full_supervisor_denial(tmp_path: Path) ->
     )
     ctx = command_context(tmp_path, "git status --short && git diff --stat", available=["decline", "cancel"])
 
-    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=full).decide(ctx)
 
     assert decision.decision in {"decline", "cancel"}
     assert full.calls == 1
@@ -629,7 +642,7 @@ async def test_full_supervisor_failure_fails_closed(tmp_path: Path) -> None:
     full = FakeFullSupervisor(exc=RuntimeError("full failed"))
     ctx = command_context(tmp_path, "git status --short && git diff --stat")
 
-    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=full).decide(ctx)
 
     assert decision.decision in {"decline", "cancel"}
     assert "supervisor approval fallback failed" in decision.reason
@@ -647,11 +660,194 @@ async def test_full_supervisor_invalid_output_fails_closed(tmp_path: Path) -> No
     )
     ctx = command_context(tmp_path, "git status --short && git diff --stat")
 
-    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=full).decide(ctx)
 
     assert decision.decision in {"decline", "cancel"}
     assert "not an approval" in decision.reason
     assert full.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_windows_ambiguous_command_routes_to_full_supervisor(tmp_path: Path) -> None:
+    full = FakeFullSupervisor()
+    ctx = command_context(tmp_path, r"Get-Content safe,.env")
+
+    decision = await _approval_manager(
+        tmp_path,
+        supervisor=full,
+        shell_kind="powershell",
+    ).decide(ctx)
+
+    assert decision.decision == "accept"
+    assert decision.from_supervisor is True
+    assert full.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_windows_ambiguous_command_without_supervisor_fails_closed(tmp_path: Path) -> None:
+    ctx = command_context(tmp_path, r"type %USERPROFILE%\.env")
+
+    decision = await _approval_manager(tmp_path, shell_kind="cmd").decide(ctx)
+
+    assert decision.decision in {"decline", "cancel"}
+    assert "ambiguous" in decision.reason.lower() or "judgment" in decision.reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_windows_ambiguous_command_cannot_receive_session_grant(tmp_path: Path) -> None:
+    full = FakeFullSupervisor(
+        SupervisorDecision(
+            decision=SupervisorDecisionKind.APPROVE,
+            approval_decision=ApprovalDecisionKind.ACCEPT_FOR_SESSION,
+            reason="approve the concrete invocation",
+        )
+    )
+    ctx = normalize_approval_request(
+        message(
+            "item/commandExecution/requestApproval",
+            299,
+            {
+                "command": r"type %USERPROFILE%\.env",
+                "cwd": str(tmp_path),
+                "availableDecisions": ["acceptForSession", "decline", "cancel"],
+            },
+        )
+    )
+
+    decision = await _approval_manager(tmp_path, supervisor=full, shell_kind="cmd").decide(ctx)
+
+    assert decision.decision in {"decline", "cancel"}
+    assert "acceptForSession is forbidden" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_windows_encoded_command_cannot_persist_exact_execpolicy_amendment(
+    tmp_path: Path,
+) -> None:
+    amendment = ["powershell", "-EncodedCommand"]
+    full = FakeFullSupervisor(
+        SupervisorDecision(
+            decision=SupervisorDecisionKind.APPROVE,
+            approval_decision=ApprovalDecisionKind.ACCEPT,
+            execpolicy_amendment=amendment,
+            persistent_decision="reuse encoded invocation",
+            reason="approve this concrete invocation only",
+        )
+    )
+    offered = {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": amendment}}
+    ctx = normalize_approval_request(
+        message(
+            "item/commandExecution/requestApproval",
+            304,
+            {
+                "command": "powershell -EncodedCommand AAAA",
+                "cwd": str(tmp_path),
+                "proposedExecpolicyAmendment": amendment,
+                "availableDecisions": ["accept", offered, "decline"],
+            },
+        )
+    )
+
+    decision = await _approval_manager(
+        tmp_path,
+        supervisor=full,
+        shell_kind="powershell",
+    ).decide(ctx)
+
+    assert decision.decision == "accept"
+    assert decision.persistent_decision is None
+
+
+@pytest.mark.asyncio
+async def test_windows_file_change_denies_case_alias_of_runtime_directory(tmp_path: Path) -> None:
+    runtime = tmp_path / ".SUPERVISOR"
+    runtime.mkdir()
+    ctx = normalize_approval_request(
+        message(
+            "item/fileChange/requestApproval",
+            300,
+            {
+                "cwd": str(tmp_path),
+                "grantRoot": r".SUPERVISOR\state.json",
+                "availableDecisions": ["accept", "decline", "cancel"],
+            },
+        )
+    )
+
+    decision = await _approval_manager(tmp_path, shell_kind="powershell").decide(ctx)
+
+    assert decision.decision in {"decline", "cancel"}
+    assert "runtime/state" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_windows_file_change_matches_immutable_path_case_insensitively(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    ctx = normalize_approval_request(
+        message(
+            "item/fileChange/requestApproval",
+            301,
+            {
+                "cwd": str(tmp_path),
+                "grantRoot": "task.md",
+                "availableDecisions": ["accept", "decline", "cancel"],
+            },
+        )
+    )
+
+    decision = await _approval_manager(
+        tmp_path,
+        immutable_paths=(task,),
+        shell_kind="powershell",
+    ).decide(ctx)
+
+    assert decision.decision in {"decline", "cancel"}
+    assert "immutable path" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_windows_file_change_ads_path_never_auto_approves(tmp_path: Path) -> None:
+    ctx = normalize_approval_request(
+        message(
+            "item/fileChange/requestApproval",
+            302,
+            {
+                "cwd": str(tmp_path),
+                "grantRoot": r"src\file.txt:stream",
+                "availableDecisions": ["accept", "decline", "cancel"],
+            },
+        )
+    )
+
+    decision = await _approval_manager(tmp_path, shell_kind="cmd").decide(ctx)
+
+    assert decision.decision in {"decline", "cancel"}
+    assert "ambiguous" in decision.reason.lower() or "escapes" in decision.reason.lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_path", ["CONIN$", "conout$.txt", r"src\bad|name.txt"])
+async def test_windows_invalid_direct_file_change_paths_fail_closed(
+    tmp_path: Path,
+    raw_path: str,
+) -> None:
+    ctx = normalize_approval_request(
+        message(
+            "item/fileChange/requestApproval",
+            303,
+            {
+                "cwd": str(tmp_path),
+                "grantRoot": raw_path,
+                "availableDecisions": ["accept", "decline", "cancel"],
+            },
+        )
+    )
+
+    decision = await _approval_manager(tmp_path, shell_kind="powershell").decide(ctx)
+
+    assert decision.decision in {"decline", "cancel"}
+    assert "ambiguous" in decision.reason.lower() or "escapes" in decision.reason.lower()
 
 
 @pytest.mark.parametrize(
@@ -675,7 +871,7 @@ async def test_unsupported_request_types_are_denied_without_full_supervisor(tmp_
     }
     ctx = normalize_approval_request(message(method, 200, params))
 
-    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=full).decide(ctx)
 
     assert decision.decision in {"decline", "cancel"}
     assert full.calls == 0
@@ -697,7 +893,7 @@ async def test_network_approval_goes_directly_to_full_supervisor(tmp_path: Path)
         )
     )
 
-    decision = await ApprovalManager(tmp_path, supervisor=full).decide(ctx)
+    decision = await _approval_manager(tmp_path, supervisor=full).decide(ctx)
 
     assert decision.decision == "accept"
     assert full.calls == 1
@@ -1048,7 +1244,7 @@ def test_cheap_runtime_packet_does_not_emit_retired_masked_routing_signals(tmp_p
 async def test_adversary_mode_allows_destructive_delete_inside_snapshot(tmp_path: Path) -> None:
     # Contained cleanup escalates (destructive) but stays inside the snapshot → auto-approve.
     (tmp_path / "build").mkdir()
-    manager = ApprovalManager(tmp_path, adversary_mode=True)
+    manager = _approval_manager(tmp_path, adversary_mode=True)
     context = command_context(tmp_path, "rm -rf build")
 
     resolution = await manager.decide(context)
@@ -1059,7 +1255,7 @@ async def test_adversary_mode_allows_destructive_delete_inside_snapshot(tmp_path
 
 @pytest.mark.asyncio
 async def test_adversary_mode_allows_in_snapshot_file_write(tmp_path: Path) -> None:
-    manager = ApprovalManager(tmp_path, adversary_mode=True)
+    manager = _approval_manager(tmp_path, adversary_mode=True)
     context = command_context(tmp_path, "mkdir probe_out")
 
     resolution = await manager.decide(context)
@@ -1069,7 +1265,7 @@ async def test_adversary_mode_allows_in_snapshot_file_write(tmp_path: Path) -> N
 
 @pytest.mark.asyncio
 async def test_adversary_mode_network_command_fails_closed_without_supervisor(tmp_path: Path) -> None:
-    manager = ApprovalManager(tmp_path, adversary_mode=True)
+    manager = _approval_manager(tmp_path, adversary_mode=True)
     context = command_context(tmp_path, "curl http://localhost:9999/health")
 
     resolution = await manager.decide(context)
@@ -1082,7 +1278,7 @@ async def test_adversary_mode_network_command_fails_closed_without_supervisor(tm
 async def test_adversary_mode_interpreter_execution_fails_closed_without_supervisor(tmp_path: Path) -> None:
     # python -c could open a socket or read grading material at runtime, invisible to static
     # analysis — situational, so it needs the supervisor; with none wired it fails closed.
-    manager = ApprovalManager(tmp_path, adversary_mode=True)
+    manager = _approval_manager(tmp_path, adversary_mode=True)
     context = command_context(
         tmp_path, "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://x\")'"
     )
@@ -1095,7 +1291,7 @@ async def test_adversary_mode_interpreter_execution_fails_closed_without_supervi
 
 @pytest.mark.asyncio
 async def test_adversary_mode_denies_unknown_binary_and_dependency_install_without_supervisor(tmp_path: Path) -> None:
-    manager = ApprovalManager(tmp_path, adversary_mode=True)
+    manager = _approval_manager(tmp_path, adversary_mode=True)
     for command in ("nc evil.example 443", "pip install requests"):
         resolution = await manager.decide(command_context(tmp_path, command))
         assert resolution.decision in {"decline", "cancel"}, command
@@ -1103,7 +1299,7 @@ async def test_adversary_mode_denies_unknown_binary_and_dependency_install_witho
 
 @pytest.mark.asyncio
 async def test_adversary_mode_denies_workspace_escape_without_supervisor(tmp_path: Path) -> None:
-    manager = ApprovalManager(tmp_path, adversary_mode=True)
+    manager = _approval_manager(tmp_path, adversary_mode=True)
     context = command_context(tmp_path, "cat /etc/hosts")
 
     resolution = await manager.decide(context)
@@ -1116,7 +1312,7 @@ async def test_adversary_gray_zone_routes_to_full_supervisor(tmp_path: Path) -> 
     # The same command can be legitimate under one task and cheating under another, so the
     # gray zone is judged situationally by the full supervisor instead of a static deny.
     supervisor = FakeFullSupervisor()
-    manager = ApprovalManager(tmp_path, supervisor=supervisor, adversary_mode=True)
+    manager = _approval_manager(tmp_path, supervisor=supervisor, adversary_mode=True)
     context = command_context(
         tmp_path, "'/Applications/Browser.app/Contents/MacOS/Browser' --headless index.html"
     )
@@ -1137,7 +1333,7 @@ async def test_adversary_gray_zone_supervisor_deny_declines(tmp_path: Path) -> N
             reason="no task grounding for network access",
         )
     )
-    manager = ApprovalManager(tmp_path, supervisor=supervisor, adversary_mode=True)
+    manager = _approval_manager(tmp_path, supervisor=supervisor, adversary_mode=True)
     context = command_context(tmp_path, "curl https://example.com/data")
 
     resolution = await manager.decide(context)
@@ -1149,7 +1345,7 @@ async def test_adversary_gray_zone_supervisor_deny_declines(tmp_path: Path) -> N
 @pytest.mark.asyncio
 async def test_adversary_gray_zone_supervisor_error_fails_closed(tmp_path: Path) -> None:
     supervisor = FakeFullSupervisor(exc=RuntimeError("boom"))
-    manager = ApprovalManager(tmp_path, supervisor=supervisor, adversary_mode=True)
+    manager = _approval_manager(tmp_path, supervisor=supervisor, adversary_mode=True)
     context = command_context(tmp_path, "curl https://example.com/data")
 
     resolution = await manager.decide(context)
@@ -1163,7 +1359,7 @@ async def test_adversary_secret_path_denied_without_consulting_supervisor(tmp_pa
     # not even consulted.
     (tmp_path / ".env").write_text("KEY=1", encoding="utf-8")
     supervisor = FakeFullSupervisor()
-    manager = ApprovalManager(tmp_path, supervisor=supervisor, adversary_mode=True)
+    manager = _approval_manager(tmp_path, supervisor=supervisor, adversary_mode=True)
     context = command_context(tmp_path, "cat .env")
 
     resolution = await manager.decide(context)
@@ -1175,7 +1371,7 @@ async def test_adversary_secret_path_denied_without_consulting_supervisor(tmp_pa
 
 @pytest.mark.asyncio
 async def test_without_adversary_mode_gray_zone_still_denied_when_no_supervisor(tmp_path: Path) -> None:
-    manager = ApprovalManager(tmp_path)
+    manager = _approval_manager(tmp_path)
     context = command_context(tmp_path, "rm -rf build")
 
     resolution = await manager.decide(context)

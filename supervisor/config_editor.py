@@ -211,12 +211,13 @@ class Theme:
 
     @classmethod
     def from_environment(cls) -> Theme:
-        ascii_enabled = os.environ.get("BELLO_CONFIG_ASCII", "").strip().lower() in {
+        ascii_setting = os.environ.get("BELLO_CONFIG_ASCII", "").strip().lower()
+        ascii_enabled = ascii_setting in {
             "1",
             "true",
             "yes",
             "on",
-        }
+        } or (not ascii_setting and not _terminal_supports_unicode())
         symbols = Symbols.ascii() if ascii_enabled else Symbols.default()
         styles = {
             "root": "#ddd7eb bg:#050716",
@@ -272,6 +273,17 @@ class Theme:
 
     def style(self, *keys: str) -> str:
         return " ".join(self.styles[key] for key in keys if key in self.styles)
+
+
+def _terminal_supports_unicode() -> bool:
+    encoding = getattr(sys.stdout, "encoding", None)
+    if not encoding:
+        return True
+    try:
+        "╭✦↵".encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return False
+    return True
 
 
 @dataclass(frozen=True)

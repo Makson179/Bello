@@ -39,7 +39,16 @@ from supervisor.health import (
     patch_health,
     record_restart_issue_intervention,
 )
+from supervisor.filesystem_safety import is_link_or_reparse, is_windows_platform
+from supervisor.executables import ExecutableResolutionError, require_trusted_executable
 from supervisor.project_config import DEFAULT_MODEL, ProjectConfig
+from supervisor.policy import (
+    _executable_basename,
+    command_is_windows_shell_wrapper,
+    lex_windows_command,
+    native_shell_kind,
+    windows_shell_wrapper_payload,
+)
 from supervisor.review_limits import review_limit_reached
 from supervisor.schemas import (
     AppEvent,
@@ -88,7 +97,9 @@ from supervisor.workspace_snapshot import (
     WorkspaceSnapshot,
     WorkspaceSnapshotError,
     apply_snapshot_patch,
+    copy_isolated_workspace_tree,
     create_workspace_snapshot,
+    remove_isolated_workspace_tree,
     snapshot_git_environment,
 )
 from supervisor.workspace_clean import clean_workspace_except_task
@@ -590,15 +601,28 @@ class BelloController:
         snapshot = getattr(self, "_coder_snapshot", None)
         if snapshot is None:
             return None
-        snapshot_task = snapshot.snapshot_root / snapshot.task_relative_path
-        if not snapshot_task.is_symlink():
-            return "the coder workspace replaced or removed the read-only task link"
-        try:
-            if snapshot_task.resolve(strict=True) != self.task_path.resolve(strict=True):
-                return "the coder workspace redirected the read-only task link"
-        except OSError:
-            return "the coder workspace task link is broken"
-        return None
+        return snapshot.task_integrity_issue()
+
+    def _runtime_integrity_issue(self) -> str | None:
+        snapshot = getattr(self, "_coder_snapshot", None)
+        if snapshot is None:
+            return None
+        return snapshot.runtime_integrity_issue()
+
+    async def _escalate_runtime_integrity_issue(self, *, source: str) -> bool:
+        issue = self._runtime_integrity_issue()
+        if issue is None:
+            return False
+        message = f"coder workspace runtime integrity failure ({source}): {issue}"
+        self.tui.render("INTEGRITY", message)
+        self.store.append_text_locked(PROGRESS, f"- Integrity failure: {message}\n")
+        self._append_event(
+            AppEventSource.SUPERVISOR,
+            "integrity/runtime_control_mutation",
+            reason=message,
+        )
+        await self.finalize(f"escalated: {message}", status=BelloStatus.ESCALATED)
+        return True
 
     def _repair_snapshot_runtime_controls(self, *, source: str) -> tuple[str, ...]:
         snapshot = getattr(self, "_coder_snapshot", None)
@@ -791,7 +815,10 @@ class BelloController:
 
     async def preflight(self) -> None:
         self.tui.status("checking Codex version")
-        version = _run_probe(["codex", "--version"])[1]
+        codex = _controller_executable("codex", self.project_root)
+        if codex is None:
+            raise RuntimeError("trusted codex executable not found")
+        version = _run_probe([codex, "--version"])[1]
         self.tui.status("checking Codex app-server schema")
         schema_hash = await self._generate_schema_hash_async()
         self.store.update_bello_config(
@@ -1188,6 +1215,8 @@ class BelloController:
                 self.store.append_recent_action(summary)
                 triggering_action = _triggering_action_from_item(item, item_id=item_id, summary=summary)
                 repaired_runtime_controls = self._repair_snapshot_runtime_controls(source="coder_action")
+                if await self._escalate_runtime_integrity_issue(source="coder_action"):
+                    return
                 self._record_changed_files(triggering_action)
                 declared_grading_issue = self._declared_grading_access_issue(triggering_action)
                 if declared_grading_issue is not None:
@@ -1289,6 +1318,8 @@ class BelloController:
 
     async def _handle_coder_turn_completed(self, *, item_id: str | None) -> None:
         repaired_runtime_controls = self._repair_snapshot_runtime_controls(source="coder_turn_completed")
+        if await self._escalate_runtime_integrity_issue(source="coder_turn_completed"):
+            return
         if repaired_runtime_controls:
             self._schedule_supervisor_check(
                 "Runtime integrity trigger: coder workspace runtime links were replaced and restored.",
@@ -1628,6 +1659,17 @@ class BelloController:
                 return None, None
             recovery_path = await self._preserve_snapshot_for_recovery(snapshot, reason=status.value)
             return None, recovery_path
+        runtime_integrity_issue = self._runtime_integrity_issue()
+        if runtime_integrity_issue is not None:
+            recovery_path = await self._preserve_snapshot_for_recovery(
+                snapshot,
+                reason="runtime_integrity",
+            )
+            return (
+                "escalated: accepted snapshot failed runtime integrity validation; "
+                f"workspace preserved at {recovery_path}: {runtime_integrity_issue}",
+                recovery_path,
+            )
         task_integrity_issue = self._task_integrity_issue()
         if task_integrity_issue is not None:
             recovery_path = await self._preserve_snapshot_for_recovery(snapshot, reason="task_integrity")
@@ -3135,7 +3177,7 @@ class BelloController:
         finally:
             self._active_adversary_workspace_root = None
             if snapshot_root is not None:
-                shutil.rmtree(snapshot_root.parent, ignore_errors=True)
+                remove_isolated_workspace_tree(snapshot_root.parent)
 
         report = AdversaryReport(
             candidate_finding=result.candidate_finding,
@@ -4271,7 +4313,7 @@ class BelloController:
 
     async def _git_output(self, command: list[str]) -> str | None:
         try:
-            exec_command = command
+            exec_command = list(command)
             env = None
             snapshot = getattr(self, "_coder_snapshot", None)
             if snapshot is not None and command and command[0] == "git":
@@ -4281,6 +4323,15 @@ class BelloController:
                 if len(command) > 1 and command[1] == "diff":
                     exec_command = [*exec_command[:4], "--no-ext-diff", "--no-textconv", *exec_command[4:]]
                 env = snapshot_git_environment()
+            if exec_command and exec_command[0] == "git":
+                git = _controller_executable(
+                    "git",
+                    self._active_workspace_root(),
+                    environ=env,
+                )
+                if git is None:
+                    return None
+                exec_command[0] = git
             proc = await asyncio.create_subprocess_exec(
                 *exec_command,
                 cwd=str(self._active_workspace_root()),
@@ -4515,12 +4566,13 @@ class BelloController:
         self.store.update_bello_config(lambda current: current.model_copy(update={"last_event_sequence": self._sequence}))
 
     def _generate_schema_hash(self) -> str:
-        if shutil.which("codex") is None:
+        codex = _controller_executable("codex", self.project_root)
+        if codex is None:
             raise RuntimeError("codex executable not found")
         with tempfile.TemporaryDirectory(prefix="bello-appserver-schema-") as tmp_dir:
             out_dir = Path(tmp_dir)
             completed = subprocess.run(
-                ["codex", "app-server", "generate-json-schema", "--experimental", "--out", str(out_dir)],
+                [codex, "app-server", "generate-json-schema", "--experimental", "--out", str(out_dir)],
                 capture_output=True,
                 text=True,
                 timeout=20,
@@ -4718,10 +4770,486 @@ def _runtime_trigger_reasons_from_summary(summary: str | None) -> tuple[str, ...
 
 _RESTART_SHELL_NAMES = frozenset({"bash", "dash", "ksh", "sh", "zsh"})
 
+_LITERAL_POWERSHELL_PYTHONPATH_PREFIX = re.compile(
+    r"\A\s*\$env:PYTHONPATH\s*=\s*'(?:(?:'')|[^'\r\n])*'\s*;\s*(?P<command>[^\r\n]+?)\s*\Z",
+    re.IGNORECASE,
+)
+_QUOTED_POWERSHELL_PYTHONPATH_WRAPPER = re.compile(
+    r'\A(?P<prefix>.*?)"(?P<payload>\$env:PYTHONPATH[^"\r\n]*)"\s*\Z',
+    re.IGNORECASE,
+)
+_SPLICE_QUOTED_POWERSHELL_PYTHONPATH_WRAPPER = re.compile(
+    r'\A(?P<prefix>.*?)\'\$env:PYTHONPATH=\'"(?P<tail>\'[^"\r\n]*)"\s*\Z',
+    re.IGNORECASE,
+)
+
+
+def _literal_powershell_file_invocation(command: str) -> tuple[list[str], str] | None:
+    """Extract a simple literal ``powershell -File script.ps1`` invocation.
+
+    The approval parser deliberately leaves every ``-File`` invocation for
+    supervisor judgment.  Runtime evidence classification has a narrower job:
+    after Codex has already run a command, recognize a literal script execution
+    without treating PowerShell expansion or composition as evidence.  Keep the
+    two paths separate so this recognition cannot widen auto-approval policy.
+    """
+
+    tokens, problem = lex_windows_command(command, "powershell")
+    if tokens is None or problem or _executable_basename(tokens[0]) not in {"powershell", "pwsh"}:
+        return None
+    lowered = [token.casefold() for token in tokens]
+    file_indexes = [index for index, token in enumerate(lowered[1:], start=1) if token == "-file"]
+    if len(file_indexes) != 1:
+        return None
+    file_index = file_indexes[0]
+    script_index = file_index + 1
+    if script_index >= len(tokens):
+        return None
+
+    # Accept only the small host-option subset needed for deterministic,
+    # non-interactive script execution.  Everything after -File belongs to the
+    # script and remains literal because lex_windows_command already rejected
+    # expansion, escaping, redirection, and composition.
+    switches = {"-nologo", "-noprofile", "-noninteractive", "-mta", "-sta"}
+    value_options = {"-executionpolicy", "-inputformat", "-outputformat", "-version", "-windowstyle"}
+    index = 1
+    while index < file_index:
+        option = lowered[index]
+        if option in switches:
+            index += 1
+            continue
+        if option in value_options and index + 1 < file_index:
+            index += 2
+            continue
+        return None
+
+    script = tokens[script_index]
+    if not script or script.startswith("-") or not script.casefold().endswith(".ps1"):
+        return None
+    return [_executable_basename(script), *tokens[script_index + 1 :]], script
+
+
+def _literal_powershell_pythonpath_payload(payload: str) -> tuple[list[str], str] | None:
+    """Recognize one literal PYTHONPATH assignment followed by one command.
+
+    This is runtime-evidence parsing, not approval parsing.  PowerShell env
+    assignments require ``;`` composition, so the approval lexer correctly
+    leaves them for supervisor judgment.  Once the command has executed, we
+    can safely classify this one narrow form by removing only a single-quoted
+    literal PYTHONPATH prefix and passing the entire remainder back through the
+    existing fail-closed Windows lexer.
+    """
+
+    match = _LITERAL_POWERSHELL_PYTHONPATH_PREFIX.fullmatch(payload)
+    if match is None:
+        return None
+    command = match.group("command")
+    tokens, problem = lex_windows_command(command, "powershell", cross_shell_safe=True)
+    if tokens is None or problem:
+        return None
+    normalized = list(tokens)
+    normalized[0] = _executable_basename(normalized[0])
+    # The production failure was specifically ``python -m pytest``.  Keeping
+    # this exception on that exact action avoids exposing unrelated Python or
+    # tool classifiers through a new env-prefix surface.
+    if normalized[0] != "py" and re.fullmatch(r"python(?:3(?:\.\d+)?)?", normalized[0]) is None:
+        return None
+    python_action = _windows_python_action(normalized)
+    if python_action is None or python_action[:2] != ("module", "pytest"):
+        return None
+    return normalized, command
+
+
+def _literal_powershell_pythonpath_invocation(command: str) -> tuple[list[str], str] | None:
+    """Extract the narrow PYTHONPATH form from a PowerShell ``-Command`` wrapper."""
+
+    if "\n" in command or "\r" in command:
+        return None
+
+    match = _QUOTED_POWERSHELL_PYTHONPATH_WRAPPER.fullmatch(command)
+    if match is not None:
+        payload = match.group("payload")
+    else:
+        # Codex's Windows command renderer can represent a single quote inside
+        # the payload with a POSIX-style quote splice, for example:
+        #   -Command '$env:PYTHONPATH='"'C:\deps;src'; python -m pytest -q"
+        # Recognize that exact boundary without asking POSIX shlex to interpret
+        # arbitrary PowerShell syntax; the two grammars disagree on quote
+        # termination and can otherwise hide outer-shell composition.
+        match = _SPLICE_QUOTED_POWERSHELL_PYTHONPATH_WRAPPER.fullmatch(command)
+        if match is None:
+            return None
+        payload = f"$env:PYTHONPATH={match.group('tail')}"
+
+    marker = "__bello_literal_pythonpath_payload__"
+    sanitized_wrapper = f'{match.group("prefix")}\"{marker}\"'
+    tokens, problem = lex_windows_command(sanitized_wrapper, "powershell", cross_shell_safe=True)
+    if tokens is None or problem:
+        return None
+    if not tokens or _executable_basename(tokens[0]) not in {"powershell", "pwsh"}:
+        return None
+
+    lowered = [token.casefold() for token in tokens]
+    command_indexes = [
+        index for index, token in enumerate(lowered[1:], start=1) if token in {"-c", "-command"}
+    ]
+    if len(command_indexes) != 1:
+        return None
+    command_index = command_indexes[0]
+    payload_index = command_index + 1
+    if payload_index != len(tokens) - 1 or tokens[payload_index] != marker:
+        return None
+
+    switches = {"-nologo", "-noprofile", "-noninteractive", "-mta", "-sta"}
+    value_options = {"-executionpolicy", "-inputformat", "-outputformat", "-version", "-windowstyle"}
+    index = 1
+    while index < command_index:
+        option = lowered[index]
+        if option in switches:
+            index += 1
+            continue
+        if option in value_options and index + 1 < command_index:
+            index += 2
+            continue
+        return None
+
+    return _literal_powershell_pythonpath_payload(payload)
+
+
+def _windows_classification_tokens(command: str) -> tuple[bool, list[str] | None, str | None]:
+    """Return normalized tokens for a native/wrapped Windows command.
+
+    The boolean distinguishes "not a Windows command surface" from "a Windows
+    surface whose syntax is ambiguous".  Callers must treat the latter as
+    unclassified, never fall through to POSIX ``shlex`` or regex matching.
+    """
+
+    current = command
+    for _ in range(6):
+        wrapper = windows_shell_wrapper_payload(current)
+        if wrapper is None:
+            break
+        shell_kind, payload, _problem = wrapper
+        if payload is None:
+            if shell_kind == "powershell":
+                pythonpath_invocation = _literal_powershell_pythonpath_invocation(current)
+                if pythonpath_invocation is not None:
+                    tokens, command_payload = pythonpath_invocation
+                    return True, tokens, command_payload
+                file_invocation = _literal_powershell_file_invocation(current)
+                if file_invocation is not None:
+                    tokens, script = file_invocation
+                    return True, tokens, script
+            return True, None, None
+        if command_is_windows_shell_wrapper(payload):
+            current = payload
+            continue
+        tokens, problem = lex_windows_command(payload, shell_kind)
+        if tokens is None or problem:
+            return True, None, payload
+        normalized = list(tokens)
+        normalized[0] = _executable_basename(normalized[0])
+        return True, normalized, payload
+    else:
+        return True, None, None
+    if command_is_windows_shell_wrapper(command):
+        return True, None, None
+    shell_kind = native_shell_kind()
+    if shell_kind == "posix":
+        return False, None, None
+    tokens, problem = lex_windows_command(command, shell_kind, cross_shell_safe=True)
+    if tokens is None or problem:
+        if shell_kind == "powershell":
+            pythonpath_invocation = _literal_powershell_pythonpath_payload(command)
+            if pythonpath_invocation is not None:
+                normalized, command_payload = pythonpath_invocation
+                return True, normalized, command_payload
+        return True, None, command
+    normalized = list(tokens)
+    normalized[0] = _executable_basename(normalized[0])
+    return True, normalized, command
+
+
+def _windows_tokens_are_git_inspection(tokens: list[str]) -> bool:
+    if not tokens or tokens[0] != "git" or len(tokens) < 2:
+        return False
+    subcommand = tokens[1].casefold()
+    args = [token.casefold() for token in tokens[2:]]
+    if subcommand == "branch":
+        # Creating, copying, renaming, or deleting a branch is mutation.  The
+        # no-argument/options-only forms are the subset we can prove to be an
+        # inspection without implementing Git's full option grammar.
+        return not any(not arg.startswith("-") for arg in args)
+    if subcommand == "remote":
+        return not args or args == ["-v"] or (args[0] == "get-url" and len(args) == 2)
+    return subcommand in {
+        "diff",
+        "for-each-ref",
+        "log",
+        "rev-parse",
+        "show",
+        "status",
+    }
+
+
+def _windows_effective_tool_tokens(tokens: list[str]) -> list[str]:
+    if len(tokens) > 1 and tokens[0] == "npx" and not tokens[1].startswith("-"):
+        return [_executable_basename(tokens[1]), *tokens[2:]]
+    return tokens
+
+
+def _windows_python_args(tokens: list[str]) -> list[str] | None:
+    if not tokens:
+        return None
+    executable = tokens[0]
+    if executable == "py":
+        args = list(tokens[1:])
+        if args and re.fullmatch(r"-3(?:\.\d+)?", args[0]):
+            args = args[1:]
+        elif args and (
+            re.match(r"^-\d", args[0])
+            or args[0].casefold().startswith(("-v:", "--list", "--company", "--tag"))
+        ):
+            return None
+        return args
+    if re.fullmatch(r"python(?:3(?:\.\d+)?)?", executable):
+        return list(tokens[1:])
+    return None
+
+
+def _windows_python_action(tokens: list[str]) -> tuple[str, str, list[str]] | None:
+    """Return Python's first executable action without scanning later argv.
+
+    ``-c code -m pytest`` runs ``code`` and merely passes ``-m pytest`` to that
+    code.  Looking for ``-m`` anywhere therefore turns harmless output from a
+    different action into false test evidence.  Parse only the small, explicit
+    interpreter-option subset that may precede Python's mutually exclusive
+    ``-c``/``-m``/script action.
+    """
+
+    args = _windows_python_args(tokens)
+    if args is None:
+        return None
+    no_value_options = {
+        "-b",
+        "-bb",
+        "-B",
+        "-d",
+        "-E",
+        "-i",
+        "-I",
+        "-O",
+        "-OO",
+        "-P",
+        "-q",
+        "-R",
+        "-s",
+        "-S",
+        "-u",
+        "-v",
+        "-x",
+    }
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in no_value_options:
+            index += 1
+            continue
+        if arg in {"-W", "-X", "--check-hash-based-pycs"}:
+            if index + 1 >= len(args):
+                return None
+            index += 2
+            continue
+        if (arg.startswith("-W") or arg.startswith("-X")) and len(arg) > 2:
+            index += 1
+            continue
+        if arg in {"-c", "-m"}:
+            if index + 1 >= len(args) or not args[index + 1]:
+                return None
+            return ("command" if arg == "-c" else "module"), args[index + 1], args[index + 2 :]
+        if arg == "--":
+            if index + 1 >= len(args) or not args[index + 1]:
+                return None
+            return "script", args[index + 1], args[index + 2 :]
+        if arg == "-":
+            return "script", arg, args[index + 1 :]
+        if arg.startswith("-"):
+            return None
+        return "script", arg, args[index + 1 :]
+    return None
+
+
+_PYTEST_NO_RUN_OPTIONS = frozenset(
+    {
+        "--cache-show",
+        "--co",
+        "--collect-only",
+        "--fixtures",
+        "--fixtures-per-test",
+        "--funcargs",
+        "--help",
+        "--markers",
+        "--setup-only",
+        "--setup-plan",
+        "--version",
+    }
+)
+
+
+def _pytest_args_request_no_test_execution(args: list[str]) -> bool:
+    for arg in args:
+        if arg == "--":
+            break
+        if (
+            arg.startswith("-h")
+            or re.fullmatch(r"-[qvxslf]+h.*", arg)
+            or re.fullmatch(r"-(?:h|V)+", arg)
+        ):
+            return True
+        if not arg.startswith("--"):
+            continue
+        option = arg.casefold().partition("=")[0]
+        if option in _PYTEST_NO_RUN_OPTIONS:
+            return True
+    return False
+
+
+def _windows_tokens_are_static_validation(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    tokens = _windows_effective_tool_tokens(tokens)
+    executable = tokens[0]
+    args = [token.casefold() for token in tokens[1:]]
+    if executable == "git":
+        return bool(args and args[0] == "diff" and "--check" in args)
+    if executable in {"node", "nodejs"}:
+        return bool(args and args[0] in {"-c", "--check"})
+    if executable in {"eslint"}:
+        return True
+    if executable in {"npm", "pnpm", "yarn"}:
+        command_args = args[1:] if args[:1] == ["run"] else args
+        return bool(
+            command_args
+            and (
+                command_args[0] == "lint"
+                or command_args[0].startswith("lint:")
+                or command_args[0].startswith(("type-check", "typecheck"))
+            )
+        )
+    if executable == "prettier":
+        return "--check" in args
+    if executable == "tsc":
+        return "--noemit" in args
+    python_action = _windows_python_action(tokens)
+    if python_action is not None and python_action[0] == "module":
+        return python_action[1].casefold() in {"compileall", "json.tool", "py_compile"}
+    return False
+
+
+def _windows_tokens_are_behavioral_validation(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    tokens = _windows_effective_tool_tokens(tokens)
+    executable = tokens[0]
+    args = [token.casefold() for token in tokens[1:]]
+    if executable == "pytest":
+        return not _pytest_args_request_no_test_execution(tokens[1:])
+    if executable in {"ava", "cypress", "jest", "mocha", "playwright", "rspec", "tap", "tox", "vitest"}:
+        return True
+    if executable in {"npm", "pnpm", "yarn"}:
+        command_args = args[1:] if args[:1] == ["run"] else args
+        return bool(command_args and (command_args[0] == "test" or command_args[0].startswith("test:")))
+    if executable in {"node", "nodejs"}:
+        return "--test" in args
+    python_action = _windows_python_action(tokens)
+    if python_action is not None and python_action[0] == "module":
+        module = python_action[1].casefold()
+        if module == "pytest":
+            return not _pytest_args_request_no_test_execution(python_action[2])
+        return module in {"nose", "nose2", "tox", "unittest"}
+    if executable in {"cargo", "dotnet", "go", "gradle", "make", "mvn", "swift"}:
+        return bool(args and args[0] == "test")
+    return _windows_tokens_execute_script(tokens, require_test_name=True)
+
+
+def _windows_tokens_execute_script(tokens: list[str], *, require_test_name: bool = False) -> bool:
+    if not tokens:
+        return False
+    tokens = _windows_effective_tool_tokens(tokens)
+    executable = tokens[0]
+    script: str | None = None
+    python_action = _windows_python_action(tokens)
+    if python_action is not None and python_action[0] == "script":
+        script = python_action[1]
+    elif executable in {"node", "nodejs", "ruby"} and len(tokens) > 1:
+        non_options = [token for token in tokens[1:] if not token.startswith("-")]
+        if non_options:
+            script = non_options[0]
+    elif executable.endswith((".js", ".mjs", ".cjs", ".py", ".ps1", ".rb")):
+        script = executable
+    if not script:
+        return False
+    normalized = script.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    if not require_test_name:
+        return True
+    stem = normalized.rsplit(".", 1)[0]
+    return bool(re.search(r"(^|[._-])tests?([._-]|$)", stem))
+
+
+def _windows_tokens_are_read_only_inspection(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    if _windows_tokens_are_git_inspection(tokens):
+        return True
+    executable = tokens[0]
+    args = [token.casefold() for token in tokens[1:]]
+    if executable in {"cat", "get-content", "head", "tail", "type", "wc"}:
+        return bool(args)
+    if executable in {"dir", "get-childitem", "ls", "pwd", "get-location"}:
+        return not any(arg in {"-recurse", "/s"} for arg in args)
+    if executable in {"grep", "rg", "select-string"}:
+        return len(args) >= 2
+    if executable == "find":
+        return not any(arg in {"-delete", "-exec", "-execdir"} for arg in args)
+    return False
+
+
+def _windows_tokens_are_behavior_demo(tokens: list[str], *, payload: str, changed_paths: list[str]) -> bool:
+    if not tokens:
+        return False
+    tokens = _windows_effective_tool_tokens(tokens)
+    executable = tokens[0]
+    args = [token.casefold() for token in tokens[1:]]
+    python_action = _windows_python_action(tokens)
+    if python_action is not None and python_action[0] == "command":
+        return True
+    if executable in {"node", "nodejs", "ruby"} and any(flag in args for flag in {"-c", "-e"}):
+        return True
+    if _windows_tokens_execute_script(tokens):
+        return True
+    lowered = payload.casefold()
+    if re.search(r"https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[?::1\]?)", lowered):
+        return True
+    normalized_payload = lowered.replace("\\", "/")
+    return any(
+        path.replace("\\", "/").lstrip("./").casefold() in normalized_payload
+        for path in changed_paths
+        if path and not _is_internal_runtime_path(path, project_root=None, task_path=None)
+    )
+
 
 def _canonical_restart_command(command: str) -> str:
     current = _normalize_command(command)
     for _ in range(6):
+        wrapper = windows_shell_wrapper_payload(current)
+        if wrapper is not None:
+            _shell_kind, payload, _problem = wrapper
+            if payload:
+                nested = _normalize_command(payload)
+                if nested and nested != current:
+                    current = nested
+                    continue
+            break
         try:
             parts = shlex.split(current)
         except ValueError:
@@ -5064,6 +5592,9 @@ def _classify_validation_command(command: str, *, changed_paths: list[str]) -> s
 
 
 def _is_static_validation_command(command: str) -> bool:
+    windows_surface, windows_tokens, _payload = _windows_classification_tokens(command)
+    if windows_surface:
+        return bool(windows_tokens and _windows_tokens_are_static_validation(windows_tokens))
     inner = _shell_command_payload(command)
     if inner is not None and inner != command:
         return _is_static_validation_command(inner)
@@ -5089,6 +5620,9 @@ def _is_static_validation_command(command: str) -> bool:
 
 
 def _is_git_inspection_command(command: str) -> bool:
+    windows_surface, windows_tokens, _payload = _windows_classification_tokens(command)
+    if windows_surface:
+        return bool(windows_tokens and _windows_tokens_are_git_inspection(windows_tokens))
     inner = _shell_command_payload(command)
     if inner is not None and inner != command:
         return _is_git_inspection_command(inner)
@@ -5098,6 +5632,15 @@ def _is_git_inspection_command(command: str) -> bool:
 
 
 def _is_git_diff_check_command(command: str) -> bool:
+    windows_surface, windows_tokens, _payload = _windows_classification_tokens(command)
+    if windows_surface:
+        return bool(
+            windows_tokens
+            and _windows_tokens_are_git_inspection(windows_tokens)
+            and len(windows_tokens) > 1
+            and windows_tokens[1].casefold() == "diff"
+            and "--check" in (token.casefold() for token in windows_tokens[2:])
+        )
     inner = _shell_command_payload(command)
     if inner is not None and inner != command:
         return _is_git_diff_check_command(inner)
@@ -5107,6 +5650,9 @@ def _is_git_diff_check_command(command: str) -> bool:
 
 
 def _is_read_only_inspection_command(command: str) -> bool:
+    windows_surface, windows_tokens, _payload = _windows_classification_tokens(command)
+    if windows_surface:
+        return bool(windows_tokens and _windows_tokens_are_read_only_inspection(windows_tokens))
     inner = _shell_command_payload(command)
     if inner is not None and inner != command:
         return _is_read_only_inspection_command(inner)
@@ -5124,6 +5670,9 @@ def _is_read_only_inspection_command(command: str) -> bool:
 
 
 def _inspection_command_segments(command: str) -> list[list[str]] | None:
+    windows_surface, windows_tokens, _payload = _windows_classification_tokens(command)
+    if windows_surface:
+        return [windows_tokens] if windows_tokens else None
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars="|;&<>")
         lexer.whitespace_split = True
@@ -5219,6 +5768,9 @@ def _is_read_only_inspection_tokens(tokens: list[str]) -> bool:
 
 
 def _is_behavioral_validation_command(command: str) -> bool:
+    windows_surface, windows_tokens, _payload = _windows_classification_tokens(command)
+    if windows_surface:
+        return bool(windows_tokens and _windows_tokens_are_behavioral_validation(windows_tokens))
     inner = _shell_command_payload(command)
     if inner is not None and inner != command:
         return _is_behavioral_validation_command(inner)
@@ -5256,6 +5808,9 @@ def _is_test_wrapper_script_command(command: str) -> bool:
 
 
 def _is_direct_script_execution_command(command: str) -> bool:
+    windows_surface, windows_tokens, _payload = _windows_classification_tokens(command)
+    if windows_surface:
+        return bool(windows_tokens and _windows_tokens_execute_script(windows_tokens))
     lowered = command.lower()
     boundary = r"(?=$|[\s;&|()'\"])"
     python_flags = r"(?:\s+-(?!m(?:\s|$))[a-z][\w-]*(?:=[^\s;&|()'\"]+)?)"
@@ -5272,6 +5827,17 @@ def _is_direct_script_execution_command(command: str) -> bool:
 
 
 def _is_behavior_demo_command(command: str, *, changed_paths: list[str]) -> bool:
+    windows_surface, windows_tokens, payload = _windows_classification_tokens(command)
+    if windows_surface:
+        return bool(
+            windows_tokens
+            and payload
+            and _windows_tokens_are_behavior_demo(
+                windows_tokens,
+                payload=payload,
+                changed_paths=changed_paths,
+            )
+        )
     lowered = command.lower()
     python_flags = r"(?:\s+-(?!m(?:\s|$))[a-z][\w-]*(?:=[^\s;&|()'\"]+)?)"
     node_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*node(?:js)?"
@@ -5325,6 +5891,26 @@ def _marked_behavior_demo_command_is_plausible(command: str, changed_paths: list
 
 
 def _is_observationless_output_command(command: str) -> bool:
+    windows_surface, windows_tokens, _payload = _windows_classification_tokens(command)
+    if windows_surface:
+        if not windows_tokens:
+            return False
+        return windows_tokens[0] in {
+            "cat",
+            "echo",
+            "false",
+            "get-content",
+            "head",
+            "ls",
+            "printf",
+            "pwd",
+            "rg",
+            "tail",
+            "true",
+            "type",
+            "wc",
+            "yes",
+        }
     segments = [segment.strip() for segment in re.split(r"\s*(?:&&|;|\|)\s*", command) if segment.strip()]
     if not segments:
         return False
@@ -5527,6 +6113,11 @@ def _command_was_filtered(command: str) -> bool:
 
 
 def _raw_validation_selector(command: str) -> str | None:
+    windows_surface, windows_tokens, payload = _windows_classification_tokens(command)
+    if windows_surface:
+        if not windows_tokens or not payload:
+            return None
+        command = payload.replace("\\", "/")
     selectors: list[str] = []
     patterns = (
         r"(?:^|\s)(-k)\s+([^\s;&|]+)",
@@ -8310,8 +8901,16 @@ def _assertion_snippets(text: str, *, limit: int = 30) -> list[str]:
 
 
 def _target_files_or_test_files(command: str) -> list[str]:
+    windows_surface, windows_tokens, payload = _windows_classification_tokens(command)
+    if windows_surface:
+        if not windows_tokens or not payload:
+            return []
+        command = payload.replace("\\", "/")
     targets: list[str] = []
-    for match in re.finditer(r"(?<![\w./-])(?:\.?/)?[\w./-]+\.(?:py|js|jsx|ts|tsx|mjs|cjs|rb|go|rs|java|cs|php)(?![\w.-])", command):
+    for match in re.finditer(
+        r"(?<![\w./-])(?:\.?/)?[\w./-]+\.(?:py|ps1|js|jsx|ts|tsx|mjs|cjs|rb|go|rs|java|cs|php)(?![\w.-])",
+        command,
+    ):
         target = match.group(0).strip("'\"")
         if target:
             targets.append(target.lstrip("./"))
@@ -8319,14 +8918,22 @@ def _target_files_or_test_files(command: str) -> list[str]:
 
 
 def _inspected_paths_from_command(command: str, *, limit: int = 50) -> list[str]:
+    windows_surface, windows_tokens, payload = _windows_classification_tokens(command)
+    if windows_surface:
+        if not windows_tokens or not payload:
+            return []
+        tokens = windows_tokens
+    else:
+        tokens = []
     inner = _shell_command_payload(command)
-    if inner is not None and inner != command:
+    if not windows_surface and inner is not None and inner != command:
         return _inspected_paths_from_command(inner, limit=limit)
     targets: list[str] = []
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        tokens = command.split()
+    if not windows_surface:
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            tokens = command.split()
     option_value_flags = {"-f", "--file", "--config", "-C"}
     skip_next = False
     commands = {
@@ -8345,6 +8952,11 @@ def _inspected_paths_from_command(command: str, *, limit: int = 50) -> list[str]
         "stat",
         "file",
         "find",
+        "get-childitem",
+        "get-content",
+        "get-location",
+        "select-string",
+        "type",
         "git",
         "diff",
         "status",
@@ -8363,8 +8975,9 @@ def _inspected_paths_from_command(command: str, *, limit: int = 50) -> list[str]
         if token in option_value_flags:
             skip_next = True
             continue
-        stripped = token.strip("'\"").lstrip("./")
-        if not stripped or stripped.startswith("-") or stripped in commands:
+        path_token = token.replace("\\", "/") if windows_surface else token
+        stripped = path_token.strip("'\"").lstrip("./")
+        if not stripped or stripped.startswith(("-", "/")) or stripped.casefold() in commands:
             continue
         if stripped == ".":
             targets.append(".")
@@ -8464,6 +9077,25 @@ def _run_probe(args: list[str], timeout: float = 5.0) -> tuple[bool, str]:
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
     return completed.returncode == 0, (completed.stdout + completed.stderr).strip()
+
+
+def _controller_executable(
+    name: str,
+    cwd: Path,
+    *,
+    environ: dict[str, str] | None = None,
+) -> str | None:
+    if not is_windows_platform():
+        return shutil.which(name, path=(environ or os.environ).get("PATH")) or name
+    try:
+        return require_trusted_executable(
+            name,
+            cwd=cwd,
+            environ=environ,
+            windows=True,
+        )
+    except ExecutableResolutionError:
+        return None
 
 
 def _resolve_controller_models(
@@ -8818,14 +9450,16 @@ def _create_adversary_snapshot(project_root: Path) -> Path:
     temp_root = Path(tempfile.mkdtemp(prefix="bello-adversary-")).resolve()
     snapshot_root = temp_root / "workspace"
     try:
-        shutil.copytree(
+        copy_isolated_workspace_tree(
             project_root,
             snapshot_root,
-            symlinks=True,
             ignore=_adversary_snapshot_ignore,
         )
     except Exception:
-        shutil.rmtree(temp_root, ignore_errors=True)
+        try:
+            remove_isolated_workspace_tree(temp_root)
+        except OSError:
+            pass
         raise
     _init_snapshot_git(snapshot_root)
     return snapshot_root
@@ -8837,7 +9471,7 @@ def _init_snapshot_git(snapshot_root: Path) -> None:
     Best-effort: an empty initial commit makes HEAD/status/diff usable while keeping every
     file untracked, so recursive deletes inside the snapshot stay policy-approvable.
     """
-    git = shutil.which("git")
+    git = _controller_executable("git", snapshot_root, environ=snapshot_git_environment())
     if git is None:
         return
     identity = [
@@ -8903,6 +9537,9 @@ def _adversary_snapshot_ignore(directory: str, names: list[str]) -> set[str]:
         ".mypy_cache",
         ".ruff_cache",
     }
+    if is_windows_platform():
+        ignored_keys = {name.casefold() for name in ignored}
+        return {name for name in names if name.casefold() in ignored_keys}
     return {name for name in names if name in ignored}
 
 
@@ -8928,11 +9565,13 @@ def _workspace_state_id(project_root: Path) -> str:
                 continue
             path = Path(current) / name
             try:
-                mode = path.lstat().st_mode
+                metadata = path.lstat()
             except OSError:
                 _update_workspace_entry_digest(digest, path, (rel_dir / name).as_posix())
                 continue
-            if stat.S_ISDIR(mode):
+            if is_link_or_reparse(path, stat_result=metadata):
+                _update_workspace_entry_digest(digest, path, (rel_dir / name).as_posix())
+            elif stat.S_ISDIR(metadata.st_mode):
                 traversable_dirs.append(name)
             else:
                 _update_workspace_entry_digest(digest, path, (rel_dir / name).as_posix())
@@ -8949,10 +9588,15 @@ def _update_workspace_entry_digest(digest: Any, path: Path, relative_path: str) 
     digest.update(encoded_path)
     digest.update(b"\0")
     try:
-        mode = path.lstat().st_mode
-        if stat.S_ISLNK(mode):
+        metadata = path.lstat()
+        mode = metadata.st_mode
+        if is_link_or_reparse(path, stat_result=metadata):
             digest.update(b"symlink\0")
-            digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+            try:
+                target = os.readlink(path)
+            except OSError:
+                target = "<opaque-reparse-point>"
+            digest.update(target.encode("utf-8", errors="surrogateescape"))
         elif stat.S_ISREG(mode):
             flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
             descriptor = os.open(path, flags)

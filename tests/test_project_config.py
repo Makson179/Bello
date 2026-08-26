@@ -599,7 +599,7 @@ def test_config_editor_switching_to_gpt_55_hides_variant_and_clamps_reasoning() 
 
 def test_available_model_choices_falls_back_to_codex_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr("supervisor.config_editor._available_models_from_app_server", lambda project_root: ())
-    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     cache = tmp_path / ".codex" / "models_cache.json"
     cache.parent.mkdir()
     cache.write_text(

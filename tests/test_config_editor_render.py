@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import supervisor.config_editor as config_editor_module
 from supervisor.config_editor import (
     ULTRA_WAVE_BACKGROUNDS,
     EditorState,
@@ -20,6 +21,7 @@ from supervisor.project_config import MODEL_GPT_5_5, MODEL_GPT_5_6_LUNA, MODEL_G
 @pytest.fixture(autouse=True)
 def _default_unicode_symbols(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("BELLO_CONFIG_ASCII", raising=False)
+    monkeypatch.setattr(config_editor_module, "_terminal_supports_unicode", lambda: True)
 
 
 def _render(
@@ -577,13 +579,24 @@ def test_config_editor_uses_unicode_borders_by_default() -> None:
     assert "◇ BELLO PROJECT CONFIG" in output
 
 
-def test_config_editor_ascii_borders_are_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_config_editor_ascii_borders_can_be_forced(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BELLO_CONFIG_ASCII", "1")
 
     output = _render(width=120, height=12)
 
     assert "+---" in output
     assert "|" in output
+    assert "│" not in output
+
+
+def test_config_editor_uses_ascii_when_terminal_encoding_cannot_render_unicode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config_editor_module, "_terminal_supports_unicode", lambda: False)
+
+    output = _render(width=120, height=12)
+
+    assert "+---" in output
     assert "│" not in output
 
 

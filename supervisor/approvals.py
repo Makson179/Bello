@@ -8,9 +8,13 @@ from typing import Any, Protocol
 from supervisor.appserver import AppServerMessage
 from supervisor.policy import (
     PolicyEngine,
+    ShellKind,
     analyze_command,
     is_secret_path,
+    is_supervisor_runtime_path,
     normalize_path,
+    normalize_path_from_cwd,
+    path_root_hit,
 )
 from supervisor.schemas import (
     ApprovalContext,
@@ -137,6 +141,7 @@ class ApprovalManager:
         immutable_paths: list[str | Path] | tuple[str | Path, ...] | None = None,
         timeout_seconds: float = 360.0,
         adversary_mode: bool = False,
+        shell_kind: ShellKind | None = None,
     ):
         self.workspace = workspace.resolve()
         self.immutable_paths = tuple(Path(path).expanduser() for path in immutable_paths or ())
@@ -144,6 +149,7 @@ class ApprovalManager:
             self.workspace,
             declared_grading_roots=declared_grading_roots,
             immutable_paths=self.immutable_paths,
+            shell_kind=shell_kind,
         )
         self.supervisor = supervisor
         self.timeout_seconds = timeout_seconds
@@ -193,7 +199,12 @@ class ApprovalManager:
         supervisor, which judges the command against the task and project state; without a
         wired supervisor that route fails closed to deny.
         """
-        analysis = analyze_command(self.workspace, context.command or "", context.cwd)
+        analysis = analyze_command(
+            self.workspace,
+            context.command or "",
+            context.cwd,
+            shell_kind=self.policy.shell_kind,
+        )
         unsafe = analysis.risk_tags - ADVERSARY_SNAPSHOT_SAFE_TAGS
         if not unsafe:
             return self._allow(
@@ -237,8 +248,17 @@ class ApprovalManager:
             approval = decision.approval_decision.value
             if approval not in {"accept", "acceptForSession"}:
                 return self._deny(context, "supervisor approve used a denial decision")
-            network_scoped = _network_scoped_approval(context, self.workspace)
-            if decision.execpolicy_amendment and not network_scoped:
+            network_scoped = _network_scoped_approval(
+                context,
+                self.workspace,
+                shell_kind=self.policy.shell_kind,
+            )
+            persistence_forbidden = _accept_for_session_forbidden(
+                context,
+                self.workspace,
+                shell_kind=self.policy.shell_kind,
+            )
+            if decision.execpolicy_amendment and not network_scoped and not persistence_forbidden:
                 protocol_decision = {
                     "acceptWithExecpolicyAmendment": {"execpolicy_amendment": decision.execpolicy_amendment}
                 }
@@ -259,13 +279,15 @@ class ApprovalManager:
                     persistent_decision=None,
                     from_supervisor=True,
                 )
-            if approval == "acceptForSession" and _accept_for_session_forbidden(context, self.workspace):
+            if approval == "acceptForSession" and persistence_forbidden:
                 return self._deny(context, "acceptForSession is forbidden for this approval class")
             if self._is_allowed(context, approval):
                 return ApprovalResolution(
                     decision=approval,
                     reason=decision.reason,
-                    persistent_decision=decision.persistent_decision,
+                    persistent_decision=(
+                        None if persistence_forbidden else decision.persistent_decision
+                    ),
                     from_supervisor=True,
                 )
         if decision.decision == SupervisorDecisionKind.DENY and decision.approval_decision:
@@ -285,14 +307,34 @@ class ApprovalManager:
             raw_paths.append(context.grant_root)
         if not raw_paths:
             return PolicyDecision.allow("app-server file-change approval without exposed paths treated as workspace edit")
+        cwd_path = self.workspace
+        if context.cwd:
+            cwd_path = normalize_path(
+                self.workspace,
+                context.cwd,
+                windows_paths=self.policy.windows_paths,
+            )
+            if cwd_path is None:
+                return PolicyDecision.route_llm("file-change working directory escapes workspace or is ambiguous")
         for raw in raw_paths:
-            immutable_hit = _immutable_path_hit(raw, cwd=context.cwd, workspace=self.workspace, roots=self.immutable_paths)
+            immutable_hit = _immutable_path_hit(
+                raw,
+                cwd=context.cwd,
+                workspace=self.workspace,
+                roots=self.immutable_paths,
+                windows_paths=self.policy.windows_paths,
+            )
             if immutable_hit is not None:
                 return PolicyDecision.deny(f"immutable path write denied: {immutable_hit}")
-            path = normalize_path(self.workspace, raw)
+            path = normalize_path_from_cwd(
+                self.workspace,
+                cwd_path,
+                raw,
+                windows_paths=self.policy.windows_paths,
+            )
             if path is None:
                 return PolicyDecision.route_llm(f"path escapes workspace or is ambiguous: {raw}")
-            if ".supervisor" in path.parts:
+            if is_supervisor_runtime_path(self.workspace, path):
                 return PolicyDecision.deny("writes to supervisor runtime/state files are denied")
             if is_secret_path(path):
                 return PolicyDecision.deny("writes to secret-pattern paths are denied")
@@ -302,7 +344,11 @@ class ApprovalManager:
         decision = "accept"
         if not self._is_allowed(context, decision):
             choices = ["accept"]
-            if not _accept_for_session_forbidden(context, self.workspace):
+            if not _accept_for_session_forbidden(
+                context,
+                self.workspace,
+                shell_kind=self.policy.shell_kind,
+            ):
                 choices.append("acceptForSession")
             decision = self._first_allowed(context, choices) or self._deny_decision(context)
         return ApprovalResolution(decision=decision, reason=reason)
@@ -389,48 +435,60 @@ def _immutable_path_hit(
     cwd: str | None,
     workspace: Path,
     roots: tuple[Path, ...],
+    windows_paths: bool = False,
 ) -> str | None:
     if not roots:
         return None
-    path = Path(raw).expanduser()
-    if not path.is_absolute():
-        base = Path(cwd).expanduser() if cwd else workspace
-        path = base / path
-    try:
-        resolved = path.resolve(strict=False)
-    except OSError:
-        return None
-    for root in roots:
-        try:
-            immutable = root.resolve(strict=False)
-        except OSError:
-            continue
-        if resolved == immutable:
-            return str(immutable)
-        try:
-            resolved.relative_to(immutable)
-            return str(immutable)
-        except ValueError:
-            continue
-    return None
+    base = workspace
+    if cwd:
+        resolved_cwd = normalize_path(workspace, cwd, windows_paths=windows_paths)
+        if resolved_cwd is None:
+            return None
+        base = resolved_cwd
+    return path_root_hit(
+        raw,
+        cwd=base,
+        roots=roots,
+        windows_paths=windows_paths,
+    )
 
 
-def _accept_for_session_forbidden(context: ApprovalContext, workspace: Path) -> bool:
-    if _network_scoped_approval(context, workspace):
+def _accept_for_session_forbidden(
+    context: ApprovalContext,
+    workspace: Path,
+    *,
+    shell_kind: ShellKind | None = None,
+) -> bool:
+    if _network_scoped_approval(context, workspace, shell_kind=shell_kind):
         return True
     if context.request_type == ApprovalRequestType.FILE_CHANGE:
-        return _file_change_session_forbidden(context, workspace)
+        return _file_change_session_forbidden(context, workspace, shell_kind=shell_kind)
     if context.command:
-        return _command_session_forbidden(context.command)
+        return _command_session_forbidden(
+            context.command,
+            workspace=workspace,
+            cwd=context.cwd,
+            shell_kind=shell_kind,
+        )
     return False
 
 
-def _network_scoped_approval(context: ApprovalContext, workspace: Path) -> bool:
+def _network_scoped_approval(
+    context: ApprovalContext,
+    workspace: Path,
+    *,
+    shell_kind: ShellKind | None = None,
+) -> bool:
     if context.network_approval_context is not None or context.proposed_network_policy_amendments:
         return True
     if not context.command:
         return False
-    if "network" in analyze_command(workspace, context.command, context.cwd).risk_tags:
+    if "network" in analyze_command(
+        workspace,
+        context.command,
+        context.cwd,
+        shell_kind=shell_kind,
+    ).risk_tags:
         return True
     command = context.command
     return bool(
@@ -439,22 +497,51 @@ def _network_scoped_approval(context: ApprovalContext, workspace: Path) -> bool:
     )
 
 
-def _file_change_session_forbidden(context: ApprovalContext, workspace: Path) -> bool:
+def _file_change_session_forbidden(
+    context: ApprovalContext,
+    workspace: Path,
+    *,
+    shell_kind: ShellKind | None = None,
+) -> bool:
+    windows_paths = shell_kind in {"powershell", "cmd"}
     paths = list(context.paths)
     if context.grant_root and context.grant_root not in paths:
         paths.append(context.grant_root)
     if not paths:
         return True
+    cwd_path = workspace
+    if context.cwd:
+        cwd_path = normalize_path(workspace, context.cwd, windows_paths=windows_paths)
+        if cwd_path is None:
+            return True
     for raw in paths:
-        path = normalize_path(workspace, raw)
+        path = normalize_path_from_cwd(
+            workspace,
+            cwd_path,
+            raw,
+            windows_paths=windows_paths,
+        )
         if path is None:
             return True
-        if ".supervisor" in path.parts or is_secret_path(path):
+        if is_supervisor_runtime_path(workspace, path) or is_secret_path(path):
             return True
     return False
 
 
-def _command_session_forbidden(command: str) -> bool:
+def _command_session_forbidden(
+    command: str,
+    *,
+    workspace: Path | None = None,
+    cwd: str | None = None,
+    shell_kind: ShellKind | None = None,
+) -> bool:
+    if shell_kind in {"powershell", "cmd"} and workspace is not None:
+        # Native commands reach the supervisor precisely when the deliberately
+        # small parser cannot prove them harmless.  A reviewer may approve the
+        # concrete invocation, but Bello must not turn an ambiguous/unknown
+        # parse into a reusable app-server session grant.
+        if analyze_command(workspace, command, cwd, shell_kind=shell_kind).risk_tags:
+            return True
     lowered = command.lower()
     destructive = ("rm -rf", "rm -fr", "rmdir", "unlink", "del /", "remove-item")
     deploy_publish = ("deploy", "publish", "release", "npm publish", "twine upload", "docker push")

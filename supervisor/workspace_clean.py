@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
-import shutil
+import stat
 from collections.abc import Iterable
 from pathlib import Path
+
+from supervisor.filesystem_safety import is_reparse_point, remove_path_tree
 
 
 class WorkspaceCleanError(RuntimeError):
@@ -16,6 +18,12 @@ def clean_workspace_except_task(
     *,
     protected_paths: Iterable[str | Path] = (),
 ) -> list[Path]:
+    lexical_root = Path(os.path.abspath(project_root.expanduser()))
+    lexical_task = Path(os.path.abspath(task_path.expanduser()))
+    if _path_has_reparse_component(lexical_task, lexical_root):
+        raise WorkspaceCleanError(
+            f"task path traverses a Windows reparse point: {task_path}"
+        )
     root = project_root.resolve()
     task = task_path.resolve()
     if not task.is_file():
@@ -33,12 +41,27 @@ def clean_workspace_except_task(
 
 def _clean_dir(directory: Path, preserved: tuple[Path, ...], removed: list[Path]) -> None:
     for child in directory.iterdir():
+        try:
+            metadata = child.lstat()
+        except FileNotFoundError:
+            continue
+        if is_reparse_point(child, stat_result=metadata):
+            _remove_entry(child, stat_result=metadata)
+            removed.append(child)
+            continue
         if any(_same_path(child, path) for path in preserved):
             continue
-        if child.is_dir() and not child.is_symlink() and any(_contains_path(child, path) for path in preserved):
+        filesystem_link = stat.S_ISLNK(metadata.st_mode) or is_reparse_point(
+            child, stat_result=metadata
+        )
+        if (
+            stat.S_ISDIR(metadata.st_mode)
+            and not filesystem_link
+            and any(_contains_path(child, path) for path in preserved)
+        ):
             _clean_dir(child, preserved, removed)
             continue
-        _remove_entry(child)
+        _remove_entry(child, stat_result=metadata)
         removed.append(child)
 
 
@@ -53,6 +76,10 @@ def _existing_paths_in_root(root: Path, paths: Iterable[str | Path]) -> tuple[Pa
             candidate.relative_to(root)
         except ValueError:
             continue
+        if _path_has_reparse_component(candidate, root):
+            raise WorkspaceCleanError(
+                f"protected path traverses a Windows reparse point: {candidate}"
+            )
         if candidate.exists() or candidate.is_symlink():
             result.append(candidate)
     return tuple(dict.fromkeys(result))
@@ -73,8 +100,22 @@ def _same_path(left: Path, right: Path) -> bool:
         return False
 
 
-def _remove_entry(path: Path) -> None:
-    if path.is_dir() and not path.is_symlink():
-        shutil.rmtree(path)
-    else:
-        path.unlink()
+def _path_has_reparse_component(path: Path, root: Path) -> bool:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return True
+    current = root
+    for part in relative.parts:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            return False
+        if is_reparse_point(current, stat_result=metadata):
+            return True
+    return False
+
+
+def _remove_entry(path: Path, *, stat_result: os.stat_result | None = None) -> None:
+    remove_path_tree(path, stat_result=stat_result)

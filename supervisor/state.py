@@ -1,17 +1,28 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal, TypeVar
 
-import fcntl
 from pydantic import BaseModel
 
+if os.name == "nt":
+    import msvcrt as _msvcrt
+
+    _fcntl = None
+else:
+    import fcntl as _fcntl
+
+    _msvcrt = None
+
 from supervisor.schemas import AppEvent, FinalReport, HealthState, BelloConfig
+from supervisor.filesystem_safety import remove_path_tree
 from supervisor.review_limits import normalize_review_limit_payload
 
 T = TypeVar("T")
@@ -36,6 +47,18 @@ RECOVERY = "recovery"
 
 INITIALIZATION_MODES = Literal["fresh", "resume"]
 
+_IS_WINDOWS = os.name == "nt"
+_WINDOWS_LOCK_POLL_SECONDS = 0.05
+_WINDOWS_LOCK_BUSY_ERRNOS = {
+    errno.EACCES,
+    errno.EAGAIN,
+    getattr(errno, "EDEADLK", errno.EACCES),
+}
+_WINDOWS_LOCK_BUSY_WINERRORS = {32, 33}
+_WINDOWS_REPLACE_RETRY_SECONDS = 2.0
+_WINDOWS_REPLACE_POLL_SECONDS = 0.05
+_WINDOWS_REPLACE_BUSY_WINERRORS = {5, 32, 33}
+
 
 def require_inside_workspace(workspace: Path, path: Path) -> Path:
     workspace = workspace.resolve()
@@ -53,16 +76,106 @@ class FileLock:
         self.fd: int | None = None
 
     def __enter__(self) -> "FileLock":
+        if self.fd is not None:
+            raise RuntimeError(f"file lock is already held: {self.path}")
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
-        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        fd = os.open(self.path, os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0), 0o600)
+        try:
+            _acquire_file_lock(fd)
+        except BaseException:
+            os.close(fd)
+            raise
+        self.fd = fd
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         if self.fd is not None:
-            fcntl.flock(self.fd, fcntl.LOCK_UN)
-            os.close(self.fd)
-            self.fd = None
+            fd = self.fd
+            try:
+                _release_file_lock(fd)
+            finally:
+                os.close(fd)
+                self.fd = None
+
+
+def _acquire_file_lock(fd: int) -> None:
+    if not _IS_WINDOWS:
+        if _fcntl is None:  # pragma: no cover - protects an invalid platform import state
+            raise RuntimeError("POSIX file locking is unavailable")
+        _fcntl.flock(fd, _fcntl.LOCK_EX)
+        return
+
+    if _msvcrt is None:  # pragma: no cover - msvcrt is part of supported Windows Python
+        raise RuntimeError("Windows file locking is unavailable")
+
+    # msvcrt locks a byte range starting at the current file position.  A
+    # persistent sentinel byte makes the range valid without truncating an
+    # existing lock file.  Another creator can populate and lock the empty
+    # file between fstat() and write(); Windows then reports the write as a
+    # sharing violation.  Treat that narrow race exactly like lock
+    # contention and re-check the file after the holder makes progress.
+    while os.fstat(fd).st_size == 0:
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            written = os.write(fd, b"\0")
+        except OSError as exc:
+            if not _is_windows_lock_contention(exc):
+                raise
+            time.sleep(_WINDOWS_LOCK_POLL_SECONDS)
+            continue
+        if written != 1:  # pragma: no cover - regular files must accept one byte or fail
+            raise OSError(errno.EIO, "failed to initialize Windows lock file")
+
+    while True:
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
+            return
+        except OSError as exc:
+            if not _is_windows_lock_contention(exc):
+                raise
+            # LK_LOCK gives up after a fixed number of retries.  Polling the
+            # non-blocking operation preserves flock's indefinite wait
+            # semantics for long-running Bello processes.
+            time.sleep(_WINDOWS_LOCK_POLL_SECONDS)
+
+
+def _release_file_lock(fd: int) -> None:
+    if not _IS_WINDOWS:
+        if _fcntl is None:  # pragma: no cover - protects an invalid platform import state
+            raise RuntimeError("POSIX file locking is unavailable")
+        _fcntl.flock(fd, _fcntl.LOCK_UN)
+        return
+
+    if _msvcrt is None:  # pragma: no cover - msvcrt is part of supported Windows Python
+        raise RuntimeError("Windows file locking is unavailable")
+    os.lseek(fd, 0, os.SEEK_SET)
+    _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
+
+
+def _is_windows_lock_contention(exc: OSError) -> bool:
+    return exc.errno in _WINDOWS_LOCK_BUSY_ERRNOS or getattr(exc, "winerror", None) in _WINDOWS_LOCK_BUSY_WINERRORS
+
+
+def _atomic_replace(source: str, destination: Path) -> None:
+    """Replace a state file, tolerating only transient Windows sharing locks."""
+
+    deadline = time.monotonic() + _WINDOWS_REPLACE_RETRY_SECONDS
+    while True:
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as exc:
+            retryable = (
+                _IS_WINDOWS
+                and (
+                    exc.errno in {errno.EACCES, errno.EAGAIN}
+                    or getattr(exc, "winerror", None) in _WINDOWS_REPLACE_BUSY_WINERRORS
+                )
+            )
+            if not retryable or time.monotonic() >= deadline:
+                raise
+            time.sleep(_WINDOWS_REPLACE_POLL_SECONDS)
 
 
 class StateStore:
@@ -91,7 +204,7 @@ class StateStore:
                 handle.write(text)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(tmp_name, path)
+            _atomic_replace(tmp_name, path)
         finally:
             if os.path.exists(tmp_name):
                 os.unlink(tmp_name)
@@ -202,10 +315,11 @@ class StateStore:
         for child in self.state_dir.iterdir():
             if child.name in preserve:
                 continue
-            if child.is_dir() and not child.is_symlink():
-                shutil.rmtree(child)
-            else:
-                child.unlink(missing_ok=True)
+            try:
+                metadata = child.lstat()
+            except FileNotFoundError:
+                continue
+            remove_path_tree(child, stat_result=metadata)
 
     def ensure_previous_runs_dir(self) -> Path:
         path = self.path(PREVIOUS_RUNS)
