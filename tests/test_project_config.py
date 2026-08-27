@@ -17,8 +17,10 @@ from supervisor.project_config import (
     MODEL_GPT_5_6_LUNA,
     MODEL_GPT_5_6_SOL,
     MODEL_GPT_5_6_TERRA,
+    MultiAgentConfig,
     ProjectConfig,
     ProjectConfigError,
+    SubagentDefaultConfig,
     changed_project_config_fields,
     ensure_runtime_state_initialized,
     intelligence_choices_for_model,
@@ -57,6 +59,14 @@ def test_first_load_creates_default_project_config(tmp_path: Path) -> None:
     assert config.clean is False
     assert config.task is None
     assert config.protected_path == ()
+    assert config.multi_agent == MultiAgentConfig()
+    assert config.multi_agent.enabled is False
+    assert config.multi_agent.max_concurrent == 4
+    assert config.multi_agent.default == SubagentDefaultConfig(model=MODEL_GPT_5_6_LUNA, intelligence="high")
+    assert config.multi_agent.allowed == {
+        MODEL_GPT_5_6_LUNA: ("medium", "high", "xhigh"),
+        MODEL_GPT_5_6_TERRA: ("medium", "high"),
+    }
     assert project_config_path(tmp_path).exists()
     assert project_config_path(tmp_path) == tmp_path.resolve() / ".supervisor" / "config.json"
     assert not (tmp_path / ".bello").exists()
@@ -100,6 +110,74 @@ def test_project_config_invalid_json_reports_path(tmp_path: Path) -> None:
         load_project_config(tmp_path)
 
 
+def test_project_config_loads_multi_agent_structure(tmp_path: Path) -> None:
+    path = project_config_path(tmp_path)
+    path.parent.mkdir()
+    path.write_text(
+        json.dumps(
+            {
+                "multi_agent": {
+                    "enabled": True,
+                    "max_concurrent": 7,
+                    "default": {"model": MODEL_GPT_5_6_TERRA, "intelligence": "medium"},
+                    "allowed": {
+                        MODEL_GPT_5_6_LUNA: ["low", "high"],
+                        MODEL_GPT_5_6_TERRA: ["medium", "high"],
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_project_config(tmp_path, create=False)
+
+    assert config.multi_agent.enabled is True
+    assert config.multi_agent.max_concurrent == 7
+    assert config.multi_agent.default == SubagentDefaultConfig(MODEL_GPT_5_6_TERRA, "medium")
+    assert config.multi_agent.allowed == {
+        MODEL_GPT_5_6_LUNA: ("low", "high"),
+        MODEL_GPT_5_6_TERRA: ("medium", "high"),
+    }
+    assert config.to_json_data()["multi_agent"] == {
+        "enabled": True,
+        "max_concurrent": 7,
+        "default": {"model": MODEL_GPT_5_6_TERRA, "intelligence": "medium"},
+        "allowed": {
+            MODEL_GPT_5_6_LUNA: ["low", "high"],
+            MODEL_GPT_5_6_TERRA: ["medium", "high"],
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("multi_agent", "error"),
+    [
+        ({"max_concurrent": 0}, "multi_agent.max_concurrent"),
+        ({"allowed": {}}, "multi_agent.allowed must not be empty"),
+        (
+            {
+                "default": {"model": MODEL_GPT_5_6_LUNA, "intelligence": "high"},
+                "allowed": {MODEL_GPT_5_6_TERRA: ["high"]},
+            },
+            "multi_agent.default must be included",
+        ),
+        ({"allowed": {MODEL_GPT_5_6_LUNA: ["ultra"]}}, f"multi_agent.allowed.{MODEL_GPT_5_6_LUNA}"),
+    ],
+)
+def test_project_config_rejects_invalid_multi_agent_settings(
+    tmp_path: Path,
+    multi_agent: object,
+    error: str,
+) -> None:
+    path = project_config_path(tmp_path)
+    path.parent.mkdir()
+    path.write_text(json.dumps({"multi_agent": multi_agent}), encoding="utf-8")
+
+    with pytest.raises(ProjectConfigError, match=error):
+        load_project_config(tmp_path, create=False)
+
+
 def test_project_config_save_shape(tmp_path: Path) -> None:
     save_project_config(
         tmp_path,
@@ -121,6 +199,7 @@ def test_project_config_save_shape(tmp_path: Path) -> None:
     assert payload["runtime_mod"] == DEFAULT_MODEL
     assert payload["completion_mod"] == DEFAULT_MODEL
     assert payload["adversary_mod"] == DEFAULT_MODEL
+    assert payload["multi_agent"] == MultiAgentConfig().to_json_data()
 
 
 def test_project_config_loads_runtime_config_shape(tmp_path: Path) -> None:
@@ -311,6 +390,13 @@ def test_changed_project_config_fields_tracks_cheap_runtime() -> None:
     assert changed_project_config_fields(before, after) == ("cheap_runtime",)
 
 
+def test_changed_project_config_fields_tracks_multi_agent_as_one_structured_setting() -> None:
+    before = ProjectConfig()
+    after = ProjectConfig(multi_agent=MultiAgentConfig(enabled=True))
+
+    assert changed_project_config_fields(before, after) == ("multi_agent",)
+
+
 def test_config_editor_state_expands_selects_and_advances() -> None:
     config = ProjectConfig()
     params = parameter_defs(config)
@@ -366,6 +452,68 @@ def test_config_editor_choice_can_update_boolean() -> None:
     assert action is None
     assert config.clean is True
     assert state.parameter_index == clean_index + 1
+
+
+def test_config_editor_multi_agent_toggle_reveals_structured_settings() -> None:
+    config = ProjectConfig()
+    parameters = parameter_defs(config)
+    toggle_index = [parameter.key for parameter in parameters].index("multi_agent_enabled")
+
+    config, state, action = select_current(
+        config,
+        EditorState(parameter_index=toggle_index, expanded_index=toggle_index, option_index=0),
+    )
+
+    assert action is None
+    assert config.multi_agent.enabled is True
+    updated = parameter_defs(config)
+    assert "multi_agent_max_concurrent" in {parameter.key for parameter in updated}
+    assert updated[state.parameter_index].key == "multi_agent_max_concurrent"
+
+
+def test_config_editor_multi_agent_max_concurrent_requires_positive_integer() -> None:
+    config = ProjectConfig(multi_agent=MultiAgentConfig(enabled=True))
+    parameters = parameter_defs(config)
+    max_index = [parameter.key for parameter in parameters].index("multi_agent_max_concurrent")
+
+    config, state, _ = select_current(config, EditorState(parameter_index=max_index))
+    assert state.edit_kind == "positive_int"
+    assert state.edit_value == "4"
+
+    config, state, _ = select_current(config, replace(state, edit_value="0"))
+    assert config.multi_agent.max_concurrent == 4
+    assert state.edit_error == "enter a positive integer"
+
+    config, state, _ = select_current(config, replace(state, edit_value="6"))
+    assert config.multi_agent.max_concurrent == 6
+    assert state.editing is False
+
+
+def test_config_editor_toggles_allowed_efforts_but_protects_default() -> None:
+    config = ProjectConfig(multi_agent=MultiAgentConfig(enabled=True))
+    parameters = parameter_defs(config)
+    allowed_key = f"multi_agent_allowed:{MODEL_GPT_5_6_LUNA}"
+    allowed_index = [parameter.key for parameter in parameters].index(allowed_key)
+    allowed_parameter = parameters[allowed_index]
+    low_index = [option.label for option in allowed_parameter.options].index("low")
+
+    config, state, _ = select_current(
+        config,
+        EditorState(parameter_index=allowed_index, expanded_index=allowed_index, option_index=low_index),
+    )
+
+    assert config.multi_agent.allowed[MODEL_GPT_5_6_LUNA] == ("low", "medium", "high", "xhigh")
+    assert parameter_defs(config)[state.parameter_index].key == allowed_key
+    assert state.expanded_index == state.parameter_index
+
+    parameters = parameter_defs(config)
+    allowed_index = [parameter.key for parameter in parameters].index(allowed_key)
+    high_index = [option.label for option in parameters[allowed_index].options].index("high")
+    unchanged, _, _ = select_current(
+        config,
+        EditorState(parameter_index=allowed_index, expanded_index=allowed_index, option_index=high_index),
+    )
+    assert unchanged == config
 
 
 def test_config_editor_can_disable_cheap_runtime() -> None:

@@ -628,17 +628,36 @@ class AppServerClient:
     ) -> dict[str, Any]:
         return await self.request("thread/read", {"threadId": thread_id, "includeTurns": include_turns}, timeout=timeout)
 
+    async def thread_list(
+        self,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float = APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        return await self.request("thread/list", dict(params or {}), timeout=timeout)
+
     async def thread_turns_list(
         self,
         thread_id: str,
         *,
         limit: int = 10,
         items_view: str = "full",
+        cursor: str | None = None,
+        sort_direction: str | None = None,
         timeout: float = APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "limit": limit,
+            "itemsView": items_view,
+        }
+        if cursor is not None:
+            params["cursor"] = cursor
+        if sort_direction is not None:
+            params["sortDirection"] = sort_direction
         return await self.request(
             "thread/turns/list",
-            {"threadId": thread_id, "limit": limit, "itemsView": items_view},
+            params,
             timeout=timeout,
         )
 

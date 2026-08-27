@@ -479,6 +479,7 @@ class CheapRuntimeReviewer:
             "experimentalRawEvents": False,
             "persistExtendedHistory": False,
             "model": self.model,
+            "config": {"agents": {"enabled": False}},
         }
 
     async def _cleanup_thread(self, thread_id: str) -> None:

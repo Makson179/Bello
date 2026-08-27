@@ -41,9 +41,23 @@ from supervisor.controller import (
 from supervisor.adversary_agent import AdversaryAgentError
 from supervisor.approvals import normalize_approval_request
 from supervisor.appserver import APP_SERVER_CODER_RPC_TIMEOUT_SECONDS, AppServerError, AppServerMessage, AppServerTimeoutError
-from supervisor.coder import CODEX_FAST_SERVICE_TIER, CoderSession, coder_thread_params, coder_turn_params
+from supervisor.coder import (
+    CODEX_FAST_SERVICE_TIER,
+    CoderSession,
+    build_multi_agent_developer_instructions,
+    coder_thread_params,
+    coder_turn_params,
+)
 from supervisor.main import _run_async_cleanly
-from supervisor.project_config import DEFAULT_MODEL, MODEL_GPT_5_5, MODEL_GPT_5_6_SOL
+from supervisor.project_config import (
+    DEFAULT_MODEL,
+    MODEL_GPT_5_5,
+    MODEL_GPT_5_6_LUNA,
+    MODEL_GPT_5_6_SOL,
+    MODEL_GPT_5_6_TERRA,
+    MultiAgentConfig,
+    SubagentDefaultConfig,
+)
 from supervisor.schemas import (
     AdvReportControllerDecision,
     AppEvent,
@@ -327,6 +341,78 @@ def test_coder_fast_mode_sets_codex_service_tier(tmp_path: Path) -> None:
 
 def test_coder_turn_params_include_intelligence_effort(tmp_path: Path) -> None:
     assert coder_turn_params("thread", "work", tmp_path, intelligence="xhigh")["effort"] == "xhigh"
+
+
+def test_coder_thread_disables_native_subagents_by_default(tmp_path: Path) -> None:
+    params = coder_thread_params(tmp_path)
+
+    assert params["config"] == {"agents": {"enabled": False}}
+    assert "developerInstructions" not in params
+
+
+def test_coder_thread_applies_structured_multi_agent_config_and_separate_instructions(tmp_path: Path) -> None:
+    multi_agent = MultiAgentConfig(
+        enabled=True,
+        max_concurrent=6,
+        default=SubagentDefaultConfig(MODEL_GPT_5_6_LUNA, "xhigh"),
+        allowed={
+            MODEL_GPT_5_6_LUNA: ("high", "xhigh"),
+            MODEL_GPT_5_6_TERRA: ("medium", "high"),
+        },
+    )
+
+    params = coder_thread_params(tmp_path, multi_agent=multi_agent)
+
+    assert params["config"] == {
+        "agents": {
+            "enabled": True,
+            "max_concurrent_threads_per_session": 6,
+            "default_subagent_model": MODEL_GPT_5_6_LUNA,
+            "default_subagent_reasoning_effort": "xhigh",
+        }
+    }
+    instructions = params["developerInstructions"]
+    assert instructions == build_multi_agent_developer_instructions(multi_agent)
+    assert "fastest and least expensive allowed profile" in instructions
+    assert f"- {MODEL_GPT_5_6_LUNA}: high, xhigh" in instructions
+    assert f"- {MODEL_GPT_5_6_TERRA}: medium, high" in instructions
+    assert "Wait for every subagent whose result affects task completion." in instructions
+    assert "instructions" not in multi_agent.to_json_data()
+
+
+async def test_coder_session_passes_multi_agent_config_only_at_thread_start(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    multi_agent = MultiAgentConfig(enabled=True)
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.thread_params = None
+            self.turn_params = None
+
+        async def thread_start(self, params, *, timeout):
+            self.thread_params = params
+            return {"thread": {"id": "coder-thread"}}
+
+        async def turn_start(self, params, *, timeout):
+            self.turn_params = params
+            return {"turn": {"id": "coder-turn"}}
+
+    client = FakeClient()
+    coder = CoderSession(client, store, tmp_path, task, multi_agent=multi_agent)  # type: ignore[arg-type]
+
+    await coder.start_thread()
+    await coder.start_turn("unchanged user prompt")
+
+    assert client.thread_params["config"]["agents"]["enabled"] is True
+    assert "developerInstructions" in client.thread_params
+    assert client.turn_params["input"] == [
+        {"type": "text", "text": "unchanged user prompt", "text_elements": []}
+    ]
+    assert "developerInstructions" not in client.turn_params
+    assert "config" not in client.turn_params
 
 
 def test_git_status_path_parser_handles_missing_second_status_column() -> None:
@@ -3204,11 +3290,7 @@ async def test_repeated_same_failing_validation_uses_command_identity(tmp_path: 
     assert "repeated_same_failing_validation" in trace["trigger_reasons"]
 
 
-async def test_done_without_fresh_validation_wakes_full_runtime_not_completion(tmp_path: Path) -> None:
-    controller, store, fake = _runtime_controller(tmp_path)
-    cheap = _CheapRuntimeNoopReviewer()
-    controller.runtime_triage_reviewer = cheap
-    controller.runtime_triage_config = SimpleNamespace(model=cheap.model)
+def _prepare_done_without_fresh_validation(controller: BelloController) -> None:
     controller.last_coder_message = CoderMessage(text="Summary\nBELLO_READY_FOR_REVIEW", sequence=3)
     controller.observed_changed_files = {
         "src/app.py": ChangedFile(path="src/app.py", status="modified", sequence=2)
@@ -3224,6 +3306,14 @@ async def test_done_without_fresh_validation_wakes_full_runtime_not_completion(t
         )
     ]
 
+
+async def test_done_without_fresh_validation_runtime_noop_resumes_completion(tmp_path: Path) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    cheap = _CheapRuntimeNoopReviewer()
+    controller.runtime_triage_reviewer = cheap
+    controller.runtime_triage_config = SimpleNamespace(model=cheap.model)
+    _prepare_done_without_fresh_validation(controller)
+
     await controller._handle_coder_turn_completed(item_id="done-1")
     await controller._supervisor_task
 
@@ -3232,13 +3322,63 @@ async def test_done_without_fresh_validation_wakes_full_runtime_not_completion(t
         "Runtime trigger (done_without_fresh_validation):"
     )
     assert cheap.calls == []
-    assert fake.completion_packets == []
+    assert len(fake.completion_packets) == 1
+    assert fake.completion_packets[0].last_readiness_marker_sequence == 3
+    assert fake.completion_packets[0].wake_sequence > fake.runtime_packets[0].wake_sequence
+    assert len(controller.completion_returns) == 1
     assert store.get_bello_config().last_relevant_edit_sequence == 2
+    assert "completion/readiness_validation_waived" in store.path(EVENTS).read_text(encoding="utf-8")
     trace = json.loads(store.path(RUNTIME_TRACE).read_text(encoding="utf-8").splitlines()[-1])
     assert trace["trigger_reasons"] == ["done_without_fresh_validation"]
     assert trace["should_wake_runtime_supervisor"] is True
     assert trace["deterministic_action"] is None
     assert trace["skipped_noop"] is False
+
+
+async def test_done_without_fresh_validation_runtime_intervene_does_not_resume_completion(
+    tmp_path: Path,
+) -> None:
+    controller, _, fake = _runtime_controller(tmp_path)
+    fake.runtime_decision_kind = SupervisorDecisionKind.INTERVENE
+    _prepare_done_without_fresh_validation(controller)
+
+    await controller._handle_coder_turn_completed(item_id="done-intervene")
+    await controller._supervisor_task
+
+    assert len(fake.runtime_packets) == 1
+    assert fake.completion_packets == []
+
+
+async def test_done_without_fresh_validation_runtime_noop_finalizes_when_review_disabled(
+    tmp_path: Path,
+) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    store.update_bello_config(lambda cfg: cfg.model_copy(update={"completion_review_enabled": False}))
+    _prepare_done_without_fresh_validation(controller)
+
+    await controller._handle_coder_turn_completed(item_id="done-review-disabled")
+    await controller._supervisor_task
+
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
+    assert fake.completion_packets == []
+    assert "completion/readiness_validation_waived" in store.path(EVENTS).read_text(encoding="utf-8")
+
+
+async def test_done_without_fresh_validation_stale_runtime_noop_does_not_resume_completion(
+    tmp_path: Path,
+) -> None:
+    controller, _, fake = _runtime_controller(tmp_path)
+    _prepare_done_without_fresh_validation(controller)
+    fake.before_runtime_decision = lambda: controller._append_event(
+        AppEventSource.APP_SERVER,
+        "test/newer_event",
+    )
+
+    await controller._handle_coder_turn_completed(item_id="done-stale")
+    await controller._supervisor_task
+
+    assert len(fake.runtime_packets) == 1
+    assert fake.completion_packets == []
 
 
 async def test_completion_packet_details_can_send_delta_after_return(tmp_path: Path) -> None:
@@ -4620,9 +4760,6 @@ async def test_completion_review_no_message_retries_with_ultra_compact_minimal_p
             "uncovered_edge_candidates": ["independent demo missing"],
             "actionable_gap_or_none": "run an independent demo",
         },
-        "basis_event_seq": 7,
-        "last_relevant_edit_seq": 5,
-        "last_validation_seq": 6,
         "files_reviewed": [],
         "behavior_evidence_matrix": [],
         "uncovered_behaviors": ["independent demo"],
@@ -4849,7 +4986,6 @@ async def test_completion_return_sends_message_and_continues_same_generation(tmp
     controller._sequence = 0
     controller.completion_returns = []
     controller.completion_restarts = 0
-    controller.completion_reviewer_rerun_count = 0
     controller.no_marker_idle_nudge_count = 0
 
     class _CloseTrackingSupervisor:
@@ -4893,7 +5029,7 @@ async def test_completion_return_sends_message_and_continues_same_generation(tmp
     assert completion_supervisor.closed == 1
 
 
-async def test_completion_accept_gate_allows_minimal_accept_with_fresh_validation(tmp_path: Path) -> None:
+async def test_completion_accept_finalizes_without_deterministic_gate(tmp_path: Path) -> None:
     validations = [
         ValidationRun(
             command="pytest tests/test_app.py",
@@ -4928,17 +5064,39 @@ async def test_completion_accept_gate_allows_minimal_accept_with_fresh_validatio
     assert store.get_bello_config().status == BelloStatus.COMPLETE
     assert len(controller.completion_returns) == 0
     assert coder.messages == []
-    assert store.get_bello_config().accept_gate_accepts == 1
-    log_entries = [json.loads(line) for line in store.path(LOG).read_text(encoding="utf-8").splitlines()]
-    log_entry = next(entry for entry in log_entries if entry.get("type") == "completion_accept_gate_pass")
-    check_names = {check["check_name"] for check in log_entry["checks"]}
-    assert "behavioral_floor" in check_names
-    assert "evidence_binding" not in check_names
-    assert "independent_evidence_binding" not in check_names
-    assert "file_review_coverage" not in check_names
+    assert "completion_accept_gate" not in store.path(LOG).read_text(encoding="utf-8")
 
 
-async def test_completion_accept_gate_allows_changed_test_without_independent_evidence(tmp_path: Path) -> None:
+async def test_completion_accept_still_checks_task_integrity_without_snapshot(tmp_path: Path) -> None:
+    validations = [
+        ValidationRun(
+            command="pytest tests/test_app.py",
+            exit_code=0,
+            passed=True,
+            summary="1 passed",
+            sequence=3,
+        )
+    ]
+    controller, store, task, coder = _completion_gate_controller(tmp_path, validations=validations)
+    controller._canonical_task_hash = _hash_file(task)
+    packet = _gate_packet(task, validations=validations)
+    task.write_text("# Changed task", encoding="utf-8")
+
+    await controller.apply_completion_decision(
+        _covered_accept_decision(wake_sequence=1, validation_id="validation-3"),
+        packet_thread_id="thread",
+        packet=packet,
+    )
+
+    assert store.get_bello_config().status == BelloStatus.ESCALATED
+    assert controller.completion_returns == []
+    assert coder.messages == []
+    report = store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert "accepted workspace failed task integrity validation" in report
+    assert "the original task file changed after the run started" in report
+
+
+async def test_completion_accept_does_not_require_independent_changed_test_evidence(tmp_path: Path) -> None:
     validations = [
         ValidationRun(
             command="pytest tests/test_app_new.py",
@@ -4974,7 +5132,6 @@ async def test_completion_accept_gate_allows_changed_test_without_independent_ev
     assert store.get_bello_config().status == BelloStatus.COMPLETE
     assert len(controller.completion_returns) == 0
     assert coder.messages == []
-    assert store.get_bello_config().accept_gate_accepts == 1
 
 
 async def test_adversary_remaining_limit_runs_before_completion_finalize(
@@ -5803,7 +5960,7 @@ async def test_completion_return_never_appends_raw_adversary_report(tmp_path: Pa
     assert "SIGSEGV" not in coder.messages[0]
 
 
-async def test_completion_accept_gate_returns_for_vacuous_changed_test_masking(tmp_path: Path) -> None:
+async def test_completion_accept_is_not_overridden_by_changed_test_masking_heuristic(tmp_path: Path) -> None:
     validations = [
         ValidationRun(
             command="pytest tests/test_app.py",
@@ -5837,14 +5994,12 @@ async def test_completion_accept_gate_returns_for_vacuous_changed_test_masking(t
         packet=packet,
     )
 
-    assert store.get_bello_config().status == BelloStatus.STARTING
-    assert len(controller.completion_returns) == 1
-    assert store.get_bello_config().accept_gate_coder_returns == 1
-    assert "changed test appears to mask validation" in coder.messages[0]
-    assert "trivially true assertion" in coder.messages[0]
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
+    assert controller.completion_returns == []
+    assert coder.messages == []
 
 
-async def test_completion_accept_gate_returns_for_skipped_changed_test_masking(tmp_path: Path) -> None:
+async def test_completion_accept_is_not_overridden_by_skipped_test_heuristic(tmp_path: Path) -> None:
     validations = [
         ValidationRun(
             command="pytest tests/test_app.py",
@@ -5873,14 +6028,12 @@ async def test_completion_accept_gate_returns_for_skipped_changed_test_masking(t
         packet=packet,
     )
 
-    assert store.get_bello_config().status == BelloStatus.STARTING
-    assert len(controller.completion_returns) == 1
-    assert store.get_bello_config().accept_gate_coder_returns == 1
-    assert "changed test appears to mask validation" in coder.messages[0]
-    assert "skipped/todo test marker" in coder.messages[0]
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
+    assert controller.completion_returns == []
+    assert coder.messages == []
 
 
-async def test_completion_accept_gate_returns_to_coder_without_fresh_behavioral_validation(tmp_path: Path) -> None:
+async def test_completion_accept_is_not_overridden_by_behavioral_validation_heuristic(tmp_path: Path) -> None:
     validations = [
         ValidationRun(
             command="python -m py_compile src/app.py",
@@ -5899,13 +6052,12 @@ async def test_completion_accept_gate_returns_to_coder_without_fresh_behavioral_
         packet=_gate_packet(task, validations=validations),
     )
 
-    assert store.get_bello_config().status == BelloStatus.STARTING
-    assert len(controller.completion_returns) == 1
-    assert "no fresh passing behavioral validation" in coder.messages[0]
-    assert store.get_bello_config().accept_gate_coder_returns == 1
+    assert store.get_bello_config().status == BelloStatus.COMPLETE
+    assert controller.completion_returns == []
+    assert coder.messages == []
 
 
-async def test_completion_decision_with_stale_anchor_sequences_reruns_reviewer(tmp_path: Path) -> None:
+async def test_completion_return_is_not_blocked_by_controller_freshness_gate(tmp_path: Path) -> None:
     validations = [
         ValidationRun(
             validation_id="validation-new",
@@ -5933,9 +6085,6 @@ async def test_completion_decision_with_stale_anchor_sequences_reruns_reviewer(t
                 "uncovered_edge_candidates": [],
                 "actionable_gap_or_none": "old gap",
             },
-            "basis_event_seq": 10,
-            "last_relevant_edit_seq": 8,
-            "last_validation_seq": 9,
             "files_reviewed": [
                 {"path": "src/app.py", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None}
             ],
@@ -5968,14 +6117,9 @@ async def test_completion_decision_with_stale_anchor_sequences_reruns_reviewer(t
     await controller.apply_completion_decision(decision, packet_thread_id="thread", packet=packet)
 
     assert store.get_bello_config().status == BelloStatus.STARTING
-    assert controller.completion_returns == []
-    assert coder.messages == []
-    assert controller.completion_decision_staleness_rerun_count == 1
-    progress = store.path(PROGRESS).read_text(encoding="utf-8")
-    assert "stale decision anchors" in progress
-    log = store.path(LOG).read_text(encoding="utf-8")
-    assert "completion_decision_staleness_failure" in log
-    assert "last_validation_seq=9 < latest_validation_sequence=12" in log
+    assert len(controller.completion_returns) == 1
+    assert coder.messages == ["fix old gap"]
+    assert "completion_decision_staleness_failure" not in store.path(LOG).read_text(encoding="utf-8")
 
 
 async def test_completion_restart_writes_handoff_and_starts_new_generation(tmp_path: Path) -> None:
@@ -7500,7 +7644,6 @@ def _completion_gate_controller(
     tmp_path: Path,
     *,
     validations: list[ValidationRun],
-    reruns: int = 0,
 ) -> tuple[BelloController, StateStore, Path, _GateFakeCoder]:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
@@ -7537,13 +7680,10 @@ def _completion_gate_controller(
     controller.completion_returns = []
     controller.completion_attempt_count = 0
     controller.completion_restarts = 0
-    controller.completion_reviewer_rerun_count = reruns
-    controller.completion_decision_staleness_rerun_count = 0
     controller.no_marker_idle_nudge_count = 0
     controller.provider_failure_recovery_counts = {}
     controller.validation_runtime_state = {}
     controller.completion_review_return_sequence = None
-    controller.completion_review_return_validation_sequence = None
     controller._terminal_cleanup_started = False
     controller._command_output_chunks = {}
     controller._last_large_diff_signature = None
@@ -7561,15 +7701,24 @@ class _RuntimeFakeSupervisor:
         self.completion_packets = []
         self.completion_thread_id = None
         self.closed_completion_reviews = 0
+        self.runtime_decision_kind = SupervisorDecisionKind.NOOP
+        self.before_runtime_decision = None
 
     def build_packet(self, **kwargs):
         return self.agent.build_packet(**kwargs)
 
     async def decide(self, packet):
         self.runtime_packets.append(packet)
+        if self.before_runtime_decision is not None:
+            self.before_runtime_decision()
         return SupervisorDecision(
-            decision=SupervisorDecisionKind.NOOP,
+            decision=self.runtime_decision_kind,
             reason="observed",
+            message_to_coder=(
+                "Run a task-relevant behavioral validation."
+                if self.runtime_decision_kind == SupervisorDecisionKind.INTERVENE
+                else None
+            ),
             wake_sequence=packet.wake_sequence,
             generation=packet.generation,
         )
@@ -7649,12 +7798,9 @@ def _runtime_controller(tmp_path: Path) -> tuple[BelloController, StateStore, _R
     controller.completion_returns = []
     controller.completion_attempt_count = 0
     controller.completion_restarts = 0
-    controller.completion_reviewer_rerun_count = 0
-    controller.completion_decision_staleness_rerun_count = 0
     controller.validation_runtime_state = {}
     controller.provider_failure_recovery_counts = {}
     controller.completion_review_return_sequence = None
-    controller.completion_review_return_validation_sequence = None
     controller._terminal_cleanup_started = False
     controller._command_output_chunks = {}
     controller._last_large_diff_signature = None
@@ -7772,7 +7918,7 @@ def _gate_packet(
     )
 
 
-async def test_completion_return_with_fresh_delta_evidence_goes_to_coder_without_rerun(tmp_path: Path) -> None:
+async def test_completion_return_with_delta_evidence_goes_to_coder(tmp_path: Path) -> None:
     validations = [
         ValidationRun(
             validation_id="validation-old",
@@ -7824,9 +7970,6 @@ async def test_completion_return_with_fresh_delta_evidence_goes_to_coder_without
 
     assert coder.messages == ["provide direct behavior evidence"]
     assert len(controller.completion_returns) == 1
-    assert controller.completion_decision_staleness_rerun_count == 0
-    assert getattr(controller, "completion_return_freshness_rerun_count", 0) == 0
-    assert "stale return ignored fresh delta evidence" not in store.path(PROGRESS).read_text(encoding="utf-8")
     assert "completion_return_freshness_failure" not in store.path(LOG).read_text(encoding="utf-8")
 
 

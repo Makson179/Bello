@@ -36,6 +36,7 @@ from supervisor.schemas import (
     InspectionRun,
     PriorIntervention,
     RestartHandoff,
+    SubagentSummary,
     SupervisorDecision,
     SupervisorWakePacket,
     TriggeringAction,
@@ -601,6 +602,7 @@ class StatelessSupervisorAgent:
         pending_approvals: list[ApprovalWakeContext] | None = None,
         triggering_action: TriggeringAction | None = None,
         runtime_triggering_actions: list[TriggeringAction] | None = None,
+        subagents: list[SubagentSummary] | None = None,
         last_coder_message: CoderMessage | None = None,
         validations: list[ValidationRun] | None = None,
         inspections: list[InspectionRun] | None = None,
@@ -627,7 +629,6 @@ class StatelessSupervisorAgent:
         completion_payload_mode: Literal["full", "delta", "full_fallback"] | None = None,
         completion_payload_since_sequence: int | None = None,
         completion_review_thread_id: str | None = None,
-        pending_accept_gate_rejection: dict[str, Any] | None = None,
         adversary_report: AdversaryReport | None = None,
         behavior_surface: list[BehaviorSurfaceItem] | None = None,
         prior_uncovered_edge_candidates: list[str] | None = None,
@@ -663,6 +664,7 @@ class StatelessSupervisorAgent:
             pending_approvals=pending_approvals or [],
             triggering_action=triggering_action,
             runtime_triggering_actions=runtime_triggering_actions or [],
+            subagents=subagents or [],
             last_coder_message=last_coder_message,
             validations=validations or [],
             inspections=inspections or [],
@@ -689,7 +691,6 @@ class StatelessSupervisorAgent:
             completion_payload_mode=completion_payload_mode,
             completion_payload_since_sequence=completion_payload_since_sequence,
             completion_review_thread_id=completion_review_thread_id,
-            pending_accept_gate_rejection=pending_accept_gate_rejection,
             adversary_report=adversary_report,
             behavior_surface=behavior_surface or [],
             prior_uncovered_edge_candidates=prior_uncovered_edge_candidates or [],
@@ -714,6 +715,7 @@ class StatelessSupervisorAgent:
             "ephemeral": False,
             "experimentalRawEvents": False,
             "persistExtendedHistory": False,
+            "config": {"agents": {"enabled": False}},
         }
         if self.model:
             params["model"] = self.model
@@ -867,7 +869,7 @@ def _completion_review_repair_json_prompt(
         "uncovered_behaviors, validation_gaps, claim_evidence_mismatches, packet_or_access_limitations, "
         "or changed_test_risks, plus the minimal message_to_coder needed to get that issue fixed. "
         "For restart, include a valid handoff and set message_to_coder=null. "
-        "For decision=\"accept\", include only the evidence needed for the accept gates.\n\n"
+        "For decision=\"accept\", include only the concise evidence needed by the completion output contract.\n\n"
         "Previous invalid response excerpt, for context only:\n"
         "```text\n"
         f"{excerpt}\n"
@@ -892,7 +894,7 @@ def _minimal_completion_review_retry_prompt(
         "If the decision is return or restart, avoid the full evidence matrix: use files_reviewed=[] and "
         "behavior_evidence_matrix=[]. For return, include only the concrete blocker and the minimal message_to_coder "
         "needed to resolve it. For restart, include a valid handoff and set message_to_coder=null. "
-        "If the decision is accept, include only evidence required by the accept gates."
+        "If the decision is accept, include only concise evidence required by the completion output contract."
     )
 
 
@@ -997,12 +999,11 @@ def _slim_completion_packet(packet: SupervisorWakePacket) -> SupervisorWakePacke
     The completion-review supervisor reads source and re-runs checks itself (it
     already issues rg/sed/git exec_command calls during review), so we drop from the
     prompt everything redundant or recoverable and keep only the evidence skeleton
-    the accept gate / behavior_evidence_matrix bind to:
+    useful to the completion reviewer and final report:
 
     - drop inlined file diffs/contexts (changed_file_diffs/changed_file_contexts) — it runs `git diff`;
     - drop validation_outputs/inspection_outputs entirely — after captured_output is
-      emptied they are near-duplicates of the validations/inspections ledgers, and the
-      accept gate does not consume them (it binds validation_ids from `validations`);
+      emptied they are near-duplicates of the validations/inspections ledgers;
     - in each ledger item: empty captured_output, drop the duplicate raw/normalized
       command, blank the constant cwd, and bound command + summary;
     - in evidence_provenance_summary keep the risk flags but drop the third copy of the
@@ -1040,6 +1041,9 @@ def _slim_completion_packet(packet: SupervisorWakePacket) -> SupervisorWakePacke
             "inspections": [slim_run(v) for v in packet.inspections],
             "validation_outputs": [],
             "inspection_outputs": [],
+            # Child-agent orchestration is runtime evidence. Completion reviews use
+            # the resulting workspace and shared validation ledger instead.
+            "subagents": [],
             "changed_file_diffs": [],
             "changed_file_contexts": [],
             "evidence_provenance_summary": provenance,

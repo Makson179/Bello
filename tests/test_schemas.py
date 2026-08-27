@@ -9,6 +9,7 @@ import pytest
 
 from supervisor.prompts import (
     PROMPTS_ENV_VAR,
+    build_cheap_runtime_prompt,
     build_completion_review_prompt,
     build_coder_prompt,
     build_restart_prompt,
@@ -20,6 +21,8 @@ from supervisor.schemas.models import (
     CompletionDecisionArtifact,
     CompletionReviewDecision,
     RestartHandoff,
+    SubagentActivity,
+    SubagentSummary,
     SupervisorDecision,
     SupervisorWakePacket,
     TriggeringAction,
@@ -62,9 +65,9 @@ def test_completion_review_decision_schema_is_strict() -> None:
     assert "EvidenceItem" in schema["$defs"]
     assert "CompletionDecisionArtifact" in schema["$defs"]
     assert "decision_artifact" in schema["properties"]
-    assert "basis_event_seq" in schema["properties"]
-    assert "last_relevant_edit_seq" in schema["properties"]
-    assert "last_validation_seq" in schema["properties"]
+    assert "basis_event_seq" not in schema["properties"]
+    assert "last_relevant_edit_seq" not in schema["properties"]
+    assert "last_validation_seq" not in schema["properties"]
     assert "validation_id" in schema["$defs"]["EvidenceItem"]["properties"]
 
 
@@ -80,9 +83,6 @@ def test_completion_review_decision_accepts_expected_shapes() -> None:
                 "uncovered_edge_candidates": [],
                 "actionable_gap_or_none": None,
             },
-            "basis_event_seq": 10,
-            "last_relevant_edit_seq": 8,
-            "last_validation_seq": 9,
             "files_reviewed": [
                 {"path": "src/app.py", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None}
             ],
@@ -144,9 +144,6 @@ def test_completion_review_decision_accepts_minimal_return_without_full_review_a
                 "uncovered_edge_candidates": ["stack-passed call arguments"],
                 "actionable_gap_or_none": "validate more than six call arguments",
             },
-            "basis_event_seq": 12,
-            "last_relevant_edit_seq": 10,
-            "last_validation_seq": 11,
             "uncovered_behaviors": ["stack-passed call arguments"],
             "validation_gaps": ["no regression covers more than six call arguments"],
             "claim_evidence_mismatches": [],
@@ -335,6 +332,60 @@ def test_stateless_prompt_assembles_blocks_from_packet() -> None:
     assert "handoff" not in completion_payload["prompt_sections"]
     assert "approval" not in completion_payload["prompt_sections"]
     assert "action_review" not in completion_payload["prompt_sections"]
+
+
+def test_runtime_prompt_exposes_bounded_subagent_evidence_and_targets_root() -> None:
+    summary = SubagentSummary(
+        thread_id="child-1",
+        parent_thread_id="coder-root",
+        status="active",
+        active_turn_id="child-turn",
+        model="gpt-5.6-luna",
+        reasoning_effort="high",
+        prompt="Inspect the parser failure.",
+        recent_actions=[
+            SubagentActivity(
+                sequence=7,
+                kind="commandExecution",
+                summary="pytest parser tests exit=1",
+                item_id="child-command",
+            )
+        ],
+        validation_ids=["validation-7"],
+        last_event_sequence=7,
+    )
+    packet = SupervisorWakePacket(
+        wake_sequence=8,
+        latest_event_sequence=7,
+        generation=0,
+        restart_count=0,
+        task_path="TASK.md",
+        task_contents="# Task",
+        current_summary="Coder turn completed",
+        coder_thread_id="coder-root",
+        subagents=[summary],
+    )
+
+    payload = json.loads(build_stateless_supervisor_prompt(packet))
+    instructions = "\n".join(payload["instructions"])
+
+    assert payload["subagents"][0]["thread_id"] == "child-1"
+    assert payload["subagents"][0]["recent_actions"][0]["sequence"] == 7
+    assert "address only the root coder" in instructions
+    assert "Identify the child by thread_id" in instructions
+    assert "Never attempt to steer a child directly" in instructions
+
+    with pytest.raises(ValueError):
+        SupervisorWakePacket.model_validate(
+            {**packet.model_dump(mode="json"), "subagents": [summary.model_dump(mode="json")] * 13}
+        )
+
+    cheap_payload = json.loads(
+        build_cheap_runtime_prompt({"subagents": [summary.model_dump(mode="json")]})
+    )
+    cheap_instructions = "\n".join(cheap_payload["instructions"])
+    assert "child activity is evidence about the root coder's work" in cheap_instructions
+    assert "A child merely being active" in cheap_instructions
 
 
 def test_prompts_are_loaded_from_single_toml_file(monkeypatch, tmp_path: Path) -> None:

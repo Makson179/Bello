@@ -631,6 +631,16 @@ the variant row. Sol and Terra support reasoning effort from `low` through
 `ultra`, and Luna supports `low` through `max`. Active primary roles default to
 GPT-5.6 Sol at `xhigh`, and cheap runtime triage uses Luna.
 
+`multi-agent` is off by default. Turning it on reveals the maximum concurrent
+agent count, the default child profile, and an allowed-efforts row for each
+available model. The coder chooses among those allowed model/effort pairs for
+each independent subtask, falling back to the configured default when there is
+no clear reason to choose another. Bello records bounded child activity in the
+existing runtime snapshots; runtime intervention still goes only to the root
+coder, which steers or stops the named child. A spawn outside the allowed map is
+detected, interrupted, and returned to the root coder as a configuration-policy
+violation.
+
 CLI flags override their corresponding saved settings for one run and never
 rewrite the project config. Settings without a CLI flag, including cheap
 runtime and review budgets, are changed through `bello config`.
@@ -641,6 +651,11 @@ runtime and review budgets, are changed through `bello config`.
 | `coder-mod` | GPT-5.6 | Model family for the coder thread. |
 | `coder-5.6-variant` | Sol | GPT-5.6 variant for the coder: Sol, Terra, or Luna. |
 | `coder-intelligence` | `xhigh` | Coder reasoning effort, limited by the selected variant. |
+| `multi-agent` | `off` | Allow the coder to delegate independent work to Codex subagents. When off, subagent tools are disabled for the coder thread. |
+| `subagent-max-concurrent` | `4` | Maximum concurrent Codex agent threads in the coder session. Hidden while `multi-agent` is off. |
+| `subagent-default-mod` / `subagent-default-5.6-variant` | GPT-5.6 Luna | Default child model. Only models with at least one allowed effort can be selected. |
+| `subagent-default-intelligence` | `high` | Default child effort, selected from that model's allowed efforts. |
+| `subagent-allowed-*` | Luna: `medium, high, xhigh`; Terra: `medium, high` | Toggle the exact model/effort pairs available to the coder. The active default and final remaining pair cannot be removed. |
 | `runtime-mod` | GPT-5.6 | Model family for fresh-context runtime checks, including risky-action judgment and drift detection. |
 | `runtime-5.6-variant` | Sol | GPT-5.6 variant for the full runtime supervisor. |
 | `runtime-intelligence` | `xhigh` | Full runtime supervisor reasoning effort. |

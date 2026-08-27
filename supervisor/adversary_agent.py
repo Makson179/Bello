@@ -201,6 +201,7 @@ class AdversaryAgent:
             "ephemeral": False,
             "experimentalRawEvents": False,
             "persistExtendedHistory": False,
+            "config": {"agents": {"enabled": False}},
         }
         if self.model:
             params["model"] = self.model

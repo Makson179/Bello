@@ -18,6 +18,8 @@ from supervisor.schemas import (
     InspectionRun,
     PriorIntervention,
     BelloConfig,
+    SubagentActivity,
+    SubagentSummary,
     SupervisorDecisionKind,
     TriggeringAction,
     ValidationOutput,
@@ -365,6 +367,31 @@ def test_supervisor_packet_uses_canonical_task_contents_override(tmp_path: Path)
     assert packet.task_contents == "strict original task"
 
 
+def test_supervisor_packet_plumbs_subagents_and_completion_slims_them(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    store = StateStore(tmp_path)
+    store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
+    agent = StatelessSupervisorAgent(object(), store, task)  # type: ignore[arg-type]
+    child = SubagentSummary(
+        thread_id="child-1",
+        parent_thread_id="coder-root",
+        status="idle",
+        recent_actions=[
+            SubagentActivity(sequence=4, kind="fileChange", summary="changed parser.py")
+        ],
+    )
+
+    packet = agent.build_packet(
+        wake_sequence=5,
+        current_summary="Coder turn completed",
+        subagents=[child],
+    )
+
+    assert packet.subagents == [child]
+    assert supervisor_agent_module._slim_completion_packet(packet).subagents == []
+
+
 async def test_runtime_prompt_uses_recent_state_and_relevant_ledgers(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\nImplement the parser.\n", encoding="utf-8")
@@ -596,9 +623,6 @@ async def test_completion_review_uses_minimal_retry_after_repair_output_is_inval
             "uncovered_edge_candidates": ["calls with more than six integer arguments"],
             "actionable_gap_or_none": "add and pass a regression for stack-passed arguments",
         },
-        "basis_event_seq": 7,
-        "last_relevant_edit_seq": None,
-        "last_validation_seq": None,
         "files_reviewed": [],
         "behavior_evidence_matrix": [],
         "uncovered_behaviors": ["stack-passed call arguments"],
@@ -803,9 +827,9 @@ async def test_completion_review_compacts_large_packet_under_budget(tmp_path: Pa
 
     assert decision.decision == "accept"
     # The completion packet is slimmed: the evidence skeleton (ids, outcomes, short
-    # command/summary) is kept so the accept gate can bind to it, but full captured
-    # output and inlined file diffs are dropped — the supervisor reads the workspace
-    # itself. So evidence ids survive; raw captured output and diffs do not.
+    # command/summary) remains available to the reviewer and final report, but full
+    # captured output and inlined file diffs are dropped — the supervisor reads the
+    # workspace itself. So evidence ids survive; raw captured output and diffs do not.
     assert "inspection-49" in client.prompt  # evidence id (skeleton) kept
     assert "validation-11" in client.prompt
     assert "INSPECTION-49" not in client.prompt  # raw captured output not inlined
@@ -813,8 +837,8 @@ async def test_completion_review_compacts_large_packet_under_budget(tmp_path: Pa
     assert len(client.prompt) < 500_000  # comfortably under the 1 MiB app-server cap
     audit = json.loads(store.path(SUPERVISOR_WAKES).read_text(encoding="utf-8").splitlines()[-1])
     assert audit["packet"]["inspections"][0]["captured_output"] == ""
-    # validation_outputs / inspection_outputs are dropped entirely (near-duplicates of
-    # the ledgers once captured_output is emptied; the accept gate does not consume them).
+    # validation_outputs / inspection_outputs are dropped entirely because they are
+    # near-duplicates of the ledgers once captured_output is emptied.
     assert audit["packet"]["validation_outputs"] == []
     assert audit["packet"]["inspection_outputs"] == []
     assert audit["packet"]["changed_file_diffs"] == []

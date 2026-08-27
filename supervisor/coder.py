@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +13,7 @@ from supervisor.appserver import (
     text_input,
 )
 from supervisor.prompts import build_coder_prompt, build_restart_prompt
+from supervisor.project_config import MultiAgentConfig
 from supervisor.state import StateStore
 
 
@@ -69,7 +70,34 @@ def apply_intelligence(params: dict[str, Any], intelligence: str | None) -> dict
     return params
 
 
-def coder_thread_params(project_root: Path, *, model: str | None = None, fast: bool = False) -> dict[str, Any]:
+def build_multi_agent_developer_instructions(config: MultiAgentConfig) -> str | None:
+    if not config.enabled:
+        return None
+    allowed = "\n".join(
+        f"- {model}: {', '.join(efforts)}"
+        for model, efforts in config.allowed.items()
+    )
+    return (
+        "Use subagents when independent delegation would materially improve speed or quality.\n"
+        "Before spawning each subagent, choose the fastest and least expensive allowed profile that can "
+        "reliably complete its task. Use a stronger profile for ambiguous, cross-cutting, or "
+        "correctness-critical work.\n"
+        "Choose only from these allowed model and reasoning-effort combinations:\n"
+        f"{allowed}\n"
+        f"The default subagent profile is {config.default.model} at {config.default.intelligence} effort.\n"
+        "Use the default profile when there is no clear task-specific reason to choose another allowed profile.\n"
+        "Wait for every subagent whose result affects task completion."
+    )
+
+
+def coder_thread_params(
+    project_root: Path,
+    *,
+    model: str | None = None,
+    fast: bool = False,
+    multi_agent: MultiAgentConfig | None = None,
+) -> dict[str, Any]:
+    multi_agent = multi_agent or MultiAgentConfig()
     params: dict[str, Any] = {
         "cwd": str(project_root),
         "runtimeWorkspaceRoots": [str(project_root)],
@@ -80,7 +108,21 @@ def coder_thread_params(project_root: Path, *, model: str | None = None, fast: b
         "ephemeral": False,
         "experimentalRawEvents": False,
         "persistExtendedHistory": False,
+        "config": {
+            "agents": {
+                "enabled": multi_agent.enabled,
+            }
+        },
     }
+    if multi_agent.enabled:
+        params["config"]["agents"].update(
+            {
+                "max_concurrent_threads_per_session": multi_agent.max_concurrent,
+                "default_subagent_model": multi_agent.default.model,
+                "default_subagent_reasoning_effort": multi_agent.default.intelligence,
+            }
+        )
+        params["developerInstructions"] = build_multi_agent_developer_instructions(multi_agent)
     if model:
         params["model"] = model
     return params
@@ -122,10 +164,16 @@ class CoderSession:
     thread_id: str | None = None
     active_turn_id: str | None = None
     coder_rpc_timeout_seconds: float = APP_SERVER_CODER_RPC_TIMEOUT_SECONDS
+    multi_agent: MultiAgentConfig = field(default_factory=MultiAgentConfig)
 
     async def start_thread(self) -> str:
         response = await self.client.thread_start(
-            coder_thread_params(self.project_root, model=self.model, fast=self.fast),
+            coder_thread_params(
+                self.project_root,
+                model=self.model,
+                fast=self.fast,
+                multi_agent=self.multi_agent,
+            ),
             timeout=APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
         )
         thread = response.get("thread", {})

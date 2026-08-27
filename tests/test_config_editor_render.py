@@ -15,7 +15,14 @@ from supervisor.config_editor import (
     parameter_defs,
     render_editor,
 )
-from supervisor.project_config import MODEL_GPT_5_5, MODEL_GPT_5_6_LUNA, MODEL_GPT_5_6_SOL, MODEL_GPT_5_6_TERRA, ProjectConfig
+from supervisor.project_config import (
+    MODEL_GPT_5_5,
+    MODEL_GPT_5_6_LUNA,
+    MODEL_GPT_5_6_SOL,
+    MODEL_GPT_5_6_TERRA,
+    MultiAgentConfig,
+    ProjectConfig,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -309,6 +316,44 @@ def test_config_editor_render_has_independent_rows_for_all_agent_roles() -> None
         assert f"{role}-mod" in output
         assert f"{role}-5.6-variant" in output
         assert f"{role}-intelligence" in output
+
+
+def test_config_editor_hides_multi_agent_details_until_enabled() -> None:
+    disabled = ProjectConfig()
+    disabled_keys = {parameter.key for parameter in parameter_defs(disabled)}
+
+    assert "multi_agent_enabled" in disabled_keys
+    assert "multi_agent_max_concurrent" not in disabled_keys
+    assert not any(key.startswith("multi_agent_allowed:") for key in disabled_keys)
+
+    enabled = ProjectConfig(multi_agent=MultiAgentConfig(enabled=True))
+    enabled_parameters = parameter_defs(enabled)
+    enabled_keys = {parameter.key for parameter in enabled_parameters}
+
+    assert "multi_agent_max_concurrent" in enabled_keys
+    assert "multi_agent_default_model" in enabled_keys
+    assert "multi_agent_default_model_variant" in enabled_keys
+    assert "multi_agent_default_intelligence" in enabled_keys
+    assert f"multi_agent_allowed:{MODEL_GPT_5_6_LUNA}" in enabled_keys
+    assert f"multi_agent_allowed:{MODEL_GPT_5_6_TERRA}" in enabled_keys
+
+
+def test_config_editor_multi_agent_allowed_row_is_a_model_to_efforts_toggle() -> None:
+    config = ProjectConfig(multi_agent=MultiAgentConfig(enabled=True))
+    parameters = parameter_defs(config)
+    allowed_key = f"multi_agent_allowed:{MODEL_GPT_5_6_LUNA}"
+    allowed_index = [parameter.key for parameter in parameters].index(allowed_key)
+    output = _render(
+        config,
+        EditorState(parameter_index=allowed_index, expanded_index=allowed_index),
+        width=120,
+        height=24,
+    )
+
+    assert "subagent-allowed-Luna" in output
+    assert "medium, high, xhigh" in output
+    assert "low" in output
+    assert "max" in output
 
 
 def test_config_editor_render_variant_row_has_sol_terra_luna_options() -> None:

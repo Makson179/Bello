@@ -123,6 +123,23 @@ class PolicyDecision(BaseModel):
         return cls(kind=PolicyDecisionKind.ROUTE_LLM, reason=reason, payload=payload)
 
 
+class SubagentDefaultSettings(BaseModel):
+    model: str = "gpt-5.6-luna"
+    intelligence: str = "high"
+
+
+class MultiAgentSettings(BaseModel):
+    enabled: bool = False
+    max_concurrent: int = Field(default=4, ge=1)
+    default: SubagentDefaultSettings = Field(default_factory=SubagentDefaultSettings)
+    allowed: dict[str, list[str]] = Field(
+        default_factory=lambda: {
+            "gpt-5.6-luna": ["medium", "high", "xhigh"],
+            "gpt-5.6-terra": ["medium", "high"],
+        }
+    )
+
+
 class BelloConfig(BaseModel):
     project_root: str
     task: str | None = None
@@ -171,14 +188,15 @@ class BelloConfig(BaseModel):
     max_adversary_runs: int = 1
     completion_review_enabled: bool = True
     cheap_runtime: bool = True
+    # Runtime-state mirror of the strictly validated ProjectConfig structure. Keep this
+    # as JSON data because StateStore patches it with model_copy(update=...), which does
+    # not revalidate nested model instances.
+    multi_agent: dict[str, Any] = Field(
+        default_factory=lambda: MultiAgentSettings().model_dump(mode="json")
+    )
     adversary_run_count: int = 0
     completion_return_count: int = 0
     completion_returns_since_adversary: int = 0
-    accept_gate_accepts: int = 0
-    accept_gate_rejections: int = 0
-    accept_gate_reviewer_reruns: int = 0
-    accept_gate_coder_returns: int = 0
-    accept_gate_audit_failures: int = 0
     last_relevant_edit_sequence: int | None = None
     last_validation_sequence: int | None = None
     last_trusted_behavioral_validation_sequence: int | None = None
@@ -348,9 +366,6 @@ class CompletionReviewDecision(BaseModel):
     decision: CompletionReviewDecisionKind
     reason: str
     decision_artifact: CompletionDecisionArtifact | None = None
-    basis_event_seq: int | None = None
-    last_relevant_edit_seq: int | None = None
-    last_validation_seq: int | None = None
     files_reviewed: list[ReviewedFile] = Field(default_factory=list)
     behavior_evidence_matrix: list[BehaviorEvidence] = Field(default_factory=list)
     uncovered_behaviors: list[str] = Field(default_factory=list)
@@ -654,17 +669,13 @@ class PriorIntervention(BaseModel):
 
 
 class CompletionReturnRecord(BaseModel):
-    source: Literal[
-        "completion_review", "accept_gate", "adversary_report_controller"
-    ] = "completion_review"
+    source: Literal["completion_review", "adversary_report_controller"] = "completion_review"
     reason: str
     uncovered_behaviors: list[str] = Field(default_factory=list)
     validation_gaps: list[str] = Field(default_factory=list)
     claim_evidence_mismatches: list[str] = Field(default_factory=list)
     packet_or_access_limitations: list[str] = Field(default_factory=list)
     message_to_coder: str | None = None
-    accept_gate_check_name: str | None = None
-    accept_gate_details: dict[str, Any] = Field(default_factory=dict)
     sequence: int
     generation: int
 
@@ -820,6 +831,35 @@ class AdversaryReport(BaseModel):
     created_at: str
 
 
+class SubagentActivity(BaseModel):
+    """One bounded, factual child-agent event exposed to runtime oversight."""
+
+    sequence: int
+    kind: str
+    summary: str = Field(max_length=800)
+    item_id: str | None = None
+
+
+class SubagentSummary(BaseModel):
+    """Bounded state for one coder descendant in a runtime wake packet."""
+
+    thread_id: str
+    parent_thread_id: str
+    depth: int = Field(default=1, ge=1)
+    status: str
+    active_turn_id: str | None = None
+    model: str | None = None
+    reasoning_effort: str | None = None
+    profile_allowed: bool | None = None
+    nickname: str | None = None
+    role: str | None = None
+    prompt: str | None = Field(default=None, max_length=800)
+    last_message: str | None = Field(default=None, max_length=800)
+    recent_actions: list[SubagentActivity] = Field(default_factory=list, max_length=5)
+    validation_ids: list[str] = Field(default_factory=list, max_length=8)
+    last_event_sequence: int | None = None
+
+
 class SupervisorWakePacket(BaseModel):
     wake_sequence: int
     latest_event_sequence: int
@@ -849,6 +889,7 @@ class SupervisorWakePacket(BaseModel):
     pending_approvals: list[ApprovalWakeContext] = Field(default_factory=list)
     triggering_action: TriggeringAction | None = None
     runtime_triggering_actions: list[TriggeringAction] = Field(default_factory=list)
+    subagents: list[SubagentSummary] = Field(default_factory=list, max_length=12)
     last_coder_message: CoderMessage | None = None
     validations: list[ValidationRun] = Field(default_factory=list)
     inspections: list[InspectionRun] = Field(default_factory=list)
@@ -875,7 +916,6 @@ class SupervisorWakePacket(BaseModel):
     completion_payload_mode: Literal["full", "delta", "full_fallback"] | None = None
     completion_payload_since_sequence: int | None = None
     completion_review_thread_id: str | None = None
-    pending_accept_gate_rejection: dict[str, Any] | None = None
     adversary_report: AdversaryReport | None = None
     behavior_surface: list[BehaviorSurfaceItem] = Field(default_factory=list)
     prior_uncovered_edge_candidates: list[str] = Field(default_factory=list)

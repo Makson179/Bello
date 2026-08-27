@@ -229,6 +229,61 @@ async def test_request_times_out_without_appserver_response() -> None:
     assert "app-server RPC model/list response timed out after 0.01s" in str(exc_info.value)
 
 
+async def test_thread_list_and_turns_list_forward_query_fields() -> None:
+    class RecordingClient(AppServerClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.requests: list[tuple[str, dict, float]] = []
+
+        async def request(self, method, params=None, *, timeout):
+            self.requests.append((method, params, timeout))
+            return {"data": []}
+
+    client = RecordingClient()
+
+    await client.thread_list(
+        {
+            "cwd": "/workspace",
+            "archived": False,
+            "sourceKinds": ["subAgent", "subAgentThreadSpawn"],
+            "cursor": "next-page",
+        },
+        timeout=3.0,
+    )
+    await client.thread_turns_list(
+        "child-1",
+        limit=1,
+        items_view="summary",
+        cursor="older",
+        sort_direction="desc",
+        timeout=4.0,
+    )
+
+    assert client.requests == [
+        (
+            "thread/list",
+            {
+                "cwd": "/workspace",
+                "archived": False,
+                "sourceKinds": ["subAgent", "subAgentThreadSpawn"],
+                "cursor": "next-page",
+            },
+            3.0,
+        ),
+        (
+            "thread/turns/list",
+            {
+                "threadId": "child-1",
+                "limit": 1,
+                "itemsView": "summary",
+                "cursor": "older",
+                "sortDirection": "desc",
+            },
+            4.0,
+        ),
+    ]
+
+
 async def test_reader_reports_oversized_stdout_line_without_hanging() -> None:
     errors: list[BaseException] = []
     reader = asyncio.StreamReader(limit=64)

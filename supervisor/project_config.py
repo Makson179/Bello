@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -29,6 +29,46 @@ DEFAULT_INTELLIGENCE = "xhigh"
 BASE_INTELLIGENCE_CHOICES = ("low", "medium", "high", "xhigh")
 INTELLIGENCE_CHOICES = (*BASE_INTELLIGENCE_CHOICES, "max", "ultra")
 SPEED_CHOICES = ("usual", "fast")
+DEFAULT_SUBAGENT_MODEL = MODEL_GPT_5_6_LUNA
+DEFAULT_SUBAGENT_INTELLIGENCE = "high"
+DEFAULT_SUBAGENT_MAX_CONCURRENT = 4
+
+
+def _default_subagent_allowed() -> dict[str, tuple[str, ...]]:
+    return {
+        MODEL_GPT_5_6_LUNA: ("medium", "high", "xhigh"),
+        MODEL_GPT_5_6_TERRA: ("medium", "high"),
+    }
+
+
+@dataclass(frozen=True)
+class SubagentDefaultConfig:
+    model: str = DEFAULT_SUBAGENT_MODEL
+    intelligence: str = DEFAULT_SUBAGENT_INTELLIGENCE
+
+    def to_json_data(self) -> dict[str, str]:
+        return {"model": self.model, "intelligence": self.intelligence}
+
+
+@dataclass(frozen=True)
+class MultiAgentConfig:
+    enabled: bool = False
+    max_concurrent: int = DEFAULT_SUBAGENT_MAX_CONCURRENT
+    default: SubagentDefaultConfig = field(default_factory=SubagentDefaultConfig)
+    allowed: dict[str, tuple[str, ...]] = field(default_factory=_default_subagent_allowed)
+
+    def to_json_data(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "max_concurrent": self.max_concurrent,
+            "default": self.default.to_json_data(),
+            "allowed": {model: list(efforts) for model, efforts in self.allowed.items()},
+        }
+
+    def is_allowed(self, model: str, intelligence: str) -> bool:
+        return intelligence in self.allowed.get(model, ())
+
+
 RUNTIME_SYNC_FIELDS = (
     "task",
     "coder_mod",
@@ -49,6 +89,7 @@ RUNTIME_SYNC_FIELDS = (
     "completion_returns_after_adversary",
     "clean",
     "protected_path",
+    "multi_agent",
 )
 
 
@@ -77,6 +118,7 @@ class ProjectConfig:
     completion_returns_after_adversary: ReviewLimit = 0
     clean: bool = False
     protected_path: tuple[str, ...] = ()
+    multi_agent: MultiAgentConfig = field(default_factory=MultiAgentConfig)
 
     @property
     def fast(self) -> bool:
@@ -104,6 +146,7 @@ class ProjectConfig:
             "max_completion_returns_after_adversary": self.completion_returns_after_adversary,
             "clean": self.clean,
             "protected_path": list(self.protected_path),
+            "multi_agent": self.multi_agent.to_json_data(),
         }
 
 
@@ -316,6 +359,10 @@ def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfi
                 path=path,
             )
         ),
+        multi_agent=_multi_agent_config(
+            payload.get("multi_agent", default.multi_agent.to_json_data()),
+            path=path,
+        ),
     )
 
 
@@ -391,6 +438,12 @@ def _non_negative_int(value: Any, field: str, *, path: Path) -> int:
     raise ProjectConfigError(f"invalid Bello config at {path}: {field} must be a non-negative integer")
 
 
+def _positive_int(value: Any, field: str, *, path: Path) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+        return value
+    raise ProjectConfigError(f"invalid Bello config at {path}: {field} must be a positive integer")
+
+
 def _bool(value: Any, field: str, *, path: Path) -> bool:
     if isinstance(value, bool):
         return value
@@ -408,6 +461,68 @@ def _string_list(value: Any, field: str, *, path: Path) -> list[str]:
         if stripped:
             result.append(stripped)
     return result
+
+
+def _multi_agent_config(value: Any, *, path: Path) -> MultiAgentConfig:
+    if not isinstance(value, dict):
+        raise ProjectConfigError(f"invalid Bello config at {path}: multi_agent must be an object")
+    defaults = MultiAgentConfig()
+    enabled = _bool(value.get("enabled", defaults.enabled), "multi_agent.enabled", path=path)
+    max_concurrent = _positive_int(
+        value.get("max_concurrent", defaults.max_concurrent),
+        "multi_agent.max_concurrent",
+        path=path,
+    )
+
+    raw_default = value.get("default", defaults.default.to_json_data())
+    if not isinstance(raw_default, dict):
+        raise ProjectConfigError(f"invalid Bello config at {path}: multi_agent.default must be an object")
+    default_model = _choice(
+        raw_default.get("model", defaults.default.model),
+        "multi_agent.default.model",
+        SUPPORTED_MODEL_CHOICES,
+        path=path,
+    )
+    default_intelligence = _choice(
+        raw_default.get("intelligence", defaults.default.intelligence),
+        "multi_agent.default.intelligence",
+        intelligence_choices_for_model(default_model),
+        path=path,
+    )
+
+    raw_allowed = value.get("allowed", defaults.to_json_data()["allowed"])
+    if not isinstance(raw_allowed, dict):
+        raise ProjectConfigError(f"invalid Bello config at {path}: multi_agent.allowed must be an object")
+    allowed: dict[str, tuple[str, ...]] = {}
+    for raw_model, raw_efforts in raw_allowed.items():
+        model = _choice(raw_model, "multi_agent.allowed model", SUPPORTED_MODEL_CHOICES, path=path)
+        if not isinstance(raw_efforts, list | tuple) or not raw_efforts:
+            raise ProjectConfigError(
+                f"invalid Bello config at {path}: multi_agent.allowed.{model} must be a non-empty list"
+            )
+        efforts: list[str] = []
+        for raw_effort in raw_efforts:
+            effort = _choice(
+                raw_effort,
+                f"multi_agent.allowed.{model}",
+                intelligence_choices_for_model(model),
+                path=path,
+            )
+            if effort not in efforts:
+                efforts.append(effort)
+        allowed[model] = tuple(efforts)
+    if not allowed:
+        raise ProjectConfigError(f"invalid Bello config at {path}: multi_agent.allowed must not be empty")
+    if default_intelligence not in allowed.get(default_model, ()):
+        raise ProjectConfigError(
+            f"invalid Bello config at {path}: multi_agent.default must be included in multi_agent.allowed"
+        )
+    return MultiAgentConfig(
+        enabled=enabled,
+        max_concurrent=max_concurrent,
+        default=SubagentDefaultConfig(model=default_model, intelligence=default_intelligence),
+        allowed=allowed,
+    )
 
 
 def _runtime_config_from_project_config(project_root: Path, config: ProjectConfig):
@@ -465,6 +580,8 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
     if "protected_path" in selected:
         updates["protected_path"] = list(config.protected_path)
         updates["protected_paths"] = list(config.protected_path)
+    if "multi_agent" in selected:
+        updates["multi_agent"] = config.multi_agent.to_json_data()
     if "completion_review" in selected:
         updates["completion_review_enabled"] = config.completion_review
     if selected.intersection({"adversary", "adversary_runs"}):
