@@ -7,7 +7,7 @@ on:
 
 jobs:
   linux:
-    name: Linux / Python ${{ matrix.python-version }}
+    name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
