@@ -11,6 +11,7 @@ import stat
 import subprocess
 import tempfile
 import time
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,7 +24,12 @@ from supervisor.approval_triage import (
     runtime_triage_config_from_env,
 )
 from supervisor.adversary_agent import AdversaryAgent, AdversaryAgentError
-from supervisor.appserver import AppServerClient, AppServerError, AppServerMessage
+from supervisor.appserver import (
+    AppServerClient,
+    AppServerError,
+    AppServerMessage,
+    last_agent_message_text,
+)
 from supervisor.approvals import ApprovalManager, normalize_approval_request
 from supervisor.coder import (
     CODER_SANDBOX_DANGER_FULL_ACCESS,
@@ -92,7 +98,7 @@ from supervisor.schemas import (
 from supervisor.schemas.models import ensure_relative_to
 from supervisor.state import DECISIONS, HANDOFF, PROGRESS, StateStore
 from supervisor.supervisor_agent import StatelessSupervisorAgent, SupervisorAgentError
-from supervisor.task_select import resolve_task
+from supervisor.task_select import resolve_plan, resolve_task
 from supervisor.tui import TerminalTUI, UserCommand
 from supervisor.workspace_snapshot import (
     SnapshotPatchError,
@@ -103,6 +109,7 @@ from supervisor.workspace_snapshot import (
     create_workspace_snapshot,
     remove_isolated_workspace_tree,
     snapshot_git_environment,
+    validate_plan_git_isolation,
 )
 from supervisor.workspace_clean import clean_workspace_except_task
 
@@ -112,6 +119,13 @@ INSPECTION_LEDGER_LIMIT = 50
 SUBAGENT_SUMMARY_LIMIT = 12
 SUBAGENT_ACTION_LIMIT = 5
 SUBAGENT_TEXT_LIMIT = 800
+READINESS_EVENT_JOURNAL_LIMIT = 4096
+READINESS_REVIEWER_THREAD_LIMIT = 8192
+APP_SERVER_TRANSPORT_RECOVERY_ATTEMPTS = 3
+APP_SERVER_TRANSPORT_RECOVERY_BACKOFF_SECONDS = (0.0, 1.0, 5.0)
+TRANSPORT_RECOVERY_CODER_PROMPT = """The Codex app-server transport restarted during your previous turn.
+Continue the task from the current workspace state. Preserve useful existing work, inspect what remains,
+run the appropriate validation, and when complete output BELLO_READY_FOR_REVIEW on its own line."""
 SUBAGENT_SOURCE_KINDS = (
     "subAgent",
     "subAgentReview",
@@ -206,6 +220,24 @@ BREADTH_FEATURE_TERMS = (
 ADVERSARY_MODEL = DEFAULT_MODEL
 
 
+class _RevisionCoderDeliveryError(RuntimeError):
+    def __init__(
+        self,
+        stage: Literal["prepare", "thread/start", "turn/start"],
+        error: Exception,
+        *,
+        generation: int,
+        thread_id: str | None,
+        coder: Any,
+    ) -> None:
+        super().__init__(f"{stage} failed: {error.__class__.__name__}: {error}")
+        self.stage = stage
+        self.original_error = error
+        self.generation = generation
+        self.thread_id = thread_id
+        self.coder = coder
+
+
 @dataclass(frozen=True)
 class ControllerEvent:
     kind: str
@@ -213,6 +245,14 @@ class ControllerEvent:
     user_command: UserCommand | None = None
     error: BaseException | None = None
     error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class _ReadinessJournalEvent:
+    sequence: int
+    source: AppEventSource
+    event_type: str
+    thread_id: str | None
 
 
 @dataclass(frozen=True)
@@ -291,6 +331,7 @@ class BelloController:
         project_root: Path,
         *,
         task_path: Path | None = None,
+        plan_path: Path | None = None,
         client: AppServerClient | None = None,
         tui: TerminalTUI | None = None,
         model: str | None = None,
@@ -315,20 +356,31 @@ class BelloController:
         project_config: ProjectConfig | None = None,
     ):
         self.project_root = project_root.resolve()
-        self.task_path = resolve_task(self.project_root, task_path)
+        self.plan_path = resolve_plan(self.project_root, plan_path)
+        self.task_path = resolve_task(
+            self.project_root,
+            task_path,
+            plan_path=self.plan_path,
+        )
         self._canonical_task_contents = self.task_path.read_text(encoding="utf-8")
         self._canonical_task_hash = _hash_file(self.task_path)
         self.workspace_root = self.project_root
         self.workspace_task_path = self.task_path
+        self.workspace_plan_path = self.plan_path
         self._coder_snapshot: WorkspaceSnapshot | None = None
         self._snapshot_patch_applied = False
         self._coder_started = False
         self.declared_grading_roots = tuple(str(Path(root).expanduser()) for root in declared_grading_roots or ())
+        if self.plan_path is not None:
+            validate_plan_git_isolation(self.project_root, self.plan_path)
         if clean_workspace:
+            clean_preserved_paths: tuple[str | Path, ...] = self.declared_grading_roots
+            if self.plan_path is not None:
+                clean_preserved_paths = (*clean_preserved_paths, self.plan_path)
             clean_workspace_except_task(
                 self.project_root,
                 self.task_path,
-                protected_paths=self.declared_grading_roots,
+                protected_paths=clean_preserved_paths,
             )
         self.store = StateStore(self.project_root)
         self.coder_model, self.runtime_model, self.completion_model, self.adversary_model = _resolve_controller_models(
@@ -417,6 +469,7 @@ class BelloController:
         }
         self.completion_review_return_sequence: int | None = None
         self._terminal_cleanup_started = False
+        self._finalizing = False
         self._last_controller_activity_monotonic = time.monotonic()
         self._idle_guard_fired_for_sequence: int | None = None
         self._no_marker_completion_review_key: str | None = None
@@ -434,9 +487,27 @@ class BelloController:
         self._subagent_policy_notified: set[str] = set()
         self._deferred_completion_check: QueuedSupervisorCheck | None = None
         self._quiescing_coder_tree = False
+        self._coder_quiesce_mutex: asyncio.Lock | None = None
+        self._coder_activity_mutex: asyncio.Lock | None = None
+        self._restart_transition_token: object | None = None
+        self._revision_switch_in_progress = False
+        self._revision_switch_done: asyncio.Future[None] | None = None
+        self._revision_switch_owner: asyncio.Task[Any] | None = None
+        self._readiness_event_journal: deque[_ReadinessJournalEvent] = deque(
+            maxlen=READINESS_EVENT_JOURNAL_LIMIT
+        )
+        self._reviewer_thread_ids: OrderedDict[str, None] = OrderedDict()
+        self._reviewer_thread_roles: dict[str, str] = {}
+        self._transport_error_pending = False
+        self._transport_recovery_lock: asyncio.Lock | None = None
+        self._transport_recovery_total = 0
+        self._active_provider_phase = "startup"
+        self._active_supervisor_check: QueuedSupervisorCheck | None = None
+        self._adversary_reservation_recovery_pending = False
 
     async def run(self) -> None:
         self.initialize_state()
+        self._write_run_checkpoint("startup", state="active")
         try:
             await self.client.start()
             await self.client.initialize()
@@ -444,6 +515,7 @@ class BelloController:
             self.running = True
             self.tui.render("SYSTEM", self._runtime_settings_summary())
             self._prepare_coder_workspace()
+            self._write_run_checkpoint("coder_workspace", state="stable")
             if self._adversary_enabled_for_config() and not self._effective_completion_review():
                 self.tui.render(
                     "SYSTEM",
@@ -461,6 +533,10 @@ class BelloController:
                 model=self._runtime_model(),
                 fast=self._fast_mode(),
                 intelligence=self._runtime_intelligence(),
+                on_thread_start=lambda thread_id: self._register_reviewer_thread(
+                    thread_id,
+                    role="runtime",
+                ),
             )
             self.completion_supervisor = StatelessSupervisorAgent(
                 self.client,
@@ -473,6 +549,12 @@ class BelloController:
                 intelligence=self._completion_intelligence(),
                 completion_workspace_write=True,
                 completion_source_snapshot=getattr(self, "_coder_snapshot", None),
+                completion_multi_agent=self._completion_multi_agent_config(),
+                before_completion_thread_cleanup=self._cleanup_completion_reviewer_descendants,
+                on_thread_start=lambda thread_id: self._register_reviewer_thread(
+                    thread_id,
+                    role="completion_review",
+                ),
             )
             self.adv_report_controller = StatelessSupervisorAgent(
                 self.client,
@@ -483,6 +565,11 @@ class BelloController:
                 model=self._completion_model(),
                 fast=self._fast_mode(),
                 intelligence=self._completion_intelligence(),
+                completion_source_snapshot=getattr(self, "_coder_snapshot", None),
+                on_thread_start=lambda thread_id: self._register_reviewer_thread(
+                    thread_id,
+                    role="adv_report_controller",
+                ),
             )
             self.approvals = ApprovalManager(
                 self._active_workspace_root(),
@@ -495,15 +582,18 @@ class BelloController:
                 self.store,
                 self._active_workspace_root(),
                 self._active_task_path(),
-                model=self._coder_model(),
+                model=self._active_coder_model(),
                 fast=self._fast_mode(),
-                intelligence=self._coder_intelligence(),
+                intelligence=self._active_coder_intelligence(),
                 multi_agent=self._multi_agent_config(),
+                plan_path=self._active_coder_plan_path(),
             )
             await self.coder.start_thread()
             self._coder_started = True
             await self.coder.start_initial_turn()
             self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"status": BelloStatus.RUNNING}))
+            self._active_provider_phase = "coder"
+            self._write_run_checkpoint("coder", state="active")
             self.tui.status("supervised coder started")
             await self.event_loop()
         except (AppServerError, SupervisorAgentError) as exc:
@@ -532,6 +622,10 @@ class BelloController:
             task_path=project_config.task or "",
             task_hash=_hash_file(self.task_path),
             coder_mod=project_config.coder_mod,
+            revision_coder_enabled=project_config.revision_coder_enabled,
+            revision_coder_mod=project_config.revision_coder_mod,
+            revision_coder_intelligence=project_config.revision_coder_intelligence,
+            revision_coder_active=False,
             super_mod=project_config.runtime_mod,
             runtime_mod=project_config.runtime_mod,
             completion_mod=project_config.completion_mod,
@@ -561,11 +655,85 @@ class BelloController:
             completion_review_enabled=project_config.completion_review,
             cheap_runtime=project_config.cheap_runtime,
             multi_agent=project_config.multi_agent.to_json_data(),
+            completion_multi_agent=project_config.completion_multi_agent.to_json_data(),
+            adversary_multi_agent=project_config.adversary_multi_agent.to_json_data(),
         )
         mode = "fresh" if self.overwrite_state else "resume"
         self.store.initialize_bello(config, mode=mode)
         self._sequence = self.store.max_event_sequence()
         _ensure_internal_runtime_git_excluded(self.project_root)
+
+    def _write_run_checkpoint(
+        self,
+        phase: str,
+        *,
+        state: Literal["active", "stable", "recovering", "terminal"] = "stable",
+        detail: str | None = None,
+    ) -> None:
+        """Persist orchestration metadata without copying the coder workspace."""
+
+        self._active_provider_phase = phase
+        try:
+            cfg = self.store.get_bello_config()
+        except Exception:
+            return
+        snapshot = getattr(self, "_coder_snapshot", None)
+        active_check = getattr(self, "_active_supervisor_check", None)
+        checkpoint: dict[str, Any] = {
+            "version": 1,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "phase": phase,
+            "state": state,
+            "detail": detail,
+            "status": cfg.status.value,
+            "generation": cfg.generation,
+            "coder_thread_id": cfg.coder_thread_id,
+            "active_coder_turn_id": cfg.active_coder_turn_id,
+            "revision_coder_active": cfg.revision_coder_active,
+            "completion_return_count": cfg.completion_return_count,
+            "adversary_run_count": cfg.adversary_run_count,
+            "last_event_sequence": cfg.last_event_sequence,
+            "last_applied_supervisor_sequence": cfg.last_applied_supervisor_sequence,
+            "transport_recovery_total": int(
+                getattr(self, "_transport_recovery_total", 0) or 0
+            ),
+            "workspace_path": str(
+                snapshot.snapshot_root
+                if snapshot is not None
+                else self._active_workspace_root()
+            ),
+            "active_review": (
+                {
+                    "completion_review": active_check.completion_review,
+                    "summary": active_check.summary,
+                    "triggering_item_id": active_check.triggering_item_id,
+                }
+                if active_check is not None
+                else None
+            ),
+        }
+        accepted = getattr(self, "_accepted_completion_decision", None)
+        if isinstance(accepted, CompletionReviewDecision):
+            checkpoint["accepted_completion_decision"] = accepted.model_dump(
+                mode="json"
+            )
+        report = getattr(self, "_pending_adversary_report", None)
+        if isinstance(report, AdversaryReport):
+            checkpoint["pending_adversary_report"] = report.model_dump(mode="json")
+        try:
+            self.store.write_run_checkpoint(checkpoint)
+        except OSError as exc:
+            # Checkpointing must never corrupt or stop the live run. The normal
+            # final recovery workspace remains the fallback for a broken disk.
+            self.store.append_raw_log(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "type": "run_checkpoint_error",
+                    "phase": phase,
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc),
+                }
+            )
 
     def _persist_model_config(self) -> None:
         project_config = self._project_config_for_persistence()
@@ -574,6 +742,9 @@ class BelloController:
                 update={
                     "model": _shared_primary_model(project_config),
                     "coder_model": project_config.coder_mod,
+                    "revision_coder_enabled": project_config.revision_coder_enabled,
+                    "revision_coder_mod": project_config.revision_coder_mod,
+                    "revision_coder_intelligence": project_config.revision_coder_intelligence,
                     "supervisor_model": project_config.runtime_mod,
                     "runtime_model": project_config.runtime_mod,
                     "completion_model": project_config.completion_mod,
@@ -590,6 +761,8 @@ class BelloController:
                     "completion_review_enabled": project_config.completion_review,
                     "cheap_runtime": project_config.cheap_runtime,
                     "multi_agent": project_config.multi_agent.to_json_data(),
+                    "completion_multi_agent": project_config.completion_multi_agent.to_json_data(),
+                    "adversary_multi_agent": project_config.adversary_multi_agent.to_json_data(),
                 }
             )
         )
@@ -600,15 +773,288 @@ class BelloController:
     def _active_task_path(self) -> Path:
         return Path(getattr(self, "workspace_task_path", self.task_path)).resolve()
 
+    def _active_coder_plan_path(self) -> Path | None:
+        if self._revision_coder_active():
+            return None
+        plan_path = getattr(self, "workspace_plan_path", None)
+        if plan_path is None:
+            return None
+        return Path(plan_path).absolute()
+
+    def _review_private_relative_paths(self) -> tuple[str, ...]:
+        snapshot = getattr(self, "_coder_snapshot", None)
+        plan_relative_path = getattr(snapshot, "plan_relative_path", None)
+        if not plan_relative_path:
+            return ()
+        return (str(plan_relative_path),)
+
+    def _is_review_private_path(self, path: str) -> bool:
+        normalized = _normalize_internal_workspace_path(path)
+        private_paths = {
+            _normalize_internal_workspace_path(private_path)
+            for private_path in self._review_private_relative_paths()
+        }
+        if is_windows_platform():
+            normalized = normalized.casefold()
+            private_paths = {private_path.casefold() for private_path in private_paths}
+        return normalized in private_paths
+
+    def _exposes_review_private_input(self, value: Any) -> bool:
+        """Return whether structured evidence names a coder-only input path.
+
+        Direct provenance is path-based.  Output/message fields additionally reject
+        the complete plan payload so an aggregate or glob read cannot forward it.  A
+        plan may contain an ordinary command such as ``pytest -q``; individual plan
+        lines are never matched against commands, so genuine validation using the same
+        words remains independent evidence.
+        """
+
+        snapshot = getattr(self, "_coder_snapshot", None)
+        if snapshot is None or not getattr(snapshot, "plan_relative_path", None):
+            return False
+        structured_value = value
+        if hasattr(value, "model_dump"):
+            value = value.model_dump(mode="json")
+        text_parts: list[str] = []
+
+        def collect_strings(candidate: Any, *, depth: int = 0) -> None:
+            if depth > 8:
+                return
+            if isinstance(candidate, str):
+                text_parts.append(candidate)
+                return
+            if isinstance(candidate, bytes):
+                text_parts.append(candidate.decode("utf-8", errors="replace"))
+                return
+            if isinstance(candidate, dict):
+                for key, nested in candidate.items():
+                    collect_strings(key, depth=depth + 1)
+                    collect_strings(nested, depth=depth + 1)
+                return
+            if isinstance(candidate, (list, tuple, set)):
+                for nested in candidate:
+                    collect_strings(nested, depth=depth + 1)
+                return
+            if isinstance(candidate, Path):
+                text_parts.append(str(candidate))
+
+        collect_strings(value)
+        case_insensitive_paths = is_windows_platform()
+
+        def comparable_path_text(value: str) -> str:
+            return value.casefold() if case_insensitive_paths else value
+
+        comparable = comparable_path_text("\n".join(text_parts))
+
+        path_markers: set[str] = set()
+        for candidate in (
+            getattr(snapshot, "plan_relative_path", None),
+            getattr(snapshot, "plan_path", None),
+            getattr(snapshot, "plan_source_path", None),
+        ):
+            if candidate is None:
+                continue
+            marker = str(candidate)
+            path_markers.add(marker)
+            path_markers.add(marker.replace("/", "\\"))
+            path_markers.add(marker.replace("\\", "/"))
+        relative_marker = str(snapshot.plan_relative_path)
+        path_markers.add(f"./{relative_marker}")
+        windows_relative_marker = relative_marker.replace("/", "\\")
+        path_markers.add(f".\\{windows_relative_marker}")
+        def contains_path_token(marker: str) -> bool:
+            candidate = comparable_path_text(marker)
+            if not candidate:
+                return False
+            return re.search(
+                rf"(?<![\w./\\-]){re.escape(candidate)}(?![\w./\\-])",
+                comparable,
+            ) is not None
+
+        def contains_path_component(component: str) -> bool:
+            candidate = comparable_path_text(component)
+            if not candidate:
+                return False
+            return re.search(
+                rf"(?<![\w.-]){re.escape(candidate)}(?![\w.-])",
+                comparable,
+            ) is not None
+
+        for marker in path_markers:
+            if contains_path_token(marker):
+                return True
+
+        # A shell action can name a nested plan relative to its own cwd, for
+        # example ``cwd=.../docs`` with ``cat PLAN.md``.  Do not match the
+        # basename globally: require the relative parent components to be present
+        # in the same structured action as well.
+        plan_relative = Path(str(snapshot.plan_relative_path))
+        parent_parts = tuple(
+            comparable_path_text(part)
+            for part in plan_relative.parent.parts
+            if part not in {"", "."}
+        )
+        basename = comparable_path_text(plan_relative.name)
+        if (
+            parent_parts
+            and basename
+            and contains_path_token(basename)
+            and all(contains_path_component(part) for part in parent_parts)
+        ):
+            return True
+
+        # Indirect reads (for example a Markdown glob) need not spell the plan
+        # path.  Inspect only output/message-bearing fields for the complete plan
+        # payload; never compare plan lines against command fields.
+        private_texts: list[str] = []
+        if isinstance(structured_value, (ValidationRun, InspectionRun)):
+            private_texts.append(structured_value.captured_output)
+        elif isinstance(structured_value, CoderMessage):
+            private_texts.append(structured_value.text)
+        elif isinstance(structured_value, SubagentSummary):
+            private_texts.extend(
+                text
+                for text in (
+                    structured_value.prompt,
+                    structured_value.last_message,
+                    *(activity.summary for activity in structured_value.recent_actions),
+                )
+                if text
+            )
+        elif isinstance(structured_value, PriorIntervention):
+            private_texts.extend(
+                (structured_value.reason, structured_value.message_to_coder)
+            )
+        elif isinstance(value, dict):
+            for key in (
+                "captured_output",
+                "output",
+                "text",
+                "prompt",
+                "last_message",
+                "message_to_coder",
+            ):
+                candidate = value.get(key)
+                if isinstance(candidate, str):
+                    private_texts.append(candidate)
+        plan_bytes = getattr(snapshot, "plan_bytes", None)
+        if isinstance(plan_bytes, bytes) and plan_bytes and private_texts:
+            plan_text = plan_bytes.decode("utf-8", errors="replace")
+            markers = {plan_text, plan_text.strip()}
+            if len(plan_text) > 512:
+                markers.update(
+                    {
+                        plan_text[:256],
+                        plan_text[len(plan_text) // 2 - 128 : len(plan_text) // 2 + 128],
+                        plan_text[-256:],
+                    }
+                )
+            markers = {marker for marker in markers if marker.strip()}
+            if any(
+                marker in candidate
+                for marker in markers
+                for candidate in private_texts
+            ):
+                return True
+        return False
+
+    def _review_safe_values(self, values: list[Any]) -> list[Any]:
+        return [
+            value
+            for value in values
+            if not self._exposes_review_private_input(value)
+        ]
+
+    def _review_safe_packet_state(
+        self,
+        packet: SupervisorWakePacket,
+    ) -> SupervisorWakePacket:
+        """Remove runtime-authored state that would disclose coder-only plan input."""
+
+        def exposes_freeform(value: Any) -> bool:
+            if value is None:
+                return False
+            if hasattr(value, "model_dump"):
+                value = value.model_dump(mode="json")
+            text_parts: list[str] = []
+
+            def collect(candidate: Any) -> None:
+                if isinstance(candidate, str):
+                    text_parts.append(candidate)
+                elif isinstance(candidate, bytes):
+                    text_parts.append(candidate.decode("utf-8", errors="replace"))
+                elif isinstance(candidate, dict):
+                    for key, nested in candidate.items():
+                        collect(key)
+                        collect(nested)
+                elif isinstance(candidate, (list, tuple, set)):
+                    for nested in candidate:
+                        collect(nested)
+                elif isinstance(candidate, Path):
+                    text_parts.append(str(candidate))
+
+            collect(value)
+            return self._exposes_review_private_input(
+                {"text": "\n".join(text_parts)}
+            )
+
+        updates: dict[str, Any] = {}
+        for field_name in ("progress", "decisions", "current_summary"):
+            value = getattr(packet, field_name)
+            if exposes_freeform(value):
+                updates[field_name] = (
+                    "Coder work is ready for independent review."
+                    if field_name == "current_summary"
+                    else ""
+                )
+        if exposes_freeform(packet.handoff):
+            updates["handoff"] = None
+        if exposes_freeform(packet.health):
+            updates["health"] = {}
+        updates["last_actions"] = [
+            value for value in packet.last_actions if not exposes_freeform(value)
+        ]
+        updates["recent_events"] = [
+            value for value in packet.recent_events if not exposes_freeform(value)
+        ]
+        return packet.model_copy(update=updates)
+
+    def _git_command_excluding_review_private_inputs(
+        self,
+        command: list[str],
+    ) -> list[str]:
+        private_paths = self._review_private_relative_paths()
+        if not private_paths or tuple(command[:2]) not in {
+            ("git", "status"),
+            ("git", "diff"),
+        }:
+            return list(command)
+        filtered = list(command)
+        if "--" not in filtered:
+            filtered.append("--")
+        filtered.append(".")
+        filtered.extend(
+            f":(exclude,top,literal){private_path}"
+            for private_path in private_paths
+        )
+        return filtered
+
     def _canonical_task_text(self) -> str:
         return getattr(self, "_canonical_task_contents", _read_task_text(self.task_path))
 
     def _immutable_approval_paths(self) -> tuple[Path, ...]:
         snapshot = getattr(self, "_coder_snapshot", None)
+        plan_path = getattr(self, "plan_path", None)
         if snapshot is not None:
-            return (snapshot.original_root, self.task_path)
+            paths = [snapshot.original_root, self.task_path]
+            if plan_path is not None:
+                paths.append(Path(plan_path))
+            return tuple(paths)
         task_path = getattr(self, "task_path", None)
-        return (Path(task_path),) if task_path is not None else ()
+        paths = [Path(task_path)] if task_path is not None else []
+        if plan_path is not None:
+            paths.append(Path(plan_path))
+        return tuple(paths)
 
     def _task_integrity_issue(self) -> str | None:
         expected_hash = getattr(self, "_canonical_task_hash", None)
@@ -628,7 +1074,7 @@ class BelloController:
         snapshot = getattr(self, "_coder_snapshot", None)
         if snapshot is None:
             return None
-        return snapshot.runtime_integrity_issue()
+        return snapshot.plan_integrity_issue() or snapshot.runtime_integrity_issue()
 
     async def _escalate_runtime_integrity_issue(self, *, source: str) -> bool:
         issue = self._runtime_integrity_issue()
@@ -683,18 +1129,25 @@ class BelloController:
 
     def _prepare_coder_workspace(self) -> None:
         if not self._uses_coder_snapshot():
+            if self.plan_path is not None:
+                raise WorkspaceSnapshotError(
+                    "--plan requires the default workspace-write coder snapshot so independent reviewers can remain plan-blind"
+                )
             self.workspace_root = self.project_root
             self.workspace_task_path = self.task_path
+            self.workspace_plan_path = None
             self._coder_snapshot = None
             return
         snapshot = create_workspace_snapshot(
             self.project_root,
             self.task_path,
+            plan_path=self.plan_path,
             declared_grading_roots=getattr(self, "declared_grading_roots", ()),
         )
         self._coder_snapshot = snapshot
         self.workspace_root = snapshot.snapshot_root
         self.workspace_task_path = snapshot.task_path
+        self.workspace_plan_path = snapshot.plan_path
         self.store.append_raw_log(
             {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -708,6 +1161,35 @@ class BelloController:
 
     def _coder_model(self) -> str | None:
         return getattr(self, "coder_model", getattr(self, "model", DEFAULT_MODEL))
+
+    def _revision_coder_enabled(self) -> bool:
+        project_config = getattr(self, "project_config", None)
+        if project_config is not None:
+            return bool(project_config.revision_coder_enabled)
+        try:
+            return bool(self.store.get_bello_config().revision_coder_enabled)
+        except Exception:
+            return False
+
+    def _revision_coder_model(self) -> str | None:
+        project_config = getattr(self, "project_config", None)
+        if project_config is not None:
+            return project_config.revision_coder_mod
+        try:
+            return self.store.get_bello_config().revision_coder_mod or self._coder_model()
+        except Exception:
+            return self._coder_model()
+
+    def _revision_coder_active(self) -> bool:
+        try:
+            return bool(self.store.get_bello_config().revision_coder_active)
+        except Exception:
+            return False
+
+    def _active_coder_model(self) -> str | None:
+        if self._revision_coder_active():
+            return self._revision_coder_model()
+        return self._coder_model()
 
     def _runtime_model(self) -> str | None:
         return getattr(self, "runtime_model", getattr(self, "supervisor_model", getattr(self, "model", DEFAULT_MODEL)))
@@ -789,13 +1271,17 @@ class BelloController:
             else "absent"
         )
         speed = "fast" if self._fast_mode() else "usual"
-        multi_agent = self._multi_agent_config()
-        multi_agent_summary = "off"
-        if getattr(multi_agent, "enabled", False):
-            default = getattr(multi_agent, "default", None)
-            multi_agent_summary = (
-                f"on(max={getattr(multi_agent, 'max_concurrent', '?')},"
-                f"default={getattr(default, 'model', '?')}/{getattr(default, 'intelligence', '?')})"
+        multi_agent_summary = _format_multi_agent_summary(self._multi_agent_config())
+        completion_multi_agent_summary = _format_multi_agent_summary(
+            self._completion_multi_agent_config()
+        )
+        adversary_multi_agent_summary = _format_multi_agent_summary(
+            self._adversary_multi_agent_config()
+        )
+        revision_coder_summary = "off"
+        if self._revision_coder_enabled():
+            revision_coder_summary = (
+                f"on({self._revision_coder_model()}/{self._revision_coder_intelligence()})"
             )
         return (
             "settings: "
@@ -805,12 +1291,15 @@ class BelloController:
             f"completion-mod={self._completion_model()} "
             f"adversary-mod={self._adversary_model()} "
             f"coder-intelligence={self._coder_intelligence()} "
+            f"revision-coder={revision_coder_summary} "
             f"runtime-intelligence={self._runtime_intelligence()} "
             f"completion-intelligence={self._completion_intelligence()} "
             f"adversary-intelligence={self._adversary_intelligence()} "
             f"speed={speed} "
             f"cheap-runtime={_format_bool(self._cheap_runtime_enabled())} "
             f"multi-agent={multi_agent_summary} "
+            f"completion-multi-agent={completion_multi_agent_summary} "
+            f"adversary-multi-agent={adversary_multi_agent_summary} "
             f"start-over={_format_bool(self.overwrite_state)} "
             f"clean={_format_bool(self.clean_workspace)} "
             f"completion-review={_format_bool(self._effective_completion_review())} "
@@ -820,6 +1309,75 @@ class BelloController:
 
     def _coder_intelligence(self) -> str | None:
         return getattr(self, "coder_intelligence", DEFAULT_INTELLIGENCE)
+
+    def _revision_coder_intelligence(self) -> str | None:
+        project_config = getattr(self, "project_config", None)
+        if project_config is not None:
+            return project_config.revision_coder_intelligence
+        try:
+            return self.store.get_bello_config().revision_coder_intelligence or self._coder_intelligence()
+        except Exception:
+            return self._coder_intelligence()
+
+    def _active_coder_intelligence(self) -> str | None:
+        if self._revision_coder_active():
+            return self._revision_coder_intelligence()
+        return self._coder_intelligence()
+
+    def _coder_lifecycle_accepts_activity(
+        self,
+        cfg: BelloConfig | None = None,
+        *,
+        require_running: bool = True,
+    ) -> bool:
+        cfg = cfg or self.store.get_bello_config()
+        return bool(
+            (not require_running or getattr(self, "running", True))
+            and not getattr(self, "paused", False)
+            and not getattr(self, "_finalizing", False)
+            and not getattr(self, "_terminal_cleanup_started", False)
+            and cfg.status in {BelloStatus.STARTING, BelloStatus.RUNNING}
+        )
+
+    def _coder_activity_lock(self) -> asyncio.Lock:
+        mutex = getattr(self, "_coder_activity_mutex", None)
+        if mutex is None:
+            mutex = asyncio.Lock()
+            self._coder_activity_mutex = mutex
+        return mutex
+
+    async def _wait_for_coder_activity(self) -> None:
+        async with self._coder_activity_lock():
+            return
+
+    async def _deliver_coder_message(
+        self,
+        message: str,
+        *,
+        coder: Any | None = None,
+        force_new_turn: bool = False,
+    ) -> tuple[bool, str | None]:
+        async with self._coder_activity_lock():
+            cfg = self.store.get_bello_config()
+            target = coder if coder is not None else getattr(self, "coder", None)
+            if (
+                not self._coder_lifecycle_accepts_activity(cfg)
+                or target is None
+                or target is not getattr(self, "coder", None)
+                or getattr(target, "thread_id", cfg.coder_thread_id) != cfg.coder_thread_id
+            ):
+                return False, None
+            if force_new_turn:
+                result = await target.start_turn(message)
+            else:
+                result = await target.steer_or_start(message)
+            current = self.store.get_bello_config()
+            delivered_to_current_lifecycle = bool(
+                self._coder_lifecycle_accepts_activity(current)
+                and target is getattr(self, "coder", None)
+                and getattr(target, "thread_id", current.coder_thread_id) == current.coder_thread_id
+            )
+            return delivered_to_current_lifecycle, result
 
     def _runtime_intelligence(self) -> str | None:
         return getattr(self, "runtime_intelligence", getattr(self, "supervisor_intelligence", DEFAULT_INTELLIGENCE))
@@ -912,14 +1470,15 @@ class BelloController:
         result = _selected_model_availability(
             models_response,
             coder_model=self._coder_model(),
+            revision_coder_model=(
+                self._revision_coder_model()
+                if self._revision_coder_enabled() and self._effective_completion_review()
+                else None
+            ),
             runtime_model=self._runtime_model(),
             completion_model=self._completion_model() if self._effective_completion_review() else None,
             adversary_model=self._adversary_model() if self._adversary_model_required_for_preflight() else None,
-            subagent_models=(
-                tuple(getattr(self._multi_agent_config(), "allowed", {}))
-                if getattr(self._multi_agent_config(), "enabled", False)
-                else ()
-            ),
+            subagent_models=self._enabled_subagent_models_for_preflight(),
         )
         if result.ok:
             return
@@ -933,6 +1492,21 @@ class BelloController:
         )
         self.store.append_text_locked(PROGRESS, f"- {message}\n")
         await self.finalize(message, status=BelloStatus.PROVIDER_FAILURE)
+
+    def _enabled_subagent_models_for_preflight(self) -> tuple[str, ...]:
+        policies = [self._multi_agent_config()]
+        if self._effective_completion_review():
+            policies.append(self._completion_multi_agent_config())
+        if self._adversary_model_required_for_preflight():
+            policies.append(self._adversary_multi_agent_config())
+        models: list[str] = []
+        for policy in policies:
+            if not getattr(policy, "enabled", False):
+                continue
+            for model in getattr(policy, "allowed", {}):
+                if model not in models:
+                    models.append(model)
+        return tuple(models)
 
     def _adversary_model_required_for_preflight(self) -> bool:
         if not self._effective_completion_review():
@@ -1027,12 +1601,288 @@ class BelloController:
             elif event.kind == "notification":
                 await self.handle_notification(message)
         except AppServerError as exc:
+            if getattr(self, "_transport_error_pending", False):
+                return
             await self.fail_provider(f"app-server RPC failed while handling {event.kind}: {exc}")
 
     async def handle_transport_error(self, event: ControllerEvent) -> None:
         message = event.error_message or str(event.error) or "app-server transport error"
         self._append_event(AppEventSource.APP_SERVER, "appServer/transportError", reason=message)
+        if _is_recoverable_app_server_transport_error(message):
+            recovered = await self._recover_app_server_transport(message)
+            if recovered:
+                return
+        self._transport_error_pending = False
         await self.finalize(f"app-server transport error: {message}", status=BelloStatus.PROVIDER_FAILURE)
+
+    def _transport_recovery_mutex(self) -> asyncio.Lock:
+        lock = getattr(self, "_transport_recovery_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._transport_recovery_lock = lock
+        return lock
+
+    async def _recover_app_server_transport(self, message: str) -> bool:
+        """Restart app-server and resume the current logical run in place."""
+
+        async with self._transport_recovery_mutex():
+            if not self._coder_lifecycle_accepts_activity(require_running=False):
+                return False
+            active_check = getattr(self, "_active_supervisor_check", None)
+            failed_phase = getattr(self, "_active_provider_phase", "unknown")
+            self._write_run_checkpoint(
+                failed_phase,
+                state="recovering",
+                detail=message,
+            )
+            self.tui.render(
+                "SYSTEM",
+                f"app-server transport lost during {failed_phase}; recovering",
+            )
+            self.store.append_text_locked(
+                PROGRESS,
+                f"- Provider recovery: app-server transport was lost during {failed_phase}; "
+                "restarting the transport and preserving the current workspace.\n",
+            )
+            self.store.append_raw_log(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "type": "app_server_transport_recovery_started",
+                    "phase": failed_phase,
+                    "message": message,
+                    "coder_thread_id": self.store.get_bello_config().coder_thread_id,
+                    "active_coder_turn_id": self.store.get_bello_config().active_coder_turn_id,
+                }
+            )
+
+            supervisor_task = getattr(self, "_supervisor_task", None)
+            if supervisor_task is not None and supervisor_task is not asyncio.current_task():
+                await self._stop_supervisor_task()
+            self._supervisor_task = None
+            await self._abandon_dead_completion_review()
+            self.pending_approvals.clear()
+            self.store.update_bello_config(
+                lambda cfg: cfg.model_copy(update={"pending_server_request_ids": []})
+            )
+            self._subagents = {}
+            self._subagent_policy_notified = set()
+            self._reviewer_thread_ids = OrderedDict()
+            self._reviewer_thread_roles = {}
+            self._active_adversary_thread_id = None
+
+            if failed_phase == "adversary" and not getattr(
+                self, "_adversary_reservation_recovery_pending", False
+            ):
+                self._rollback_interrupted_adversary_reservation()
+                self._adversary_reservation_recovery_pending = True
+
+            errors: list[str] = []
+            for attempt in range(1, APP_SERVER_TRANSPORT_RECOVERY_ATTEMPTS + 1):
+                delay = APP_SERVER_TRANSPORT_RECOVERY_BACKOFF_SECONDS[
+                    min(attempt - 1, len(APP_SERVER_TRANSPORT_RECOVERY_BACKOFF_SECONDS) - 1)
+                ]
+                if delay:
+                    await asyncio.sleep(delay)
+                try:
+                    await self._restart_app_server_client()
+                    await self._recover_coder_thread_after_transport(
+                        start_continuation=active_check is None,
+                    )
+                except Exception as exc:
+                    error = f"{exc.__class__.__name__}: {exc}"
+                    errors.append(error)
+                    self.store.append_raw_log(
+                        {
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "type": "app_server_transport_recovery_attempt_failed",
+                            "attempt": attempt,
+                            "phase": failed_phase,
+                            "error": error,
+                        }
+                    )
+                    continue
+
+                self._transport_recovery_total = int(
+                    getattr(self, "_transport_recovery_total", 0) or 0
+                ) + 1
+                self._transport_error_pending = False
+                self._adversary_reservation_recovery_pending = False
+                self._write_run_checkpoint(
+                    "coder" if active_check is None else failed_phase,
+                    state="stable",
+                    detail=f"transport recovered on attempt {attempt}",
+                )
+                self.store.append_text_locked(
+                    PROGRESS,
+                    f"- Provider recovery complete: app-server resumed on attempt "
+                    f"{attempt}/{APP_SERVER_TRANSPORT_RECOVERY_ATTEMPTS}.\n",
+                )
+                self.store.append_raw_log(
+                    {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "type": "app_server_transport_recovered",
+                        "attempt": attempt,
+                        "phase": failed_phase,
+                        "coder_thread_id": self.store.get_bello_config().coder_thread_id,
+                        "active_coder_turn_id": self.store.get_bello_config().active_coder_turn_id,
+                    }
+                )
+                self.tui.render("SYSTEM", "app-server transport recovered")
+                if active_check is not None and self._coder_lifecycle_accepts_activity():
+                    self._schedule_supervisor_check(
+                        active_check.summary,
+                        triggering_item_id=active_check.triggering_item_id,
+                        triggering_action=active_check.triggering_action,
+                        human_message=active_check.human_message,
+                        patch_summary=active_check.patch_summary,
+                        completion_review=active_check.completion_review,
+                    )
+                return True
+
+            self.store.append_raw_log(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "type": "app_server_transport_recovery_exhausted",
+                    "phase": failed_phase,
+                    "errors": errors,
+                }
+            )
+            return False
+
+    async def _restart_app_server_client(self) -> None:
+        client = self.client
+        restart = getattr(client, "restart", None)
+        if callable(restart):
+            await restart()
+        else:
+            await client.stop()
+            await client.start()
+        await client.initialize()
+
+    async def _abandon_dead_completion_review(self) -> None:
+        supervisor = self._completion_supervisor_agent()
+        if supervisor is None:
+            return
+        abandon = getattr(
+            supervisor,
+            "abandon_completion_review_after_transport_loss",
+            None,
+        )
+        if callable(abandon):
+            await abandon()
+            return
+        if hasattr(supervisor, "completion_thread_id"):
+            supervisor.completion_thread_id = None
+
+    def _rollback_interrupted_adversary_reservation(self) -> None:
+        self.store.update_bello_config(
+            lambda cfg: cfg.model_copy(
+                update={
+                    "adversary_run_count": max(0, cfg.adversary_run_count - 1),
+                }
+            )
+        )
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "interrupted_adversary_reservation_rolled_back",
+            }
+        )
+
+    async def _recover_coder_thread_after_transport(
+        self,
+        *,
+        start_continuation: bool,
+    ) -> None:
+        coder = getattr(self, "coder", None)
+        cfg = self.store.get_bello_config()
+        if coder is None or not cfg.coder_thread_id:
+            raise RuntimeError("no persisted coder thread is available for recovery")
+        coder.thread_id = cfg.coder_thread_id
+        coder.active_turn_id = cfg.active_coder_turn_id
+        try:
+            thread = await coder.resume_thread()
+        except Exception as exc:
+            self.store.append_raw_log(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "type": "coder_thread_resume_failed",
+                    "thread_id": cfg.coder_thread_id,
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc),
+                }
+            )
+            await self._start_fallback_recovery_coder(
+                coder,
+                start_continuation=start_continuation,
+            )
+            return
+
+        active_turn_id = cfg.active_coder_turn_id
+        active_turn = _thread_turn_by_id(thread, active_turn_id)
+        status = active_turn.get("status") if active_turn is not None else None
+        if active_turn_id and active_turn is not None and status == "completed":
+            text = last_agent_message_text(active_turn)
+            if text:
+                self._append_event(
+                    AppEventSource.APP_SERVER,
+                    "transport/replayedCoderMessage",
+                    thread_id=cfg.coder_thread_id,
+                    turn_id=active_turn_id,
+                    reason="replayed from thread/resume after transport loss",
+                )
+                self.last_coder_message = CoderMessage(
+                    text=text.strip(),
+                    sequence=self._sequence,
+                )
+                self.tui.render("CODER", text.strip())
+            coder.mark_turn_completed(active_turn_id)
+            self._write_run_checkpoint("coder_turn_complete", state="stable")
+            await self._handle_coder_turn_completed(item_id=None)
+            return
+        if active_turn_id and status == "inProgress":
+            coder.active_turn_id = active_turn_id
+            self.store.update_bello_config(
+                lambda current: current.model_copy(
+                    update={"active_coder_turn_id": active_turn_id}
+                )
+            )
+            return
+        if active_turn_id:
+            self._clear_persisted_coder_turn(cfg.coder_thread_id, active_turn_id)
+        if start_continuation:
+            await coder.start_turn(TRANSPORT_RECOVERY_CODER_PROMPT)
+
+    async def _start_fallback_recovery_coder(
+        self,
+        previous: CoderSession,
+        *,
+        start_continuation: bool,
+    ) -> None:
+        cfg = self.store.get_bello_config()
+        replacement = CoderSession(
+            self.client,
+            self.store,
+            self._active_workspace_root(),
+            self._active_task_path(),
+            model=self._active_coder_model(),
+            fast=self._fast_mode(),
+            intelligence=self._active_coder_intelligence(),
+            multi_agent=self._multi_agent_config(),
+            plan_path=self._active_coder_plan_path(),
+        )
+        self.coder = replacement
+        new_thread_id = await replacement.start_thread()
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "coder_transport_recovery_fallback_thread",
+                "previous_thread_id": cfg.coder_thread_id or previous.thread_id,
+                "new_thread_id": new_thread_id,
+            }
+        )
+        if start_continuation:
+            await replacement.start_turn(TRANSPORT_RECOVERY_CODER_PROMPT)
 
     async def fail_provider(self, message: str) -> None:
         if not self.running and self.store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE:
@@ -1062,6 +1912,13 @@ class BelloController:
             await self.pause()
             return
         if text == "/resume":
+            current_status = self.store.get_bello_config().status
+            if (
+                getattr(self, "_finalizing", False)
+                or getattr(self, "_terminal_cleanup_started", False)
+                or current_status != BelloStatus.PAUSED
+            ):
+                return
             self.paused = False
             self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"status": BelloStatus.RUNNING}))
             self.tui.status("resumed")
@@ -1157,7 +2014,9 @@ class BelloController:
                         "As the parent coder, steer or stop that child and continue with a compliant approach."
                     )
                 try:
-                    await self.coder.steer_or_start(delivery_reason)
+                    delivered, _ = await self._deliver_coder_message(delivery_reason)
+                    if not delivered:
+                        return
                 except AppServerError as exc:
                     if not _is_no_active_turn_to_steer_error(exc):
                         raise
@@ -1167,7 +2026,12 @@ class BelloController:
                     self.store.update_bello_config(
                         lambda cfg: cfg.model_copy(update={"active_coder_turn_id": None})
                     )
-                    turn_id = await self.coder.start_turn(delivery_reason)
+                    delivered, turn_id = await self._deliver_coder_message(
+                        delivery_reason,
+                        force_new_turn=True,
+                    )
+                    if not delivered:
+                        return
                     if isinstance(turn_id, str):
                         self.store.update_bello_config(
                             lambda cfg: cfg.model_copy(update={"active_coder_turn_id": turn_id})
@@ -1180,8 +2044,24 @@ class BelloController:
             patch_health(self.store, HealthDelta(generation=self.store.get_health().generation, denied_requests=1, last_denial=resolution.reason))
 
     def _is_adversary_approval_context(self, context: ApprovalContext) -> bool:
-        thread_id = getattr(self, "_active_adversary_thread_id", None)
-        return bool(thread_id and context.thread_id == thread_id)
+        active_adversary_thread_id = getattr(self, "_active_adversary_thread_id", None)
+        if active_adversary_thread_id and context.thread_id == active_adversary_thread_id:
+            return True
+        reviewer_role = self._reviewer_role_for_thread(context.thread_id)
+        if reviewer_role is not None:
+            return reviewer_role == "adversary"
+        if not active_adversary_thread_id or not isinstance(context.thread_id, str):
+            return False
+        cfg = self.store.get_bello_config()
+        if context.thread_id == cfg.coder_thread_id or self._is_coder_descendant(
+            context.thread_id,
+            cfg=cfg,
+        ):
+            return False
+        # Child notifications normally establish ancestry before a request arrives. If
+        # app-server delivers an adversary-child approval first, keep the unknown request
+        # inside the active disposable-snapshot policy instead of risking canonical routing.
+        return True
 
     async def decide_approval(self, context: ApprovalContext, reason: str) -> SupervisorDecision:
         if self.supervisor is None:
@@ -1229,23 +2109,30 @@ class BelloController:
             if thread_id == cfg.coder_thread_id or self._is_coder_descendant(thread_id, cfg=cfg):
                 self._record_command_output_delta(method, params, item_id=item_id)
             return
+        event_payload = _bounded_subagent_event_payload(method, params)
+        if self._exposes_review_private_input(event_payload):
+            event_payload.pop("prompt", None)
         self._append_event(
             AppEventSource.APP_SERVER,
             method,
             thread_id=thread_id,
             turn_id=turn_id,
             item_id=item_id,
-            payload=_bounded_subagent_event_payload(method, params),
+            payload=event_payload,
         )
         if getattr(self, "_terminal_cleanup_started", False) and method != "serverRequest/resolved":
             return
 
+        lifecycle_accepts_activity = self._coder_lifecycle_accepts_activity(cfg)
         await self._track_subagent_notification(
             method,
             params,
             thread_id=thread_id,
             turn_id=turn_id,
+            enforce_policy=lifecycle_accepts_activity,
         )
+        cfg = self.store.get_bello_config()
+        lifecycle_accepts_activity = self._coder_lifecycle_accepts_activity(cfg)
 
         if method == "serverRequest/resolved":
             request_id = params.get("requestId")
@@ -1254,6 +2141,20 @@ class BelloController:
                 lambda current: current.model_copy(update={"pending_server_request_ids": list(self.pending_approvals)})
             )
             return
+        root_coder_notification = thread_id == cfg.coder_thread_id
+        descendant_notification = self._is_coder_descendant(thread_id, cfg=cfg)
+        if not lifecycle_accepts_activity and (root_coder_notification or descendant_notification):
+            if method == "turn/started" and isinstance(thread_id, str) and isinstance(turn_id, str):
+                await self._reject_late_coder_turn(
+                    thread_id,
+                    turn_id,
+                    root=root_coder_notification,
+                )
+            elif method == "turn/completed" and root_coder_notification and isinstance(turn_id, str):
+                if self.coder:
+                    self.coder.mark_turn_completed(turn_id)
+                self._clear_persisted_coder_turn(thread_id, turn_id)
+            return
         if method == "turn/started" and thread_id == cfg.coder_thread_id and isinstance(turn_id, str):
             if self.coder:
                 self.coder.active_turn_id = turn_id
@@ -1261,6 +2162,7 @@ class BelloController:
             self._current_turn_action_count = 0
             self._generation_has_coder_turn = True
             self.store.update_bello_config(lambda current: current.model_copy(update={"active_coder_turn_id": turn_id}))
+            self._write_run_checkpoint("coder", state="active")
             self.tui.render("CODER", f"turn started {turn_id}")
             return
         if method == "item/completed" and thread_id == cfg.coder_thread_id:
@@ -1291,10 +2193,107 @@ class BelloController:
         if method == "turn/completed" and thread_id == cfg.coder_thread_id:
             if self.coder and isinstance(turn_id, str):
                 self.coder.mark_turn_completed(turn_id)
+            self._write_run_checkpoint("coder_turn_complete", state="stable")
             await self._handle_coder_turn_completed(item_id=item_id)
             return
         if method in {"turn/completed", "thread/status/changed", "thread/closed"}:
             await self._resume_deferred_completion_if_quiescent()
+
+    def _clear_persisted_coder_turn(self, thread_id: str | None, turn_id: str | None) -> None:
+        if not thread_id or not turn_id:
+            return
+        coder = getattr(self, "coder", None)
+        if (
+            coder is not None
+            and getattr(coder, "thread_id", None) == thread_id
+            and getattr(coder, "active_turn_id", None) == turn_id
+        ):
+            coder.active_turn_id = None
+        self.store.update_bello_config(
+            lambda current: current.model_copy(
+                update={
+                    "active_coder_turn_id": (
+                        None
+                        if current.coder_thread_id == thread_id
+                        and current.active_coder_turn_id == turn_id
+                        else current.active_coder_turn_id
+                    )
+                }
+            )
+        )
+
+    async def _reject_late_coder_turn(self, thread_id: str, turn_id: str, *, root: bool) -> None:
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "late_coder_turn_rejected",
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "root": root,
+                "status": self.store.get_bello_config().status.value,
+            }
+        )
+        try:
+            await self.client.turn_interrupt(thread_id, turn_id)
+        except Exception as exc:
+            if _is_turn_already_inactive_error(exc):
+                if root:
+                    self._clear_persisted_coder_turn(thread_id, turn_id)
+                else:
+                    state = self._subagent_registry().get(thread_id)
+                    if state is not None and state.active_turn_id == turn_id:
+                        state.active_turn_id = None
+                        state.status = "interrupted"
+                return
+            self._append_cleanup_error(
+                cleanup_kind="late_coder_turn_interrupt",
+                thread_id=thread_id,
+                turn_id=turn_id,
+                error=exc,
+            )
+            if root:
+                coder = getattr(self, "coder", None)
+                if coder is not None and getattr(coder, "thread_id", None) == thread_id:
+                    coder.active_turn_id = turn_id
+                self.store.update_bello_config(
+                    lambda current: current.model_copy(
+                        update={
+                            "active_coder_turn_id": (
+                                turn_id if current.coder_thread_id == thread_id else current.active_coder_turn_id
+                            )
+                        }
+                    )
+                )
+            quiesced = await self._quiesce_coder_tree("late_turn_notification", strict=False)
+            if quiesced:
+                if root:
+                    self._clear_persisted_coder_turn(thread_id, turn_id)
+                return
+            cfg = self.store.get_bello_config()
+            message = (
+                f"late coder turn {turn_id} on {thread_id} could not be interrupted during "
+                f"{cfg.status.value} lifecycle cleanup"
+            )
+            if cfg.status == BelloStatus.PAUSED and not getattr(self, "_finalizing", False):
+                await self.finalize(message, status=BelloStatus.PROVIDER_FAILURE)
+                return
+            try:
+                await self.client.stop()
+            except Exception as stop_error:
+                self._append_cleanup_error(
+                    cleanup_kind="late_coder_turn_process_tree_stop",
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    error=stop_error,
+                )
+            return
+        if root:
+            self._clear_persisted_coder_turn(thread_id, turn_id)
+        else:
+            state = self._subagent_registry().get(thread_id)
+            if state is not None and state.active_turn_id == turn_id:
+                state.active_turn_id = None
+                state.status = "interrupted"
 
     def _record_command_output_delta(self, method: str, params: dict[str, Any], *, item_id: str | None) -> None:
         if not _is_command_output_delta_method(method):
@@ -1362,7 +2361,14 @@ class BelloController:
         )
         if not is_subagent:
             self._current_turn_action_count = getattr(self, "_current_turn_action_count", 0) + 1
-        self.store.append_recent_action(display_summary)
+        persisted_summary = display_summary
+        if self._exposes_review_private_input((item, display_summary)):
+            persisted_summary = (
+                "subagent workspace action completed"
+                if is_subagent
+                else "workspace action completed"
+            )
+        self.store.append_recent_action(persisted_summary)
         triggering_action = _triggering_action_from_item(item, item_id=item_id, summary=display_summary)
         repaired_runtime_controls = self._repair_snapshot_runtime_controls(
             source="subagent_action" if is_subagent else "coder_action"
@@ -1403,6 +2409,10 @@ class BelloController:
             sequence=self._sequence,
             item=validation_item,
         )
+        if validation is not None and self._exposes_review_private_input(validation):
+            validation = None
+        if inspection is not None and self._exposes_review_private_input(inspection):
+            inspection = None
         validation_trigger_reasons: tuple[str, ...] = ()
         if validation is not None:
             self.validations.append(validation)
@@ -1483,6 +2493,7 @@ class BelloController:
         *,
         thread_id: str | None,
         turn_id: str | None,
+        enforce_policy: bool = True,
     ) -> None:
         cfg = self.store.get_bello_config()
         if method == "thread/started":
@@ -1521,11 +2532,12 @@ class BelloController:
                 await self._track_collab_agent_tool_call(item, event_thread_id=thread_id)
 
         # A nested child can arrive before its parent notification. Re-evaluate ancestry
-        # whenever the registry changes so the allowlist is enforced as soon as the chain
-        # to the current coder root becomes known.
-        for state in tuple(self._subagent_registry().values()):
-            if self._is_coder_descendant(state.thread_id, cfg=cfg):
-                await self._enforce_subagent_profile(state)
+        # whenever the registry changes so the relevant role policy is enforced as soon as
+        # the chain to a coder or reviewer root becomes known.
+        if enforce_policy:
+            for state in tuple(self._subagent_registry().values()):
+                if self._subagent_multi_agent_policy(state.thread_id, cfg=cfg) is not None:
+                    await self._enforce_subagent_profile(state)
 
     def _upsert_subagent_thread(
         self,
@@ -1624,6 +2636,27 @@ class BelloController:
             current = state.parent_thread_id
         return False
 
+    def _subagent_depth_from_root(self, thread_id: Any, root_thread_id: Any) -> int | None:
+        if not isinstance(thread_id, str) or not isinstance(root_thread_id, str):
+            return None
+        if thread_id == root_thread_id:
+            return 0
+        seen: set[str] = set()
+        current = thread_id
+        depth = 0
+        for _ in range(32):
+            if current in seen:
+                return None
+            seen.add(current)
+            state = self._subagent_registry().get(current)
+            if state is None or not isinstance(state.parent_thread_id, str):
+                return None
+            depth += 1
+            if state.parent_thread_id == root_thread_id:
+                return depth
+            current = state.parent_thread_id
+        return None
+
     def _subagent_depth(self, thread_id: str, *, cfg: BelloConfig | None = None) -> int:
         cfg = cfg or self.store.get_bello_config()
         root_thread_id = cfg.coder_thread_id
@@ -1700,9 +2733,10 @@ class BelloController:
         return summaries
 
     async def _enforce_subagent_profile(self, state: SubagentRuntimeState) -> None:
-        if not self._is_coder_descendant(state.thread_id):
+        policy = self._subagent_multi_agent_policy(state.thread_id)
+        if policy is None:
             return
-        multi_agent = self._multi_agent_config()
+        role, multi_agent = policy
         default = getattr(multi_agent, "default", None)
         model = state.model or getattr(default, "model", None)
         intelligence = state.reasoning_effort or getattr(default, "intelligence", None)
@@ -1714,37 +2748,79 @@ class BelloController:
             getattr(multi_agent, "enabled", False)
             and getattr(multi_agent, "is_allowed", lambda *_: False)(model, intelligence)
         )
+        reviewer_depth = self._reviewer_descendant_depth(state.thread_id)
+        depth_allowed = role == "coder" or reviewer_depth == 1
+        allowed = allowed and depth_allowed
         state.profile_allowed = allowed
         if allowed:
             return
         if state.active_turn_id:
-            await self._interrupt_subagent(state, cleanup_kind="subagent_profile_policy")
+            await self._interrupt_subagent(
+                state,
+                cleanup_kind=f"{role}_subagent_policy",
+            )
         notified = self._subagent_policy_notifications()
         if state.thread_id in notified:
             return
         notified.add(state.thread_id)
         allowed_text = _format_allowed_subagent_profiles(multi_agent)
-        reason = (
-            f"Subagent {state.thread_id} used forbidden profile {model}/{intelligence}. "
-            f"Allowed profiles: {allowed_text}. Stop that child and, if delegation is still useful, "
-            "spawn a replacement using an allowed profile."
-        )
+        if not depth_allowed:
+            reason = (
+                f"Reviewer subagent {state.thread_id} attempted nested delegation at depth "
+                f"{reviewer_depth}; reviewer delegation is limited to one child level."
+            )
+        else:
+            reason = (
+                f"{role.replace('_', ' ').title()} subagent {state.thread_id} used forbidden profile "
+                f"{model}/{intelligence}. Allowed profiles: {allowed_text}. Stop that child and, if "
+                "delegation is still useful, spawn a replacement using an allowed profile."
+            )
         self._append_event(
             AppEventSource.SUPERVISOR,
-            "subagent/profile_denied",
+            "subagent/depth_denied" if not depth_allowed else "subagent/profile_denied",
             thread_id=state.thread_id,
             reason=reason,
         )
         self.store.append_text_locked(PROGRESS, f"- {reason}\n")
         self.tui.render("SUPERVISOR", reason)
-        if self.coder is not None:
-            await self.coder.steer_or_start(reason)
+        if role == "coder" and self.coder is not None:
+            await self._deliver_coder_message(reason)
+
+    def _subagent_multi_agent_policy(
+        self,
+        thread_id: Any,
+        *,
+        cfg: BelloConfig | None = None,
+    ) -> tuple[str, Any] | None:
+        if self._is_coder_descendant(thread_id, cfg=cfg):
+            return "coder", self._multi_agent_config()
+        reviewer_role = self._reviewer_role_for_thread(thread_id)
+        reviewer_depth = self._reviewer_descendant_depth(thread_id)
+        if reviewer_depth is None or reviewer_depth < 1:
+            return None
+        if reviewer_role == "completion_review":
+            return reviewer_role, self._completion_multi_agent_config()
+        if reviewer_role == "adversary":
+            return reviewer_role, self._adversary_multi_agent_config()
+        return None
 
     def _multi_agent_config(self) -> Any:
         project_config = getattr(self, "project_config", None)
         if project_config is None:
             return MultiAgentConfig()
         return getattr(project_config, "multi_agent", None)
+
+    def _completion_multi_agent_config(self) -> Any:
+        project_config = getattr(self, "project_config", None)
+        if project_config is None:
+            return MultiAgentConfig()
+        return getattr(project_config, "completion_multi_agent", MultiAgentConfig())
+
+    def _adversary_multi_agent_config(self) -> Any:
+        project_config = getattr(self, "project_config", None)
+        if project_config is None:
+            return MultiAgentConfig()
+        return getattr(project_config, "adversary_multi_agent", MultiAgentConfig())
 
     async def _refresh_coder_subagents(self) -> None:
         cfg = self.store.get_bello_config()
@@ -1792,6 +2868,139 @@ class BelloController:
                 if isinstance(turn, dict) and turn.get("status") == "inProgress" and isinstance(turn.get("id"), str):
                     state.active_turn_id = turn["id"]
 
+    async def _refresh_reviewer_subagents(
+        self,
+        root_thread_id: str,
+        workspace_root: Path,
+    ) -> None:
+        client = getattr(self, "client", None)
+        if client is None or not hasattr(client, "thread_list"):
+            return
+        cfg = self.store.get_bello_config()
+        cursor: str | None = None
+        for _ in range(20):
+            params: dict[str, Any] = {
+                "archived": False,
+                "cwd": str(workspace_root.resolve()),
+                "limit": 100,
+                "sourceKinds": list(SUBAGENT_SOURCE_KINDS),
+            }
+            if cursor is not None:
+                params["cursor"] = cursor
+            response = await client.thread_list(params)
+            threads = response.get("data")
+            if not isinstance(threads, list):
+                break
+            for thread in threads:
+                if isinstance(thread, dict):
+                    self._upsert_subagent_thread(thread, generation=cfg.generation)
+            next_cursor = response.get("nextCursor")
+            if not isinstance(next_cursor, str) or not next_cursor:
+                break
+            cursor = next_cursor
+        if not hasattr(client, "thread_turns_list"):
+            return
+        for state in tuple(self._subagent_registry().values()):
+            if self._subagent_depth_from_root(state.thread_id, root_thread_id) is None:
+                continue
+            if state.status != "active" or state.active_turn_id is not None:
+                continue
+            response = await client.thread_turns_list(
+                state.thread_id,
+                limit=1,
+                items_view="summary",
+                sort_direction="desc",
+            )
+            turns = response.get("data")
+            if isinstance(turns, list) and turns:
+                turn = turns[0]
+                if (
+                    isinstance(turn, dict)
+                    and turn.get("status") == "inProgress"
+                    and isinstance(turn.get("id"), str)
+                ):
+                    state.active_turn_id = turn["id"]
+
+    async def _cleanup_completion_reviewer_descendants(
+        self,
+        root_thread_id: str,
+        workspace_root: Path,
+    ) -> None:
+        await self._cleanup_reviewer_descendants(
+            root_thread_id,
+            workspace_root,
+            cleanup_kind="completion_review_subagent",
+        )
+
+    async def _cleanup_adversary_reviewer_descendants(
+        self,
+        root_thread_id: str,
+        workspace_root: Path,
+    ) -> None:
+        await self._cleanup_reviewer_descendants(
+            root_thread_id,
+            workspace_root,
+            cleanup_kind="adversary_subagent",
+        )
+
+    async def _cleanup_reviewer_descendants(
+        self,
+        root_thread_id: str,
+        workspace_root: Path,
+        *,
+        cleanup_kind: str,
+    ) -> None:
+        try:
+            await self._refresh_reviewer_subagents(root_thread_id, workspace_root)
+        except Exception as exc:
+            self._append_cleanup_error(
+                cleanup_kind=f"{cleanup_kind}_refresh",
+                thread_id=root_thread_id,
+                turn_id=None,
+                error=exc,
+            )
+        descendants = [
+            (depth, state)
+            for state in self._subagent_registry().values()
+            if (depth := self._subagent_depth_from_root(state.thread_id, root_thread_id))
+            is not None
+            and depth > 0
+        ]
+        descendants.sort(key=lambda item: item[0], reverse=True)
+        for _, state in descendants:
+            if state.active_turn_id:
+                try:
+                    await self._interrupt_subagent(
+                        state,
+                        cleanup_kind=f"{cleanup_kind}_interrupt",
+                    )
+                except Exception:
+                    pass
+            try:
+                if hasattr(self.client, "thread_archive"):
+                    await self.client.thread_archive(state.thread_id)
+                elif hasattr(self.client, "thread_unsubscribe"):
+                    await self.client.thread_unsubscribe(state.thread_id)
+            except Exception as exc:
+                self._append_cleanup_error(
+                    cleanup_kind=f"{cleanup_kind}_archive",
+                    thread_id=state.thread_id,
+                    turn_id=state.active_turn_id,
+                    error=exc,
+                )
+                try:
+                    if hasattr(self.client, "thread_unsubscribe"):
+                        await self.client.thread_unsubscribe(state.thread_id)
+                except Exception as unsubscribe_exc:
+                    self._append_cleanup_error(
+                        cleanup_kind=f"{cleanup_kind}_unsubscribe",
+                        thread_id=state.thread_id,
+                        turn_id=state.active_turn_id,
+                        error=unsubscribe_exc,
+                    )
+            state.status = "shutdown"
+            state.active_turn_id = None
+
     async def _interrupt_subagent(
         self,
         state: SubagentRuntimeState,
@@ -1814,51 +3023,54 @@ class BelloController:
         state.active_turn_id = None
 
     async def _quiesce_coder_tree(self, reason: str, *, strict: bool = True) -> bool:
-        if getattr(self, "_quiescing_coder_tree", False):
-            return True
-        self._quiescing_coder_tree = True
-        try:
-            coder = getattr(self, "coder", None)
-            if coder is not None:
+        mutex = getattr(self, "_coder_quiesce_mutex", None)
+        if mutex is None:
+            mutex = asyncio.Lock()
+            self._coder_quiesce_mutex = mutex
+        async with mutex:
+            self._quiescing_coder_tree = True
+            try:
+                coder = getattr(self, "coder", None)
+                if coder is not None:
+                    try:
+                        await coder.interrupt()
+                    except Exception as exc:
+                        self._append_cleanup_error(
+                            cleanup_kind=f"{reason}_coder_interrupt",
+                            thread_id=getattr(coder, "thread_id", None) or "unknown",
+                            turn_id=getattr(coder, "active_turn_id", None),
+                            error=exc,
+                        )
+                        if strict:
+                            raise
+                        return False
                 try:
-                    await coder.interrupt()
-                except Exception as exc:
-                    self._append_cleanup_error(
-                        cleanup_kind=f"{reason}_coder_interrupt",
-                        thread_id=getattr(coder, "thread_id", None) or "unknown",
-                        turn_id=getattr(coder, "active_turn_id", None),
-                        error=exc,
-                    )
+                    for _ in range(3):
+                        await self._refresh_coder_subagents()
+                        active = sorted(
+                            self._active_coder_subagents(),
+                            key=lambda state: self._subagent_depth(state.thread_id),
+                            reverse=True,
+                        )
+                        if not active:
+                            break
+                        for state in active:
+                            await self._interrupt_subagent(
+                                state,
+                                cleanup_kind=f"{reason}_subagent_interrupt",
+                            )
+                    await self._refresh_coder_subagents()
+                    remaining = self._active_coder_subagents()
+                    if remaining:
+                        ids = ", ".join(state.thread_id for state in remaining)
+                        raise RuntimeError(f"coder descendants did not quiesce: {ids}")
+                except Exception:
                     if strict:
                         raise
                     return False
-            try:
-                for _ in range(3):
-                    await self._refresh_coder_subagents()
-                    active = sorted(
-                        self._active_coder_subagents(),
-                        key=lambda state: self._subagent_depth(state.thread_id),
-                        reverse=True,
-                    )
-                    if not active:
-                        break
-                    for state in active:
-                        await self._interrupt_subagent(
-                            state,
-                            cleanup_kind=f"{reason}_subagent_interrupt",
-                        )
-                await self._refresh_coder_subagents()
-                remaining = self._active_coder_subagents()
-                if remaining:
-                    ids = ", ".join(state.thread_id for state in remaining)
-                    raise RuntimeError(f"coder descendants did not quiesce: {ids}")
-            except Exception:
-                if strict:
-                    raise
-                return False
-            return True
-        finally:
-            self._quiescing_coder_tree = False
+                return True
+            finally:
+                self._quiescing_coder_tree = False
 
     async def _resume_deferred_completion_if_quiescent(self) -> None:
         queued = getattr(self, "_deferred_completion_check", None)
@@ -1959,8 +3171,14 @@ class BelloController:
             return
         self._schedule_supervisor_check("Coder turn completed", triggering_item_id=item_id)
 
-    async def _continue_after_readiness_marker(self, *, triggering_item_id: str | None) -> None:
-        await self._refresh_coder_subagents()
+    async def _continue_after_readiness_marker(
+        self,
+        *,
+        triggering_item_id: str | None,
+        subagents_refreshed: bool = False,
+    ) -> None:
+        if not subagents_refreshed:
+            await self._refresh_coder_subagents()
         active_subagents = self._active_coder_subagents()
         if active_subagents:
             self._deferred_completion_check = QueuedSupervisorCheck(
@@ -2014,7 +3232,7 @@ class BelloController:
         patch_health(self.store, HealthDelta(generation=cfg.generation, interventions=1))
         self.tui.render("SUPERVISOR", reason)
         if self.coder:
-            await self.coder.steer_or_start(message)
+            await self._deliver_coder_message(message)
 
     async def _handle_no_marker_idle(self) -> None:
         cfg = self.store.get_bello_config()
@@ -2029,7 +3247,7 @@ class BelloController:
             # run via restart-with-exhausted-budget). Kick the coder instead; steer_or_start starts
             # a turn if the restart kickoff died.
             if self.coder:
-                await self.coder.steer_or_start(POST_RESTART_CONTINUE_NUDGE)
+                await self._deliver_coder_message(POST_RESTART_CONTINUE_NUDGE)
             return
         latest_validation_sequence = max((validation.sequence for validation in self.validations), default=None)
         last_message_sequence = self.last_coder_message.sequence if self.last_coder_message is not None else None
@@ -2059,7 +3277,11 @@ class BelloController:
         )
 
     async def pause(self) -> None:
+        if getattr(self, "_finalizing", False):
+            return
+        self._restart_transition_token = None
         self.paused = True
+        self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"status": BelloStatus.PAUSED}))
         self._supervisor_next_runtime_check = None
         self._supervisor_next_completion_check = None
         self._supervisor_next_runtime_summary = None
@@ -2067,24 +3289,89 @@ class BelloController:
         self._pending_runtime_trigger_signatures = {}
         self._pending_runtime_trigger_actions = {}
         self._sync_legacy_supervisor_queue_fields()
+        await self._wait_for_revision_switch()
+        await self._wait_for_coder_activity()
+        if getattr(self, "_finalizing", False):
+            return
         supervisor_task = getattr(self, "_supervisor_task", None)
         if supervisor_task is not None and supervisor_task is not asyncio.current_task():
             await self._stop_supervisor_task()
         await self._close_completion_review_session()
-        self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"status": BelloStatus.PAUSED}))
         await self._quiesce_coder_tree("pause")
         await self._resolve_pending_approvals("paused")
         self.tui.status("paused")
 
     async def restart(self, reason: str, *, handoff: RestartHandoff | None = None) -> None:
+        if getattr(self, "_finalizing", False):
+            return
         cfg = self.store.get_bello_config()
+        if getattr(self, "paused", False) or cfg.status == BelloStatus.PAUSED:
+            self.tui.status("paused; resume before restarting")
+            return
         if cfg.restart_count >= cfg.max_restarts:
             await self.finalize("restart cap reached", status=BelloStatus.STUCK)
             return
+        transition_token = object()
+        self._restart_transition_token = transition_token
         self._append_event(AppEventSource.SUPERVISOR, "controller/restart", reason=reason)
-        await self._close_completion_review_session()
         self.store.update_bello_config(lambda current: current.model_copy(update={"status": BelloStatus.RESTARTING}))
+        await self._wait_for_revision_switch()
+        restart_cap_reached = False
+        try:
+            async with self._coder_activity_lock():
+                current = self.store.get_bello_config()
+                if not self._restart_transition_is_current(
+                    transition_token,
+                    expected_generation=current.generation,
+                    expected_thread_id=current.coder_thread_id,
+                ):
+                    return
+                if current.restart_count >= current.max_restarts:
+                    restart_cap_reached = True
+                else:
+                    await self._restart_after_activity_barrier(
+                        reason,
+                        handoff=handoff,
+                        previous_config=current,
+                        transition_token=transition_token,
+                    )
+        finally:
+            if self._restart_transition_token is transition_token:
+                self._restart_transition_token = None
+        if restart_cap_reached:
+            await self.finalize("restart cap reached", status=BelloStatus.STUCK)
+
+    async def _restart_after_activity_barrier(
+        self,
+        reason: str,
+        *,
+        handoff: RestartHandoff | None,
+        previous_config: BelloConfig,
+        transition_token: object,
+    ) -> None:
+        supervisor_task = getattr(self, "_supervisor_task", None)
+        if supervisor_task is not None and supervisor_task is not asyncio.current_task():
+            await self._stop_supervisor_task()
+        if not self._restart_transition_is_current(
+            transition_token,
+            expected_generation=previous_config.generation,
+            expected_thread_id=previous_config.coder_thread_id,
+        ):
+            return
+        await self._close_completion_review_session()
+        if not self._restart_transition_is_current(
+            transition_token,
+            expected_generation=previous_config.generation,
+            expected_thread_id=previous_config.coder_thread_id,
+        ):
+            return
         await self._quiesce_coder_tree("restart")
+        if not self._restart_transition_is_current(
+            transition_token,
+            expected_generation=previous_config.generation,
+            expected_thread_id=previous_config.coder_thread_id,
+        ):
+            return
         await self._resolve_pending_approvals("restart")
         handoff = handoff or _fallback_restart_handoff(
             task_contents=self._canonical_task_text(),
@@ -2103,7 +3390,7 @@ class BelloController:
         self._pending_adversary_report = None
         self._active_adversary_thread_id = None
         self._active_adversary_workspace_root = None
-        self._adversary_denied_commands: list[str] = []
+        self._adversary_denied_commands = []
         self.validation_runtime_state = {}
         self._last_restart_budget_signature = None
         self._pending_runtime_trigger_signatures = {}
@@ -2117,13 +3404,19 @@ class BelloController:
         self._supervisor_next_runtime_summary = None
         self._supervisor_next_completion_summary = None
         self._sync_legacy_supervisor_queue_fields()
+        if not self._restart_transition_is_current(
+            transition_token,
+            expected_generation=previous_config.generation,
+            expected_thread_id=previous_config.coder_thread_id,
+        ):
+            return
         patch_health(
             self.store,
             HealthDelta(
-                generation=cfg.generation,
+                generation=previous_config.generation,
                 restart_count=1,
                 reset_generation_scoped=True,
-                new_generation=cfg.generation + 1,
+                new_generation=previous_config.generation + 1,
             ),
         )
         self.store.update_bello_config(
@@ -2142,14 +3435,41 @@ class BelloController:
             self.store,
             self._active_workspace_root(),
             self._active_task_path(),
-            model=self._coder_model(),
+            model=self._active_coder_model(),
             fast=self._fast_mode(),
-            intelligence=self._coder_intelligence(),
+            intelligence=self._active_coder_intelligence(),
             multi_agent=self._multi_agent_config(),
+            plan_path=self._active_coder_plan_path(),
         )
         await self.coder.start_thread()
+        if (
+            self._restart_transition_token is not transition_token
+            or not self._coder_lifecycle_accepts_activity()
+        ):
+            return
         await self.coder.start_restart_turn()
+        if (
+            self._restart_transition_token is not transition_token
+            or not self._coder_lifecycle_accepts_activity()
+        ):
+            return
         self.tui.render("SYSTEM", "restart complete")
+
+    def _restart_transition_is_current(
+        self,
+        transition_token: object,
+        *,
+        expected_generation: int,
+        expected_thread_id: str | None,
+    ) -> bool:
+        current = self.store.get_bello_config()
+        return bool(
+            self._restart_transition_token is transition_token
+            and not getattr(self, "_finalizing", False)
+            and current.status == BelloStatus.RESTARTING
+            and current.generation == expected_generation
+            and current.coder_thread_id == expected_thread_id
+        )
 
     async def finalize(
         self,
@@ -2158,7 +3478,16 @@ class BelloController:
         status: BelloStatus = BelloStatus.COMPLETE,
         completion_review_accepted: bool | None = False,
     ) -> None:
+        if getattr(self, "_finalizing", False):
+            return
+        self._finalizing = True
+        self._restart_transition_token = None
         self._reconcile_intervention_accounting()
+        await self._wait_for_revision_switch()
+        await self._wait_for_coder_activity()
+        supervisor_task = getattr(self, "_supervisor_task", None)
+        if supervisor_task is not None and supervisor_task is not asyncio.current_task():
+            await self._stop_supervisor_task()
         quiesced = await self._quiesce_coder_tree("terminal", strict=False)
         self._terminal_coder_tree_quiesced = quiesced
         if not quiesced:
@@ -2220,6 +3549,7 @@ class BelloController:
         self.store.write_final_report(report)
         self._archive_final_report_once()
         self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"status": status}))
+        self._write_run_checkpoint("terminal", state="terminal", detail=result)
         self.tui.render("SUPERVISOR", result)
         self.tui.status("final report written: .supervisor/FINAL_REPORT.md")
         await self._prepare_terminal_shutdown(result)
@@ -2291,6 +3621,11 @@ class BelloController:
             )
             return message, recovery_path
         self._snapshot_patch_applied = True
+        reportable_ignored_paths = [
+            path
+            for path in result.ignored_paths
+            if not self._is_review_private_path(path)
+        ]
         self.store.append_raw_log(
             {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2299,20 +3634,22 @@ class BelloController:
                 "original_root": str(snapshot.original_root),
                 "applied": result.applied,
                 "changed_paths": list(result.changed_paths),
-                "ignored_paths": list(result.ignored_paths),
+                "ignored_paths": reportable_ignored_paths,
                 "patch_bytes": result.patch_bytes,
             }
         )
         if result.applied:
             ignored_suffix = (
-                f"; ignored {len(result.ignored_paths)} generated artifact paths" if result.ignored_paths else ""
+                f"; ignored {len(reportable_ignored_paths)} generated artifact paths"
+                if reportable_ignored_paths
+                else ""
             )
             self.store.append_text_locked(
                 PROGRESS,
                 f"- Applied accepted coder snapshot patch to real workspace ({len(result.changed_paths)} paths{ignored_suffix}).\n",
             )
         else:
-            if result.ignored_paths:
+            if reportable_ignored_paths:
                 self.store.append_text_locked(
                     PROGRESS,
                     "- Accepted coder snapshot produced no workspace patch after generated artifacts were ignored.\n",
@@ -2447,6 +3784,7 @@ class BelloController:
         if (
             not self.running
             or getattr(self, "paused", False)
+            or getattr(self, "_finalizing", False)
             or getattr(self, "_terminal_cleanup_started", False)
             or getattr(self, "supervisor", None) is None
         ):
@@ -2851,6 +4189,9 @@ class BelloController:
     ) -> None:
         additions, deletions = _diff_line_counts(changed_files)
         suspicious_paths = [changed.path for changed in changed_files if _is_suspicious_changed_path(changed.path)]
+        private_input_action = (
+            action is not None and self._exposes_review_private_input(action)
+        )
         trace = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "event_sequence": getattr(self, "_sequence", None),
@@ -2858,8 +4199,16 @@ class BelloController:
             "event_type": event_type,
             "action_kind": action.kind if action is not None else None,
             "tool_name": action.kind if action is not None else None,
-            "command": action.command if action is not None else None,
-            "cwd": action.cwd if action is not None else None,
+            "command": (
+                action.command
+                if action is not None and not private_input_action
+                else None
+            ),
+            "cwd": (
+                action.cwd
+                if action is not None and not private_input_action
+                else None
+            ),
             "exit_code": action.exit_code if action is not None else None,
             "status": action.status if action is not None else None,
             "timed_out": action.timed_out if action is not None else False,
@@ -2978,16 +4327,35 @@ class BelloController:
         while True:
             self._supervisor_dirty = False
             self._runtime_decision_invalidated_completion = False
-            await self._run_supervisor_check(
-                summary,
-                triggering_item_id,
-                triggering_action,
-                human_message,
-                patch_summary,
-                completion_review,
+            active_check = QueuedSupervisorCheck(
+                summary=summary,
+                triggering_item_id=triggering_item_id,
+                triggering_action=triggering_action,
+                human_message=human_message,
+                patch_summary=patch_summary,
+                completion_review=completion_review,
             )
+            self._active_supervisor_check = active_check
+            phase = "completion_review" if completion_review else "runtime_review"
+            self._write_run_checkpoint(phase, state="active")
+            try:
+                await self._run_supervisor_check(
+                    summary,
+                    triggering_item_id,
+                    triggering_action,
+                    human_message,
+                    patch_summary,
+                    completion_review,
+                )
+            finally:
+                if self._active_supervisor_check is active_check:
+                    self._active_supervisor_check = None
             self._mark_controller_activity()
-            if not self.running or getattr(self, "paused", False):
+            if (
+                not self.running
+                or getattr(self, "paused", False)
+                or getattr(self, "_finalizing", False)
+            ):
                 return
             if not completion_review and getattr(
                 self,
@@ -3035,6 +4403,10 @@ class BelloController:
         patch_summary: str | None,
         completion_review: bool = False,
     ) -> None:
+        if not self._coder_lifecycle_accepts_activity():
+            if completion_review:
+                await self._close_completion_review_session()
+            return
         if completion_review:
             await self._refresh_coder_subagents()
             active_subagents = self._active_coder_subagents()
@@ -3078,6 +4450,31 @@ class BelloController:
         cfg = self.store.get_bello_config()
         wake_sequence = cfg.last_event_sequence + 1
         changed_files = await self.changed_files()
+        packet_validations = list(self.validations)
+        packet_inspections = list(getattr(self, "inspections", []))
+        packet_subagents = self._subagent_summaries()
+        packet_last_coder_message = self.last_coder_message
+        packet_triggering_action = triggering_action
+        packet_human_message = human_message
+        packet_prior_interventions = list(self.prior_interventions)
+        packet_patch_summary = patch_summary
+        if completion_review:
+            packet_validations = self._review_safe_values(packet_validations)
+            packet_inspections = self._review_safe_values(packet_inspections)
+            packet_subagents = self._review_safe_values(packet_subagents)
+            packet_prior_interventions = self._review_safe_values(
+                packet_prior_interventions
+            )
+            if self._exposes_review_private_input(packet_last_coder_message):
+                packet_last_coder_message = None
+            if self._exposes_review_private_input(packet_triggering_action):
+                packet_triggering_action = None
+            if self._exposes_review_private_input(packet_human_message):
+                packet_human_message = None
+            if self._exposes_review_private_input(packet_patch_summary):
+                packet_patch_summary = None
+            if self._exposes_review_private_input(summary):
+                summary = "Coder work is ready for independent review."
         if not completion_review:
             summary = self._prepare_runtime_trigger_summary(
                 summary,
@@ -3085,7 +4482,7 @@ class BelloController:
             )
         latest_change_sequence = _latest_relevant_change_sequence(changed_files)
         freshness_summary = _validation_freshness_summary(
-            validations=list(self.validations),
+            validations=packet_validations,
             changed_files=changed_files,
         )
         completion_payload_mode: Literal["full", "delta", "full_fallback"] | None = None
@@ -3098,7 +4495,7 @@ class BelloController:
                 since_sequence=completion_payload_since_sequence,
             )
             completion_details["evidence_provenance_summary"] = _evidence_provenance_summary(
-                validations=list(self.validations),
+                validations=packet_validations,
                 changed_files=changed_files,
                 latest_change_sequence=latest_change_sequence,
             )
@@ -3112,16 +4509,16 @@ class BelloController:
             diff_summary=await self.diff_summary(),
             triggering_item_id=triggering_item_id,
             pending_approvals=[_approval_wake_context(pending) for pending in self.pending_approvals.values()],
-            triggering_action=triggering_action,
+            triggering_action=packet_triggering_action,
             runtime_triggering_actions=runtime_trigger_actions,
-            subagents=self._subagent_summaries(),
-            last_coder_message=self.last_coder_message,
-            validations=list(self.validations),
-            inspections=list(getattr(self, "inspections", [])),
-            human_message=human_message,
-            prior_interventions=list(self.prior_interventions),
+            subagents=packet_subagents,
+            last_coder_message=packet_last_coder_message,
+            validations=packet_validations,
+            inspections=packet_inspections,
+            human_message=packet_human_message,
+            prior_interventions=packet_prior_interventions,
             changed_files=changed_files,
-            patch_summary=patch_summary or await self.patch_summary(),
+            patch_summary=packet_patch_summary or await self.patch_summary(),
             completion_attempt_count=getattr(self, "completion_attempt_count", 0),
             completion_returns_this_generation=_completion_returns_this_generation(self, cfg.generation),
             previous_completion_returns=list(getattr(self, "completion_returns", []))[-10:],
@@ -3142,6 +4539,12 @@ class BelloController:
             ),
             **completion_details,
         )
+        if completion_review:
+            packet = self._review_safe_packet_state(packet)
+        if not self._coder_lifecycle_accepts_activity():
+            if completion_review:
+                await self._close_completion_review_session()
+            return
         if completion_review:
             budget_action = self._completion_review_budget_action(packet=packet)
             if budget_action == "adversary":
@@ -3178,6 +4581,15 @@ class BelloController:
                         return
                 decision = await agent.decide(packet)
         except SupervisorAgentError as exc:
+            if getattr(self, "_transport_error_pending", False):
+                # The controller event loop owns transport recovery. Do not let
+                # the same broken stream race that recovery and terminalize the
+                # run from this reviewer task.
+                return
+            if not self._coder_lifecycle_accepts_activity():
+                if completion_review:
+                    await self._close_completion_review_session()
+                return
             failure_kind = _classify_supervisor_agent_error(exc)
             message = f"supervisor check failed ({failure_kind}): {exc}"
             self.tui.render("SUPERVISOR", message)
@@ -3256,9 +4668,9 @@ class BelloController:
                 return
             await self.finalize(message, status=BelloStatus.PROVIDER_FAILURE)
             return
-        if getattr(self, "paused", False):
-            # A user pause may race an in-flight model call. Its result belongs to the
-            # pre-pause state and must not steer, restart, or complete the paused run.
+        if not self._coder_lifecycle_accepts_activity():
+            # A lifecycle transition may race an in-flight model call. Its result belongs
+            # to the previous live state and must not steer, restart, or complete the run.
             if completion_review:
                 await self._close_completion_review_session()
             return
@@ -3293,6 +4705,8 @@ class BelloController:
                     packet=packet,
                 )
             except Exception as exc:
+                if not self._coder_lifecycle_accepts_activity():
+                    return
                 self._cancel_queued_completion_review()
                 attempts = int(getattr(self, "_runtime_apply_retry_count", 0) or 0)
                 if attempts < 1:
@@ -3316,6 +4730,8 @@ class BelloController:
                 )
                 return
             self._runtime_apply_retry_count = 0
+            if not self._coder_lifecycle_accepts_activity():
+                return
             if applied and self.store.get_bello_config().generation == packet.generation:
                 self._runtime_decision_retry_count = 0
                 self._ack_runtime_trigger_batch(runtime_trigger_batch)
@@ -3349,30 +4765,19 @@ class BelloController:
         if "done_without_fresh_validation" not in _runtime_trigger_reasons_from_summary(packet.current_summary):
             return False
         marker_sequence = packet.last_readiness_marker_sequence
-        message = self.last_coder_message
-        cfg = self.store.get_bello_config()
-        if (
-            marker_sequence is None
-            or decision.wake_sequence != packet.wake_sequence
-            or decision.generation != packet.generation
-            or cfg.generation != packet.generation
-            or cfg.coder_thread_id != packet.coder_thread_id
-            or cfg.last_event_sequence != packet.latest_event_sequence
-            or cfg.active_coder_turn_id is not None
-            or self._last_completion_marker_sequence != marker_sequence
-            or message is None
-            or message.sequence != marker_sequence
-            or not _has_readiness_marker(message.text)
-            or bool(getattr(self, "pending_approvals", None))
-            or getattr(self, "_supervisor_next_runtime_summary", None) is not None
-            or getattr(self, "_supervisor_next_runtime_check", None) is not None
-            or not getattr(self, "running", False)
-            or getattr(self, "paused", False)
-            or getattr(self, "_terminal_cleanup_started", False)
+        if marker_sequence is None or not self._runtime_noop_readiness_context_is_current(
+            decision,
+            packet,
+            marker_sequence=marker_sequence,
         ):
             return False
-        coder = getattr(self, "coder", None)
-        if coder is not None and getattr(coder, "active_turn_id", None):
+
+        await self._refresh_coder_subagents()
+        if not self._runtime_noop_readiness_context_is_current(
+            decision,
+            packet,
+            marker_sequence=marker_sequence,
+        ):
             return False
         self._append_event(
             AppEventSource.SUPERVISOR,
@@ -3380,8 +4785,81 @@ class BelloController:
             decision="noop",
             reason=decision.reason,
         )
-        await self._continue_after_readiness_marker(triggering_item_id=packet.triggering_item_id)
+        await self._continue_after_readiness_marker(
+            triggering_item_id=packet.triggering_item_id,
+            subagents_refreshed=True,
+        )
         return True
+
+    def _runtime_noop_readiness_context_is_current(
+        self,
+        decision: SupervisorDecision,
+        packet: SupervisorWakePacket,
+        *,
+        marker_sequence: int,
+    ) -> bool:
+        message = self.last_coder_message
+        cfg = self.store.get_bello_config()
+        coder = getattr(self, "coder", None)
+        return bool(
+            decision.wake_sequence == packet.wake_sequence
+            and decision.generation == packet.generation
+            and cfg.generation == packet.generation
+            and cfg.coder_thread_id == packet.coder_thread_id
+            and not self._readiness_snapshot_has_new_invalidating_event(packet, cfg=cfg)
+            and cfg.active_coder_turn_id is None
+            and self._last_completion_marker_sequence == marker_sequence
+            and message is not None
+            and message.sequence == marker_sequence
+            and _has_readiness_marker(message.text)
+            and not bool(getattr(self, "pending_approvals", None))
+            and getattr(self, "_supervisor_next_runtime_summary", None) is None
+            and getattr(self, "_supervisor_next_runtime_check", None) is None
+            and getattr(self, "running", False)
+            and not getattr(self, "paused", False)
+            and not getattr(self, "_finalizing", False)
+            and not getattr(self, "_terminal_cleanup_started", False)
+            and (coder is None or not getattr(coder, "active_turn_id", None))
+        )
+
+    def _readiness_snapshot_has_new_invalidating_event(
+        self,
+        packet: SupervisorWakePacket,
+        *,
+        cfg: BelloConfig,
+    ) -> bool:
+        """Accept only a complete bounded suffix containing known reviewer traffic."""
+
+        if cfg.last_event_sequence == packet.latest_event_sequence:
+            return False
+        if cfg.last_event_sequence < packet.latest_event_sequence:
+            return True
+
+        expected_sequence = packet.latest_event_sequence + 1
+        for event in self._readiness_journal():
+            if event.sequence < expected_sequence:
+                continue
+            if event.sequence > cfg.last_event_sequence:
+                break
+            if event.sequence != expected_sequence:
+                return True
+            expected_sequence += 1
+            if event.source != AppEventSource.APP_SERVER:
+                return True
+            if event.event_type == "account/rateLimits/updated" and event.thread_id is None:
+                continue
+            if event.thread_id is None:
+                return True
+            if event.thread_id == cfg.coder_thread_id or self._is_coder_descendant(
+                event.thread_id,
+                cfg=cfg,
+            ):
+                return True
+            if self._reviewer_role_for_thread(event.thread_id) is None:
+                return True
+
+        # Missing/evicted/non-contiguous entries make provenance unknowable.
+        return expected_sequence <= cfg.last_event_sequence
 
     async def _handle_completion_review_timeout_failure(self, *, message: str, summary: str) -> bool:
         """One fresh-thread retry when a completion-review turn times out.
@@ -3574,6 +5052,8 @@ class BelloController:
         packet: SupervisorWakePacket | None = None,
     ) -> bool:
         cfg = self.store.get_bello_config()
+        if not self._coder_lifecycle_accepts_activity(cfg, require_running=False):
+            return False
         if decision.generation is not None and decision.generation != cfg.generation:
             return False
         if packet_thread_id != cfg.coder_thread_id:
@@ -3603,14 +5083,18 @@ class BelloController:
         intervention: tuple[str, str] | None = None
         if decision.decision == SupervisorDecisionKind.INTERVENE and decision.message_to_coder and self.coder:
             self.tui.render("SUPERVISOR", f"steering coder: {decision.reason}")
-            await self.coder.steer_or_start(decision.message_to_coder)
+            delivered, _ = await self._deliver_coder_message(decision.message_to_coder)
+            if not delivered:
+                return False
             intervention = (decision.reason, decision.message_to_coder)
         elif decision.decision == SupervisorDecisionKind.RESTART:
             if not restart_candidate:
                 message = decision.message_to_coder or _restart_rejection_steering(decision.handoff)
                 self.tui.render("SUPERVISOR", f"restart rejected without health evidence: {decision.reason}")
                 if self.coder:
-                    await self.coder.steer_or_start(message)
+                    delivered, _ = await self._deliver_coder_message(message)
+                    if not delivered:
+                        return False
                 intervention = (decision.reason, message)
             else:
                 if restart_candidate_reason:
@@ -3667,6 +5151,8 @@ class BelloController:
         packet: SupervisorWakePacket | None = None,
     ) -> None:
         cfg = self.store.get_bello_config()
+        if not self._coder_lifecycle_accepts_activity(cfg, require_running=False):
+            return
         if decision.generation != cfg.generation:
             return
         if packet_thread_id != cfg.coder_thread_id:
@@ -3727,7 +5213,7 @@ class BelloController:
                     reason=decision.reason,
                 )
                 if self.coder:
-                    await self.coder.steer_or_start(POST_RESTART_CONTINUE_NUDGE)
+                    await self._deliver_coder_message(POST_RESTART_CONTINUE_NUDGE)
                 return
             self.completion_restarts = getattr(self, "completion_restarts", 0) + 1
             await self.restart(decision.reason or "completion review requested restart", handoff=decision.handoff)
@@ -3751,6 +5237,8 @@ class BelloController:
                 )
             return
         adversary_run_count, max_adversary_runs = self._reserve_adversary_run()
+        self._adversary_reservation_recovery_pending = False
+        self._write_run_checkpoint("adversary", state="active")
         forced_by_budget = decision is None
         run_reason = "completion review budget" if forced_by_budget else "completion accept"
         self.tui.render(
@@ -3767,7 +5255,10 @@ class BelloController:
         previous_report = getattr(self, "_pending_adversary_report", None)
         previous_report_payload = previous_report.model_dump(mode="json") if previous_report is not None else None
         try:
-            snapshot_root = _create_adversary_snapshot(self._active_workspace_root())
+            snapshot_root = _create_adversary_snapshot(
+                self._active_workspace_root(),
+                excluded_relative_paths=self._review_private_relative_paths(),
+            )
         except Exception as exc:
             error_summary = f"snapshot setup failed: {exc.__class__.__name__}: {exc}"
             if decision is None:
@@ -3789,10 +5280,20 @@ class BelloController:
             on_thread_start=self._mark_adversary_thread_started,
             on_thread_done=self._mark_adversary_thread_done,
             denied_probes=lambda: list(getattr(self, "_adversary_denied_commands", [])),
+            multi_agent=self._adversary_multi_agent_config(),
+            before_thread_cleanup=self._cleanup_adversary_reviewer_descendants,
         )
         try:
             result = await agent.run(packet, previous_adversary_report=previous_report_payload)
         except AdversaryAgentError as exc:
+            if getattr(self, "_transport_error_pending", False):
+                return
+            if not self._completion_packet_lifecycle_is_current(packet):
+                self._record_stale_adversary_discard(
+                    packet,
+                    reason=f"adversary failed after lifecycle changed: {exc}",
+                )
+                return
             self.store.append_raw_log(
                 {
                     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -3820,6 +5321,13 @@ class BelloController:
             if snapshot_root is not None:
                 remove_isolated_workspace_tree(snapshot_root.parent)
 
+        if not self._completion_packet_lifecycle_is_current(packet):
+            self._record_stale_adversary_discard(
+                packet,
+                reason="adversary completed after lifecycle changed",
+            )
+            return
+
         report = AdversaryReport(
             candidate_finding=result.candidate_finding,
             report_text=result.report_text,
@@ -3833,6 +5341,7 @@ class BelloController:
             created_at=datetime.now(timezone.utc).isoformat(),
         )
         self._pending_adversary_report = report
+        self._write_run_checkpoint("adversary_report", state="stable")
         self.store.append_raw_log(
             {
                 "timestamp": report.created_at,
@@ -3876,6 +5385,12 @@ class BelloController:
         packet: SupervisorWakePacket,
         accepted_completion_decision: CompletionReviewDecision | None,
     ) -> None:
+        if not self._completion_packet_lifecycle_is_current(packet):
+            self._record_stale_adversary_discard(
+                packet,
+                reason="adversary report controller skipped after lifecycle changed",
+            )
+            return
         agent = self._adv_report_controller_agent()
         if agent is None:
             await self._fail_adv_report_controller(
@@ -3891,16 +5406,35 @@ class BelloController:
         self.tui.render(
             "ADVERSARY", "normalizing adversary findings and observations"
         )
+        self._write_run_checkpoint("adversary_report_review", state="active")
         try:
             normalized = await agent.decide_adv_report(review_packet)
         except SupervisorAgentError:
+            if getattr(self, "_transport_error_pending", False):
+                return
+            if not self._completion_packet_lifecycle_is_current(packet):
+                self._record_stale_adversary_discard(
+                    packet,
+                    reason="adversary report controller failed after lifecycle changed",
+                )
+                return
             await self._fail_adv_report_controller(
                 "agent or structured-output failure"
             )
             return
 
+        if not self._completion_packet_lifecycle_is_current(packet):
+            self._record_stale_adversary_discard(
+                packet,
+                reason="adversary report controller completed after lifecycle changed",
+            )
+            return
+
         stale_reason = self._adv_report_controller_staleness_reason(report)
         if stale_reason is not None:
+            if not self._completion_packet_lifecycle_is_current(packet):
+                self._record_stale_adversary_discard(packet, reason=stale_reason)
+                return
             await self._fail_adv_report_controller(stale_reason)
             return
 
@@ -3991,6 +5525,32 @@ class BelloController:
         ):
             return "adversary normalization became stale because the workspace changed"
         return None
+
+    def _completion_packet_lifecycle_is_current(self, packet: SupervisorWakePacket) -> bool:
+        cfg = self.store.get_bello_config()
+        return bool(
+            self._coder_lifecycle_accepts_activity(cfg, require_running=False)
+            and cfg.generation == packet.generation
+            and cfg.coder_thread_id == packet.coder_thread_id
+        )
+
+    def _record_stale_adversary_discard(
+        self,
+        packet: SupervisorWakePacket,
+        *,
+        reason: str,
+    ) -> None:
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "stale_adversary_result_discarded",
+                "packet_generation": packet.generation,
+                "current_generation": self.store.get_bello_config().generation,
+                "packet_thread_id": packet.coder_thread_id,
+                "current_thread_id": self.store.get_bello_config().coder_thread_id,
+                "reason": reason,
+            }
+        )
 
     async def _fail_adv_report_controller(self, error_summary: str) -> None:
         self.tui.render(
@@ -4295,6 +5855,7 @@ class BelloController:
 
     def _mark_adversary_thread_started(self, thread_id: str) -> None:
         self._active_adversary_thread_id = thread_id
+        self._register_reviewer_thread(thread_id, role="adversary")
 
     def _mark_adversary_thread_done(self, thread_id: str) -> None:
         if getattr(self, "_active_adversary_thread_id", None) == thread_id:
@@ -4377,7 +5938,23 @@ class BelloController:
                 )
             )
         if self.coder and decision.message_to_coder:
-            await self.coder.steer_or_start(decision.message_to_coder)
+            if self._revision_coder_enabled() and not self._revision_coder_active():
+                try:
+                    await self._switch_to_revision_coder(decision.message_to_coder, source=source)
+                except _RevisionCoderDeliveryError as exc:
+                    if not self._revision_switch_context_is_current(
+                        generation=exc.generation,
+                        thread_id=exc.thread_id,
+                        coder=exc.coder,
+                    ):
+                        self._record_cancelled_revision_switch(
+                            f"lifecycle changed while revision coder {exc.stage} failed"
+                        )
+                        return
+                    await self._fail_revision_coder_switch(exc, source=source)
+                    return
+            else:
+                await self._deliver_coder_message(decision.message_to_coder)
         # Fresh completion-review thread per review: close the session after each return so
         # the next readiness review starts a new thread instead of accumulating prior turns.
         # The persistent thread otherwise grows ~55-85k tokens per return and crossed the
@@ -4387,6 +5964,334 @@ class BelloController:
         supervisor = self._completion_supervisor_agent()
         if supervisor is not None and hasattr(supervisor, "close_completion_review"):
             await supervisor.close_completion_review()
+
+    async def _switch_to_revision_coder(
+        self,
+        reviewer_feedback: str,
+        *,
+        source: Literal["completion_review", "adversary_report_controller"],
+    ) -> None:
+        done = asyncio.get_running_loop().create_future()
+        owner = asyncio.current_task()
+        self._revision_switch_in_progress = True
+        self._revision_switch_done = done
+        self._revision_switch_owner = owner
+        try:
+            async with self._coder_activity_lock():
+                if not self._coder_lifecycle_accepts_activity():
+                    self._record_cancelled_revision_switch(
+                        "lifecycle changed before the revision coder switch began"
+                    )
+                    return
+                await self._perform_revision_coder_switch(
+                    reviewer_feedback,
+                    source=source,
+                )
+        finally:
+            self._revision_switch_in_progress = False
+            if not done.done():
+                done.set_result(None)
+            if getattr(self, "_revision_switch_done", None) is done:
+                self._revision_switch_done = None
+            if getattr(self, "_revision_switch_owner", None) is owner:
+                self._revision_switch_owner = None
+
+    async def _fail_revision_coder_switch(
+        self,
+        error: Exception,
+        *,
+        source: Literal["completion_review", "adversary_report_controller"],
+    ) -> None:
+        message = (
+            f"revision coder profile switch failed while delivering {source} feedback: "
+            f"{error.__class__.__name__}: {error}"
+        )
+        self.store.append_text_locked(PROGRESS, f"- {message}\n")
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "revision_coder_switch_failed",
+                "source": source,
+                "error_type": error.__class__.__name__,
+                "error": str(error),
+            }
+        )
+        self._append_event(
+            AppEventSource.SUPERVISOR,
+            "coder/profile_switch_failed",
+            reason=message,
+            payload={"source": source, "error_type": error.__class__.__name__},
+        )
+        # The finding has already been recorded, but it was not delivered. Treat an
+        # app-server failure here like an initial coder startup failure: preserve the
+        # workspace and stop explicitly instead of leaving a dead supervisor task.
+        await self.finalize(message, status=BelloStatus.PROVIDER_FAILURE)
+
+    async def _wait_for_revision_switch(self) -> None:
+        if getattr(self, "_revision_switch_owner", None) is asyncio.current_task():
+            return
+        done = getattr(self, "_revision_switch_done", None)
+        if done is not None and not done.done():
+            await asyncio.shield(done)
+
+    async def _perform_revision_coder_switch(
+        self,
+        reviewer_feedback: str,
+        *,
+        source: Literal["completion_review", "adversary_report_controller"],
+    ) -> None:
+        """Move review-driven revisions to one fresh coder thread without a health restart."""
+        previous_coder = self.coder
+        previous_thread_id = getattr(previous_coder, "thread_id", None)
+        expected_config = self.store.get_bello_config()
+        expected_generation = expected_config.generation
+        if previous_thread_id != expected_config.coder_thread_id:
+            return
+        try:
+            await self._quiesce_coder_tree("revision_profile_switch")
+        except Exception as exc:
+            raise _RevisionCoderDeliveryError(
+                "prepare",
+                exc,
+                generation=expected_generation,
+                thread_id=previous_thread_id,
+                coder=previous_coder,
+            ) from exc
+        if not self._revision_switch_context_is_current(
+            generation=expected_generation,
+            thread_id=previous_thread_id,
+            coder=previous_coder,
+        ):
+            self._record_cancelled_revision_switch("lifecycle changed while quiescing the initial coder")
+            return
+        try:
+            await self._resolve_pending_approvals("revision coder profile switch")
+            self._repair_snapshot_runtime_controls(source="revision_profile_switch")
+        except Exception as exc:
+            raise _RevisionCoderDeliveryError(
+                "prepare",
+                exc,
+                generation=expected_generation,
+                thread_id=previous_thread_id,
+                coder=previous_coder,
+            ) from exc
+        if not self._revision_switch_context_is_current(
+            generation=expected_generation,
+            thread_id=previous_thread_id,
+            coder=previous_coder,
+        ):
+            self._record_cancelled_revision_switch("lifecycle changed while resolving pending approvals")
+            return
+
+        revision_coder = CoderSession(
+            self.client,
+            self.store,
+            self._active_workspace_root(),
+            self._active_task_path(),
+            model=self._revision_coder_model(),
+            fast=self._fast_mode(),
+            intelligence=self._revision_coder_intelligence(),
+            multi_agent=self._multi_agent_config(),
+            plan_path=None,
+        )
+        try:
+            new_thread_id = await revision_coder.start_thread(persist_state=False)
+        except Exception as exc:
+            raise _RevisionCoderDeliveryError(
+                "thread/start",
+                exc,
+                generation=expected_generation,
+                thread_id=previous_thread_id,
+                coder=previous_coder,
+            ) from exc
+        if not self._revision_switch_context_is_current(
+            generation=expected_generation,
+            thread_id=previous_thread_id,
+            coder=previous_coder,
+        ):
+            await self._discard_uncommitted_revision_thread(
+                revision_coder,
+                reason="lifecycle changed while starting the revision thread",
+            )
+            return
+        snapshot = getattr(self, "_coder_snapshot", None)
+        if snapshot is not None:
+            try:
+                snapshot.detach_plan_exposure()
+            except Exception as exc:
+                await self._discard_uncommitted_revision_thread(
+                    revision_coder,
+                    reason="private plan could not be detached before revision",
+                )
+                raise _RevisionCoderDeliveryError(
+                    "prepare",
+                    exc,
+                    generation=expected_generation,
+                    thread_id=previous_thread_id,
+                    coder=previous_coder,
+                ) from exc
+        self.workspace_plan_path = None
+        self.coder = revision_coder
+        self.store.update_bello_config(
+            lambda current: current.model_copy(
+                update={
+                    "revision_coder_active": True,
+                    "coder_thread_id": new_thread_id,
+                    "active_coder_turn_id": None,
+                }
+            )
+        )
+        self.last_coder_message = None
+        self._last_completion_marker_sequence = None
+        self._no_marker_completion_review_key = None
+        self._deferred_completion_check = None
+        self._subagent_policy_notified = set()
+        self._generation_has_coder_turn = False
+        self._append_event(
+            AppEventSource.SUPERVISOR,
+            "coder/profile_switch",
+            thread_id=new_thread_id,
+            reason=f"first {source} return moved revisions to the configured revision coder",
+            payload={
+                "source": source,
+                "previous_thread_id": previous_thread_id,
+                "revision_thread_id": new_thread_id,
+                "model": self._revision_coder_model(),
+                "intelligence": self._revision_coder_intelligence(),
+            },
+        )
+        self.store.append_text_locked(
+            PROGRESS,
+            "- Switched once to the configured revision coder after reviewer feedback; "
+            f"thread {new_thread_id}, profile {self._revision_coder_model()}/"
+            f"{self._revision_coder_intelligence()}.\n",
+        )
+        self.tui.render(
+            "SYSTEM",
+            f"revision coder started ({self._revision_coder_model()}/"
+            f"{self._revision_coder_intelligence()})",
+        )
+        try:
+            turn_id = await revision_coder.start_revision_turn(
+                reviewer_feedback,
+                persist_state=False,
+            )
+        except Exception as exc:
+            raise _RevisionCoderDeliveryError(
+                "turn/start",
+                exc,
+                generation=expected_generation,
+                thread_id=new_thread_id,
+                coder=revision_coder,
+            ) from exc
+        if not self._revision_switch_context_is_current(
+            generation=expected_generation,
+            thread_id=new_thread_id,
+            coder=revision_coder,
+        ):
+            try:
+                await self._interrupt_stale_revision_turn(
+                    revision_coder,
+                    reason="lifecycle changed while starting the first revision turn",
+                )
+            except Exception:
+                # pause/restart/finalize is waiting for this switch and will retry the
+                # preserved turn id through its normal serialized quiesce path.
+                pass
+            return
+        self.store.update_bello_config(
+            lambda current: current.model_copy(update={"active_coder_turn_id": turn_id})
+        )
+
+    def _revision_switch_context_is_current(
+        self,
+        *,
+        generation: int,
+        thread_id: str | None,
+        coder: Any,
+    ) -> bool:
+        config = self.store.get_bello_config()
+        blocked_statuses = {
+            BelloStatus.PAUSED,
+            BelloStatus.RESTARTING,
+            BelloStatus.COMPLETE,
+            BelloStatus.ESCALATED,
+            BelloStatus.STUCK,
+            BelloStatus.PROVIDER_FAILURE,
+            BelloStatus.EXITED,
+        }
+        return bool(
+            self.coder is coder
+            and config.generation == generation
+            and config.coder_thread_id == thread_id
+            and config.status not in blocked_statuses
+            and not getattr(self, "paused", False)
+            and not getattr(self, "_finalizing", False)
+            and getattr(self, "running", True)
+        )
+
+    def _record_cancelled_revision_switch(self, reason: str) -> None:
+        self.store.append_raw_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "revision_coder_switch_cancelled",
+                "reason": reason,
+            }
+        )
+
+    async def _discard_uncommitted_revision_thread(
+        self,
+        coder: CoderSession,
+        *,
+        reason: str,
+    ) -> None:
+        self._record_cancelled_revision_switch(reason)
+        thread_id = coder.thread_id
+        if not isinstance(thread_id, str) or not hasattr(self.client, "thread_unsubscribe"):
+            return
+        try:
+            await self.client.thread_unsubscribe(thread_id)
+        except Exception as exc:
+            self._append_cleanup_error(
+                cleanup_kind="cancelled_revision_thread",
+                thread_id=thread_id,
+                turn_id=None,
+                error=exc,
+            )
+
+    async def _interrupt_stale_revision_turn(
+        self,
+        coder: CoderSession,
+        *,
+        reason: str,
+    ) -> None:
+        self._record_cancelled_revision_switch(reason)
+        try:
+            await coder.interrupt()
+        except Exception as exc:
+            self._append_cleanup_error(
+                cleanup_kind="stale_revision_turn",
+                thread_id=coder.thread_id or "unknown",
+                turn_id=coder.active_turn_id,
+                error=exc,
+            )
+            raise
+        interrupted_thread_id = coder.thread_id
+        interrupted_turn_id = coder.active_turn_id
+        coder.active_turn_id = None
+        if interrupted_thread_id and interrupted_turn_id:
+            self.store.update_bello_config(
+                lambda current: current.model_copy(
+                    update={
+                        "active_coder_turn_id": (
+                            None
+                            if current.coder_thread_id == interrupted_thread_id
+                            and current.active_coder_turn_id == interrupted_turn_id
+                            else current.active_coder_turn_id
+                        )
+                    }
+                )
+            )
 
     async def _resolve_pending_approvals(self, reason: str) -> None:
         approvals = getattr(self, "approvals", None)
@@ -4424,7 +6329,9 @@ class BelloController:
         commands = [["git", "status", "--short"], ["git", "diff", "--stat"], ["git", "diff", "--name-only"]]
         parts: list[str] = []
         for command in commands:
-            output = await self._git_output(command)
+            output = await self._git_output(
+                self._git_command_excluding_review_private_inputs(command)
+            )
             if output is not None:
                 output = _filter_internal_git_output(
                     output,
@@ -4437,18 +6344,40 @@ class BelloController:
 
     async def changed_files(self) -> list[ChangedFile]:
         if not self.use_git_diff:
-            return _observed_changed_files(self)
+            return [
+                changed
+                for changed in _observed_changed_files(self)
+                if not self._is_review_private_path(changed.path)
+            ]
         if not await self._is_git_work_tree():
-            return _observed_changed_files(self)
+            return [
+                changed
+                for changed in _observed_changed_files(self)
+                if not self._is_review_private_path(changed.path)
+            ]
         status_text = await self._git_output(
-            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"]
+            self._git_command_excluding_review_private_inputs(
+                ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"]
+            )
         )
-        numstat_text = await self._git_output(["git", "diff", "--numstat", "HEAD", "--"])
+        numstat_text = await self._git_output(
+            self._git_command_excluding_review_private_inputs(
+                ["git", "diff", "--numstat", "HEAD", "--"]
+            )
+        )
         if status_text is None and numstat_text is None:
             return []
         files: dict[str, ChangedFile] = {}
         for path, status in _git_status_entries_from_porcelain_v1_z(status_text or ""):
-            if path and not _is_ignored_changed_path(path, project_root=self._active_workspace_root(), task_path=self._active_task_path()):
+            if (
+                path
+                and not self._is_review_private_path(path)
+                and not _is_ignored_changed_path(
+                    path,
+                    project_root=self._active_workspace_root(),
+                    task_path=self._active_task_path(),
+                )
+            ):
                 files[path] = ChangedFile(path=path, status=status)
         for line in (numstat_text or "").splitlines():
             parts = line.split("\t")
@@ -4459,7 +6388,15 @@ class BelloController:
             path = parts[2].strip()
             if " => " in path:
                 path = path.rsplit(" => ", 1)[1].strip("{}")
-            if not path or _is_ignored_changed_path(path, project_root=self._active_workspace_root(), task_path=self._active_task_path()):
+            if (
+                not path
+                or self._is_review_private_path(path)
+                or _is_ignored_changed_path(
+                    path,
+                    project_root=self._active_workspace_root(),
+                    task_path=self._active_task_path(),
+                )
+            ):
                 continue
             existing = files.get(path)
             status = existing.status if existing else "modified"
@@ -4480,7 +6417,15 @@ class BelloController:
             self.observed_changed_files = observed
         for raw_path in action.paths:
             path = _workspace_display_path(self._active_workspace_root(), raw_path)
-            if path and not _is_ignored_changed_path(path, project_root=self._active_workspace_root(), task_path=self._active_task_path()):
+            if (
+                path
+                and not self._is_review_private_path(path)
+                and not _is_ignored_changed_path(
+                    path,
+                    project_root=self._active_workspace_root(),
+                    task_path=self._active_task_path(),
+                )
+            ):
                 observed[path] = ChangedFile(path=path, status="modified", sequence=getattr(self, "_sequence", None))
 
     async def _is_git_work_tree(self) -> bool:
@@ -4527,7 +6472,9 @@ class BelloController:
             return None
         parts: list[str] = []
         for command in (["git", "diff", "--unified=2", "--"], ["git", "diff", "--cached", "--unified=2", "--"]):
-            output = await self._git_output(command)
+            output = await self._git_output(
+                self._git_command_excluding_review_private_inputs(command)
+            )
             if output:
                 parts.append(f"$ {' '.join(command)}\n{output}")
         if not parts:
@@ -4585,17 +6532,28 @@ class BelloController:
         materially_truncated = False
         truncation_reasons: list[str] = []
         is_git = self.use_git_diff and await self._is_git_work_tree()
-        detail_changed_files = [
+        review_changed_files = [
             changed
             for changed in changed_files
+            if not self._is_review_private_path(changed.path)
+        ]
+        detail_changed_files = [
+            changed
+            for changed in review_changed_files
             if since_sequence is None or changed.sequence is None or changed.sequence > since_sequence
         ]
+        review_validations = self._review_safe_values(list(self.validations))
+        review_inspections = self._review_safe_values(
+            list(getattr(self, "inspections", []))
+        )
         detail_validations = [
-            validation for validation in self.validations if since_sequence is None or validation.sequence > since_sequence
+            validation
+            for validation in review_validations
+            if since_sequence is None or validation.sequence > since_sequence
         ]
         detail_inspections = [
             inspection
-            for inspection in getattr(self, "inspections", [])
+            for inspection in review_inspections
             if since_sequence is None or inspection.sequence > since_sequence
         ]
 
@@ -4663,7 +6621,7 @@ class BelloController:
             ),
             "breadth_risk_summary": _breadth_risk_summary(
                 task_contents=self._canonical_task_text(),
-                changed_files=changed_files,
+                changed_files=review_changed_files,
             ),
             "diff_packet_limits": DiffPacketLimits(
                 total_diff_chars=total_diff_chars,
@@ -4675,6 +6633,8 @@ class BelloController:
         }
 
     async def _changed_file_diff(self, path: str) -> str:
+        if self._is_review_private_path(path):
+            return ""
         parts: list[str] = []
         for command in (
             ["git", "diff", "--unified=80", "--", path],
@@ -4692,6 +6652,9 @@ class BelloController:
         await self.event_queue.put(ControllerEvent(kind="server_request", message=message))
 
     async def _on_transport_error(self, error: BaseException) -> None:
+        if getattr(self, "_transport_error_pending", False):
+            return
+        self._transport_error_pending = True
         await self.event_queue.put(ControllerEvent(kind="transport_error", error=error, error_message=str(error)))
 
     def _append_cleanup_error(
@@ -4713,6 +6676,112 @@ class BelloController:
                 "error": str(error),
             }
         )
+
+    def _readiness_journal(self) -> deque[_ReadinessJournalEvent]:
+        limit = max(
+            1,
+            int(
+                getattr(
+                    self,
+                    "_readiness_event_journal_limit",
+                    READINESS_EVENT_JOURNAL_LIMIT,
+                )
+            ),
+        )
+        journal = getattr(self, "_readiness_event_journal", None)
+        if not isinstance(journal, deque) or journal.maxlen != limit:
+            journal = deque(journal or (), maxlen=limit)
+            self._readiness_event_journal = journal
+        return journal
+
+    def _register_reviewer_thread(self, thread_id: str, *, role: str = "reviewer") -> None:
+        if not isinstance(thread_id, str) or not thread_id:
+            return
+        registry = getattr(self, "_reviewer_thread_ids", None)
+        if not isinstance(registry, OrderedDict):
+            registry = OrderedDict()
+            self._reviewer_thread_ids = registry
+        roles = getattr(self, "_reviewer_thread_roles", None)
+        if not isinstance(roles, dict):
+            roles = {}
+            self._reviewer_thread_roles = roles
+        registry[thread_id] = None
+        roles[thread_id] = role
+        registry.move_to_end(thread_id)
+        limit = max(
+            1,
+            int(
+                getattr(
+                    self,
+                    "_readiness_reviewer_thread_limit",
+                    READINESS_REVIEWER_THREAD_LIMIT,
+                )
+            ),
+        )
+        while len(registry) > limit:
+            evicted_thread_id, _ = registry.popitem(last=False)
+            roles.pop(evicted_thread_id, None)
+
+    def _reviewer_role_for_thread(self, thread_id: Any) -> str | None:
+        if not isinstance(thread_id, str):
+            return None
+        roles = getattr(self, "_reviewer_thread_roles", {})
+        if not isinstance(roles, dict):
+            roles = {}
+        registry = getattr(self, "_reviewer_thread_ids", {})
+        reviewer_roots = registry if isinstance(registry, dict) else {}
+        direct = roles.get(thread_id)
+        if isinstance(direct, str):
+            return direct
+        if thread_id in reviewer_roots:
+            return "reviewer"
+        current = thread_id
+        seen: set[str] = set()
+        for _ in range(32):
+            if current in seen:
+                return None
+            seen.add(current)
+            state = self._subagent_registry().get(current)
+            if state is None or not isinstance(state.parent_thread_id, str):
+                return None
+            parent = state.parent_thread_id
+            role = roles.get(parent)
+            if isinstance(role, str):
+                return role
+            if parent in reviewer_roots:
+                return "reviewer"
+            current = parent
+        return None
+
+    def _reviewer_descendant_depth(self, thread_id: Any) -> int | None:
+        if not isinstance(thread_id, str):
+            return None
+        roles = getattr(self, "_reviewer_thread_roles", {})
+        if not isinstance(roles, dict):
+            roles = {}
+        registry = getattr(self, "_reviewer_thread_ids", {})
+        reviewer_roots = registry if isinstance(registry, dict) else {}
+        roots = set(roles) | set(reviewer_roots)
+        if thread_id in roots:
+            return 0
+        if not roots:
+            return None
+        current = thread_id
+        seen: set[str] = set()
+        depth = 0
+        for _ in range(32):
+            if current in seen:
+                return None
+            seen.add(current)
+            state = self._subagent_registry().get(current)
+            if state is None or not isinstance(state.parent_thread_id, str):
+                return None
+            depth += 1
+            parent = state.parent_thread_id
+            if parent in roots:
+                return depth
+            current = parent
+        return None
 
     def _append_event(
         self,
@@ -4741,6 +6810,14 @@ class BelloController:
             payload=payload or {},
         )
         self.store.append_event(event)
+        self._readiness_journal().append(
+            _ReadinessJournalEvent(
+                sequence=event.sequence,
+                source=source,
+                event_type=event_type,
+                thread_id=event.thread_id,
+            )
+        )
         self.store.update_bello_config(lambda current: current.model_copy(update={"last_event_sequence": self._sequence}))
 
     def _generate_schema_hash(self) -> str:
@@ -5603,6 +7680,20 @@ def _runtime_triggering_validation(packet: SupervisorWakePacket) -> ValidationRu
 
 def _is_no_active_turn_to_steer_error(exc: AppServerError) -> bool:
     return "no active turn to steer" in str(exc).lower()
+
+
+def _is_turn_already_inactive_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "already completed",
+            "already interrupted",
+            "no active turn",
+            "turn is not active",
+            "turn not found",
+        )
+    )
 
 
 def _fallback_restart_handoff(*, task_contents: str, reason: str, last_actions: list[str]) -> RestartHandoff:
@@ -6497,6 +8588,36 @@ def _validation_is_usable_behavioral_pass(validation: ValidationRun) -> bool:
 
 def _has_readiness_marker(text: str) -> bool:
     return bool(READINESS_MARKER_RE.search(text.strip()))
+
+
+def _is_recoverable_app_server_transport_error(message: str) -> bool:
+    normalized = " ".join(message.lower().split())
+    return any(
+        marker in normalized
+        for marker in (
+            "app-server stream closed",
+            "broken pipe",
+            "connection reset",
+            "connection closed",
+            "unexpected eof",
+            "end of file",
+        )
+    )
+
+
+def _thread_turn_by_id(
+    thread: dict[str, Any],
+    turn_id: str | None,
+) -> dict[str, Any] | None:
+    if not turn_id:
+        return None
+    turns = thread.get("turns")
+    if not isinstance(turns, list):
+        return None
+    for turn in turns:
+        if isinstance(turn, dict) and turn.get("id") == turn_id:
+            return turn
+    return None
 
 
 def _has_malformed_readiness_marker(text: str) -> bool:
@@ -7709,6 +9830,7 @@ def _selected_model_availability(
     runtime_model: str | None,
     completion_model: str | None,
     adversary_model: str | None = None,
+    revision_coder_model: str | None = None,
     subagent_models: tuple[str, ...] = (),
 ) -> ModelAvailabilityResult:
     available_models = tuple(sorted(_extract_model_ids(models_response)))
@@ -7716,6 +9838,8 @@ def _selected_model_availability(
     missing: list[str] = []
     if coder_model and coder_model not in available:
         missing.append(f"coder={coder_model}")
+    if revision_coder_model and revision_coder_model not in available:
+        missing.append(f"revision-coder={revision_coder_model}")
     if runtime_model and runtime_model not in available:
         missing.append(f"runtime={runtime_model}")
     if completion_model and completion_model not in available:
@@ -8026,6 +10150,16 @@ def _short_thread_id(thread_id: Any) -> str:
     return thread_id if len(thread_id) <= 12 else thread_id[:12]
 
 
+def _format_multi_agent_summary(multi_agent: Any) -> str:
+    if not getattr(multi_agent, "enabled", False):
+        return "off"
+    default = getattr(multi_agent, "default", None)
+    return (
+        f"on(max={getattr(multi_agent, 'max_concurrent', '?')},"
+        f"default={getattr(default, 'model', '?')}/{getattr(default, 'intelligence', '?')})"
+    )
+
+
 def _format_allowed_subagent_profiles(multi_agent: Any) -> str:
     allowed = getattr(multi_agent, "allowed", {})
     if not isinstance(allowed, dict) or not allowed:
@@ -8119,14 +10253,21 @@ def _adversary_enabled_from_env() -> bool | None:
     return None
 
 
-def _create_adversary_snapshot(project_root: Path) -> Path:
+def _create_adversary_snapshot(
+    project_root: Path,
+    *,
+    excluded_relative_paths: tuple[str, ...] = (),
+) -> Path:
     temp_root = Path(tempfile.mkdtemp(prefix="bello-adversary-")).resolve()
     snapshot_root = temp_root / "workspace"
     try:
         copy_isolated_workspace_tree(
             project_root,
             snapshot_root,
-            ignore=_adversary_snapshot_ignore,
+            ignore=_adversary_snapshot_ignore_with_paths(
+                project_root,
+                excluded_relative_paths,
+            ),
         )
     except Exception:
         try:
@@ -8214,6 +10355,32 @@ def _adversary_snapshot_ignore(directory: str, names: list[str]) -> set[str]:
         ignored_keys = {name.casefold() for name in ignored}
         return {name for name in names if name.casefold() in ignored_keys}
     return {name for name in names if name in ignored}
+
+
+def _adversary_snapshot_ignore_with_paths(
+    project_root: Path,
+    excluded_relative_paths: tuple[str, ...],
+):
+    root = project_root.resolve()
+    if is_windows_platform():
+        excluded = {Path(path).as_posix().casefold() for path in excluded_relative_paths}
+    else:
+        excluded = {Path(path).as_posix() for path in excluded_relative_paths}
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        ignored = _adversary_snapshot_ignore(directory, names)
+        try:
+            relative_directory = Path(directory).resolve().relative_to(root)
+        except (OSError, ValueError):
+            return ignored
+        for name in names:
+            relative_path = (relative_directory / name).as_posix()
+            key = relative_path.casefold() if is_windows_platform() else relative_path
+            if key in excluded:
+                ignored.add(name)
+        return ignored
+
+    return ignore
 
 
 def _workspace_state_id(project_root: Path) -> str:

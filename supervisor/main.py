@@ -43,6 +43,15 @@ class BelloClickGroup(click.Group):
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 @click.option("--task", "task_path", type=click.Path(exists=False, dir_okay=False, path_type=Path))
+@click.option(
+    "--plan",
+    "plan_path",
+    type=click.Path(exists=False, dir_okay=False, path_type=Path),
+    help=(
+        "Optional advisory plan for the initial coder; it must be untracked and "
+        "absent from reachable Git history."
+    ),
+)
 @click.option("--coder-mod", "coder_model", default=None, help="Model to use for coder turns.")
 @click.option("--runtime-mod", "runtime_model", default=None, help="Model to use for runtime supervisor turns.")
 @click.option("--completion-mod", "completion_model", default=None, help="Model to use for completion review turns.")
@@ -113,7 +122,7 @@ class BelloClickGroup(click.Group):
     default=None,
     type=click.BOOL,
     metavar="[true|false]",
-    help="Delete everything except the selected task file and protected paths before starting.",
+    help="Delete everything except the selected task, optional plan, and protected paths before starting.",
 )
 @click.option(
     "--completion-review",
@@ -152,6 +161,7 @@ class BelloClickGroup(click.Group):
 def cli(
     ctx: click.Context,
     task_path: Path | None,
+    plan_path: Path | None,
     coder_model: str | None,
     runtime_model: str | None,
     completion_model: str | None,
@@ -178,6 +188,7 @@ def cli(
         run_settings = _resolve_run_settings(
             project_config=project_config,
             task_path=task_path,
+            plan_path=plan_path,
             coder_model=coder_model,
             runtime_model=runtime_model,
             completion_model=completion_model,
@@ -278,6 +289,10 @@ def config_command() -> None:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"Saved Bello config: {project_config_path(Path.cwd())}")
     click.echo(f"coder-mod: {config.coder_mod}")
+    click.echo(f"revision-coder: {'on' if config.revision_coder_enabled else 'off'}")
+    if config.revision_coder_enabled:
+        click.echo(f"revision-coder-mod: {config.revision_coder_mod}")
+        click.echo(f"revision-coder-intelligence: {config.revision_coder_intelligence}")
     click.echo(f"runtime-mod: {config.runtime_mod}")
     click.echo(f"completion-mod: {config.completion_mod}")
     click.echo(f"adversary-mod: {config.adversary_mod}")
@@ -395,6 +410,7 @@ async def _run_bello(settings: RunSettings) -> int:
     controller = BelloController(
         Path.cwd(),
         task_path=settings.task_path,
+        plan_path=settings.plan_path,
         coder_model=settings.coder_model,
         runtime_model=settings.runtime_model,
         completion_model=settings.completion_model,
@@ -422,6 +438,7 @@ async def _run_bello(settings: RunSettings) -> int:
 @dataclass(frozen=True)
 class RunSettings:
     task_path: Path | None
+    plan_path: Path | None
     coder_model: str
     runtime_model: str
     completion_model: str
@@ -443,6 +460,7 @@ def _resolve_run_settings(
     *,
     project_config: ProjectConfig,
     task_path: Path | None = None,
+    plan_path: Path | None = None,
     coder_model: str | None = None,
     runtime_model: str | None = None,
     completion_model: str | None = None,
@@ -483,6 +501,12 @@ def _resolve_run_settings(
     selected_completion_intelligence = completion_intelligence or project_config.completion_intelligence
     selected_adversary_intelligence = adversary_intelligence or project_config.adversary_intelligence
     _validate_model_intelligence("coder", selected_coder_model, selected_coder_intelligence)
+    if project_config.revision_coder_enabled:
+        _validate_model_intelligence(
+            "revision coder",
+            project_config.revision_coder_mod,
+            project_config.revision_coder_intelligence,
+        )
     _validate_model_intelligence("runtime", selected_runtime_model, selected_runtime_intelligence)
     _validate_model_intelligence("completion", selected_completion_model, selected_completion_intelligence)
     _validate_model_intelligence("adversary", selected_adversary_model, selected_adversary_intelligence)
@@ -490,6 +514,7 @@ def _resolve_run_settings(
     selected_protected_paths = protected_paths or tuple(Path(path) for path in project_config.protected_path)
     return RunSettings(
         task_path=selected_task,
+        plan_path=plan_path,
         coder_model=selected_coder_model,
         runtime_model=selected_runtime_model,
         completion_model=selected_completion_model,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -21,7 +22,7 @@ from supervisor.project_config import (
     ProjectConfig,
     SubagentDefaultConfig,
 )
-from supervisor.schemas import BelloConfig, BelloStatus
+from supervisor.schemas import AppEventSource, ApprovalContext, BelloConfig, BelloStatus
 from supervisor.state import StateStore
 from supervisor.supervisor_agent import StatelessSupervisorAgent
 
@@ -57,6 +58,7 @@ class _Client:
     def __init__(self) -> None:
         self.interrupts: list[tuple[str, str]] = []
         self.responses: list[tuple[int | str, dict[str, Any]]] = []
+        self.archived: list[str] = []
 
     async def turn_interrupt(self, thread_id: str, turn_id: str) -> dict[str, Any]:
         self.interrupts.append((thread_id, turn_id))
@@ -64,6 +66,16 @@ class _Client:
 
     async def respond(self, request_id: int | str, response: dict[str, Any]) -> None:
         self.responses.append((request_id, response))
+
+    async def thread_archive(self, thread_id: str) -> dict[str, Any]:
+        self.archived.append(thread_id)
+        return {}
+
+    async def thread_list(self, params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": []}
+
+    async def thread_turns_list(self, thread_id: str, **_kwargs: Any) -> dict[str, Any]:
+        return {"data": []}
 
 
 def _multi_agent_config() -> MultiAgentConfig:
@@ -82,6 +94,8 @@ def _controller(
     tmp_path: Path,
     *,
     multi_agent: MultiAgentConfig | None = None,
+    completion_multi_agent: MultiAgentConfig | None = None,
+    adversary_multi_agent: MultiAgentConfig | None = None,
 ) -> tuple[BelloController, StateStore]:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
@@ -100,7 +114,11 @@ def _controller(
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
-    controller.project_config = ProjectConfig(multi_agent=multi_agent or _multi_agent_config())
+    controller.project_config = ProjectConfig(
+        multi_agent=multi_agent or _multi_agent_config(),
+        completion_multi_agent=completion_multi_agent or MultiAgentConfig(),
+        adversary_multi_agent=adversary_multi_agent or MultiAgentConfig(),
+    )
     controller.client = _Client()
     controller.coder = None
     controller.approvals = None
@@ -109,6 +127,8 @@ def _controller(
     controller._sequence = 0
     controller._subagents = {}
     controller._subagent_policy_notified = set()
+    controller._reviewer_thread_ids = {}
+    controller._reviewer_thread_roles = {}
     controller._deferred_completion_check = None
     controller._quiescing_coder_tree = False
     controller._terminal_cleanup_started = False
@@ -246,6 +266,225 @@ async def test_spawn_profiles_allow_default_and_deny_with_root_steering(tmp_path
     )
     assert controller.client.interrupts == [("denied", "denied-turn")]
     assert len(coder.messages) == 1
+
+
+async def test_completion_reviewer_subagents_use_own_policy_and_forbid_nested_children(
+    tmp_path: Path,
+) -> None:
+    controller, _store = _controller(
+        tmp_path,
+        completion_multi_agent=_multi_agent_config(),
+    )
+    controller._register_reviewer_thread("completion-root", role="completion_review")
+
+    async def spawn(
+        sender: str,
+        receiver: str,
+        *,
+        model: str,
+        effort: str,
+    ) -> None:
+        await controller.handle_notification(
+            AppServerMessage(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": sender,
+                        "turnId": f"{sender}-turn",
+                        "item": {
+                            "type": "collabAgentToolCall",
+                            "tool": "spawnAgent",
+                            "senderThreadId": sender,
+                            "receiverThreadIds": [receiver],
+                            "agentsStates": {receiver: {"status": "running"}},
+                            "status": "completed",
+                            "model": model,
+                            "reasoningEffort": effort,
+                            "prompt": f"probe {receiver}",
+                        },
+                    },
+                }
+            )
+        )
+
+    await spawn(
+        "completion-root",
+        "completion-child",
+        model=MODEL_GPT_5_6_LUNA,
+        effort="high",
+    )
+    assert controller._subagents["completion-child"].profile_allowed is True
+    assert controller._reviewer_role_for_thread("completion-child") == "completion_review"
+
+    await spawn(
+        "completion-child",
+        "completion-grandchild",
+        model=MODEL_GPT_5_6_LUNA,
+        effort="high",
+    )
+    grandchild = controller._subagents["completion-grandchild"]
+    assert controller._reviewer_descendant_depth(grandchild.thread_id) == 2
+    assert grandchild.profile_allowed is False
+
+    await controller.handle_notification(
+        AppServerMessage(
+            {
+                "method": "turn/started",
+                "params": {
+                    "threadId": grandchild.thread_id,
+                    "turn": {"id": "grandchild-turn", "status": "inProgress"},
+                },
+            }
+        )
+    )
+    assert controller.client.interrupts == [(grandchild.thread_id, "grandchild-turn")]
+    assert controller.coder is None
+    assert any("limited to one child level" in text for _role, text in controller.tui.messages)
+
+
+async def test_adversary_reviewer_subagent_forbidden_profile_is_interrupted_without_coder_steering(
+    tmp_path: Path,
+) -> None:
+    controller, _store = _controller(
+        tmp_path,
+        adversary_multi_agent=_multi_agent_config(),
+    )
+    controller._register_reviewer_thread("adversary-root", role="adversary")
+    controller._subagents["adversary-child"] = SubagentRuntimeState(
+        thread_id="adversary-child",
+        parent_thread_id="adversary-root",
+        generation=2,
+        status="active",
+        active_turn_id="adversary-child-turn",
+        model=MODEL_GPT_5_6_TERRA,
+        reasoning_effort="xhigh",
+    )
+
+    await controller._enforce_subagent_profile(controller._subagents["adversary-child"])
+
+    assert controller._subagents["adversary-child"].profile_allowed is False
+    assert controller.client.interrupts == [("adversary-child", "adversary-child-turn")]
+    assert controller.coder is None
+    assert any(
+        f"{MODEL_GPT_5_6_TERRA}/xhigh" in text
+        for _role, text in controller.tui.messages
+    )
+
+
+def test_reviewer_descendant_events_do_not_invalidate_readiness_snapshot(tmp_path: Path) -> None:
+    controller, store = _controller(tmp_path)
+    controller._register_reviewer_thread("completion-root", role="completion_review")
+    controller._subagents["completion-child"] = SubagentRuntimeState(
+        thread_id="completion-child",
+        parent_thread_id="completion-root",
+        generation=2,
+    )
+    packet = SimpleNamespace(latest_event_sequence=0)
+
+    controller._append_event(
+        AppEventSource.APP_SERVER,
+        "item/completed",
+        thread_id="completion-child",
+    )
+    cfg = store.get_bello_config()
+
+    assert controller._readiness_snapshot_has_new_invalidating_event(packet, cfg=cfg) is False
+
+    next_packet = SimpleNamespace(latest_event_sequence=cfg.last_event_sequence)
+    controller._append_event(
+        AppEventSource.APP_SERVER,
+        "item/completed",
+        thread_id="unknown-thread",
+    )
+    cfg = store.get_bello_config()
+    assert controller._readiness_snapshot_has_new_invalidating_event(next_packet, cfg=cfg) is True
+
+
+def test_adversary_child_approval_context_uses_adversary_ancestry(tmp_path: Path) -> None:
+    controller, _store = _controller(tmp_path)
+    controller._register_reviewer_thread("adversary-root", role="adversary")
+    controller._subagents["adversary-child"] = SubagentRuntimeState(
+        thread_id="adversary-child",
+        parent_thread_id="adversary-root",
+        generation=2,
+    )
+    context = ApprovalContext(
+        server_request_id=9,
+        server_request_method="item/commandExecution/requestApproval",
+        thread_id="adversary-child",
+        turn_id="child-turn",
+        command="pytest -q",
+    )
+
+    assert controller._is_adversary_approval_context(context) is True
+
+    controller._active_adversary_thread_id = "adversary-root"
+    early_child_context = context.model_copy(update={"thread_id": "not-yet-tracked-child"})
+    coder_context = context.model_copy(update={"thread_id": "coder-root"})
+    assert controller._is_adversary_approval_context(early_child_context) is True
+    assert controller._is_adversary_approval_context(coder_context) is False
+
+
+async def test_reviewer_cleanup_interrupts_and_archives_descendants_before_snapshot_removal(
+    tmp_path: Path,
+) -> None:
+    controller, _store = _controller(tmp_path)
+    controller._register_reviewer_thread("completion-root", role="completion_review")
+    controller._subagents["completion-child"] = SubagentRuntimeState(
+        thread_id="completion-child",
+        parent_thread_id="completion-root",
+        generation=2,
+        status="active",
+        active_turn_id="completion-child-turn",
+    )
+    controller._subagents["completion-grandchild"] = SubagentRuntimeState(
+        thread_id="completion-grandchild",
+        parent_thread_id="completion-child",
+        generation=2,
+        status="completed",
+    )
+
+    await controller._cleanup_completion_reviewer_descendants("completion-root", tmp_path)
+
+    assert controller.client.interrupts == [("completion-child", "completion-child-turn")]
+    assert controller.client.archived == ["completion-grandchild", "completion-child"]
+    assert controller._subagents["completion-child"].status == "shutdown"
+    assert controller._subagents["completion-grandchild"].status == "shutdown"
+
+
+def test_model_preflight_includes_only_enabled_active_stage_subagent_models(tmp_path: Path) -> None:
+    coder = MultiAgentConfig(
+        enabled=True,
+        default=SubagentDefaultConfig(MODEL_GPT_5_6_LUNA, "high"),
+        allowed={MODEL_GPT_5_6_LUNA: ("high",)},
+    )
+    completion = MultiAgentConfig(
+        enabled=True,
+        default=SubagentDefaultConfig(MODEL_GPT_5_6_TERRA, "high"),
+        allowed={MODEL_GPT_5_6_TERRA: ("high",)},
+    )
+    adversary = MultiAgentConfig(
+        enabled=True,
+        default=SubagentDefaultConfig("gpt-5.6-sol", "high"),
+        allowed={"gpt-5.6-sol": ("high",)},
+    )
+    controller, store = _controller(
+        tmp_path,
+        multi_agent=coder,
+        completion_multi_agent=completion,
+        adversary_multi_agent=adversary,
+    )
+
+    assert controller._enabled_subagent_models_for_preflight() == (
+        MODEL_GPT_5_6_LUNA,
+        MODEL_GPT_5_6_TERRA,
+        "gpt-5.6-sol",
+    )
+
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(update={"completion_review_enabled": False})
+    )
+    assert controller._enabled_subagent_models_for_preflight() == (MODEL_GPT_5_6_LUNA,)
 
 
 def test_runtime_packet_subagent_summaries_are_bounded(tmp_path: Path) -> None:

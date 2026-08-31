@@ -23,6 +23,7 @@ from supervisor.schemas.models import (
 )
 from supervisor.state import SUPERVISOR_WAKES, StateStore
 from supervisor.supervisor_agent import StatelessSupervisorAgent, SupervisorAgentError
+from supervisor.workspace_snapshot import create_workspace_snapshot
 
 
 RAW_REPORT = """candidate_finding: true
@@ -142,16 +143,22 @@ async def test_dedicated_agent_uses_completion_settings_and_does_not_log_raw_pac
 ) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
+    implementation = tmp_path / "implementation.py"
+    implementation.write_text("RESULT = 'submitted'\n", encoding="utf-8")
     store = StateStore(tmp_path)
     store.initialize_bello(
         BelloConfig(project_root=str(tmp_path), task_path=str(task)),
         overwrite=True,
     )
+    plan = tmp_path / "PLAN.md"
+    plan.write_text("PRIVATE PLAN INPUT\n", encoding="utf-8")
+    coder_snapshot = create_workspace_snapshot(tmp_path, task, plan_path=plan)
 
     class FakeClient:
         turn_params: dict[str, object] | None = None
         thread_params: dict[str, object] | None = None
         input_root: Path | None = None
+        review_root: Path | None = None
 
         async def thread_start(self, params, *, timeout):
             self.thread_params = params
@@ -159,6 +166,11 @@ async def test_dedicated_agent_uses_completion_settings_and_does_not_log_raw_pac
 
         async def turn_start(self, params, *, timeout):
             self.turn_params = params
+            self.review_root = Path(params["cwd"])
+            assert self.review_root.joinpath("implementation.py").read_text(
+                encoding="utf-8"
+            ) == "RESULT = 'submitted'\n"
+            assert not self.review_root.joinpath("PLAN.md").exists()
             prompt = json.loads(params["input"][0]["text"])
             assert set(prompt) == {
                 "instructions",
@@ -203,13 +215,18 @@ async def test_dedicated_agent_uses_completion_settings_and_does_not_log_raw_pac
         client,  # type: ignore[arg-type]
         store,
         task,
+        workspace_root=coder_snapshot.snapshot_root,
+        completion_source_snapshot=coder_snapshot,
         model="gpt-completion",
         intelligence="high",
     )
     packet = _packet(tmp_path)
     packet.current_summary = "SECRET_ACCUMULATED_CONTEXT"
 
-    decision = await agent.decide_adv_report(packet)
+    try:
+        decision = await agent.decide_adv_report(packet)
+    finally:
+        coder_snapshot.cleanup()
 
     assert decision.forward_to_coder is True
     assert client.turn_params is not None
@@ -217,14 +234,22 @@ async def test_dedicated_agent_uses_completion_settings_and_does_not_log_raw_pac
     assert client.turn_params["effort"] == "high"
     assert client.thread_params is not None
     assert client.input_root is not None
-    expected_roots = [str(tmp_path.resolve()), str(client.input_root.resolve())]
-    assert client.thread_params["runtimeWorkspaceRoots"] == expected_roots
-    assert client.turn_params["runtimeWorkspaceRoots"] == expected_roots
+    assert client.review_root is not None
+    input_root = str(client.input_root.resolve())
+    review_root = str(client.review_root.resolve())
+    active_root = str(coder_snapshot.snapshot_root.resolve())
+    assert client.thread_params["cwd"] == review_root
+    assert client.turn_params["cwd"] == review_root
+    assert client.thread_params["runtimeWorkspaceRoots"] == [review_root, input_root]
+    assert client.turn_params["runtimeWorkspaceRoots"] == [review_root, input_root]
+    assert active_root not in client.thread_params["runtimeWorkspaceRoots"]
+    assert active_root not in client.turn_params["runtimeWorkspaceRoots"]
     assert client.turn_params["sandboxPolicy"] == {
         "type": "readOnly",
         "networkAccess": False,
     }
     assert not client.input_root.exists()
+    assert not client.review_root.exists()
     audit = json.loads(
         store.path(SUPERVISOR_WAKES).read_text(encoding="utf-8").splitlines()[-1]
     )
