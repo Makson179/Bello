@@ -22,12 +22,9 @@
 - [TL;DR](#tldr)
 - [Install](#install)
 - [Quick start](#quick-start)
-- [Native Windows and WSL](#native-windows-and-wsl)
 - [Bello in 42 seconds](#bello-in-42-seconds)
-- [Motivation](#motivation)
 - [How Bello solves tasks](#how-bello-solves-tasks)
-- [Relationship to existing LLM research](#relationship-to-existing-llm-research)
-- [Choose your supervision depth](#choose-your-supervision-depth)
+- [Choose your configuration](#choose-your-configuration)
 - [Results](#results)
 - [Configuration](#configuration)
 - [Command reference](#command-reference)
@@ -42,21 +39,25 @@ lets you use separate models for implementation, runtime supervision,
 completion review, and adversarial testing. In our Efficient Budget comparison,
 Raw GPT-5.6 Sol XHigh consumed 2.966 times as much of the weekly Codex limit.
 Bello also scored 0.697 percentage points higher on average across four
-ProgramBench tasks. The tradeoff was time, because Bello took 3.857 times as
-long.
+ProgramBench tasks.
 
 Bello also protects the run while it works. The coder operates inside a
-disposable sandbox, and a separate supervisor reviews risky actions before they
-happen. Optional completion review checks the finished diff against the task,
-and an adversary tries to break the result without seeing how it was developed.
-Confirmed findings go back to the coder.
+disposable sandbox, and a runtime supervisor watches the live agent. It catches
+hallucinations and task drift, blocks harmful actions before they reach the
+project or production systems, and can restart a failing run without losing the
+workspace. On three workplace-style tasks, `runtime-only` scored about 9%
+higher than Raw Codex at about the same cost and wall time. Optional completion
+review checks the finished diff against the task, and an adversary tries to
+break the result without seeing how it was developed.
 
 You choose the tradeoff for each task. The Codex plugin can inspect the task and
 recommend a configuration for lower cost, higher quality, or shorter wall time.
-Efficient Budget favors cost while preserving average completion quality. The
-setup that prioritizes quality scored 36.4% higher than Raw Codex across its
-nine matched runs, while `runtime-only` adds the sandbox and live supervisor at
-about the cost of Raw Codex.
+Faster configurations use quicker reasoning where latency matters and reserve
+stronger models for the decisions that need them. This can cut wall time while
+keeping the total cost and expected result close to a slower configuration.
+Efficient Budget favors cost while preserving average completion quality, and
+the setup that prioritizes quality scored 36.4% higher than Raw Codex across its
+nine matched runs.
 
 Install the plugin or standalone command in [Install](#install), then provide a
 task file as shown in [Quick start](#quick-start). Bello runs the selected
@@ -72,9 +73,7 @@ files, checks, and remaining risks.
 - **Codex CLI** installed and authenticated. Bello drives `codex app-server`,
   and your Codex account provides the models.
 - **Python 3.11+** and **git**.
-- macOS, Linux, or a supported native Windows installation. See
-  [Native Windows and WSL](#native-windows-and-wsl) for the tested baseline and
-  filesystem guidance.
+- macOS, Linux, or a supported native Windows installation.
 
 Verify your environment at any time with `bello doctor`.
 
@@ -99,362 +98,97 @@ bello doctor
 Bello checks for updates at startup and offers to install them. Run
 `bello update` to update explicitly.
 
-### Native Windows install
-
-Use a 64-bit Windows 11 or Windows Server installation with native Windows
-builds of Python, Git, and Codex. In PowerShell:
-
-```powershell
-py -m pip install --user pipx
-py -m pipx ensurepath
-pipx install bello
-bello doctor
-```
-
-Restart the terminal after `ensurepath` if `pipx` or `bello` is not found. Bello
-does not require Administrator privileges, Developer Mode, or permission to
-create symbolic links. Install and authenticate the native Codex CLI before
-starting a run.
-
 ## Quick start
 
-```bash
-cd your-project
-echo "Build a CLI tool that ..." > task.md
-bello --task task.md
-```
+After installing the plugin, open Codex in the project that contains `task.md`.
+The full start can be a short conversation:
 
-If you already prepared a plan, pass it as a separate Markdown file that is
-untracked and has never been committed on a currently reachable Git ref:
+> **You:** Do you see the Bello plugin?
+>
+> **Codex:** Yes. I can inspect the task, recommend a configuration, and run it
+> with Bello.
+>
+> **You:** Please recommend the best balance of price and quality for
+> completing `task.md`.
+>
+> **Codex:** I recommend a configuration based on the task, repository, expected
+> quality, total cost, and wall time.
+>
+> **You:** Thanks. Please run `task.md` with that configuration and keep me
+> updated on what is happening.
 
-```bash
-bello --task task.md --plan PLAN.md
-```
-
-The plan is advisory rather than binding. The initial coder verifies its
-assumptions against the task, repository, and tests, and may depart from it when
-implementation reveals facts the planner could not know. Bello exposes the plan
-to the initial coder (and runtime supervision) but excludes it from completion
-review, adversarial testing, revision-coder threads, patches, and recovery
-artifacts. Requiring the plan to be untracked and absent from reachable history
-keeps it out of the repository history visible to those independent reviewers.
-Do not use `AGENTS.md` as the plan filename: Codex treats that name as workspace
-instructions, so Bello rejects it to keep the plan advisory.
-
-Bello starts the coder, supervises the run, and writes
-`.supervisor/FINAL_REPORT.md` when it finishes. The report lists the status, the
-changed files, the validations that were run, and the remaining risks.
-
-While a run is active you can type into the terminal, and your message is routed
-to the supervisor rather than the coder:
-
-| Control | Action |
-| --- | --- |
-| `/status` | Show task, generation, active turn, pending approvals, health. |
-| `/pause` / `/resume` | Pause and resume the autonomous loop. |
-| `/restart` | Request a supervised restart. |
-| `/quit` | Write state and exit. |
-| any text | Delivered to the supervisor as an instruction or constraint. |
-
-Everything the run does is written to inspectable files under `.supervisor/`
-in your project: `PROGRESS.md` (what has happened), `DECISIONS.md` (standing
-decisions), `HANDOFF.md` (restart context), `events.jsonl` (full event
-stream), and `FINAL_REPORT.md` (the result).
-
-## Native Windows and WSL
-
-Bello supports native 64-bit Windows 11 and Windows Server 2022/2025. The full
-applicable suite runs on Windows Server 2022 with Python 3.11 and Windows Server
-2025 with Python 3.14; the workflow also records the exact GitHub runner image.
-Python 3.11+ is supported. Windows on ARM, Windows 10, and older Windows Server
-releases are not in the supported or tested matrix.
-
-Keep active projects on a local NTFS volume. Drive-letter paths and paths on a
-different local volume are supported. Bello recognizes UNC paths, but network
-share and cloud-sync reparse semantics vary by provider and are not part of the
-tested configuration; move the project to local NTFS if `bello doctor` or
-snapshot creation cannot establish a safe path. Bello fails closed on ambiguous
-reparse points, hardlinks, reserved device names, and path aliases. Internal
-links inside read-only dependency trees are materialized only when their targets
-remain in the project; external targets are rejected. Linked Git worktrees are
-not currently supported. Cross-volume isolation may copy large dependency
-directories and can therefore be slower.
-
-PowerShell and `cmd.exe` commands are classified using their own quoting and
-composition rules. A Windows command Bello cannot parse unambiguously is sent
-to the supervisor for review or denied; it is never treated as a POSIX command
-and silently approved.
-
-WSL2 remains a supported alternative (WSL1 is not supported by current Codex
-CLI releases). Install Python, Git, Codex, and Bello inside the distribution
-and run against a project in the WSL Linux filesystem
-(for example, under `/home`), rather than mixing a Windows Bello/Codex process
-with a `\\wsl$` path or placing a high-I/O project under `/mnt/c`.
-
-For platform-specific diagnostics and remedies, see
-[Windows installation and troubleshooting](docs/windows.md).
-
----
+Codex shows the resolved configuration before launch. Bello then runs the task
+and writes `.supervisor/FINAL_REPORT.md` with the result, changed files, checks,
+and remaining risks.
 
 ## Bello in 42 seconds
 
 https://github.com/user-attachments/assets/f0324432-f616-45f6-beca-9bd8282f06ef
 
----
-
-# Motivation
-
-Modern language models can write code, analyze documents, and solve hard
-problems, but a model still produces its answer one step at a time. On a long,
-multi-stage task, the same model has to hold the requirements, plan the work,
-carry it out, judge its own progress, notice its own mistakes, and decide when
-the result can be called finished.
-
-Doing all of that inside one model is unreliable. As the context grows, model
-quality drops quickly and hallucination becomes more likely
-[[1]](https://aclanthology.org/2024.tacl-1.9/)
-[[2]](https://arxiv.org/abs/2404.06654)
-[[3]](https://aclanthology.org/2022.acl-long.229/)
-[[4]](https://aclanthology.org/2023.emnlp-main.397/). Compressing the history
-reduces the context problem, but compression can drop a rule, a decision, or a
-prohibition that still applies. A confident report from the model is also not
-evidence that the task was actually completed.
-
-Bello moves the orchestration, the state, and the control of complex work
-outside the language model.
-
-Cost also depends on the complete run, rather than one source of tokens. Tools
-such as [Context Mode](https://github.com/mksglu/context-mode) and
-[Token-Saver](https://github.com/ppgranger/token-saver) reduce the tool output
-part of an agent session. Bello changes the models and review schedule used for
-the whole task. The Efficient Budget results below compare complete runs. The
-Bello count includes the coder, runtime supervisor, completion reviewer, and
-adversary, so the reported saving covers the complete task.
-
-The coder still plans its own work and derives the requirements from the task,
-because a language model is good at exactly that. What Bello keeps outside the
-model is everything around it: which role runs when, what state survives a
-restart, what the coder is allowed to do, and who decides that the work is
-finished. With completion review and the adversary enabled, Bello runs a
-repeatable loop in which a solution is written, reviewed, attacked, corrected,
-and accepted only after an independent check confirms it.
-
 ## How Bello solves tasks
 
-The run starts by building the first complete solution. The coder in the
-isolated sandbox reads the task, modifies the project, runs checks, and produces
-a working prototype. While the coder works, a runtime supervisor with a fresh
-context watches the execution, blocks risky actions before they happen, and
-steers the coder back on track when it detects drift, repeated mistakes, or
-unsafe behavior. The supervisor can also deny an action or restart a failing
-generation, and a restart keeps the coder's current workspace, so the run stays
-autonomous and still under control.
+Bello separates implementation, live safety, review, and attack into roles that
+can use different models and reasoning levels.
 
-When completion review is enabled and a review opportunity remains, the result
-then goes to an independent **completion review**. The reviewer does not continue
-development, and it does not accept the coder's report as evidence. It
-reconstructs the mandatory requirements of the task on its own and checks:
+1. The **coder** works inside a disposable sandbox. It reads the task, changes
+   the project, and runs checks without receiving direct access to the original
+   workspace.
+2. The **runtime supervisor** watches the coder while it works. It catches
+   hallucinations and task drift, blocks dangerous actions before they happen,
+   protects project and production resources, and can restart a failing run
+   without discarding the current workspace.
+3. An optional **completion reviewer** reads the task, code, and diff with a
+   fresh context. It checks whether the requested behavior is actually present
+   and supported by evidence. Confirmed gaps go back to the coder.
+4. An optional **adversary** receives the finished artifact without the
+   development history and tries to break it through edge cases, invalid input,
+   and feature interactions. A separate controller checks its findings before
+   they reach the coder.
+5. Bello returns confirmed problems to the coder and repeats only the stages
+   allowed by the selected configuration. It then writes the final report and
+   preserves enough state to recover from an interrupted run.
 
-* whether the required behavior has been implemented;
-* whether the checks support the claimed result;
-* whether any modes or edge cases remain untested;
-* whether any regressions have been introduced;
-* whether fresh validation was performed after the latest substantial changes.
+The complete loop is:
 
-When the reviewer finds a problem, the work goes back to the coder. After the
-fix, the reviewer runs a full review again while the budget still holds a review
-opportunity, because a local change can affect other parts of the system. Once
-the budget is spent, Bello moves on to the adversary, or finishes the run when
-the adversary is off.
+**build → supervise → review → attack → repair → accept**
 
-Bello starts the **adversary** when the reviewer accepts the result, or when the
-review budget before the attack runs out. With `max-reviews-before-adversary`
-set to `0` the adversary runs on the first solution, without any review before
-it. The adversary tries to break the result.
-It explores invalid inputs, unexpected action sequences, interactions between
-features, boundary states, and assumptions that the coder and the reviewer may
-have overlooked.
+Every part is configurable. You can choose the model and reasoning level for
+each role, the number and order of review and adversary passes, whether findings
+move to a fresh revision coder, whether roles may use subagents, and whether to
+use the faster service tier. A run can contain only runtime protection, one
+review, several review and adversary rounds, or any supported combination. The
+configuration advisor can inspect the task and recommend a setup around cost,
+quality, and wall time.
 
-The adversary works without the development history of the solution. It judges
-the final artifact rather than the author's explanation. Its report goes to a
-separate report controller, which checks every finding, keeps the confirmed ones,
-rejects the incorrect ones, and downgrades the doubtful ones to observations. The
-coder then receives the surviving findings together with all observations.
+## Choose your configuration
 
-If a run ends unexpectedly after the coder has started working, for example
-because of a usage limit, a provider error, or an interrupted process, Bello
-preserves the coder's current workspace under `.supervisor/`, including changes
-that were never validated. To keep that recovery state available on the next
-run, leave Start over disabled (`start-over: false`, the default). If a security
-policy interrupted the run, restart it with `--start-over=false`. Enabling Start
-over discards previous recovery data.
+Bello is not limited to a small set of preset modes. You can combine its roles,
+models, reasoning levels, and review budgets around the task. The configurations
+below are examples of what that flexibility can produce.
 
-With every stage enabled, Bello therefore implements the following cycle:
-
-**build a solution → independently review completeness → fix defects → perform adversarial testing → reassess → accept the result.**
-
-## Relationship to existing LLM research
-
-Bello separates iterative repair from acceptance.
-[Is Self-Repair a Silver Bullet for Code Generation?](https://arxiv.org/abs/2306.09896)
-found that cost-adjusted self-repair gains were often modest, variable, or
-absent, and that they increased substantially when feedback came from a stronger
-model or a human. [CRITIC](https://arxiv.org/abs/2305.11738) provides the
-complementary result that correction is more reliable when it is grounded in
-observable feedback from external tools. Bello therefore lets the coder execute
-tests and repair the artifact, but does not let the authoring trajectory certify
-completion. Acceptance is decided by a fresh reviewer that does not modify the
-artifact and does not treat the coder's report as evidence. The reviewer reads
-the specification, the artifact, and the diff, and it obtains its own behavioral
-evidence by selectively rerunning checks against the result. The diff makes that
-evidence harder to stage, because weakened assertions, skipped cases,
-substituted mocks, and deleted tests all appear as changes even when the suite
-reports green. [StackEval](https://arxiv.org/abs/2412.05288) found that reference
-answers consistently improved LLM code-judging accuracy, and it detected no
-statistically significant self-preference when such references were supplied.
-The finding supports review anchored in evidence, although StackEval's one-shot
-setting does not establish that a fresh reviewer is an independent correctness
-oracle. In Bello, the use of a fresh context separates the acceptance decision
-from the coder's trajectory, and validation remains necessary.
-
-The adversarial stage addresses weaknesses in both fixed and model-generated
-tests. [EvalPlus](https://arxiv.org/abs/2305.01210) showed that the original
-HumanEval suites accepted substantial amounts of functionally incorrect code.
-[Revisit Self-Debugging with Self-Generated Tests for Code Generation](https://arxiv.org/abs/2501.12793)
-found that self-generated tests can produce biased and misleading repair
-signals. Taken together, the studies above and the 2026 preprint
-[AdverMCTS](https://arxiv.org/abs/2604.10449) provide the closest evidence for
-Bello's attacker role. In AdverMCTS, targeted corner cases reduced
-pseudo-correctness caused by sparse static tests, in a setting of programming
-problems. Bello accordingly separates implementation, counterexample generation,
-and acceptance. The adversary searches beyond the existing suite, but its tests
-are candidate evidence rather than ground truth. A separate report controller
-checks each finding and drops the ones it cannot confirm before the coder sees
-the report, acceptance stays with the completion reviewer whenever review rounds
-are scheduled after the attack, and relevant edits invalidate earlier acceptance
-evidence.
-
-The [AgentCoder](https://arxiv.org/abs/2312.13010) preprint is the closest prior
-architecture. It separates a programmer, an implementation-independent test
-designer, and a test executor, and its ablations support separating test
-construction from code generation. Its evaluation is limited to function-level
-synthesis, and it treats a task as complete when the generated tests pass. It
-therefore supports Bello's role separation without covering long-running runtime
-supervision, a separate completion gate, a separate handler for adversary
-findings, or restart state. The additional controls in Bello target failures
-identified by [MAST](https://arxiv.org/abs/2503.13657) across more than 1,600
-multi-agent traces, including role violations, history loss, task derailment, premature
-termination, and absent or incorrect verification. Bello maps them to fixed role
-contracts, durable handoffs, live drift detection, explicit stage transitions,
-and a separate final acceptance decision. Multi-agent specialization is prior
-art, and Bello's architectural claim concerns the governance and evidence
-requirements imposed around the roles.
-
-Finally, [CaMeL](https://arxiv.org/abs/2503.18813) demonstrates a
-prompt-injection defense in which trusted control flow and security policy are
-enforced by a protective system layer rather than delegated to model compliance.
-Bello applies the same principle through isolated execution, mediated actions,
-live runtime supervision, and fail-closed approvals, without claiming CaMeL's
-capability model or formal guarantees.
-
-## Choose your supervision depth
-
-Bello can reduce cost, prioritize quality, or stay close to Raw Codex in wall
-time. In the effort levels below, `C` is an independent **completion review**
-and `A` is an **adversarial pass**. Runtime supervision stays active at every
-effort level.
-
-| Effort | What it does | Measured result | When to use |
+| Example | Configuration | What it prioritizes | Measured result |
 | --- | --- | --- | --- |
-| `runtime-only` | A supervisor with a fresh context watches the live run, blocks dangerous actions, and pulls the coder back when it drifts. | Time and cost match Raw Codex, and scores run about 9% higher on messy tasks with many requirements. | The everyday default, on any task. |
-| `C+A` | Adds one independent completion review and one adversarial pass on top of runtime supervision. | Efficient Budget used 33.711% of the weekly limit used by Raw GPT-5.6 Sol XHigh and scored 0.697 points higher across four tasks. With Sol `ultra`, C+A raised macro completion from 53.53% to 67.67% at a higher cost. | A hard task where you want to choose between lower cost and more quality. |
-| `4C+A+2C` | Allows up to four review rounds before the attack and two after it. | The higher score in all nine matched runs, and 36.4% higher completion than Raw Codex on average. Significantly more expensive than Raw Codex. | The hardest tasks, where quality is the priority and cost does not matter. |
+| Runtime protection | `runtime-only` | Safety with almost no added cost. The live supervisor catches hallucinations and drift, blocks harmful actions, and protects project and production resources. | About the same cost and wall time as Raw Codex. Scores were about 9% higher on three workplace-style tasks and about 2% higher on the shorter ProgramBench tasks. |
+| Efficient Budget | Luna-based `C+A` | Lower total cost without losing average quality. | Raw GPT-5.6 Sol XHigh used **2.966 times** as much of the weekly limit. Bello scored **0.697 percentage points higher** on average across four tasks. |
+| Quality C+A | GPT-5.6 Sol `ultra` with `C+A` | A strong completion review and adversarial pass when quality matters more than cost. | Macro completion increased from **53.53% to 67.67%**, a gain of **14.14 percentage points**. |
+| Maximum quality experiment | `4C+A+2C` | The highest quality Bello can pursue with repeated review before and after an attack. | Bello scored higher in all nine matched runs and improved completion by **36.4%** on average. This is an expensive, long-running experiment for rare cases, not a default recommendation. |
 
-### `runtime-only`, for everyday work
+Here, `C` means an independent completion review and `A` means an adversarial
+pass. Runtime supervision remains active in every example. The same `C+A`
+schedule can be inexpensive or quality-focused because each role can use a
+different model and reasoning level.
 
-The coder works as usual while a supervisor with a clean context watches the
-live trajectory. The supervisor stops abrupt, irreversible actions, such as
-dropping a database or cancelling a paid subscription, and it redirects a coder
-that has drifted away from the task. On average it matches Raw Codex on both
-time and cost, and on individual tasks it is sometimes faster and cheaper,
-because a coder that is kept on track does less useless work.
+You can also use one review without an adversary, several reviews, reviews after
+an adversary, repeated attacks, or any supported combination. Review counts are
+upper limits, so Bello can accept early when no further work is needed. For a
+faster run, use quicker reasoning profiles on the serial roles and reserve the
+strongest models for the decisions that need them.
 
-Use `runtime-only` as the default for any task. It removes most of the risk that
-the coder starts hallucinating and doing damage, and the quality gain is largest
-when the task is written the way people normally write tasks at work: long,
-messy, and full of requirements added in passing. On our three custom tasks of
-that kind, `runtime-only` scored about 9% higher than Raw Codex, because it
-catches drift and hallucination early. The ProgramBench tasks are short, so they
-understate the effect, and there the mean gain was about 2%.
-
-### `C+A`, for lower cost or more quality
-
-This effort level adds up to one independent completion review followed by an
-adversarial attempt to break the result, and it keeps every `runtime-only`
-protection. The models assigned to those roles decide whether the same schedule
-prioritizes cost or quality.
-
-Efficient Budget assigns GPT-5.6 Luna to the coding and review roles. Across
-four ProgramBench tasks and three runs per task, it consumed **5.2690%** of a
-weekly Codex limit, compared with **15.6297%** for Raw GPT-5.6 Sol XHigh. The
-mean score increased from **48.100% to 48.797%**, while the mean solution time
-increased from **28:27 to 1:49:44**.
-
-When quality matters more than cost, C+A can use stronger models throughout.
-With GPT-5.6 Sol at `ultra`, it raised macro completion from 53.53% to 67.67%,
-which is **69% of the improvement** delivered by the full `4C+A+2C` setup in
-our shorter comparison. That three-task run took about 2.5 times longer and
-cost roughly 1.8 to 2.3 times more than Raw Codex.
-
-Use `C+A` for a hard task when you want an independent review and adversarial
-test. Select the models based on whether cost or quality matters more, and plan
-for a longer wall time than a Raw Codex run.
-
-### `4C+A+2C`, for maximum quality
-
-This effort level allows up to four completion-review rounds to refine the
-implementation before the adversary probes its assumptions, and up to two further
-rounds to resolve what the attack uncovers. We built it to see how high Bello can
-score on a benchmark with every stage enabled, and the measured completion was
-the highest of the three effort levels. Bello scored higher in all nine matched
-runs. Averaged over them it improved completion by **36.4% over Raw Codex**, and
-in the GPT-5.6 Sol `ultra` comparison by 38.30%.
-
-This effort level is significantly more expensive than Raw Codex and takes much
-longer, so it is worth choosing deliberately. It fits a genuinely awkward task
-with many cases and nuances, where quality is the priority and cost is not a
-constraint. Plan for a long run, because in our `ultra` runs a single task took
-between 7 hours 39 minutes and 19 hours 25 minutes.
-
-Configure these effort levels with `bello config`. For `runtime-only`, set
-`completion-review` and `adversary` to `false`. For `C+A`, enable both and set
-`max-reviews-before-adversary`, `max-adversary-runs`, and
-`max-reviews-after-adversary` to `1`, `1`, and `0`. For `4C+A+2C`, use `4`, `1`,
-and `2`. The fields, defaults, and one-run CLI overrides are documented in the
+You do not have to choose manually. The plugin's configuration advisor inspects
+the task and relevant workspace files, presents a few concrete options for cost,
+quality, and wall time, and applies the selected configuration when you ask it
+to. Every field remains available in `bello config` and in the
 [Configuration section](#configuration).
-
-### Custom effort levels
-
-Bello has no built-in list of modes to pick from. The three effort levels above are
-configuration recipes, and the budget fields are independent numbers, so you can
-choose whatever effort level your task needs: a single `C` with the adversary off,
-`2C+A`, `C+A+C`, `4C+2A`, and so on. Set `max-reviews-before-adversary` for the
-review rounds before the first attack, `max-adversary-runs` for the number of
-adversary passes, and `max-reviews-after-adversary` for the review rounds that
-follow each pass. Both review budgets also accept `Unlimited`, which removes the
-cap and lets the loop keep going until the reviewer accepts the result.
-
-The numbers are upper limits rather than a fixed sequence. A run can end before
-it uses them, because the reviewer can accept early and the run completes
-once nothing further is scheduled, so a name like `4C+2A` describes the most the
-run may do rather than what it will do. The adversary also requires
-`completion-review` to be enabled, and setting `max-reviews-before-adversary` to
-`0` is allowed, which sends the first solution straight to the attack.
-
-The Codex plugin includes a configuration advisor. You can give Codex the task
-and ask it to recommend a Bello setup for lower cost, higher quality, or shorter
-wall time. It inspects the task and relevant workspace files, presents concrete
-options, and can apply the selected configuration when you ask it to.
 
 ## Results
 
