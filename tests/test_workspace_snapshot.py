@@ -16,6 +16,7 @@ from supervisor.workspace_snapshot import (
     apply_snapshot_patch,
     create_verification_workspace_snapshot,
     create_workspace_snapshot,
+    validate_plan_git_isolation,
 )
 
 
@@ -40,6 +41,310 @@ def _init_repo(root: Path) -> None:
         cwd=root,
         check=True,
     )
+
+
+def test_private_plan_is_coder_only_and_never_enters_patch_or_completion(
+    tmp_path: Path,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    source = tmp_path / "app.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    plan = tmp_path / "PLAN.md"
+    plan.write_text("SECRET PLAN: implement the cache first.\n", encoding="utf-8")
+    launcher_runtime = tmp_path / ".codex" / "bello-run"
+    launcher_runtime.mkdir(parents=True)
+    launcher_runtime.joinpath("launch.json").write_text(
+        '{"plan_file": "PLAN.md"}\n',
+        encoding="utf-8",
+    )
+    tmp_path.joinpath(".codex", "project-instructions.md").write_text(
+        "public project instruction\n",
+        encoding="utf-8",
+    )
+
+    validate_plan_git_isolation(tmp_path, plan)
+    snapshot = create_workspace_snapshot(tmp_path, task, plan_path=plan)
+    try:
+        assert snapshot.plan_source_path == plan.resolve()
+        assert snapshot.plan_path == snapshot.snapshot_root / "PLAN.md"
+        assert snapshot.plan_path.is_file()
+        assert not snapshot.plan_path.is_symlink()
+        assert snapshot.plan_path.resolve() != plan.resolve()
+        assert snapshot.plan_path.stat().st_nlink == 1
+        if os.name != "nt":
+            assert stat.S_IMODE(snapshot.plan_path.stat().st_mode) == 0o444
+        assert snapshot.plan_relative_path == "PLAN.md"
+        assert snapshot.plan_bytes == plan.read_bytes()
+        assert snapshot.plan_exposed is True
+        assert snapshot.plan_path.read_text(encoding="utf-8") == plan.read_text(
+            encoding="utf-8"
+        )
+        assert snapshot.plan_integrity_issue() is None
+        assert not snapshot.snapshot_root.joinpath(".codex", "bello-run").exists()
+        assert snapshot.snapshot_root.joinpath(
+            ".codex", "project-instructions.md"
+        ).read_text(encoding="utf-8") == "public project instruction\n"
+        assert subprocess.run(
+            ["git", "status", "--porcelain=v1"],
+            cwd=snapshot.snapshot_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        ).stdout == ""
+        assert subprocess.run(
+            ["git", "show", "HEAD:PLAN.md"],
+            cwd=snapshot.snapshot_root,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).returncode != 0
+
+        # Even a force-staged private mount is stripped from the review index and
+        # filtered from the eventual patch.
+        subprocess.run(
+            ["git", "add", "-f", "--", "PLAN.md"],
+            cwd=snapshot.snapshot_root,
+            check=True,
+        )
+        with (snapshot.snapshot_root / ".git" / "info" / "exclude").open(
+            "a", encoding="utf-8"
+        ) as handle:
+            handle.write("review-cache.local\n")
+        verification = create_verification_workspace_snapshot(
+            snapshot.snapshot_root,
+            source_snapshot=snapshot,
+        )
+        try:
+            assert not (verification.snapshot_root / "PLAN.md").exists()
+            assert not (verification.snapshot_root / "PLAN.md").is_symlink()
+            assert subprocess.run(
+                ["git", "ls-files", "--error-unmatch", "--", "PLAN.md"],
+                cwd=verification.snapshot_root,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ).returncode != 0
+            assert subprocess.run(
+                ["git", "log", "--all", "--format=%H", "--", "PLAN.md"],
+                cwd=verification.snapshot_root,
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            ).stdout == ""
+            verification_exclude = verification.snapshot_root.joinpath(
+                ".git", "info", "exclude"
+            ).read_text(encoding="utf-8")
+            assert "review-cache.local" in verification_exclude
+            assert "bello-private-plan-input" not in verification_exclude
+            assert "PLAN.md" not in verification_exclude
+            for current, _dirs, files in os.walk(
+                verification.snapshot_root / ".git",
+                followlinks=False,
+            ):
+                for name in files:
+                    candidate = Path(current) / name
+                    if candidate.is_file() and not candidate.is_symlink():
+                        payload = candidate.read_bytes()
+                        assert b"SECRET PLAN" not in payload
+                        assert b"PLAN.md" not in payload
+            verification.assert_submission_unchanged()
+        finally:
+            verification.cleanup()
+
+        (snapshot.snapshot_root / "app.py").write_text("value = 2\n", encoding="utf-8")
+        result = apply_snapshot_patch(snapshot)
+        assert result.changed_paths == ("app.py",)
+        assert "PLAN.md" in result.ignored_paths
+        assert source.read_text(encoding="utf-8") == "value = 2\n"
+        assert plan.read_text(encoding="utf-8") == "SECRET PLAN: implement the cache first.\n"
+    finally:
+        snapshot.cleanup()
+
+
+def test_detached_private_plan_is_not_restored_or_preserved_for_recovery(
+    tmp_path: Path,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    plan = tmp_path / "PLAN.md"
+    plan.write_text("private plan\n", encoding="utf-8")
+
+    snapshot = create_workspace_snapshot(tmp_path, task, plan_path=plan)
+    assert snapshot.detach_plan_exposure() is True
+    assert snapshot.plan_exposed is False
+    assert snapshot.plan_path is not None and not snapshot.plan_path.exists()
+    detached_exclude = snapshot.snapshot_root.joinpath(".git", "info", "exclude").read_text(
+        encoding="utf-8"
+    )
+    assert "bello-private-plan-input" not in detached_exclude
+    assert "PLAN.md" not in detached_exclude
+    assert snapshot.restore_runtime_links() == ()
+    assert snapshot.plan_integrity_issue() is None
+    assert snapshot.detach_plan_exposure() is False
+
+    recovery_root = tmp_path / "recovery"
+    recovered_workspace = snapshot.preserve(recovery_root)
+    assert recovered_workspace.joinpath("TASK.md").read_text(encoding="utf-8") == "# Task\n"
+    assert not recovered_workspace.joinpath("PLAN.md").exists()
+    assert plan.read_text(encoding="utf-8") == "private plan\n"
+
+
+def test_private_plan_is_removed_when_active_snapshot_is_preserved(
+    tmp_path: Path,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    plan = tmp_path / "PLAN.md"
+    plan.write_text("private plan\n", encoding="utf-8")
+    snapshot = create_workspace_snapshot(tmp_path, task, plan_path=plan)
+
+    recovered_workspace = snapshot.preserve(tmp_path / "active-recovery")
+
+    assert not recovered_workspace.joinpath("PLAN.md").exists()
+    assert recovered_workspace.joinpath("TASK.md").read_text(encoding="utf-8") == "# Task\n"
+    assert snapshot.plan_exposed is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX plan-copy mode")
+def test_posix_private_plan_uses_guarded_workspace_copy_and_checks_both_sources(
+    tmp_path: Path,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    plan = tmp_path / "PLAN.md"
+    plan.write_text("private POSIX plan\n", encoding="utf-8")
+
+    snapshot = create_workspace_snapshot(tmp_path, task, plan_path=plan)
+    try:
+        assert snapshot.runtime_exposure_mode == workspace_snapshot_module.RUNTIME_EXPOSURE_SYMLINK
+        assert snapshot.plan_path is not None and snapshot.plan_path.is_file()
+        assert not snapshot.plan_path.is_symlink()
+        assert snapshot.plan_path.resolve() != plan.resolve()
+        assert snapshot.plan_path.read_text(encoding="utf-8") == "private POSIX plan\n"
+        assert stat.S_IMODE(snapshot.plan_path.stat().st_mode) == 0o444
+        assert snapshot.plan_integrity_issue() is None
+
+        snapshot.plan_path.chmod(0o644)
+        snapshot.plan_path.write_text("forged isolated plan\n", encoding="utf-8")
+        assert snapshot.plan_integrity_issue() == (
+            "the coder workspace replaced or modified the isolated plan copy"
+        )
+        assert snapshot.restore_runtime_links() == ("plan",)
+        assert snapshot.plan_path.read_text(encoding="utf-8") == "private POSIX plan\n"
+        assert stat.S_IMODE(snapshot.plan_path.stat().st_mode) == 0o444
+        assert snapshot.plan_integrity_issue() is None
+        assert snapshot.runtime_integrity_issue() == (
+            "the coder modified the isolated plan copy during an action"
+        )
+
+        plan.write_text("changed canonical plan\n", encoding="utf-8")
+        assert snapshot.plan_integrity_issue() == (
+            "the original private plan changed after the run started"
+        )
+        assert snapshot.plan_path.read_text(encoding="utf-8") == "private POSIX plan\n"
+    finally:
+        snapshot.cleanup()
+
+
+def test_private_plan_rejects_task_path(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    _init_repo(tmp_path)
+
+    with pytest.raises(WorkspaceSnapshotError, match="different from the task"):
+        create_workspace_snapshot(tmp_path, task, plan_path=task)
+
+
+def test_private_plan_rejects_codex_instruction_filename(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    plan = tmp_path / "nested" / "AGENTS.md"
+    plan.parent.mkdir()
+    plan.write_text("advisory plan\n", encoding="utf-8")
+    _init_repo(tmp_path)
+
+    with pytest.raises(WorkspaceSnapshotError, match="loads it as workspace instructions"):
+        create_workspace_snapshot(tmp_path, task, plan_path=plan)
+
+
+def test_private_plan_rejects_reserved_outside_and_nonregular_paths(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    task = project / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    _init_repo(project)
+    reserved = project / ".supervisor" / "PLAN.md"
+    reserved.parent.mkdir()
+    reserved.write_text("private\n", encoding="utf-8")
+    outside = tmp_path / "outside-plan.md"
+    outside.write_text("private\n", encoding="utf-8")
+    directory = project / "plan-directory"
+    directory.mkdir()
+
+    with pytest.raises(WorkspaceSnapshotError, match="runtime, cache, or dependency"):
+        create_workspace_snapshot(project, task, plan_path=reserved)
+    with pytest.raises(WorkspaceSnapshotError, match="inside the project root"):
+        create_workspace_snapshot(project, task, plan_path=outside)
+    with pytest.raises(WorkspaceSnapshotError, match="must be a regular file"):
+        create_workspace_snapshot(project, task, plan_path=directory)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink input validation")
+def test_private_plan_rejects_symlink_input(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    target = tmp_path / "real-plan.md"
+    target.write_text("private\n", encoding="utf-8")
+    plan = tmp_path / "PLAN.md"
+    plan.symlink_to(target)
+
+    with pytest.raises(WorkspaceSnapshotError, match="must be a regular file"):
+        create_workspace_snapshot(tmp_path, task, plan_path=plan)
+
+
+def test_private_plan_rejects_tracked_and_reachable_history(tmp_path: Path) -> None:
+    tracked_root = tmp_path / "tracked"
+    tracked_root.mkdir()
+    tracked_task = tracked_root / "TASK.md"
+    tracked_task.write_text("# Task\n", encoding="utf-8")
+    tracked_plan = tracked_root / "PLAN.md"
+    tracked_plan.write_text("tracked plan\n", encoding="utf-8")
+    _init_repo(tracked_root)
+    with pytest.raises(WorkspaceSnapshotError, match="tracked by Git"):
+        create_workspace_snapshot(tracked_root, tracked_task, plan_path=tracked_plan)
+
+    history_root = tmp_path / "history"
+    history_root.mkdir()
+    history_task = history_root / "TASK.md"
+    history_task.write_text("# Task\n", encoding="utf-8")
+    history_plan = history_root / "PLAN.md"
+    history_plan.write_text("historical plan\n", encoding="utf-8")
+    _init_repo(history_root)
+    subprocess.run(["git", "rm", "--cached", "PLAN.md"], cwd=history_root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-q",
+            "-m",
+            "untrack plan",
+        ],
+        cwd=history_root,
+        check=True,
+    )
+    with pytest.raises(WorkspaceSnapshotError, match="reachable Git history"):
+        create_workspace_snapshot(history_root, history_task, plan_path=history_plan)
 
 
 def test_verification_snapshot_preserves_candidate_git_state_and_is_disposable(
@@ -1276,6 +1581,60 @@ def test_windows_copy_runtime_exposures_refresh_and_preserve_isolation(
         result = apply_snapshot_patch(snapshot)
         assert result.changed_paths == ("app.py",)
         assert source.read_text(encoding="utf-8") == "value = 2\n"
+    finally:
+        snapshot.cleanup()
+
+
+def test_windows_private_plan_copy_restores_then_detaches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    plan = tmp_path / "PLAN.md"
+    plan.write_text("private Windows plan\n", encoding="utf-8")
+    monkeypatch.setattr(workspace_snapshot_module, "_is_windows_platform", lambda: True)
+    monkeypatch.setattr(
+        workspace_snapshot_module,
+        "_native_windows_runtime_controls_enabled",
+        lambda: False,
+    )
+
+    snapshot = create_workspace_snapshot(tmp_path, task, plan_path=plan)
+    try:
+        assert snapshot.runtime_exposure_mode == workspace_snapshot_module.RUNTIME_EXPOSURE_COPY
+        assert snapshot.plan_path is not None
+        assert snapshot.plan_path.is_file() and not snapshot.plan_path.is_symlink()
+        assert snapshot.plan_path.resolve() != plan.resolve()
+        assert snapshot.plan_integrity_issue() is None
+
+        snapshot.plan_path.write_text("forged\n", encoding="utf-8")
+        assert snapshot.plan_integrity_issue() == (
+            "the coder workspace replaced or modified the isolated plan copy"
+        )
+        assert snapshot.restore_runtime_links() == ("plan",)
+        assert snapshot.plan_path.read_text(encoding="utf-8") == "private Windows plan\n"
+        assert snapshot.plan_integrity_issue() is None
+        assert snapshot.runtime_integrity_issue() == (
+            "the coder modified the isolated plan copy during an action"
+        )
+
+        verification = create_verification_workspace_snapshot(
+            snapshot.snapshot_root,
+            source_snapshot=snapshot,
+        )
+        try:
+            assert not verification.snapshot_root.joinpath("PLAN.md").exists()
+            verification.assert_submission_unchanged()
+        finally:
+            verification.cleanup()
+
+        assert snapshot.detach_plan_exposure() is True
+        assert not snapshot.plan_path.exists()
+        assert snapshot.restore_runtime_links() == ()
+        assert snapshot.plan_integrity_issue() is None
     finally:
         snapshot.cleanup()
 

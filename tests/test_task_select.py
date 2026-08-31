@@ -6,7 +6,14 @@ from pathlib import Path
 import pytest
 
 import supervisor.task_select as task_select_module
-from supervisor.task_select import TaskSelectionError, resolve_task, scan_markdown_tasks, validate_task_path
+from supervisor.task_select import (
+    TaskSelectionError,
+    resolve_plan,
+    resolve_task,
+    scan_markdown_tasks,
+    validate_plan_path,
+    validate_task_path,
+)
 
 
 def test_task_selection_ranking_and_exclusions(tmp_path: Path) -> None:
@@ -39,6 +46,74 @@ def test_resolve_task_uses_selector_for_multiple_candidates(tmp_path: Path) -> N
     assert selected.name == "notes.md"
 
 
+def test_resolve_plan_accepts_relative_markdown_path_inside_project(tmp_path: Path) -> None:
+    plan = tmp_path / "docs" / "PLAN.md"
+    plan.parent.mkdir()
+    plan.write_text("plan", encoding="utf-8")
+
+    assert resolve_plan(tmp_path, Path("docs/PLAN.md")) == plan.resolve()
+    assert validate_plan_path(plan, tmp_path) == plan.resolve()
+
+
+def test_resolve_plan_rejects_codex_instruction_filename(tmp_path: Path) -> None:
+    plan = tmp_path / "docs" / "agents.MD"
+    plan.parent.mkdir()
+    plan.write_text("advisory plan\n", encoding="utf-8")
+
+    with pytest.raises(TaskSelectionError, match="loads it as workspace instructions"):
+        resolve_plan(tmp_path, plan)
+
+
+@pytest.mark.parametrize(
+    ("fixture", "message"),
+    [
+        ("missing", "plan file does not exist"),
+        ("directory", "plan path is not a file"),
+        ("text", "plan file must end in .md"),
+        ("outside", "plan file must be inside project root"),
+    ],
+)
+def test_resolve_plan_rejects_unsafe_input(tmp_path: Path, fixture: str, message: str) -> None:
+    if fixture == "directory":
+        plan = tmp_path / "PLAN.md"
+        plan.mkdir()
+    elif fixture == "text":
+        plan = tmp_path / "PLAN.txt"
+        plan.write_text("plan", encoding="utf-8")
+    elif fixture == "outside":
+        plan = tmp_path.parent / f"{tmp_path.name}-PLAN.md"
+        plan.write_text("plan", encoding="utf-8")
+    else:
+        plan = tmp_path / "PLAN.md"
+
+    try:
+        with pytest.raises(TaskSelectionError, match=message):
+            resolve_plan(tmp_path, plan)
+    finally:
+        if fixture == "outside":
+            plan.unlink()
+
+
+def test_resolve_task_excludes_supplied_plan_from_auto_selection(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("task", encoding="utf-8")
+    plan = tmp_path / "PLAN.md"
+    plan.write_text("plan", encoding="utf-8")
+
+    selected = resolve_task(tmp_path, None, plan_path=resolve_plan(tmp_path, plan))
+
+    assert selected == task.resolve()
+
+
+def test_resolve_task_rejects_same_file_as_plan(tmp_path: Path) -> None:
+    plan = tmp_path / "PLAN.md"
+    plan.write_text("plan", encoding="utf-8")
+    resolved_plan = resolve_plan(tmp_path, plan)
+
+    with pytest.raises(TaskSelectionError, match="task and plan must be different files"):
+        resolve_task(tmp_path, plan, plan_path=resolved_plan)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink regression")
 def test_task_scan_preserves_posix_file_symlink_behavior(tmp_path: Path) -> None:
     target = tmp_path / "task-source.md"
@@ -51,6 +126,20 @@ def test_task_scan_preserves_posix_file_symlink_behavior(tmp_path: Path) -> None
 
     assert validate_task_path(link, tmp_path) == target.resolve()
     assert target.resolve() in scan_markdown_tasks(tmp_path)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink regression")
+def test_plan_input_rejects_posix_file_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "plan-source.md"
+    target.write_text("plan\n", encoding="utf-8")
+    link = tmp_path / "PLAN.md"
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+
+    with pytest.raises(TaskSelectionError, match="regular file, not a link"):
+        resolve_plan(tmp_path, link)
 
 
 def test_task_scan_prunes_simulated_windows_reparse_directory(

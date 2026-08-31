@@ -109,6 +109,9 @@ VERIFICATION_SAFE_GIT_CONFIG: dict[str, set[str] | None] = {
 
 RUNTIME_EXPOSURE_SYMLINK = "symlink"
 RUNTIME_EXPOSURE_COPY = "copy"
+PRIVATE_PLAN_EXCLUDE_BEGIN = "# bello-private-plan-input: begin"
+PRIVATE_PLAN_EXCLUDE_END = "# bello-private-plan-input: end"
+BELLO_LAUNCHER_RUNTIME_PARTS = (".codex", "bello-run")
 
 # ReadDirectoryChangesW filters used for materialized dependency trees.  Do not
 # include FILE_NOTIFY_CHANGE_SECURITY (0x00000100): Codex's native Windows
@@ -537,6 +540,12 @@ class WorkspaceSnapshot:
     git_config_mode: int
     git_worktree_config_bytes: bytes | None
     git_worktree_config_mode: int | None
+    plan_source_path: Path | None = None
+    plan_path: Path | None = None
+    plan_relative_path: str | None = None
+    plan_bytes: bytes | None = field(default=None, repr=False, compare=False)
+    plan_sha256: str | None = None
+    plan_exposed: bool = False
     readonly_dependency_paths: tuple[str, ...] = ()
     declared_grading_roots: tuple[str | Path, ...] = ()
     rewritten_symlinks: tuple[SnapshotSymlinkRewrite, ...] = ()
@@ -572,6 +581,34 @@ class WorkspaceSnapshot:
 
     def task_integrity_issue(self) -> str | None:
         return _runtime_task_integrity_issue(self)
+
+    def plan_integrity_issue(self) -> str | None:
+        return _runtime_plan_integrity_issue(self)
+
+    def detach_plan_exposure(self) -> bool:
+        """Remove the initial-coder-only plan mount without deleting its source."""
+
+        if not self.plan_exposed or self.plan_path is None:
+            return False
+        guard = self.windows_runtime_file_guards.pop("plan", None)
+        if guard is not None:
+            try:
+                guard.close()
+            except OSError as exc:
+                raise WorkspaceSnapshotError(
+                    f"failed to close Windows plan integrity control: {exc}"
+                ) from exc
+        try:
+            _scrub_private_plan_from_snapshot_git(self)
+            _remove_private_plan_git_exclude(self.snapshot_root)
+            _remove_path(self.plan_path)
+        except OSError as exc:
+            raise WorkspaceSnapshotError(
+                f"failed to detach private plan exposure: {exc}"
+            ) from exc
+        self.runtime_copy_manifests.pop("plan", None)
+        object.__setattr__(self, "plan_exposed", False)
+        return True
 
     def runtime_integrity_issue(self) -> str | None:
         return self.runtime_integrity_issues[0] if self.runtime_integrity_issues else None
@@ -668,10 +705,229 @@ def _close_windows_runtime_controls(
     file_guards.clear()
 
 
+def _scrub_private_plan_from_snapshot_git(snapshot: WorkspaceSnapshot) -> None:
+    """Remove any coder-created Git reference to the private plan before revision.
+
+    The ordinary ignore rule prevents routine staging, but a coder can explicitly use
+    ``git add -f``.  Completion receives a fresh reachable-object clone and is already
+    protected; a revision coder reuses this snapshot, so its index, reflogs, and loose
+    objects must be scrubbed before that fresh thread starts.
+    """
+
+    relative = snapshot.plan_relative_path
+    if relative is None:
+        return
+    _restore_trusted_snapshot_git_config(snapshot)
+    git = _git_executable(snapshot.snapshot_root)
+
+    def run(arguments: list[str]) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [git, *arguments],
+            cwd=snapshot.snapshot_root,
+            env=_isolated_git_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    history = run(
+        [
+            "--literal-pathspecs",
+            "log",
+            "--all",
+            "--format=%H",
+            "--",
+            relative,
+        ]
+    )
+    if history.returncode != 0:
+        detail = history.stderr.decode("utf-8", errors="replace").strip()
+        raise WorkspaceSnapshotError(
+            "failed to inspect coder snapshot history before detaching the private plan"
+            + (f": {detail}" if detail else "")
+        )
+    if history.stdout.strip():
+        raise WorkspaceSnapshotError(
+            "coder snapshot Git history contains the private plan and cannot be exposed "
+            f"to the revision coder: {relative}"
+        )
+
+    removal = run(
+        [
+            "--literal-pathspecs",
+            "update-index",
+            "--force-remove",
+            "--",
+            relative,
+        ]
+    )
+    if removal.returncode != 0:
+        detail = removal.stderr.decode("utf-8", errors="replace").strip()
+        raise WorkspaceSnapshotError(
+            "failed to remove the private plan from the coder snapshot Git index"
+            + (f": {detail}" if detail else "")
+        )
+
+    for arguments, label in (
+        (["reflog", "expire", "--expire=now", "--all"], "expire snapshot Git reflogs"),
+        (["prune", "--expire=now"], "prune private snapshot Git objects"),
+    ):
+        completed = run(arguments)
+        if completed.returncode != 0:
+            detail = completed.stderr.decode("utf-8", errors="replace").strip()
+            raise WorkspaceSnapshotError(
+                f"failed to {label}" + (f": {detail}" if detail else "")
+            )
+
+    tracked = run(
+        [
+            "--literal-pathspecs",
+            "ls-files",
+            "--error-unmatch",
+            "--",
+            relative,
+        ]
+    )
+    if tracked.returncode == 0:
+        raise WorkspaceSnapshotError(
+            f"coder snapshot Git index still exposes the private plan: {relative}"
+        )
+    if tracked.returncode != 1:
+        detail = tracked.stderr.decode("utf-8", errors="replace").strip()
+        raise WorkspaceSnapshotError(
+            "failed to verify private-plan removal from the coder snapshot Git index"
+            + (f": {detail}" if detail else "")
+        )
+
+
+def validate_plan_git_isolation(project_root: Path, plan_path: Path) -> None:
+    """Require a private plan input that reviewers cannot recover from Git.
+
+    Completion review receives a faithful clone of the submitted repository's Git
+    metadata.  A plan that is tracked now, or was committed on any reachable ref,
+    therefore cannot be made genuinely reviewer-blind without rewriting project
+    history.  Reject that ambiguous case before constructing the coder snapshot.
+    """
+
+    original_root = project_root.resolve()
+    _original_plan, plan_relative = _resolve_plan_input(original_root, plan_path)
+    if not _is_top_level_git_repository(original_root):
+        return
+    relative = plan_relative.as_posix()
+    tracked = subprocess.run(
+        [
+            _git_executable(original_root),
+            "--literal-pathspecs",
+            "ls-files",
+            "--error-unmatch",
+            "--",
+            relative,
+        ],
+        cwd=original_root,
+        env=_isolated_git_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if tracked.returncode == 0:
+        raise WorkspaceSnapshotError(
+            f"private plan path is tracked by Git and cannot be hidden from reviewers: {relative}"
+        )
+    if tracked.returncode != 1:
+        detail = tracked.stderr.decode("utf-8", errors="replace").strip()
+        raise WorkspaceSnapshotError(
+            "failed to verify that the private plan is untracked"
+            + (f": {detail}" if detail else "")
+        )
+    history = subprocess.run(
+        [
+            _git_executable(original_root),
+            "--literal-pathspecs",
+            "log",
+            "--all",
+            "--format=%H",
+            "--",
+            relative,
+        ],
+        cwd=original_root,
+        env=_isolated_git_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        text=True,
+    )
+    if history.returncode != 0:
+        detail = history.stderr.strip()
+        raise WorkspaceSnapshotError(
+            "failed to inspect reachable Git history for the private plan"
+            + (f": {detail}" if detail else "")
+        )
+    if history.stdout.strip():
+        raise WorkspaceSnapshotError(
+            "private plan path appears in reachable Git history and cannot be hidden "
+            f"from reviewers: {relative}"
+        )
+
+
+def _resolve_plan_input(project_root: Path, plan_path: Path) -> tuple[Path, Path]:
+    root = project_root.resolve()
+    candidate = Path(plan_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    candidate = candidate.absolute()
+    try:
+        metadata = candidate.lstat()
+    except OSError as exc:
+        raise WorkspaceSnapshotError(f"private plan input is missing or unreadable: {candidate}") from exc
+    if is_link_or_reparse(candidate, stat_result=metadata) or not stat.S_ISREG(metadata.st_mode):
+        raise WorkspaceSnapshotError(
+            f"private plan input must be a regular file, not a link or directory: {candidate}"
+        )
+    if metadata.st_nlink > 1:
+        raise WorkspaceSnapshotError(
+            f"private plan input must not be a hardlink: {candidate}"
+        )
+    try:
+        resolved = candidate.resolve(strict=True)
+        relative = resolved.relative_to(root)
+    except ValueError as exc:
+        raise WorkspaceSnapshotError(
+            f"private plan input must be inside the project root: {candidate}"
+        ) from exc
+    except OSError as exc:
+        raise WorkspaceSnapshotError(f"failed to resolve private plan input: {candidate}") from exc
+    reserved_names = {_name_key(name) for name in SNAPSHOT_RESERVED_TASK_PATH_NAMES}
+    reserved_part = next(
+        (part for part in relative.parts if _name_key(part) in reserved_names),
+        None,
+    )
+    if reserved_part is not None:
+        raise WorkspaceSnapshotError(
+            "private plan input cannot be inside Bello runtime, cache, or dependency "
+            f"directory: {reserved_part}"
+        )
+    if relative.name.casefold() == "agents.md":
+        raise WorkspaceSnapshotError(
+            "private plan input cannot be named AGENTS.md because Codex loads it as "
+            "workspace instructions"
+        )
+    if any("\n" in part or "\r" in part for part in relative.parts):
+        raise WorkspaceSnapshotError("private plan path cannot contain a newline")
+    return resolved, relative
+
+
+def _gitignore_literal_path(raw_path: str) -> str:
+    # `.git/info/exclude` uses gitignore syntax. Escape every metacharacter while
+    # retaining slash separators so the post-baseline runtime mount stays quiet in
+    # ordinary `git status` output without becoming part of Git history.
+    return re.sub(r"([\\ *?!\[\]#])", r"\\\1", raw_path)
+
+
 def create_workspace_snapshot(
     project_root: Path,
     task_path: Path,
     *,
+    plan_path: Path | None = None,
     declared_grading_roots: Iterable[str | Path] = (),
     prefix: str = "bello-coder-",
 ) -> WorkspaceSnapshot:
@@ -697,6 +953,21 @@ def create_workspace_snapshot(
         raise WorkspaceSnapshotError(
             f"task path cannot be inside Bello runtime, cache, or dependency directory: {reserved_task_part}"
         )
+
+    original_plan: Path | None = None
+    plan_relative: Path | None = None
+    plan_bytes: bytes | None = None
+    plan_sha256: str | None = None
+    if plan_path is not None:
+        original_plan, plan_relative = _resolve_plan_input(original_root, plan_path)
+        if original_plan == original_task:
+            raise WorkspaceSnapshotError("plan path must be different from the task path")
+        validate_plan_git_isolation(original_root, plan_path)
+        try:
+            plan_bytes, _plan_mode = _read_regular_file(original_plan)
+        except (OSError, WorkspaceSnapshotError) as exc:
+            raise WorkspaceSnapshotError(f"failed to read private plan input: {exc}") from exc
+        plan_sha256 = hashlib.sha256(plan_bytes).hexdigest()
 
     declared_roots = tuple(declared_grading_roots)
     resolved_declared_roots = _resolve_declared_roots(original_root, declared_roots)
@@ -739,6 +1010,7 @@ def create_workspace_snapshot(
                 original_root,
                 resolved_declared_roots,
                 original_task=original_task,
+                original_plan=original_plan,
                 readonly_dependencies=readonly_dependencies,
             ),
         )
@@ -781,9 +1053,35 @@ def create_workspace_snapshot(
         info_exclude.parent.mkdir(parents=True, exist_ok=True)
         with info_exclude.open("a", encoding="utf-8") as handle:
             handle.write("\n/.supervisor\n")
+            if plan_relative is not None:
+                handle.write(f"{PRIVATE_PLAN_EXCLUDE_BEGIN}\n")
+                handle.write(f"/{_gitignore_literal_path(plan_relative.as_posix())}\n")
+                handle.write(f"{PRIVATE_PLAN_EXCLUDE_END}\n")
             if exposure_mode == RUNTIME_EXPOSURE_COPY:
                 for name in sorted(SNAPSHOT_READ_ONLY_DEPENDENCY_NAMES):
                     handle.write(f"{name}/\n")
+        snapshot_plan: Path | None = None
+        if original_plan is not None and plan_relative is not None:
+            if plan_bytes is None:
+                raise WorkspaceSnapshotError(
+                    "private plan input bytes are missing during isolated exposure"
+                )
+            snapshot_plan = snapshot_root / plan_relative
+            _ensure_safe_runtime_destination_parent(snapshot_plan, snapshot_root)
+            _atomic_replace_bytes(
+                snapshot_plan,
+                plan_bytes,
+                0o644 if _is_windows_platform() else 0o444,
+            )
+            if _sha256_file(original_plan) != plan_sha256:
+                raise WorkspaceSnapshotError(
+                    "private plan input changed while the coder workspace was being prepared"
+                )
+            runtime_copy_manifests["plan"] = _runtime_exposure_manifest(snapshot_plan)
+            if _native_windows_runtime_controls_enabled():
+                windows_runtime_file_guards["plan"] = _WindowsRuntimeFileGuard.open(
+                    snapshot_plan
+                )
         if exposure_mode == RUNTIME_EXPOSURE_COPY:
             for source, relative in readonly_dependencies:
                 destination = snapshot_root / relative
@@ -835,6 +1133,12 @@ def create_workspace_snapshot(
             git_config_mode=git_config_mode,
             git_worktree_config_bytes=git_worktree_config_bytes,
             git_worktree_config_mode=git_worktree_config_mode,
+            plan_source_path=original_plan,
+            plan_path=snapshot_plan,
+            plan_relative_path=(plan_relative.as_posix() if plan_relative is not None else None),
+            plan_bytes=plan_bytes,
+            plan_sha256=plan_sha256,
+            plan_exposed=snapshot_plan is not None,
             readonly_dependency_paths=tuple(sorted(dict.fromkeys(readonly_dependency_paths))),
             declared_grading_roots=declared_roots,
             rewritten_symlinks=rewritten_symlinks,
@@ -892,6 +1196,11 @@ def create_verification_workspace_snapshot(
         )
 
     trusted_mounts = _verification_trusted_mounts(original_root, source_snapshot)
+    private_runtime_paths = (
+        (source_snapshot.plan_relative_path,)
+        if source_snapshot is not None and source_snapshot.plan_relative_path is not None
+        else ()
+    )
     source_is_git = _is_top_level_git_repository(original_root)
     if source_is_git:
         _reject_verification_git_alternates(original_root)
@@ -925,7 +1234,10 @@ def create_verification_workspace_snapshot(
             snapshot_root,
             dirs_exist_ok=history_preserved,
             symlinks=True,
-            ignore=_verification_snapshot_ignore,
+            ignore=_verification_snapshot_ignore(
+                original_root,
+                private_runtime_paths=private_runtime_paths,
+            ),
         )
         if _is_windows_platform():
             _validate_windows_snapshot_source(
@@ -954,6 +1266,7 @@ def create_verification_workspace_snapshot(
                 )
             _copy_snapshot_git_index(original_root, snapshot_root)
             _hide_verification_runtime_state(snapshot_root)
+            _hide_verification_private_inputs(snapshot_root, private_runtime_paths)
         verification = VerificationWorkspaceSnapshot(
             original_root=original_root,
             snapshot_root=snapshot_root.resolve(),
@@ -1236,6 +1549,34 @@ def _restore_runtime_links(snapshot: WorkspaceSnapshot) -> tuple[str, ...]:
         snapshot.runtime_copy_manifests[label] = destination_manifest
         if was_replaced:
             repaired.append(label)
+
+    if snapshot.plan_exposed and snapshot.plan_path is not None:
+        expected = snapshot.runtime_copy_manifests.get("plan", ())
+        try:
+            current = _runtime_exposure_manifest(snapshot.plan_path)
+        except (OSError, WorkspaceSnapshotError):
+            current = ()
+        if current != expected:
+            issue = "the coder modified the isolated plan copy during an action"
+            if issue not in snapshot.runtime_integrity_issues:
+                snapshot.runtime_integrity_issues.append(issue)
+            if snapshot.plan_bytes is None:
+                raise WorkspaceSnapshotError(
+                    "private plan input bytes are missing during restoration"
+                )
+            _ensure_safe_runtime_destination_parent(
+                snapshot.plan_path,
+                snapshot.snapshot_root,
+            )
+            _atomic_replace_bytes(
+                snapshot.plan_path,
+                snapshot.plan_bytes,
+                0o644 if _is_windows_platform() else 0o444,
+            )
+            snapshot.runtime_copy_manifests["plan"] = _runtime_exposure_manifest(
+                snapshot.plan_path
+            )
+            repaired.append("plan")
     return tuple(repaired)
 
 
@@ -1267,9 +1608,49 @@ def _runtime_task_integrity_issue(snapshot: WorkspaceSnapshot) -> str | None:
     return None
 
 
+def _runtime_plan_integrity_issue(snapshot: WorkspaceSnapshot) -> str | None:
+    if not snapshot.plan_exposed:
+        return None
+    plan = snapshot.plan_path
+    source = snapshot.plan_source_path
+    expected_hash = snapshot.plan_sha256
+    if plan is None or source is None or expected_hash is None:
+        return "the private plan exposure metadata is incomplete"
+    try:
+        source_metadata = source.lstat()
+        if is_link_or_reparse(source, stat_result=source_metadata) or not stat.S_ISREG(
+            source_metadata.st_mode
+        ):
+            return "the original private plan is no longer a regular file"
+        if _sha256_file(source) != expected_hash:
+            return "the original private plan changed after the run started"
+    except OSError:
+        return "the original private plan is missing or unreadable"
+    guard = snapshot.windows_runtime_file_guards.get("plan")
+    if guard is not None:
+        guard_issue = guard.integrity_issue()
+        if guard_issue is not None:
+            return guard_issue
+    try:
+        current = _runtime_exposure_manifest(plan)
+    except (OSError, WorkspaceSnapshotError):
+        current = ()
+    if current != snapshot.runtime_copy_manifests.get("plan", ()):
+        return "the coder workspace replaced or modified the isolated plan copy"
+    return None
+
+
 def _snapshot_patch_selection(snapshot: WorkspaceSnapshot) -> SnapshotPatchSelection:
     snapshot_root = snapshot.snapshot_root
-    excluded = [".supervisor", *snapshot.readonly_dependency_paths]
+    excluded = [
+        ".supervisor",
+        *(
+            (snapshot.plan_relative_path,)
+            if snapshot.plan_relative_path is not None
+            else ()
+        ),
+        *snapshot.readonly_dependency_paths,
+    ]
     pathspecs = [".", *(f":(exclude,top,literal){path}" for path in excluded)]
     # Exclude controller-owned runtime copies before Git walks the tree.  The
     # previous add-then-filter flow unnecessarily exposed large dependency
@@ -1296,6 +1677,11 @@ def _snapshot_patch_selection(snapshot: WorkspaceSnapshot) -> SnapshotPatchSelec
         snapshot_root,
         changed_paths,
         readonly_dependency_paths=snapshot.readonly_dependency_paths,
+        private_runtime_paths=(
+            (snapshot.plan_relative_path,)
+            if snapshot.plan_relative_path is not None
+            else ()
+        ),
     )
 
 
@@ -1304,12 +1690,15 @@ def _filter_snapshot_patch_paths(
     changed_paths: tuple[str, ...],
     *,
     readonly_dependency_paths: tuple[str, ...],
+    private_runtime_paths: tuple[str, ...] = (),
 ) -> SnapshotPatchSelection:
     kept: list[str] = []
     ignored: list[str] = []
     for path in changed_paths:
         if _is_generated_artifact_path(snapshot_root, path) or any(
             _path_is_at_or_below(path, dependency) for dependency in readonly_dependency_paths
+        ) or any(
+            _path_is_at_or_below(path, private_path) for private_path in private_runtime_paths
         ):
             ignored.append(path)
         else:
@@ -1519,6 +1908,10 @@ def _restore_trusted_snapshot_git_config(snapshot: WorkspaceSnapshot) -> None:
 def _detach_recovery_workspace(snapshot: WorkspaceSnapshot) -> None:
     _remove_path(snapshot.snapshot_root / ".git")
     _remove_path(snapshot.snapshot_root / ".supervisor")
+    if snapshot.plan_path is not None:
+        _remove_path(snapshot.plan_path)
+        object.__setattr__(snapshot, "plan_exposed", False)
+        snapshot.runtime_copy_manifests.pop("plan", None)
     for relative in snapshot.readonly_dependency_paths:
         _remove_path(snapshot.snapshot_root / relative)
     task = snapshot.snapshot_root / snapshot.task_relative_path
@@ -1645,12 +2038,34 @@ def _is_top_level_git_repository(root: Path) -> bool:
         return False
 
 
-def _verification_snapshot_ignore(directory: str, names: list[str]) -> set[str]:
-    # Runtime state is not part of the submitted artifact and must not become writable
-    # review input.  Keep every other path, including caches and untracked files, so the
-    # copied worktree and its Git status retain the candidate state exactly.
-    ignored = {_name_key(".git"), _name_key(".supervisor")}
-    return {name for name in names if _name_key(name) in ignored}
+def _verification_snapshot_ignore(
+    original_root: Path,
+    *,
+    private_runtime_paths: tuple[str, ...] = (),
+):
+    root = original_root.resolve()
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        # Runtime state and initial-coder-only inputs are not part of the submitted
+        # artifact and must not become writable review input. Keep every other path,
+        # including caches and untracked files, so Git status retains the candidate.
+        ignored_names = {_name_key(".git"), _name_key(".supervisor")}
+        ignored = {name for name in names if _name_key(name) in ignored_names}
+        try:
+            relative_dir = Path(directory).relative_to(root)
+        except ValueError:
+            relative_dir = Path()
+        for name in names:
+            relative = (relative_dir / name).as_posix()
+            if any(
+                _path_is_at_or_below(relative, private_path)
+                and _path_is_at_or_below(private_path, relative)
+                for private_path in private_runtime_paths
+            ):
+                ignored.add(name)
+        return ignored
+
+    return ignore
 
 
 def _verification_trusted_mounts(
@@ -1908,6 +2323,114 @@ def _hide_verification_runtime_state(snapshot_root: Path) -> None:
         raise WorkspaceSnapshotError(
             "verification source Git history exposes private .supervisor runtime state"
         )
+
+
+def _hide_verification_private_inputs(
+    snapshot_root: Path,
+    private_runtime_paths: tuple[str, ...],
+) -> None:
+    if not private_runtime_paths:
+        return
+    _remove_private_plan_git_exclude(snapshot_root)
+    for relative in private_runtime_paths:
+        history = subprocess.run(
+            [
+                _git_executable(snapshot_root),
+                "--literal-pathspecs",
+                "log",
+                "--all",
+                "--format=%H",
+                "--",
+                relative,
+            ],
+            cwd=snapshot_root,
+            env=_isolated_git_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+        )
+        if history.returncode != 0 or history.stdout.strip():
+            raise WorkspaceSnapshotError(
+                "verification source Git history exposes private plan input: "
+                f"{relative}"
+            )
+        removal = subprocess.run(
+            [
+                _git_executable(snapshot_root),
+                "--literal-pathspecs",
+                "update-index",
+                "--force-remove",
+                "--",
+                relative,
+            ],
+            cwd=snapshot_root,
+            env=_isolated_git_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if removal.returncode != 0:
+            detail = removal.stderr.decode("utf-8", errors="replace").strip()
+            raise WorkspaceSnapshotError(
+                "failed to remove private plan input from verification Git index"
+                + (f": {detail}" if detail else "")
+            )
+        tracked = subprocess.run(
+            [
+                _git_executable(snapshot_root),
+                "--literal-pathspecs",
+                "ls-files",
+                "--error-unmatch",
+                "--",
+                relative,
+            ],
+            cwd=snapshot_root,
+            env=_isolated_git_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if tracked.returncode == 0:
+            raise WorkspaceSnapshotError(
+                f"verification Git index still exposes private plan input: {relative}"
+            )
+        if tracked.returncode != 1:
+            detail = tracked.stderr.decode("utf-8", errors="replace").strip()
+            raise WorkspaceSnapshotError(
+                "failed to verify private plan removal from the verification Git index"
+                + (f": {detail}" if detail else "")
+            )
+
+
+def _remove_private_plan_git_exclude(snapshot_root: Path) -> None:
+    exclude = snapshot_root / ".git" / "info" / "exclude"
+    if not (exclude.exists() or exclude.is_symlink()):
+        return
+    raw, mode = _read_regular_file(exclude)
+    text = raw.decode("utf-8", errors="surrogateescape")
+    kept: list[str] = []
+    in_private_block = False
+    for line in text.splitlines(keepends=True):
+        value = line.rstrip("\r\n")
+        if value == PRIVATE_PLAN_EXCLUDE_BEGIN:
+            in_private_block = True
+            continue
+        if value == PRIVATE_PLAN_EXCLUDE_END:
+            in_private_block = False
+            continue
+        if in_private_block:
+            continue
+        kept.append(line)
+    if in_private_block:
+        raise WorkspaceSnapshotError(
+            "verification source has an unterminated private plan Git exclusion"
+        )
+    _atomic_replace_bytes(
+        exclude,
+        "".join(kept).encode("utf-8", errors="surrogateescape"),
+        mode,
+    )
 
 
 def _verification_git_manifest(snapshot_root: Path) -> tuple[tuple[str, str], ...]:
@@ -2996,6 +3519,7 @@ def _snapshot_ignore(
     declared_roots: tuple[Path, ...],
     *,
     original_task: Path,
+    original_plan: Path | None,
     readonly_dependencies: list[tuple[Path, str]],
 ):
     root = original_root.resolve()
@@ -3016,6 +3540,21 @@ def _snapshot_ignore(
             except OSError:
                 resolved_candidate = None
             if resolved_candidate == original_task:
+                ignored.add(name)
+                continue
+            if original_plan is not None and resolved_candidate == original_plan:
+                ignored.add(name)
+                continue
+            relative_parts = tuple(
+                _name_key(part) for part in Path(candidate_relative).parts
+            )
+            if relative_parts[: len(BELLO_LAUNCHER_RUNTIME_PARTS)] == tuple(
+                _name_key(part) for part in BELLO_LAUNCHER_RUNTIME_PARTS
+            ):
+                # The Bello delegation skill writes its launcher command and
+                # parameters here.  They are controller-side runtime records,
+                # not submitted project input; in particular, an optional
+                # private plan path must not become reviewer-visible metadata.
                 ignored.add(name)
                 continue
             if _name_key(name) in dependency_names:
