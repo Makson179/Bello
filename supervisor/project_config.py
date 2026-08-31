@@ -72,10 +72,13 @@ class MultiAgentConfig:
 RUNTIME_SYNC_FIELDS = (
     "task",
     "coder_mod",
+    "revision_coder_enabled",
+    "revision_coder_mod",
     "runtime_mod",
     "completion_mod",
     "adversary_mod",
     "coder_intelligence",
+    "revision_coder_intelligence",
     "runtime_intelligence",
     "completion_intelligence",
     "adversary_intelligence",
@@ -90,6 +93,8 @@ RUNTIME_SYNC_FIELDS = (
     "clean",
     "protected_path",
     "multi_agent",
+    "completion_multi_agent",
+    "adversary_multi_agent",
 )
 
 
@@ -101,10 +106,13 @@ class ProjectConfigError(RuntimeError):
 class ProjectConfig:
     task: str | None = None
     coder_mod: str = DEFAULT_MODEL
+    revision_coder_enabled: bool = False
+    revision_coder_mod: str = DEFAULT_MODEL
     runtime_mod: str = DEFAULT_MODEL
     completion_mod: str = DEFAULT_MODEL
     adversary_mod: str = DEFAULT_MODEL
     coder_intelligence: str = DEFAULT_INTELLIGENCE
+    revision_coder_intelligence: str = DEFAULT_INTELLIGENCE
     runtime_intelligence: str = DEFAULT_INTELLIGENCE
     completion_intelligence: str = DEFAULT_INTELLIGENCE
     adversary_intelligence: str = DEFAULT_INTELLIGENCE
@@ -119,6 +127,8 @@ class ProjectConfig:
     clean: bool = False
     protected_path: tuple[str, ...] = ()
     multi_agent: MultiAgentConfig = field(default_factory=MultiAgentConfig)
+    completion_multi_agent: MultiAgentConfig = field(default_factory=MultiAgentConfig)
+    adversary_multi_agent: MultiAgentConfig = field(default_factory=MultiAgentConfig)
 
     @property
     def fast(self) -> bool:
@@ -129,10 +139,13 @@ class ProjectConfig:
             REVIEW_LIMIT_FORMAT_FIELD: EXPLICIT_REVIEW_LIMIT_FORMAT,
             "task": self.task,
             "coder_mod": self.coder_mod,
+            "revision_coder_enabled": self.revision_coder_enabled,
+            "revision_coder_mod": self.revision_coder_mod,
             "runtime_mod": self.runtime_mod,
             "completion_mod": self.completion_mod,
             "adversary_mod": self.adversary_mod,
             "coder_intelligence": self.coder_intelligence,
+            "revision_coder_intelligence": self.revision_coder_intelligence,
             "runtime_intelligence": self.runtime_intelligence,
             "completion_intelligence": self.completion_intelligence,
             "adversary_intelligence": self.adversary_intelligence,
@@ -147,6 +160,8 @@ class ProjectConfig:
             "clean": self.clean,
             "protected_path": list(self.protected_path),
             "multi_agent": self.multi_agent.to_json_data(),
+            "completion_multi_agent": self.completion_multi_agent.to_json_data(),
+            "adversary_multi_agent": self.adversary_multi_agent.to_json_data(),
         }
 
 
@@ -255,6 +270,17 @@ def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfi
         "coder_model",
         path=path,
     )
+    coder_intelligence = _choice(
+        _first_present(payload, ("coder_intelligence",), default.coder_intelligence, skip_none=True),
+        "coder_intelligence",
+        intelligence_choices_for_model(coder_mod),
+        path=path,
+    )
+    revision_coder_mod = _required_string(
+        _first_present(payload, ("revision_coder_mod",), coder_mod, skip_none=True),
+        "revision_coder_mod",
+        path=path,
+    )
     legacy_super_mod = _required_string(
         _first_present(payload, ("super_mod", "supervisor_model", "model"), default.runtime_mod, skip_none=True),
         "supervisor_model",
@@ -284,10 +310,17 @@ def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfi
     return ProjectConfig(
         task=_optional_string(_first_present(payload, ("task", "task_path"), default.task, skip_none=True), "task_path", path=path),
         coder_mod=coder_mod,
-        coder_intelligence=_choice(
-            _first_present(payload, ("coder_intelligence",), default.coder_intelligence, skip_none=True),
-            "coder_intelligence",
-            intelligence_choices_for_model(coder_mod),
+        revision_coder_enabled=_bool(
+            payload.get("revision_coder_enabled", default.revision_coder_enabled),
+            "revision_coder_enabled",
+            path=path,
+        ),
+        revision_coder_mod=revision_coder_mod,
+        coder_intelligence=coder_intelligence,
+        revision_coder_intelligence=_choice(
+            _first_present(payload, ("revision_coder_intelligence",), coder_intelligence, skip_none=True),
+            "revision_coder_intelligence",
+            intelligence_choices_for_model(revision_coder_mod),
             path=path,
         ),
         runtime_mod=runtime_mod,
@@ -362,6 +395,23 @@ def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfi
         multi_agent=_multi_agent_config(
             payload.get("multi_agent", default.multi_agent.to_json_data()),
             path=path,
+            field_name="multi_agent",
+        ),
+        completion_multi_agent=_multi_agent_config(
+            payload.get(
+                "completion_multi_agent",
+                default.completion_multi_agent.to_json_data(),
+            ),
+            path=path,
+            field_name="completion_multi_agent",
+        ),
+        adversary_multi_agent=_multi_agent_config(
+            payload.get(
+                "adversary_multi_agent",
+                default.adversary_multi_agent.to_json_data(),
+            ),
+            path=path,
+            field_name="adversary_multi_agent",
         ),
     )
 
@@ -463,48 +513,68 @@ def _string_list(value: Any, field: str, *, path: Path) -> list[str]:
     return result
 
 
-def _multi_agent_config(value: Any, *, path: Path) -> MultiAgentConfig:
+def _multi_agent_config(
+    value: Any,
+    *,
+    path: Path,
+    field_name: str = "multi_agent",
+) -> MultiAgentConfig:
     if not isinstance(value, dict):
-        raise ProjectConfigError(f"invalid Bello config at {path}: multi_agent must be an object")
+        raise ProjectConfigError(
+            f"invalid Bello config at {path}: {field_name} must be an object"
+        )
     defaults = MultiAgentConfig()
-    enabled = _bool(value.get("enabled", defaults.enabled), "multi_agent.enabled", path=path)
+    enabled = _bool(
+        value.get("enabled", defaults.enabled),
+        f"{field_name}.enabled",
+        path=path,
+    )
     max_concurrent = _positive_int(
         value.get("max_concurrent", defaults.max_concurrent),
-        "multi_agent.max_concurrent",
+        f"{field_name}.max_concurrent",
         path=path,
     )
 
     raw_default = value.get("default", defaults.default.to_json_data())
     if not isinstance(raw_default, dict):
-        raise ProjectConfigError(f"invalid Bello config at {path}: multi_agent.default must be an object")
+        raise ProjectConfigError(
+            f"invalid Bello config at {path}: {field_name}.default must be an object"
+        )
     default_model = _choice(
         raw_default.get("model", defaults.default.model),
-        "multi_agent.default.model",
+        f"{field_name}.default.model",
         SUPPORTED_MODEL_CHOICES,
         path=path,
     )
     default_intelligence = _choice(
         raw_default.get("intelligence", defaults.default.intelligence),
-        "multi_agent.default.intelligence",
+        f"{field_name}.default.intelligence",
         intelligence_choices_for_model(default_model),
         path=path,
     )
 
     raw_allowed = value.get("allowed", defaults.to_json_data()["allowed"])
     if not isinstance(raw_allowed, dict):
-        raise ProjectConfigError(f"invalid Bello config at {path}: multi_agent.allowed must be an object")
+        raise ProjectConfigError(
+            f"invalid Bello config at {path}: {field_name}.allowed must be an object"
+        )
     allowed: dict[str, tuple[str, ...]] = {}
     for raw_model, raw_efforts in raw_allowed.items():
-        model = _choice(raw_model, "multi_agent.allowed model", SUPPORTED_MODEL_CHOICES, path=path)
+        model = _choice(
+            raw_model,
+            f"{field_name}.allowed model",
+            SUPPORTED_MODEL_CHOICES,
+            path=path,
+        )
         if not isinstance(raw_efforts, list | tuple) or not raw_efforts:
             raise ProjectConfigError(
-                f"invalid Bello config at {path}: multi_agent.allowed.{model} must be a non-empty list"
+                f"invalid Bello config at {path}: {field_name}.allowed.{model} must be a non-empty list"
             )
         efforts: list[str] = []
         for raw_effort in raw_efforts:
             effort = _choice(
                 raw_effort,
-                f"multi_agent.allowed.{model}",
+                f"{field_name}.allowed.{model}",
                 intelligence_choices_for_model(model),
                 path=path,
             )
@@ -512,10 +582,12 @@ def _multi_agent_config(value: Any, *, path: Path) -> MultiAgentConfig:
                 efforts.append(effort)
         allowed[model] = tuple(efforts)
     if not allowed:
-        raise ProjectConfigError(f"invalid Bello config at {path}: multi_agent.allowed must not be empty")
+        raise ProjectConfigError(
+            f"invalid Bello config at {path}: {field_name}.allowed must not be empty"
+        )
     if default_intelligence not in allowed.get(default_model, ()):
         raise ProjectConfigError(
-            f"invalid Bello config at {path}: multi_agent.default must be included in multi_agent.allowed"
+            f"invalid Bello config at {path}: {field_name}.default must be included in {field_name}.allowed"
         )
     return MultiAgentConfig(
         enabled=enabled,
@@ -544,6 +616,10 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
     if "coder_mod" in selected:
         updates["coder_mod"] = config.coder_mod
         updates["coder_model"] = config.coder_mod
+    if "revision_coder_enabled" in selected:
+        updates["revision_coder_enabled"] = config.revision_coder_enabled
+    if "revision_coder_mod" in selected:
+        updates["revision_coder_mod"] = config.revision_coder_mod
     if "runtime_mod" in selected:
         updates["runtime_mod"] = config.runtime_mod
         updates["runtime_model"] = config.runtime_mod
@@ -560,6 +636,8 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
         updates["model"] = config.coder_mod if len(shared_models) == 1 else None
     if "coder_intelligence" in selected:
         updates["coder_intelligence"] = config.coder_intelligence
+    if "revision_coder_intelligence" in selected:
+        updates["revision_coder_intelligence"] = config.revision_coder_intelligence
     if "runtime_intelligence" in selected:
         updates["runtime_intelligence"] = config.runtime_intelligence
         updates["super_intelligence"] = config.runtime_intelligence
@@ -582,6 +660,10 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
         updates["protected_paths"] = list(config.protected_path)
     if "multi_agent" in selected:
         updates["multi_agent"] = config.multi_agent.to_json_data()
+    if "completion_multi_agent" in selected:
+        updates["completion_multi_agent"] = config.completion_multi_agent.to_json_data()
+    if "adversary_multi_agent" in selected:
+        updates["adversary_multi_agent"] = config.adversary_multi_agent.to_json_data()
     if "completion_review" in selected:
         updates["completion_review_enabled"] = config.completion_review
     if selected.intersection({"adversary", "adversary_runs"}):

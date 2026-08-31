@@ -157,6 +157,10 @@ class BelloConfig(BaseModel):
     pending_server_request_ids: list[int | str] = Field(default_factory=list)
     status: BelloStatus = BelloStatus.STARTING
     coder_mod: str | None = None
+    revision_coder_enabled: bool = False
+    revision_coder_mod: str | None = None
+    revision_coder_intelligence: str | None = None
+    revision_coder_active: bool = False
     super_mod: str | None = None
     runtime_mod: str | None = None
     completion_mod: str | None = None
@@ -192,6 +196,12 @@ class BelloConfig(BaseModel):
     # as JSON data because StateStore patches it with model_copy(update=...), which does
     # not revalidate nested model instances.
     multi_agent: dict[str, Any] = Field(
+        default_factory=lambda: MultiAgentSettings().model_dump(mode="json")
+    )
+    completion_multi_agent: dict[str, Any] = Field(
+        default_factory=lambda: MultiAgentSettings().model_dump(mode="json")
+    )
+    adversary_multi_agent: dict[str, Any] = Field(
         default_factory=lambda: MultiAgentSettings().model_dump(mode="json")
     )
     adversary_run_count: int = 0

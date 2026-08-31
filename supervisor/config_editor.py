@@ -123,13 +123,37 @@ MODEL_VARIANT_LABELS = {
 }
 ROLE_PURPOSES = {
     "coder": "coder that implements the task in the writable workspace snapshot",
+    "revision-coder": "coder that applies completion-review and adversary feedback after the first return",
     "runtime": "runtime supervisor that evaluates live events and approval requests",
     "completion": "read-only completion reviewer that decides whether the work is done",
     "adversary": "adversarial tester that attacks the candidate in a disposable snapshot",
     "subagent-default": "default subagent selected when the coder does not request another allowed profile",
+    "completion-subagent-default": (
+        "default subagent selected when the completion reviewer does not request another allowed profile"
+    ),
+    "adversary-subagent-default": (
+        "default subagent selected when the adversarial tester does not request another allowed profile"
+    ),
 }
 
-MULTI_AGENT_ALLOWED_FIELD_PREFIX = "multi_agent_allowed:"
+MULTI_AGENT_CONFIG_FIELDS = (
+    "multi_agent",
+    "completion_multi_agent",
+    "adversary_multi_agent",
+)
+
+
+def _multi_agent_editor_field_parts(field: str) -> tuple[str, str] | None:
+    for config_field in MULTI_AGENT_CONFIG_FIELDS:
+        prefix = f"{config_field}_"
+        if field.startswith(prefix):
+            return config_field, field.removeprefix(prefix)
+    return None
+
+
+def _is_multi_agent_allowed_field(field: str) -> bool:
+    parts = _multi_agent_editor_field_parts(field)
+    return parts is not None and parts[1].startswith("allowed:")
 
 
 @dataclass(frozen=True)
@@ -422,7 +446,38 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
         config.coder_intelligence,
         models,
     )
-    multi_agent_parameters = _multi_agent_parameters(config, models)
+    revision_coder_toggle = EditorParameter(
+        "revision_coder_enabled",
+        "revision-coder",
+        "on" if config.revision_coder_enabled else "off",
+        (
+            EditorOption("on", "revision_coder_enabled", True),
+            EditorOption("off", "revision_coder_enabled", False),
+        ),
+        help_text=(
+            "on starts one fresh coder thread with this profile when completion review or adversary first returns "
+            "findings; later findings reuse that revision thread. off returns findings to the current coder thread."
+        ),
+    )
+    revision_coder_parameters = (
+        _role_parameters(
+            "revision-coder",
+            "revision_coder_mod",
+            "revision_coder_intelligence",
+            config.revision_coder_mod,
+            config.revision_coder_intelligence,
+            models,
+        )
+        if config.revision_coder_enabled
+        else ()
+    )
+    multi_agent_parameters = _multi_agent_parameters(
+        config,
+        models,
+        config_field="multi_agent",
+        owner="coder",
+        label_prefix="",
+    )
     runtime_parameters = _role_parameters(
         "runtime",
         "runtime_mod",
@@ -443,6 +498,17 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
         if config.completion_review
         else ()
     )
+    completion_multi_agent_parameters = (
+        _multi_agent_parameters(
+            config,
+            models,
+            config_field="completion_multi_agent",
+            owner="completion reviewer",
+            label_prefix="completion-",
+        )
+        if config.completion_review
+        else ()
+    )
     adversary_enabled = config.adversary and config.adversary_runs > 0
     adversary_active = config.completion_review and adversary_enabled
     adversary_parameters = (
@@ -453,6 +519,17 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
             config.adversary_mod,
             config.adversary_intelligence,
             models,
+        )
+        if adversary_active
+        else ()
+    )
+    adversary_multi_agent_parameters = (
+        _multi_agent_parameters(
+            config,
+            models,
+            config_field="adversary_multi_agent",
+            owner="adversarial tester",
+            label_prefix="adversary-",
         )
         if adversary_active
         else ()
@@ -534,17 +611,21 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
             help_text="Default task file for this folder. A --task CLI argument overrides it for one run.",
         ),
         *coder_parameters,
+        revision_coder_toggle,
+        *revision_coder_parameters,
         *multi_agent_parameters,
         *runtime_parameters,
         *completion_parameters,
+        *completion_multi_agent_parameters,
         *adversary_parameters,
+        *adversary_multi_agent_parameters,
         EditorParameter(
             "speed",
             "speed",
             config.speed,
             tuple(EditorOption(value, "speed", value) for value in SPEED_CHOICES),
             help_text=(
-                "fast uses the priority service tier for coder, runtime, and completion-review turns. "
+                "fast uses the priority service tier for coder, revision-coder, runtime, and completion-review turns. "
                 "usual leaves the service tier unset."
             ),
         ),
@@ -608,19 +689,29 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
     )
 
 
-def _multi_agent_parameters(config: ProjectConfig, models: tuple[str, ...]) -> tuple[EditorParameter, ...]:
-    settings = config.multi_agent
+def _multi_agent_parameters(
+    config: ProjectConfig,
+    models: tuple[str, ...],
+    *,
+    config_field: str,
+    owner: str,
+    label_prefix: str,
+) -> tuple[EditorParameter, ...]:
+    settings = getattr(config, config_field)
+    field_prefix = config_field
+    allowed_field_prefix = f"{field_prefix}_allowed:"
+    default_role = f"{label_prefix}subagent-default"
     toggle = EditorParameter(
-        "multi_agent_enabled",
-        "multi-agent",
+        f"{field_prefix}_enabled",
+        f"{label_prefix}multi-agent",
         "on" if settings.enabled else "off",
         (
-            EditorOption("on", "multi_agent_enabled", True),
-            EditorOption("off", "multi_agent_enabled", False),
+            EditorOption("on", f"{field_prefix}_enabled", True),
+            EditorOption("off", f"{field_prefix}_enabled", False),
         ),
         help_text=(
-            "on lets the coder delegate independent work to Codex subagents using only the configured models and "
-            "reasoning efforts. off removes subagent tools from the coder thread."
+            f"on lets the {owner} delegate bounded independent investigations to Codex subagents using only the "
+            f"configured models and reasoning efforts. off removes subagent tools from the {owner} thread."
         ),
     )
     if not settings.enabled:
@@ -628,38 +719,38 @@ def _multi_agent_parameters(config: ProjectConfig, models: tuple[str, ...]) -> t
 
     allowed_models = tuple(model for model in models if settings.allowed.get(model))
     default_model_parameters = _model_parameters(
-        "subagent-default",
-        "multi_agent_default_model",
+        default_role,
+        f"{field_prefix}_default_model",
         settings.default.model,
         allowed_models,
     )
     default_intelligence = EditorParameter(
-        "multi_agent_default_intelligence",
-        "subagent-default-intelligence",
+        f"{field_prefix}_default_intelligence",
+        f"{default_role}-intelligence",
         settings.default.intelligence,
         tuple(
-            EditorOption(value, "multi_agent_default_intelligence", value)
+            EditorOption(value, f"{field_prefix}_default_intelligence", value)
             for value in settings.allowed[settings.default.model]
         ),
         help_text=(
-            "Reasoning effort used when the coder does not explicitly choose another allowed subagent profile."
+            f"Reasoning effort used when the {owner} does not explicitly choose another allowed subagent profile."
         ),
     )
     allowed_parameters = tuple(
         EditorParameter(
-            f"{MULTI_AGENT_ALLOWED_FIELD_PREFIX}{model}",
-            f"subagent-allowed-{MODEL_VARIANT_LABELS.get(model, model)}",
+            f"{allowed_field_prefix}{model}",
+            f"{label_prefix}subagent-allowed-{MODEL_VARIANT_LABELS.get(model, model)}",
             ", ".join(settings.allowed.get(model, ())) or "none",
             tuple(
                 EditorOption(
                     effort,
-                    f"{MULTI_AGENT_ALLOWED_FIELD_PREFIX}{model}",
+                    f"{allowed_field_prefix}{model}",
                     effort,
                 )
                 for effort in intelligence_choices_for_model(model)
             ),
             help_text=(
-                f"Toggle reasoning efforts the coder may use with {model}. The active default and the final "
+                f"Toggle reasoning efforts the {owner} may use with {model}. The active default and the final "
                 "remaining profile cannot be removed."
             ),
         )
@@ -668,12 +759,12 @@ def _multi_agent_parameters(config: ProjectConfig, models: tuple[str, ...]) -> t
     return (
         toggle,
         EditorParameter(
-            "multi_agent_max_concurrent",
-            "subagent-max-concurrent",
+            f"{field_prefix}_max_concurrent",
+            f"{label_prefix}subagent-max-concurrent",
             str(settings.max_concurrent),
             (),
             edit_kind="positive_int",
-            help_text="Maximum number of Codex agent threads that may run concurrently in this coder session.",
+            help_text=f"Maximum number of Codex agent threads that may run concurrently in this {owner} session.",
         ),
         *default_model_parameters,
         default_intelligence,
@@ -804,7 +895,7 @@ def select_current(
         return config, _start_inline_edit(config, state, parameter, edit_kind="protected_path_entry", initial_value=""), None
     if option.field is None:
         return config, advance_after_selection(state, len(parameters)), None
-    if option.field.startswith(MULTI_AGENT_ALLOWED_FIELD_PREFIX):
+    if _is_multi_agent_allowed_field(option.field):
         updated = _toggle_multi_agent_allowed(config, option.field, str(option.value))
         return updated, _keep_parameter_expanded(state, parameter.key, updated, model_choices), None
     updated = _replace_config_field(config, option.field, option.value)
@@ -913,8 +1004,10 @@ def _inline_initial_value(config: ProjectConfig, parameter: EditorParameter) -> 
         return format_review_limit(config.completion_returns_before_adversary)
     if parameter.key == "completion_returns_after_adversary":
         return format_review_limit(config.completion_returns_after_adversary)
-    if parameter.key == "multi_agent_max_concurrent":
-        return str(config.multi_agent.max_concurrent)
+    multi_agent_parts = _multi_agent_editor_field_parts(parameter.key)
+    if multi_agent_parts is not None and multi_agent_parts[1] == "max_concurrent":
+        settings = getattr(config, multi_agent_parts[0])
+        return str(settings.max_concurrent)
     return parameter.value if parameter.value != "absent" else ""
 
 
@@ -956,21 +1049,28 @@ def _commit_inline_edit(
 
 
 def _replace_config_field(config: ProjectConfig, field: str, value: Any) -> ProjectConfig:
-    if field == "multi_agent_enabled":
-        return replace(config, multi_agent=replace(config.multi_agent, enabled=bool(value)))
-    if field == "multi_agent_max_concurrent":
-        return replace(config, multi_agent=replace(config.multi_agent, max_concurrent=int(value)))
-    if field == "multi_agent_default_model":
+    multi_agent_parts = _multi_agent_editor_field_parts(field)
+    if multi_agent_parts is not None:
+        config_field, setting_field = multi_agent_parts
+        settings = getattr(config, config_field)
+    else:
+        config_field = setting_field = ""
+        settings = None
+    if setting_field == "enabled":
+        return replace(config, **{config_field: replace(settings, enabled=bool(value))})
+    if setting_field == "max_concurrent":
+        return replace(config, **{config_field: replace(settings, max_concurrent=int(value))})
+    if setting_field == "default_model":
         model = str(value)
-        allowed_efforts = config.multi_agent.allowed[model]
-        intelligence = config.multi_agent.default.intelligence
+        allowed_efforts = settings.allowed[model]
+        intelligence = settings.default.intelligence
         if intelligence not in allowed_efforts:
             intelligence = "high" if "high" in allowed_efforts else allowed_efforts[0]
         default = SubagentDefaultConfig(model=model, intelligence=intelligence)
-        return replace(config, multi_agent=replace(config.multi_agent, default=default))
-    if field == "multi_agent_default_intelligence":
-        default = replace(config.multi_agent.default, intelligence=str(value))
-        return replace(config, multi_agent=replace(config.multi_agent, default=default))
+        return replace(config, **{config_field: replace(settings, default=default)})
+    if setting_field == "default_intelligence":
+        default = replace(settings.default, intelligence=str(value))
+        return replace(config, **{config_field: replace(settings, default=default)})
     if field == "adversary":
         enabled = bool(value)
         return replace(
@@ -983,6 +1083,7 @@ def _replace_config_field(config: ProjectConfig, field: str, value: Any) -> Proj
         return replace(config, adversary_runs=runs, adversary=runs > 0)
     model_effort_fields = {
         "coder_mod": "coder_intelligence",
+        "revision_coder_mod": "revision_coder_intelligence",
         "runtime_mod": "runtime_intelligence",
         "completion_mod": "completion_intelligence",
         "adversary_mod": "adversary_intelligence",
@@ -999,23 +1100,28 @@ def _replace_config_field(config: ProjectConfig, field: str, value: Any) -> Proj
 
 
 def _toggle_multi_agent_allowed(config: ProjectConfig, field: str, effort: str) -> ProjectConfig:
-    model = field.removeprefix(MULTI_AGENT_ALLOWED_FIELD_PREFIX)
-    current = config.multi_agent.allowed.get(model, ())
+    parts = _multi_agent_editor_field_parts(field)
+    if parts is None or not parts[1].startswith("allowed:"):
+        return config
+    config_field, setting_field = parts
+    settings = getattr(config, config_field)
+    model = setting_field.removeprefix("allowed:")
+    current = settings.allowed.get(model, ())
     if effort in current:
-        total_profiles = sum(len(efforts) for efforts in config.multi_agent.allowed.values())
-        if total_profiles == 1 or (model == config.multi_agent.default.model and effort == config.multi_agent.default.intelligence):
+        total_profiles = sum(len(efforts) for efforts in settings.allowed.values())
+        if total_profiles == 1 or (model == settings.default.model and effort == settings.default.intelligence):
             return config
         updated_efforts = tuple(value for value in current if value != effort)
     else:
         selected = {*current, effort}
         updated_efforts = tuple(value for value in intelligence_choices_for_model(model) if value in selected)
 
-    allowed = dict(config.multi_agent.allowed)
+    allowed = dict(settings.allowed)
     if updated_efforts:
         allowed[model] = updated_efforts
     else:
         allowed.pop(model, None)
-    return replace(config, multi_agent=replace(config.multi_agent, allowed=allowed))
+    return replace(config, **{config_field: replace(settings, allowed=allowed)})
 
 
 def _printable_text(text: str) -> bool:
@@ -1879,6 +1985,9 @@ def _parameter_icon(parameter_key: str, theme: Theme) -> str:
             "task": "T",
             "coder_mod": "C",
             "coder_mod_variant": "V",
+            "revision_coder_enabled": "R",
+            "revision_coder_mod": "R",
+            "revision_coder_mod_variant": "V",
             "runtime_mod": "R",
             "runtime_mod_variant": "V",
             "completion_mod": "F",
@@ -1886,6 +1995,7 @@ def _parameter_icon(parameter_key: str, theme: Theme) -> str:
             "adversary_mod": "A",
             "adversary_mod_variant": "V",
             "coder_intelligence": "I",
+            "revision_coder_intelligence": "I",
             "runtime_intelligence": "I",
             "completion_intelligence": "I",
             "adversary_intelligence": "I",
@@ -1904,6 +2014,9 @@ def _parameter_icon(parameter_key: str, theme: Theme) -> str:
         "task": "☑",
         "coder_mod": "◇",
         "coder_mod_variant": "◇",
+        "revision_coder_enabled": "↪",
+        "revision_coder_mod": "↪",
+        "revision_coder_mod_variant": "↪",
         "runtime_mod": "☆",
         "runtime_mod_variant": "☆",
         "completion_mod": "✓",
@@ -1911,6 +2024,7 @@ def _parameter_icon(parameter_key: str, theme: Theme) -> str:
         "adversary_mod": "◈",
         "adversary_mod_variant": "◈",
         "coder_intelligence": "✾",
+        "revision_coder_intelligence": "✾",
         "runtime_intelligence": "✾",
         "completion_intelligence": "✾",
         "adversary_intelligence": "✾",
@@ -1960,6 +2074,9 @@ def _icon_style_key(parameter_key: str) -> str:
         "task": "violet",
         "coder_mod": "violet",
         "coder_mod_variant": "violet",
+        "revision_coder_enabled": "violet",
+        "revision_coder_mod": "violet",
+        "revision_coder_mod_variant": "violet",
         "runtime_mod": "magenta",
         "runtime_mod_variant": "magenta",
         "completion_mod": "green",
@@ -1967,6 +2084,7 @@ def _icon_style_key(parameter_key: str) -> str:
         "adversary_mod": "cyan",
         "adversary_mod_variant": "cyan",
         "coder_intelligence": "magenta",
+        "revision_coder_intelligence": "violet",
         "runtime_intelligence": "magenta",
         "completion_intelligence": "green",
         "adversary_intelligence": "cyan",
@@ -2072,17 +2190,21 @@ def _parameter_value_fragments(
 def _option_matches_current(config: ProjectConfig, parameter: EditorParameter, option: EditorOption) -> bool:
     if option.action is not None or option.field is None:
         return False
-    if option.field == "multi_agent_enabled":
-        return config.multi_agent.enabled == option.value
-    if option.field == "multi_agent_max_concurrent":
-        return config.multi_agent.max_concurrent == option.value
-    if option.field == "multi_agent_default_model":
-        return config.multi_agent.default.model == option.value
-    if option.field == "multi_agent_default_intelligence":
-        return config.multi_agent.default.intelligence == option.value
-    if option.field.startswith(MULTI_AGENT_ALLOWED_FIELD_PREFIX):
-        model = option.field.removeprefix(MULTI_AGENT_ALLOWED_FIELD_PREFIX)
-        return str(option.value) in config.multi_agent.allowed.get(model, ())
+    multi_agent_parts = _multi_agent_editor_field_parts(option.field)
+    if multi_agent_parts is not None:
+        config_field, setting_field = multi_agent_parts
+        settings = getattr(config, config_field)
+        if setting_field == "enabled":
+            return settings.enabled == option.value
+        if setting_field == "max_concurrent":
+            return settings.max_concurrent == option.value
+        if setting_field == "default_model":
+            return settings.default.model == option.value
+        if setting_field == "default_intelligence":
+            return settings.default.intelligence == option.value
+        if setting_field.startswith("allowed:"):
+            model = setting_field.removeprefix("allowed:")
+            return str(option.value) in settings.allowed.get(model, ())
     value = getattr(config, option.field)
     return value == option.value
 
@@ -2248,15 +2370,17 @@ def available_model_choices(project_root: Path) -> tuple[str, ...]:
 
 
 def _model_choices_for_config(config: ProjectConfig, model_choices: tuple[str, ...] | None) -> tuple[str, ...]:
+    multi_agent_settings = tuple(getattr(config, field) for field in MULTI_AGENT_CONFIG_FIELDS)
     return _normalize_model_choices(
         [
             *(model_choices if model_choices is not None else SUPPORTED_MODEL_CHOICES),
             config.coder_mod,
+            config.revision_coder_mod,
             config.runtime_mod,
             config.completion_mod,
             config.adversary_mod,
-            config.multi_agent.default.model,
-            *config.multi_agent.allowed,
+            *(settings.default.model for settings in multi_agent_settings),
+            *(model for settings in multi_agent_settings for model in settings.allowed),
         ]
     )
 
