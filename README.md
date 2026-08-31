@@ -287,6 +287,10 @@ for Raw, making Bello **1.45% better**. Mean solution time was
 | Miller | 33.839% | 34.684% | +2.50% | 3.3190% | 1.1428% | 2.904× | 34.432% | 24:44 | 1:36:00 | 3.882× |
 | **All 12 + 12** | **48.100%** | **48.797%** | **+1.45%** | **15.6297%** | **5.2690%** | **2.966×** | **33.711%** | **28:27** | **1:49:44** | **3.857×** |
 
+The final solution patches for all 24 reported runs, together with SHA-256
+checksums, are available in the
+[public evaluation artifacts folder](https://drive.google.com/drive/folders/1W1Lm0U7gcb5rTa3DyXQH_6n6XbFXwB9c?usp=share_link).
+
 #### Settings that prioritize quality
 
 With GPT-5.6 Sol at `ultra`, C+A raised the unweighted macro completion score
