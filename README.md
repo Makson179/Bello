@@ -2,7 +2,7 @@
 
 <p align="center">
   <strong>Spend less on coding tasks without giving up completion quality.</strong><br>
-  Bello assigns models to coding, runtime supervision, completion review, and adversarial testing. Across 12 + 12 matched ProgramBench runs, Efficient Budget used 66.3% less of a weekly Codex limit than Raw GPT-5.6 Sol XHigh while scoring 0.697 percentage points higher on average. Settings that prioritize quality can raise completion further. <br>
+  Bello assigns models to coding, runtime supervision, completion review, and adversarial testing. Across 12 + 12 matched ProgramBench runs, <a href="#results">one of the tested configurations</a> used 66.3% less of a weekly Codex limit than Raw GPT-5.6 Sol XHigh while scoring 1.45% higher on average. Settings that prioritize quality can raise completion further. <br>
 </p>
 
 <p align="center">
@@ -42,23 +42,26 @@ use its own model and reasoning level. The same system can therefore reduce the
 cost of a complete run, push completion quality beyond Raw Codex, and protect an
 autonomous coding session from hallucinations, task drift, and harmful actions.
 
-Cost is the clearest measured advantage of Efficient Budget. Across four
-ProgramBench tasks, Raw GPT-5.6 Sol XHigh consumed **2.966 times** as much of the
-weekly Codex limit, while Bello scored **0.697 percentage points higher** on
-average. When quality takes priority over cost, the deeper configuration scored
-**36.4% higher** than Raw Codex across nine matched runs.
+Cost is the clearest measured advantage in one of the configurations tested in
+[Results](#results). Across four ProgramBench tasks, Raw GPT-5.6 Sol XHigh
+consumed **2.966 times** as much of the weekly Codex limit, while Bello scored
+**1.45% higher** on average. When quality takes priority over cost, the deeper
+configuration scored **36.4% higher** than Raw Codex across nine matched runs.
 
 Protection remains active even in the lightest configuration. The coder works
 inside a disposable sandbox while the runtime supervisor follows the live run,
 redirects hallucinated or off-task work, blocks dangerous actions before they
 reach the project or production systems, and can restart a failing generation
-without losing the workspace. On three workplace-style tasks, `runtime-only`
-scored about **9% higher** than Raw Codex at about the same cost and wall time.
+without losing the workspace. On three large custom tasks built from
+deliberately messy and contradictory specifications, `runtime-only` scored about
+**9% higher** than Raw Codex at about the same cost and time. Those are the
+conditions where long autonomous runs are especially prone to drift and
+invented assumptions.
 
 These outcomes are not tied to fixed presets. Every role can use a different
 model, reasoning level, review budget, and service tier. One configuration can
 reserve expensive reasoning for decisive reviews, another can spend more to
-maximize completion, and another can use faster profiles to reduce wall time
+maximize quality, and another can use faster profiles to reduce time
 while preserving a similar balance of price and quality. The Codex plugin can
 inspect the task and recommend a complete configuration around the user's
 priorities.
@@ -115,15 +118,19 @@ The full start can be a short conversation:
 > **You:** Please recommend the best balance of price and quality for
 > completing `task.md`.
 >
-> **Codex:** I recommend a configuration based on the task, repository, expected
-> quality, total cost, and wall time.
+> **Codex:** I recommend Configuration X for `task.md`. It offers the best
+> balance of price, quality, and time for this task.
 >
-> **You:** Thanks. Please run `task.md` with that configuration and keep me
+> **You:** Thanks. Please run `task.md` with Configuration X and keep me
 > updated on what is happening.
 
 Codex shows the resolved configuration before launch. Bello then runs the task
 and writes `.supervisor/FINAL_REPORT.md` with the result, changed files, checks,
 and remaining risks.
+
+You can also ask a stronger model to prepare an advisory `PLAN.md`, then have a
+less expensive Bello configuration execute it. The coder receives the plan as
+guidance, while completion review and adversarial testing remain independent.
 
 ## Bello in 42 seconds
 
@@ -149,8 +156,7 @@ can use different models and reasoning levels.
    and feature interactions. A separate controller checks its findings before
    they reach the coder.
 5. Bello returns confirmed problems to the coder and repeats only the stages
-   allowed by the selected configuration. It then writes the final report and
-   preserves enough state to recover from an interrupted run.
+   allowed by the selected configuration.
 
 The complete loop is:
 
@@ -162,7 +168,7 @@ move to a fresh revision coder, whether roles may use subagents, and whether to
 use the faster service tier. A run can contain only runtime protection, one
 review, several review and adversary rounds, or any supported combination. The
 configuration advisor can inspect the task and recommend a setup around cost,
-quality, and wall time.
+quality, and time.
 
 ## Choose your configuration
 
@@ -172,9 +178,9 @@ below are examples of what that flexibility can produce.
 
 | Example | Configuration | What it prioritizes | Measured result |
 | --- | --- | --- | --- |
-| Runtime protection | `runtime-only` | Safety with almost no added cost. The live supervisor catches hallucinations and drift, blocks harmful actions, and protects project and production resources. | About the same cost and wall time as Raw Codex. Scores were about 9% higher on three workplace-style tasks and about 2% higher on the shorter ProgramBench tasks. |
-| Efficient Budget | Luna-based `C+A` | Lower total cost without losing average quality. | Raw GPT-5.6 Sol XHigh used **2.966 times** as much of the weekly limit. Bello scored **0.697 percentage points higher** on average across four tasks. |
-| Quality C+A | GPT-5.6 Sol `ultra` with `C+A` | A strong completion review and adversarial pass when quality matters more than cost. | Macro completion increased from **53.53% to 67.67%**, a gain of **14.14 percentage points**. |
+| Runtime protection | `runtime-only` | Safety with almost no added cost. The live supervisor catches hallucinations and drift, blocks harmful actions, and protects project and production resources. | About the same cost and time as Raw Codex. Scores were about 9% higher on three large tasks with deliberately messy, contradictory specifications and about 2% higher on the shorter ProgramBench tasks. |
+| Efficient Budget | Luna-based `C+A` | Lower total cost without losing average quality. | Raw GPT-5.6 Sol XHigh used **2.966 times** as much of the weekly limit. Bello scored **1.45% higher** on average across four tasks. |
+| Quality C+A | GPT-5.6 Sol `ultra` with `C+A` | A strong completion review and adversarial pass when quality matters more than cost. | Macro completion increased from **53.53% to 67.67%**, making Bello **26.41% better**. |
 | Maximum quality experiment | `4C+A+2C` | The highest quality Bello can pursue with repeated review before and after an attack. | Bello scored higher in all nine matched runs and improved completion by **36.4%** on average. This is an expensive, long-running experiment for rare cases, not a default recommendation. |
 
 Here, `C` means an independent completion review and `A` means an adversarial
@@ -186,11 +192,12 @@ You can also use one review without an adversary, several reviews, reviews after
 an adversary, repeated attacks, or any supported combination. Review counts are
 upper limits, so Bello can accept early when no further work is needed. For a
 faster run, use quicker reasoning profiles on the serial roles and reserve the
-strongest models for the decisions that need them.
+strongest models for the decisions that need them. The coder, completion
+reviewer, and adversary can each use bounded subagents for independent work.
 
 You do not have to choose manually. The plugin's configuration advisor inspects
 the task and relevant workspace files, presents a few concrete options for cost,
-quality, and wall time, and applies the selected configuration when you ask it
+quality, and time, and applies the selected configuration when you ask it
 to. Every field remains available in `bello config` and in the
 [Configuration section](#configuration).
 
@@ -206,17 +213,17 @@ scheduled completion-review and adversary rounds.
 
 We also tested `runtime-only` on
 [three custom tasks](https://drive.google.com/drive/u/1/folders/1eLut349Wu_uxw59H6u87cuWNRqYb3x7x)
-designed to resemble ordinary work rather than polished benchmark prompts. Their
-briefs are deliberately incomplete, awkward, and uneven, the way a task is often
-described by a normal colleague at work.
+built from large, deliberately messy specifications with contradictions and
+late corrections. They stress the kind of long autonomous run in which an agent
+can lose requirements, follow an outdated instruction, or invent assumptions.
 
-| Task | Raw Codex score | `runtime-only` score | Difference | Raw Codex time | `runtime-only` time |
+| Task | Raw Codex score | `runtime-only` score | Change | Raw Codex time | `runtime-only` time |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Marl (weighted spec completeness) | 32.91% | **37.91%** | **+5.00 pp** | 00:58:49 | 00:46:09 |
-| Slab | 81.08% | **85.69%** | **+4.61 pp** | 00:57:26 | 01:04:11 |
-| Pinch | 89.25% | **98.00%** | **+8.75 pp** | 00:40:09 | 00:43:34 |
+| Marl (weighted spec completeness) | 32.91% | **37.91%** | **+15.19%** | 00:58:49 | 00:46:09 |
+| Slab | 81.08% | **85.69%** | **+5.69%** | 00:57:26 | 01:04:11 |
+| Pinch | 89.25% | **98.00%** | **+9.80%** | 00:40:09 | 00:43:34 |
 
-![Runtime-only results on custom workplace-style tasks](./docs/assets/runtime-only-custom-task-results.svg)
+![Runtime-only results on large tasks with deliberately messy specifications](./docs/assets/runtime-only-custom-task-results.svg)
 
 *Figure R1. Comparable 0 to 100 evaluator scores for Marl, Slab, and Pinch. The
 scores are separate task-specific measures, not components of a pooled
@@ -238,7 +245,7 @@ adversarial pass and no completion pass after it.
 Across 12 runs per system, Bello consumed **5.2690%** of a weekly Codex limit,
 compared with **15.6297%** for Raw GPT-5.6 Sol XHigh. Raw used **2.966 times** as
 much of the limit. Bello's mean score was **48.797%**, compared with **48.100%**
-for Raw, a difference of **+0.697 percentage points**. Mean solution time was
+for Raw, making Bello **1.45% better**. Mean solution time was
 **1:49:44** for Bello and **28:27** for Raw.
 
 | Task | System | Run | Score | Tests | Solution time | Weekly limit |
@@ -272,30 +279,30 @@ for Raw, a difference of **+0.697 percentage points**. Mean solution time was
 
 *Figure C1. Score and weekly Codex limit used across three runs per task.*
 
-| Task | Raw XHigh score | Bello score | Difference | Raw weekly limit n=3 | Bello weekly limit n=3 | Cheaper | Bello as share of Raw | Time Raw | Time Bello | Slower |
+| Task | Raw XHigh score | Bello score | Quality change | Raw weekly limit n=3 | Bello weekly limit n=3 | Cheaper | Bello as share of Raw | Time Raw | Time Bello | Slower |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Revive | 40.990% | 45.530% | +4.539 pp | 3.2757% | 1.0555% | 3.104× | 32.221% | 24:52 | 1:23:22 | 3.352× |
-| JSONSchema | 56.821% | 54.673% | −2.149 pp | 3.0069% | 0.8138% | 3.695× | 27.064% | 23:34 | 1:20:43 | 3.426× |
-| LightningCSS | 60.750% | 60.302% | −0.448 pp | 6.0281% | 2.2569% | 2.671× | 37.440% | 40:39 | 2:58:52 | 4.399× |
-| Miller | 33.839% | 34.684% | +0.845 pp | 3.3190% | 1.1428% | 2.904× | 34.432% | 24:44 | 1:36:00 | 3.882× |
-| **All 12 + 12** | **48.100%** | **48.797%** | **+0.697 pp** | **15.6297%** | **5.2690%** | **2.966×** | **33.711%** | **28:27** | **1:49:44** | **3.857×** |
+| Revive | 40.990% | 45.530% | +11.08% | 3.2757% | 1.0555% | 3.104× | 32.221% | 24:52 | 1:23:22 | 3.352× |
+| JSONSchema | 56.821% | 54.673% | −3.78% | 3.0069% | 0.8138% | 3.695× | 27.064% | 23:34 | 1:20:43 | 3.426× |
+| LightningCSS | 60.750% | 60.302% | −0.74% | 6.0281% | 2.2569% | 2.671× | 37.440% | 40:39 | 2:58:52 | 4.399× |
+| Miller | 33.839% | 34.684% | +2.50% | 3.3190% | 1.1428% | 2.904× | 34.432% | 24:44 | 1:36:00 | 3.882× |
+| **All 12 + 12** | **48.100%** | **48.797%** | **+1.45%** | **15.6297%** | **5.2690%** | **2.966×** | **33.711%** | **28:27** | **1:49:44** | **3.857×** |
 
 #### Settings that prioritize quality
 
 With GPT-5.6 Sol at `ultra`, C+A raised the unweighted macro completion score
-from **53.53% to 67.67%**: **+14.14 percentage points** (**+26.41% relative**).
+from **53.53% to 67.67%**, making Bello **26.41% better**.
 The three-task runtime was **07:08:06**, compared with **02:48:55** for Raw
 Codex. The corresponding rows are available in the
 [C+A run-level data](./programbench_ca_run_info.csv).
 The corresponding Bello solutions are available in the
 [C+A solution artifacts folder](https://drive.google.com/drive/u/1/folders/1oWR5v3fziEZj1PkQ8xDyq5JBRCUPf5gV).
 
-| Task | Raw Codex completion | C+A completion | Difference (pp) | Relative change | Raw Codex time | C+A time |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Solar | 53.13% | **59.00%** | **+5.87** | +11.05% | 00:32:33 | 02:17:45 |
-| Samtools | 51.86% | **63.00%** | **+11.14** | +21.48% | 00:36:17 | 02:14:40 |
-| Rumdl | 55.60% | **81.00%** | **+25.40** | +45.68% | 01:40:05 | 02:35:41 |
-| **Macro mean / total time** | 53.53% | **67.67%** | **+14.14** | **+26.41%** | **02:48:55** | **07:08:06** |
+| Task | Raw Codex completion | C+A completion | Change | Raw Codex time | C+A time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Solar | 53.13% | **59.00%** | +11.05% | 00:32:33 | 02:17:45 |
+| Samtools | 51.86% | **63.00%** | +21.48% | 00:36:17 | 02:14:40 |
+| Rumdl | 55.60% | **81.00%** | +45.68% | 01:40:05 | 02:35:41 |
+| **Macro mean / total time** | 53.53% | **67.67%** | **+26.41%** | **02:48:55** | **07:08:06** |
 
 ![C+A completion and runtime compared with Raw Codex](./docs/assets/programbench-ca-performance.svg)
 
@@ -308,17 +315,16 @@ Sol `ultra` task configurations.*
 
 - Across all three tasks and all model and effort settings, Bello achieved the
   higher completion score in **9 of 9 matched configurations**. The overall
-  unweighted mean increased from **44.87% to 61.21%**: **+16.33 percentage
-  points** (+36.40% relative).
+  unweighted mean increased from **44.87% to 61.21%**, making Bello **36.40%
+  better**.
 - With GPT-5.6 Sol, Bello achieved the higher completion score in **6 of 6
   matched configurations**. The unweighted mean increased from **48.92% to
-  67.04%**: **+18.13 percentage points** (+37.06% relative).
+  67.04%**, making Bello **37.06% better**.
 - In the complete GPT-5.6 Sol `ultra` comparison, every task improved by
-  **18.17 to 24.59 points**, and the macro average increased from **53.53% to
-  74.03%**.
+  **34.20% to 44.23%**, and the macro average increased from **53.53% to
+  74.03%**, a **38.30% improvement**.
 - With GPT-5.5 `xhigh`, Bello scored higher on all three tasks, and the macro
-  average increased from **36.79% to 49.53%**: **+12.74 percentage points**
-  (+34.64% relative).
+  average increased from **36.79% to 49.53%**, a **34.64% improvement**.
 
 #### Evaluation protocol
 
@@ -327,7 +333,7 @@ We evaluated Bello on three ProgramBench tasks: **Solar**, **Samtools**, and
 both `ultra` and `xhigh` modes and with GPT-5.5 in `xhigh` mode. We report the
 completion score recorded in the `completion_pct` field and time from the
 `runtime` field of the [run-level data](./programbench_run_info.csv).
-Completion scores are rounded to the nearest hundredth of a percentage point.
+Completion scores are rounded to two decimal places.
 Runtime was not held constant, so the comparison is not compute matched.
 The final solution patches for all nine reported Bello runs, together with
 SHA-256 checksums, are available in the
@@ -337,67 +343,67 @@ SHA-256 checksums, are available in the
 
 ##### `ultra`
 
-| Task | Raw Codex completion | Bello completion | Difference (pp) | Relative change | Raw Codex time | Bello time |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Solar | 53.13% | **71.30%** | **+18.17** | +34.20% | 00:32:33 | 07:39:17 |
-| Samtools | 51.86% | **70.60%** | **+18.74** | +36.14% | 00:36:17 | 19:25:22 |
-| Rumdl | 55.60% | **80.19%** | **+24.59** | +44.23% | 01:40:05 | 07:44:12 |
-| **Macro mean / total time** | 53.53% | **74.03%** | **+20.50** | **+38.30%** | **02:48:55** | **34:48:51** |
+| Task | Raw Codex completion | Bello completion | Change | Raw Codex time | Bello time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Solar | 53.13% | **71.30%** | +34.20% | 00:32:33 | 07:39:17 |
+| Samtools | 51.86% | **70.60%** | +36.14% | 00:36:17 | 19:25:22 |
+| Rumdl | 55.60% | **80.19%** | +44.23% | 01:40:05 | 07:44:12 |
+| **Macro mean / total time** | 53.53% | **74.03%** | **+38.30%** | **02:48:55** | **34:48:51** |
 
 *Bold completion values indicate the higher observed score within each matched
 row.*
 
-Across the three matched `ultra` runs, Bello increased completion by 18.17 to
-24.59 percentage points on every task. The unweighted macro average rose from
-53.53% to 74.03%, a gain of 20.50 points (38.30% relative).
+Across the three matched `ultra` runs, Bello improved completion by 34.20% to
+44.23% on every task. The unweighted macro average rose from 53.53% to 74.03%,
+a 38.30% improvement.
 
-![GPT-5.6 Sol ultra completion-score differences](./docs/assets/programbench-5-6-ultra-matched-differences.svg)
+![GPT-5.6 Sol ultra completion improvements](./docs/assets/programbench-5-6-ultra-matched-differences.svg)
 
-*Figure 1a. Bello-minus-Raw completion differences for the three GPT-5.6 Sol
-`ultra` configurations. Every point lies to the right of zero, and the diamond
-shows the unweighted mean difference (+20.50 points). Uncertainty intervals are
-not shown because each configuration has one observation.*
+*Figure 1a. Completion improvements over Raw Codex for the three GPT-5.6 Sol
+`ultra` configurations. The diamond shows the change in the unweighted macro
+mean (38.30%). Uncertainty intervals are not shown because each configuration
+has one observation.*
 
 ##### `xhigh`
 
-| Task | Raw Codex completion | Bello completion | Difference (pp) | Relative change | Raw Codex time | Bello time |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Solar | 46.61% | **66.50%** | **+19.89** | +42.67% | 00:16:58 | 04:26:04 |
-| Samtools | 38.11% | **51.93%** | **+13.82** | +36.26% | 00:28:48 | 05:39:13 |
-| Rumdl | 48.19% | **61.74%** | **+13.55** | +28.12% | 00:31:57 | 03:53:35 |
-| **Macro mean / total time** | 44.30% | **60.06%** | **+15.75** | **+35.56%** | **01:17:43** | **13:58:52** |
+| Task | Raw Codex completion | Bello completion | Change | Raw Codex time | Bello time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Solar | 46.61% | **66.50%** | +42.67% | 00:16:58 | 04:26:04 |
+| Samtools | 38.11% | **51.93%** | +36.26% | 00:28:48 | 05:39:13 |
+| Rumdl | 48.19% | **61.74%** | +28.12% | 00:31:57 | 03:53:35 |
+| **Macro mean / total time** | 44.30% | **60.06%** | **+35.56%** | **01:17:43** | **13:58:52** |
 
 *Bold completion values indicate the higher observed score within each matched
 row.*
 
-All three `xhigh` tasks improved. The gains ranged from 13.55 to 19.89
-percentage points, and the unweighted macro average increased from 44.30% to
-60.06% (+15.75 points, +35.56% relative).
+All three `xhigh` tasks improved. The gains ranged from 28.12% to 42.67%, and
+the unweighted macro average increased from 44.30% to 60.06%, a 35.56%
+improvement.
 
-![GPT-5.6 Sol xhigh completion-score differences](./docs/assets/programbench-5-6-xhigh-matched-differences.svg)
+![GPT-5.6 Sol xhigh completion improvements](./docs/assets/programbench-5-6-xhigh-matched-differences.svg)
 
-*Figure 1b. Bello-minus-Raw completion differences for the three GPT-5.6 Sol
-`xhigh` configurations. Every point lies to the right of zero, and the diamond
-shows the unweighted mean difference (+15.75 points). Uncertainty intervals are
-not shown because each configuration has one observation.*
+*Figure 1b. Completion improvements over Raw Codex for the three GPT-5.6 Sol
+`xhigh` configurations. The diamond shows the change in the unweighted macro
+mean (35.56%). Uncertainty intervals are not shown because each configuration
+has one observation.*
 
 #### GPT-5.5
 
 ##### `xhigh`
 
-| Task | Raw Codex completion | Bello completion | Difference (pp) | Relative change | Raw Codex time | Bello time |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Solar | 43.78% | **53.39%** | **+9.61** | +21.95% | 00:16:27 | 01:29:35 |
-| Samtools | 20.28% | **44.21%** | **+23.93** | +118.00% | 00:16:28 | 02:30:01 |
-| Rumdl | 46.30% | **50.99%** | **+4.69** | +10.13% | 00:26:03 | 03:30:01 |
-| **Macro mean / total time** | 36.79% | **49.53%** | **+12.74** | **+34.64%** | **00:58:58** | **07:29:37** |
+| Task | Raw Codex completion | Bello completion | Change | Raw Codex time | Bello time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Solar | 43.78% | **53.39%** | +21.95% | 00:16:27 | 01:29:35 |
+| Samtools | 20.28% | **44.21%** | +118.00% | 00:16:28 | 02:30:01 |
+| Rumdl | 46.30% | **50.99%** | +10.13% | 00:26:03 | 03:30:01 |
+| **Macro mean / total time** | 36.79% | **49.53%** | **+34.64%** | **00:58:58** | **07:29:37** |
 
 *Bold completion values indicate the higher observed score within each matched
 row.*
 
-Bello's score was higher on all three tasks. The task-level differences ranged
-from 4.69 to 23.93 percentage points, and the unweighted macro average increased
-from 36.79% to 49.53%, a gain of 12.74 points (34.64% relative).
+Bello's score was higher on all three tasks. The improvements ranged from
+10.13% to 118.00%, and the unweighted macro average increased from 36.79% to
+49.53%, a 34.64% improvement.
 
 #### Cross-task completion summary
 
@@ -405,8 +411,8 @@ from 36.79% to 49.53%, a gain of 12.74 points (34.64% relative).
 
 *Figure 2. Cross-task completion summary on a common 0% to 100% scale. Panels
 (a), (b), and (c) show the matched GPT-5.6 Sol `ultra`, GPT-5.6 Sol `xhigh`,
-and GPT-5.5 `xhigh` comparisons. The unweighted macro differences are +20.50,
-+15.75, and +12.74 percentage points, respectively.*
+and GPT-5.5 `xhigh` comparisons. The unweighted macro improvements are 38.30%,
+35.56%, and 34.64%, respectively.*
 
 #### Task-level configuration profiles
 
@@ -442,48 +448,13 @@ Open the interactive editor from your project folder:
 bello config
 ```
 
-It creates and edits `.supervisor/config.json`. Every value is saved as you
-press Enter, and future runs in this folder use these settings automatically.
+The editor saves `.supervisor/config.json` for the project and shows only the
+settings relevant to the active pipeline. Choose the model and reasoning level
+for each role, enable completion review or adversarial testing, set review
+budgets, and optionally configure a revision coder, subagents, or the Fast tier.
 
-For a new project the editor starts with `completion-review` and `adversary`
-turned off, which is the `runtime-only` setup, and it only shows settings
-that can affect the selected pipeline. Turning on `completion-review` reveals
-the completion reviewer and review budget. Turning on `adversary` then reveals
-the adversary model and the complete `C+A` setup.
-
-For each visible role, select GPT-5.6 and then choose Sol, Terra, or Luna in
-the variant row. Sol and Terra support reasoning effort from `low` through
-`ultra`, and Luna supports `low` through `max`. Active primary roles default to
-GPT-5.6 Sol at `xhigh`, and cheap runtime triage uses Luna.
-
-`revision-coder` is off by default. When enabled, the first completion-review
-or adversary finding starts one fresh coder thread with the configured revision
-profile. Later findings and runtime steering stay in that revision thread. This
-planned profile switch does not consume the health-restart budget. When it is
-off, findings continue in the current coder thread as before.
-
-`multi-agent` is off by default. Turning it on reveals the maximum concurrent
-agent count, the default child profile, and an allowed-efforts row for each
-available model. The coder chooses among those allowed model/effort pairs for
-each independent subtask, falling back to the configured default when there is
-no clear reason to choose another. Bello records bounded child activity in the
-existing runtime snapshots; runtime intervention still goes only to the root
-coder, which steers or stops the named child. A spawn outside the allowed map is
-detected, interrupted, and returned to the root coder as a configuration-policy
-violation.
-
-`completion-multi-agent` and `adversary-multi-agent` are separate and also off
-by default. Each reviewer gets its own concurrency, default profile, and allowed
-profile map. When enabled, the parent reviewer may delegate bounded independent
-checks, chooses the least expensive profile it expects to be sufficient, and
-independently verifies relevant findings before making the final judgment.
-Reviewer delegation is limited to one child level. Reviewer children stay in
-the reviewer's disposable snapshot and are cleaned up with that review; they do
-not enter coder readiness, validation, or runtime-steering logic.
-
-CLI flags override their corresponding saved settings for one run and never
-rewrite the project config. Settings without a CLI flag, including cheap
-runtime and review budgets, are changed through `bello config`.
+CLI flags override matching values for one run without rewriting the saved
+configuration. The full setting list is below.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
