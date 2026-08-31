@@ -7,3 +7,6 @@ __pycache__/
 build/
 dist/
 .supervisor/
+.bench-tmp/
+.codex/
+.DS_Store

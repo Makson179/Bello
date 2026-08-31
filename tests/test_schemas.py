@@ -9,23 +9,69 @@ import pytest
 
 from supervisor.prompts import (
     PROMPTS_ENV_VAR,
+    build_cheap_runtime_prompt,
     build_completion_review_prompt,
     build_coder_prompt,
     build_restart_prompt,
+    build_revision_prompt,
     build_stateless_supervisor_prompt,
 )
 from supervisor.schemas.models import (
     ApprovalWakeContext,
+    BelloConfig,
     HumanMessage,
+    MultiAgentSettings,
     CompletionDecisionArtifact,
     CompletionReviewDecision,
     RestartHandoff,
+    SubagentActivity,
+    SubagentSummary,
     SupervisorDecision,
     SupervisorWakePacket,
     TriggeringAction,
     openai_strict_json_schema_for_completion_review_decision,
     openai_strict_json_schema_for_supervisor_decision,
 )
+
+
+def test_bello_config_defaults_independent_reviewer_multi_agent_runtime_mirrors() -> None:
+    config = BelloConfig.model_validate(
+        {"project_root": "/workspace", "task_path": "TASK.md"}
+    )
+    expected = MultiAgentSettings().model_dump(mode="json")
+
+    assert config.multi_agent == expected
+    assert config.completion_multi_agent == expected
+    assert config.adversary_multi_agent == expected
+    assert config.completion_multi_agent is not config.multi_agent
+    assert config.adversary_multi_agent is not config.completion_multi_agent
+
+
+def test_bello_config_preserves_explicit_reviewer_multi_agent_runtime_mirrors() -> None:
+    completion = {
+        "enabled": True,
+        "max_concurrent": 2,
+        "default": {"model": "gpt-5.6-luna", "intelligence": "xhigh"},
+        "allowed": {"gpt-5.6-luna": ["high", "xhigh"]},
+    }
+    adversary = {
+        "enabled": True,
+        "max_concurrent": 5,
+        "default": {"model": "gpt-5.6-terra", "intelligence": "medium"},
+        "allowed": {"gpt-5.6-terra": ["medium", "high"]},
+    }
+
+    config = BelloConfig.model_validate(
+        {
+            "project_root": "/workspace",
+            "task_path": "TASK.md",
+            "completion_multi_agent": completion,
+            "adversary_multi_agent": adversary,
+        }
+    )
+
+    assert config.completion_multi_agent == completion
+    assert config.adversary_multi_agent == adversary
 
 
 def _walk_schema(node: Any) -> Iterator[dict[str, Any]]:
@@ -62,9 +108,9 @@ def test_completion_review_decision_schema_is_strict() -> None:
     assert "EvidenceItem" in schema["$defs"]
     assert "CompletionDecisionArtifact" in schema["$defs"]
     assert "decision_artifact" in schema["properties"]
-    assert "basis_event_seq" in schema["properties"]
-    assert "last_relevant_edit_seq" in schema["properties"]
-    assert "last_validation_seq" in schema["properties"]
+    assert "basis_event_seq" not in schema["properties"]
+    assert "last_relevant_edit_seq" not in schema["properties"]
+    assert "last_validation_seq" not in schema["properties"]
     assert "validation_id" in schema["$defs"]["EvidenceItem"]["properties"]
 
 
@@ -80,9 +126,6 @@ def test_completion_review_decision_accepts_expected_shapes() -> None:
                 "uncovered_edge_candidates": [],
                 "actionable_gap_or_none": None,
             },
-            "basis_event_seq": 10,
-            "last_relevant_edit_seq": 8,
-            "last_validation_seq": 9,
             "files_reviewed": [
                 {"path": "src/app.py", "reason": "changed source", "kind": "source", "inspected": True, "limitation": None}
             ],
@@ -144,9 +187,6 @@ def test_completion_review_decision_accepts_minimal_return_without_full_review_a
                 "uncovered_edge_candidates": ["stack-passed call arguments"],
                 "actionable_gap_or_none": "validate more than six call arguments",
             },
-            "basis_event_seq": 12,
-            "last_relevant_edit_seq": 10,
-            "last_validation_seq": 11,
             "uncovered_behaviors": ["stack-passed call arguments"],
             "validation_gaps": ["no regression covers more than six call arguments"],
             "claim_evidence_mismatches": [],
@@ -337,6 +377,60 @@ def test_stateless_prompt_assembles_blocks_from_packet() -> None:
     assert "action_review" not in completion_payload["prompt_sections"]
 
 
+def test_runtime_prompt_exposes_bounded_subagent_evidence_and_targets_root() -> None:
+    summary = SubagentSummary(
+        thread_id="child-1",
+        parent_thread_id="coder-root",
+        status="active",
+        active_turn_id="child-turn",
+        model="gpt-5.6-luna",
+        reasoning_effort="high",
+        prompt="Inspect the parser failure.",
+        recent_actions=[
+            SubagentActivity(
+                sequence=7,
+                kind="commandExecution",
+                summary="pytest parser tests exit=1",
+                item_id="child-command",
+            )
+        ],
+        validation_ids=["validation-7"],
+        last_event_sequence=7,
+    )
+    packet = SupervisorWakePacket(
+        wake_sequence=8,
+        latest_event_sequence=7,
+        generation=0,
+        restart_count=0,
+        task_path="TASK.md",
+        task_contents="# Task",
+        current_summary="Coder turn completed",
+        coder_thread_id="coder-root",
+        subagents=[summary],
+    )
+
+    payload = json.loads(build_stateless_supervisor_prompt(packet))
+    instructions = "\n".join(payload["instructions"])
+
+    assert payload["subagents"][0]["thread_id"] == "child-1"
+    assert payload["subagents"][0]["recent_actions"][0]["sequence"] == 7
+    assert "address only the root coder" in instructions
+    assert "Identify the child by thread_id" in instructions
+    assert "Never attempt to steer a child directly" in instructions
+
+    with pytest.raises(ValueError):
+        SupervisorWakePacket.model_validate(
+            {**packet.model_dump(mode="json"), "subagents": [summary.model_dump(mode="json")] * 13}
+        )
+
+    cheap_payload = json.loads(
+        build_cheap_runtime_prompt({"subagents": [summary.model_dump(mode="json")]})
+    )
+    cheap_instructions = "\n".join(cheap_payload["instructions"])
+    assert "child activity is evidence about the root coder's work" in cheap_instructions
+    assert "A child merely being active" in cheap_instructions
+
+
 def test_prompts_are_loaded_from_single_toml_file(monkeypatch, tmp_path: Path) -> None:
     prompt_file = tmp_path / "prompts.toml"
     prompt_file.write_text(
@@ -346,6 +440,9 @@ template = '''initial {task_path}'''
 
 [coder_restart]
 template = '''restart {task_path}'''
+
+[coder_revision]
+template = '''revision {task_path}: {reviewer_feedback}'''
 
 [stateless_supervisor]
 body_sections = ["role"]
@@ -362,11 +459,35 @@ text = '''completion instruction'''
     )
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
+    plan = tmp_path / "PLAN.md"
+    plan.write_text("SECRET PLAN CONTENTS\n", encoding="utf-8")
 
     monkeypatch.setenv(PROMPTS_ENV_VAR, str(prompt_file))
     try:
         assert build_coder_prompt(task) == f"initial {task.resolve()}"
         assert build_restart_prompt(task) == f"restart {task.resolve()}"
+        assert build_revision_prompt(task, "fix the edge case") == (
+            f"revision {task.resolve()}: fix the edge case"
+        )
+
+        initial_with_plan = build_coder_prompt(task, plan_path=plan)
+        restart_with_plan = build_restart_prompt(task, plan_path=plan)
+        for prompt, custom_text in (
+            (initial_with_plan, f"initial {task.resolve()}"),
+            (restart_with_plan, f"restart {task.resolve()}"),
+        ):
+            assert prompt.endswith(custom_text)
+            assert str(plan.resolve()) in prompt
+            assert "working hypothesis" in prompt
+            assert "not a binding specification" in prompt
+            assert "verify its assumptions" in prompt
+            assert "new facts or nuances" in prompt
+            assert "Do not copy or summarize the plan" in prompt
+            assert "SECRET PLAN CONTENTS" not in prompt
+
+        revision = build_revision_prompt(task, "fix the edge case")
+        assert str(plan.resolve()) not in revision
+        assert "working hypothesis" not in revision
 
         packet = SupervisorWakePacket(
             wake_sequence=1,
@@ -385,6 +506,60 @@ text = '''completion instruction'''
         assert completion_payload["instructions"] == ["completion instruction"]
     finally:
         monkeypatch.delenv(PROMPTS_ENV_VAR, raising=False)
+
+
+def test_default_coder_prompts_add_only_path_based_plan_guidance(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    plan = tmp_path / "PLAN.md"
+    plan.write_text("Do not leak this implementation sequence.\n", encoding="utf-8")
+
+    initial_without_plan = build_coder_prompt(task)
+    restart_without_plan = build_restart_prompt(task)
+    initial_with_plan = build_coder_prompt(task, plan_path=plan)
+    restart_with_plan = build_restart_prompt(task, plan_path=plan)
+
+    assert initial_without_plan == (
+        "Complete the task described by the workspace instructions. Work autonomously.\n\n"
+        "When complete, output BELLO_READY_FOR_REVIEW on its own line."
+    )
+    assert restart_without_plan == (
+        "Continue the existing task. First read `.supervisor/HANDOFF.md`, "
+        "`.supervisor/DECISIONS.md`, and `.supervisor/PROGRESS.md`,\n"
+        "then work from the current workspace. Work autonomously.\n\n"
+        "When complete, output BELLO_READY_FOR_REVIEW on its own line."
+    )
+    for prompt in (initial_with_plan, restart_with_plan):
+        assert str(plan.resolve()) in prompt
+        assert "working hypothesis" in prompt
+        assert "not a binding specification" in prompt
+        assert "verify its assumptions" in prompt
+        assert "new facts or nuances" in prompt
+        assert "Do not copy or summarize the plan" in prompt
+        assert "Do not leak this implementation sequence." not in prompt
+        assert prompt.endswith(
+            "When complete, output BELLO_READY_FOR_REVIEW on its own line."
+        )
+
+
+def test_coder_prompt_keeps_disposable_plan_mount_path(tmp_path: Path) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    source = tmp_path / "private-source.md"
+    source.write_text("private plan\n", encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    mounted_plan = workspace / "PLAN.md"
+    try:
+        mounted_plan.symlink_to(source)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    prompt = build_coder_prompt(task, plan_path=mounted_plan)
+
+    assert str(mounted_plan.absolute()) in prompt
+    assert str(source.resolve()) not in prompt
+    assert "private plan" not in prompt
 
 
 def test_missing_stateless_prompt_block_fails_fast(monkeypatch, tmp_path: Path) -> None:

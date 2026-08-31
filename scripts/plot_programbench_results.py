@@ -578,13 +578,19 @@ def matched_effect_figure(
         for task in tasks
     ]
     effects = []
+    raw_values = []
+    bello_values = []
     for label, task, mode in pairs:
         raw = indexed[(task, model, mode, "Raw Codex")]
         bello = indexed[(task, model, mode, "Bello")]
-        effects.append((label, mode, bello.completion - raw.completion))
+        raw_values.append(raw.completion)
+        bello_values.append(bello.completion)
+        effects.append(
+            (label, mode, (bello.completion / raw.completion - 1) * 100)
+        )
 
     model_label = "GPT-5.6 Sol" if model == "gpt-5.6-sol" else "GPT-5.5"
-    mean_effect = sum(effect for _, _, effect in effects) / len(effects)
+    mean_effect = (sum(bello_values) / sum(raw_values) - 1) * 100
     row_y = tuple(112.0 + index * 40 for index in range(len(effects)))
     summary_rule_y = row_y[-1] + 26
     summary_y = summary_rule_y + 20
@@ -600,15 +606,15 @@ def matched_effect_figure(
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
         f'viewBox="0 0 {width} {height}" role="img" '
         f'aria-labelledby="effect-{model}-title effect-{model}-desc">',
-        f'<title id="effect-{model}-title">{model_label} completion-score differences</title>',
+        f'<title id="effect-{model}-title">{model_label} completion improvements</title>',
         f'<desc id="effect-{model}-desc">{len(effects)} comparisons favor Bello, '
-        f'with an unweighted mean difference of {mean_effect:.2f} percentage points.</desc>',
+        f'with a {mean_effect:.2f}% change in the unweighted macro mean.</desc>',
         f'<rect width="{width}" height="{height}" fill="#FFFFFF"/>',
-        text(48, 38, f"{model_label}: completion-score differences", size=21, weight="bold"),
+        text(48, 38, f"{model_label}: completion improvements", size=21, weight="bold"),
         text(
             48,
             62,
-            "Bello minus Raw Codex · positive values favor Bello",
+            "Improvement over Raw Codex · positive values favor Bello",
             size=12,
             fill=MUTED,
         ),
@@ -665,7 +671,7 @@ def matched_effect_figure(
             text(
                 effect_x(effect) + 13,
                 y + 4,
-                f"+{effect:.2f} pp",
+                f"+{effect:.2f}%",
                 size=12,
                 fill=color,
                 weight="bold",
@@ -683,7 +689,7 @@ def matched_effect_figure(
         )
     )
     svg.append(
-        text(plot_x - 18, summary_y + 4, "Unweighted mean", size=12, anchor="end", weight="bold")
+        text(plot_x - 18, summary_y + 4, "Macro mean change", size=12, anchor="end", weight="bold")
     )
     diamond_x = effect_x(mean_effect)
     diamond_points = (
@@ -696,11 +702,11 @@ def matched_effect_figure(
         [
             line(effect_x(0), summary_y, diamond_x, summary_y, stroke=INK, stroke_width="2.2"),
             f'<polygon points="{diamond_points}" fill="{INK}" stroke="{INK}"/>',
-            text(diamond_x + 14, summary_y + 4, f"+{mean_effect:.2f} pp", size=12, weight="bold"),
+            text(diamond_x + 14, summary_y + 4, f"+{mean_effect:.2f}%", size=12, weight="bold"),
             text(
                 plot_x + plot_width / 2,
                 height - 28,
-                "Completion-score difference (percentage points)",
+                "Completion improvement over Raw Codex (%)",
                 size=13,
                 anchor="middle",
                 weight="bold",
@@ -710,17 +716,17 @@ def matched_effect_figure(
     if "ultra" in modes:
         svg.extend(
             [
-                f'<circle cx="844" cy="113" r="6.5" fill="{BELLO_COLOR}" '
+                f'<circle cx="914" cy="113" r="6.5" fill="{BELLO_COLOR}" '
                 f'stroke="{BELLO_COLOR}" stroke-width="1.5"/>',
-                text(860, 118, "ultra", size=12, fill=BELLO_COLOR, weight="bold"),
+                text(930, 118, "ultra", size=12, fill=BELLO_COLOR, weight="bold"),
             ]
         )
     if "xhigh" in modes:
         legend_y = 137 if "ultra" in modes else 107
         svg.extend(
             [
-                rectangle(837.5, legend_y, 13, 13, fill=RAW_COLOR, stroke=RAW_COLOR, stroke_width="1.5"),
-                text(860, legend_y + 11.5, "xhigh", size=12, fill=RAW_COLOR, weight="bold"),
+                rectangle(907.5, legend_y, 13, 13, fill=RAW_COLOR, stroke=RAW_COLOR, stroke_width="1.5"),
+                text(930, legend_y + 11.5, "xhigh", size=12, fill=RAW_COLOR, weight="bold"),
             ]
         )
     svg.append("</svg>")

@@ -17,6 +17,7 @@ from typing import Any
 from packaging.version import InvalidVersion, Version
 
 from supervisor import __version__
+from supervisor.executables import resolve_trusted_executable
 
 
 DISTRIBUTION_NAME = "bello"
@@ -168,8 +169,15 @@ def run_update(info: InstallInfo) -> subprocess.CompletedProcess[str]:
 
 
 def update_command(info: InstallInfo) -> list[str]:
-    if info.install_mode == "pipx" and shutil.which("pipx"):
-        return ["pipx", "upgrade", info.package_name]
+    if sys.platform == "win32":
+        pipx = resolve_trusted_executable("pipx", cwd=Path.cwd(), windows=True)
+    else:
+        # Preserve the established POSIX command shape.  Windows needs the
+        # absolute trusted path because CreateProcess searches the working
+        # directory before PATH; POSIX does not have that lookup hazard here.
+        pipx = "pipx" if shutil.which("pipx") else None
+    if info.install_mode == "pipx" and pipx:
+        return [pipx, "upgrade", info.package_name]
     if _running_inside_venv():
         return [sys.executable, "-m", "pip", "install", "--upgrade", info.package_name]
     raise UpdateCheckError(manual_update_message(info))

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import platform
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -10,7 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from supervisor.appserver import AppServerClient
+from supervisor.appserver import AppServerClient, CODEX_NO_WEB_SEARCH_CONFIG_FLAGS
+from supervisor.executables import resolve_trusted_executable
 from supervisor import update_check
 
 
@@ -46,21 +49,32 @@ def run_doctor() -> int:
 def collect_doctor_results() -> list[DoctorResult]:
     results: list[DoctorResult] = []
     results.append(_python_version_result())
+    results.extend(_platform_results())
 
-    git_path = shutil.which("git")
+    git_path = _doctor_executable("git")
     results.append(
-        DoctorResult("ok", f"Git found: {git_path}") if git_path else DoctorResult("fail", "Git not found on PATH")
+        DoctorResult("ok", f"Git found: {git_path}")
+        if git_path
+        else DoctorResult("fail", "Git not found on PATH", _missing_git_detail())
     )
 
-    codex_path = shutil.which("codex")
+    codex_path = _doctor_executable("codex")
     results.append(
-        DoctorResult("ok", f"Codex found: {codex_path}") if codex_path else DoctorResult("fail", "Codex not found on PATH")
+        DoctorResult("ok", f"Codex found: {codex_path}")
+        if codex_path
+        else DoctorResult("fail", "Codex not found on PATH", _missing_codex_detail())
     )
     if codex_path:
-        results.append(_probe_result(["codex", "--version"], "Codex version OK", "codex --version failed"))
-        results.append(_probe_result(["codex", "app-server", "--help"], "Codex app-server supported", "codex app-server --help failed"))
-        results.append(_schema_generation_result())
-        results.append(_codex_auth_result())
+        results.append(_probe_result([codex_path, "--version"], "Codex version OK", "codex --version failed"))
+        results.append(
+            _probe_result(
+                [codex_path, "app-server", "--help"],
+                "Codex app-server supported",
+                "codex app-server --help failed",
+            )
+        )
+        results.append(_schema_generation_result(codex_path))
+        results.append(_codex_auth_result(codex_path))
     else:
         results.extend(
             [
@@ -77,26 +91,36 @@ def collect_doctor_results() -> list[DoctorResult]:
     else:
         results.append(DoctorResult("ok", f"Bello package: {info.package_name} {info.version}"))
 
-    executable = shutil.which("bello")
+    executable = _doctor_executable("bello")
     if executable:
         results.append(DoctorResult("ok", f"Bello executable: {executable}"))
     else:
-        results.append(DoctorResult("warn", "bello command not found on PATH"))
+        detail = "Close and reopen the terminal after installation so PATH changes take effect." if _is_windows() else None
+        results.append(DoctorResult("warn", "bello command not found on PATH", detail))
     results.append(DoctorResult("ok", f"Bello install mode: {info.install_mode}"))
 
-    status = update_check.check_for_update(info)
-    if status.state == update_check.UpdateState.CURRENT:
-        results.append(DoctorResult("ok", "Bello is up to date"))
-    elif status.state == update_check.UpdateState.OUTDATED:
+    if update_check.skip_update_check_enabled():
         results.append(
             DoctorResult(
-                "warn",
-                f"Update available: {status.latest_version}",
-                "Run: bello update",
+                "ok",
+                "Bello update check skipped",
+                f"{update_check.SKIP_UPDATE_CHECK_ENV}=1",
             )
         )
     else:
-        results.append(DoctorResult("warn", "Could not check for Bello updates", status.warning))
+        status = update_check.check_for_update(info)
+        if status.state == update_check.UpdateState.CURRENT:
+            results.append(DoctorResult("ok", "Bello is up to date"))
+        elif status.state == update_check.UpdateState.OUTDATED:
+            results.append(
+                DoctorResult(
+                    "warn",
+                    f"Update available: {status.latest_version}",
+                    "Run: bello update",
+                )
+            )
+        else:
+            results.append(DoctorResult("warn", "Could not check for Bello updates", status.warning))
 
     return results
 
@@ -110,13 +134,117 @@ def _python_version_result() -> DoctorResult:
     version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     if sys.version_info >= (3, 11):
         return DoctorResult("ok", f"Python {version}")
-    return DoctorResult("fail", f"Python {version}", "Python 3.11 or newer is required")
+    detail = "Install Python 3.11 or newer from python.org and reopen the terminal." if _is_windows() else "Python 3.11 or newer is required"
+    return DoctorResult("fail", f"Python {version}", detail)
+
+
+def _is_windows() -> bool:
+    return sys.platform == "win32" or platform.system().casefold() == "windows"
+
+
+def _doctor_executable(name: str) -> str | None:
+    # Test doubles can emulate Windows reporting on another host, but strict
+    # CreateProcess resolution is required only on a real native-Windows
+    # interpreter.
+    if sys.platform != "win32":
+        return shutil.which(name)
+    return resolve_trusted_executable(name, cwd=Path.cwd(), windows=True)
+
+
+def _platform_results() -> list[DoctorResult]:
+    system = platform.system() or "unknown"
+    release = platform.release() or "unknown release"
+    version = platform.version()
+    if not _is_windows():
+        return [DoctorResult("ok", f"Platform: {system} {release}")]
+    return [
+        _windows_version_result(release, version),
+        _windows_architecture_result(),
+        _windows_shell_result(),
+    ]
+
+
+def _windows_version_result(release: str, version: str) -> DoctorResult:
+    build = _windows_build_number(version)
+    product_type: int | None = None
+    getwindowsversion = getattr(sys, "getwindowsversion", None)
+    if callable(getwindowsversion):
+        try:
+            native_version = getwindowsversion()
+            build = int(native_version.build)
+            product_type = int(native_version.product_type)
+        except (AttributeError, OSError, TypeError, ValueError):
+            pass
+
+    release_key = release.casefold().replace(" ", "")
+    server_release = "server" in release_key
+    is_server = (product_type is not None and product_type != 1) or server_release
+    if is_server:
+        supported = build is not None and build >= 20348
+        if build is None:
+            supported = release_key in {"2022server", "server2022", "2025server", "server2025"}
+    else:
+        supported = release_key == "11" or (build is not None and build >= 22000)
+
+    detail = f"build {version}" if version else None
+    if supported:
+        return DoctorResult("ok", f"Native Windows detected: {release}", detail)
+    detected = f"; detected build {build}" if build is not None else ""
+    return DoctorResult(
+        "fail",
+        f"Unsupported native Windows version: {release}",
+        "Bello supports Windows 11 or Windows Server 2022/2025"
+        f"{detected}. Upgrade Windows or use the WSL installation path.",
+    )
+
+
+def _windows_build_number(version: str) -> int | None:
+    numbers = [int(value) for value in version.split(".") if value.isdigit()]
+    return numbers[-1] if numbers else None
+
+
+def _windows_architecture_result() -> DoctorResult:
+    machine = (platform.machine() or "unknown").strip()
+    machine_key = machine.casefold()
+    bits = struct.calcsize("P") * 8
+    supported_machine = machine_key in {"amd64", "x64", "x86_64"}
+    if bits == 64 and supported_machine:
+        return DoctorResult("ok", f"Windows architecture: {machine} ({bits}-bit Python)")
+    return DoctorResult(
+        "fail",
+        f"Unsupported Windows architecture: {machine} ({bits}-bit Python)",
+        "Install 64-bit x86 Windows and a 64-bit Python build. Windows on ARM and 32-bit Python are not supported.",
+    )
+
+
+def _windows_shell_result() -> DoctorResult:
+    for executable in ("pwsh", "powershell", "cmd"):
+        path = _doctor_executable(executable)
+        if path:
+            return DoctorResult("ok", f"Windows shell found: {path}")
+    return DoctorResult(
+        "fail",
+        "No supported Windows shell found on PATH",
+        "Install PowerShell 7 (pwsh) or restore Windows PowerShell/cmd.exe, then reopen the terminal.",
+    )
+
+
+def _missing_git_detail() -> str:
+    if _is_windows():
+        return "Install Git for Windows, select the option to add Git to PATH, then reopen the terminal."
+    return "Install Git and ensure the git executable is on PATH."
+
+
+def _missing_codex_detail() -> str:
+    if _is_windows():
+        return "Install the native Codex CLI, ensure codex.exe or codex.cmd is on PATH, then run: codex login"
+    return "Install the Codex CLI, ensure it is on PATH, then run: codex login"
 
 
 def _probe_result(args: list[str], ok_message: str, fail_message: str, *, timeout: float = 10.0) -> DoctorResult:
     try:
         completed = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
-    except FileNotFoundError as exc:
+    except OSError as exc:
         return DoctorResult("fail", fail_message, str(exc))
     except subprocess.TimeoutExpired:
         return DoctorResult("fail", fail_message, f"{args[0]} timed out")
@@ -127,18 +255,25 @@ def _probe_result(args: list[str], ok_message: str, fail_message: str, *, timeou
     return DoctorResult("fail", fail_message, output or f"exit code {completed.returncode}")
 
 
-def _schema_generation_result() -> DoctorResult:
+def _schema_generation_result(codex_executable: str | None = None) -> DoctorResult:
     with tempfile.TemporaryDirectory(prefix="bello-doctor-schema-") as tmp_dir:
         out_dir = Path(tmp_dir)
         try:
+            codex_executable = codex_executable or _doctor_executable("codex")
+            if codex_executable is None:
+                return DoctorResult(
+                    "fail",
+                    "app-server schema generation failed",
+                    "trusted Codex executable not found on PATH",
+                )
             completed = subprocess.run(
-                ["codex", "app-server", "generate-json-schema", "--experimental", "--out", str(out_dir)],
+                [codex_executable, "app-server", "generate-json-schema", "--experimental", "--out", str(out_dir)],
                 capture_output=True,
                 text=True,
                 timeout=20,
                 check=False,
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        except (OSError, subprocess.TimeoutExpired) as exc:
             return DoctorResult("fail", "app-server schema generation failed", str(exc))
         if completed.returncode != 0:
             return DoctorResult("fail", "app-server schema generation failed", (completed.stdout + completed.stderr).strip())
@@ -164,9 +299,18 @@ def _schema_file(out_dir: Path, name: str) -> Path | None:
     return None
 
 
-def _codex_auth_result() -> DoctorResult:
+def _codex_auth_result(codex_executable: str | None = None) -> DoctorResult:
     async def probe() -> DoctorResult:
-        client = AppServerClient()
+        command = None
+        if codex_executable is not None:
+            command = [
+                codex_executable,
+                "app-server",
+                *CODEX_NO_WEB_SEARCH_CONFIG_FLAGS,
+                "--listen",
+                "stdio://",
+            ]
+        client = AppServerClient(command=command)
         try:
             await asyncio.wait_for(client.start(), timeout=10)
             await client.initialize(timeout=10)

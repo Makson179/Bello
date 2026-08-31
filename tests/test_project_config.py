@@ -17,8 +17,10 @@ from supervisor.project_config import (
     MODEL_GPT_5_6_LUNA,
     MODEL_GPT_5_6_SOL,
     MODEL_GPT_5_6_TERRA,
+    MultiAgentConfig,
     ProjectConfig,
     ProjectConfigError,
+    SubagentDefaultConfig,
     changed_project_config_fields,
     ensure_runtime_state_initialized,
     intelligence_choices_for_model,
@@ -40,10 +42,13 @@ def test_first_load_creates_default_project_config(tmp_path: Path) -> None:
     config = load_project_config(tmp_path)
 
     assert config.coder_mod == DEFAULT_MODEL
+    assert config.revision_coder_enabled is False
+    assert config.revision_coder_mod == DEFAULT_MODEL
     assert config.runtime_mod == DEFAULT_MODEL
     assert config.completion_mod == DEFAULT_MODEL
     assert config.adversary_mod == DEFAULT_MODEL
     assert config.coder_intelligence == DEFAULT_INTELLIGENCE
+    assert config.revision_coder_intelligence == DEFAULT_INTELLIGENCE
     assert config.runtime_intelligence == DEFAULT_INTELLIGENCE
     assert config.completion_intelligence == DEFAULT_INTELLIGENCE
     assert config.adversary_intelligence == DEFAULT_INTELLIGENCE
@@ -57,6 +62,18 @@ def test_first_load_creates_default_project_config(tmp_path: Path) -> None:
     assert config.clean is False
     assert config.task is None
     assert config.protected_path == ()
+    assert config.multi_agent == MultiAgentConfig()
+    assert config.multi_agent.enabled is False
+    assert config.multi_agent.max_concurrent == 4
+    assert config.multi_agent.default == SubagentDefaultConfig(model=MODEL_GPT_5_6_LUNA, intelligence="high")
+    assert config.multi_agent.allowed == {
+        MODEL_GPT_5_6_LUNA: ("medium", "high", "xhigh"),
+        MODEL_GPT_5_6_TERRA: ("medium", "high"),
+    }
+    assert config.completion_multi_agent == MultiAgentConfig()
+    assert config.completion_multi_agent.enabled is False
+    assert config.adversary_multi_agent == MultiAgentConfig()
+    assert config.adversary_multi_agent.enabled is False
     assert project_config_path(tmp_path).exists()
     assert project_config_path(tmp_path) == tmp_path.resolve() / ".supervisor" / "config.json"
     assert not (tmp_path / ".bello").exists()
@@ -83,6 +100,9 @@ def test_project_config_missing_fields_are_defaulted(tmp_path: Path) -> None:
     config = load_project_config(tmp_path)
 
     assert config.coder_mod == "gpt-coder"
+    assert config.revision_coder_enabled is False
+    assert config.revision_coder_mod == "gpt-coder"
+    assert config.revision_coder_intelligence == DEFAULT_INTELLIGENCE
     assert config.runtime_mod == DEFAULT_MODEL
     assert config.completion_mod == DEFAULT_MODEL
     assert config.adversary_mod == DEFAULT_MODEL
@@ -98,6 +118,168 @@ def test_project_config_invalid_json_reports_path(tmp_path: Path) -> None:
 
     with pytest.raises(ProjectConfigError, match="invalid Bello config JSON"):
         load_project_config(tmp_path)
+
+
+def test_project_config_loads_multi_agent_structure(tmp_path: Path) -> None:
+    path = project_config_path(tmp_path)
+    path.parent.mkdir()
+    path.write_text(
+        json.dumps(
+            {
+                "multi_agent": {
+                    "enabled": True,
+                    "max_concurrent": 7,
+                    "default": {"model": MODEL_GPT_5_6_TERRA, "intelligence": "medium"},
+                    "allowed": {
+                        MODEL_GPT_5_6_LUNA: ["low", "high"],
+                        MODEL_GPT_5_6_TERRA: ["medium", "high"],
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_project_config(tmp_path, create=False)
+
+    assert config.multi_agent.enabled is True
+    assert config.multi_agent.max_concurrent == 7
+    assert config.multi_agent.default == SubagentDefaultConfig(MODEL_GPT_5_6_TERRA, "medium")
+    assert config.multi_agent.allowed == {
+        MODEL_GPT_5_6_LUNA: ("low", "high"),
+        MODEL_GPT_5_6_TERRA: ("medium", "high"),
+    }
+    assert config.to_json_data()["multi_agent"] == {
+        "enabled": True,
+        "max_concurrent": 7,
+        "default": {"model": MODEL_GPT_5_6_TERRA, "intelligence": "medium"},
+        "allowed": {
+            MODEL_GPT_5_6_LUNA: ["low", "high"],
+            MODEL_GPT_5_6_TERRA: ["medium", "high"],
+        },
+    }
+
+
+def test_project_config_loads_independent_reviewer_multi_agent_structures(
+    tmp_path: Path,
+) -> None:
+    path = project_config_path(tmp_path)
+    path.parent.mkdir()
+    path.write_text(
+        json.dumps(
+            {
+                "completion_multi_agent": {
+                    "enabled": True,
+                    "max_concurrent": 3,
+                    "default": {
+                        "model": MODEL_GPT_5_6_LUNA,
+                        "intelligence": "xhigh",
+                    },
+                    "allowed": {
+                        MODEL_GPT_5_6_LUNA: ["high", "xhigh"],
+                    },
+                },
+                "adversary_multi_agent": {
+                    "enabled": True,
+                    "max_concurrent": 6,
+                    "default": {
+                        "model": MODEL_GPT_5_6_TERRA,
+                        "intelligence": "medium",
+                    },
+                    "allowed": {
+                        MODEL_GPT_5_6_LUNA: ["medium", "high"],
+                        MODEL_GPT_5_6_TERRA: ["medium", "high"],
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_project_config(tmp_path, create=False)
+
+    assert config.multi_agent == MultiAgentConfig()
+    assert config.completion_multi_agent == MultiAgentConfig(
+        enabled=True,
+        max_concurrent=3,
+        default=SubagentDefaultConfig(MODEL_GPT_5_6_LUNA, "xhigh"),
+        allowed={MODEL_GPT_5_6_LUNA: ("high", "xhigh")},
+    )
+    assert config.adversary_multi_agent == MultiAgentConfig(
+        enabled=True,
+        max_concurrent=6,
+        default=SubagentDefaultConfig(MODEL_GPT_5_6_TERRA, "medium"),
+        allowed={
+            MODEL_GPT_5_6_LUNA: ("medium", "high"),
+            MODEL_GPT_5_6_TERRA: ("medium", "high"),
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("multi_agent", "error"),
+    [
+        ({"max_concurrent": 0}, "multi_agent.max_concurrent"),
+        ({"allowed": {}}, "multi_agent.allowed must not be empty"),
+        (
+            {
+                "default": {"model": MODEL_GPT_5_6_LUNA, "intelligence": "high"},
+                "allowed": {MODEL_GPT_5_6_TERRA: ["high"]},
+            },
+            "multi_agent.default must be included",
+        ),
+        ({"allowed": {MODEL_GPT_5_6_LUNA: ["ultra"]}}, f"multi_agent.allowed.{MODEL_GPT_5_6_LUNA}"),
+    ],
+)
+def test_project_config_rejects_invalid_multi_agent_settings(
+    tmp_path: Path,
+    multi_agent: object,
+    error: str,
+) -> None:
+    path = project_config_path(tmp_path)
+    path.parent.mkdir()
+    path.write_text(json.dumps({"multi_agent": multi_agent}), encoding="utf-8")
+
+    with pytest.raises(ProjectConfigError, match=error):
+        load_project_config(tmp_path, create=False)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["completion_multi_agent", "adversary_multi_agent"],
+)
+@pytest.mark.parametrize(
+    ("settings", "error_suffix"),
+    [
+        ({"max_concurrent": 0}, "max_concurrent"),
+        ({"allowed": {}}, "allowed must not be empty"),
+        (
+            {
+                "default": {
+                    "model": MODEL_GPT_5_6_LUNA,
+                    "intelligence": "high",
+                },
+                "allowed": {MODEL_GPT_5_6_TERRA: ["high"]},
+            },
+            "default must be included",
+        ),
+    ],
+)
+def test_project_config_reviewer_multi_agent_uses_same_validation(
+    tmp_path: Path,
+    field_name: str,
+    settings: object,
+    error_suffix: str,
+) -> None:
+    path = project_config_path(tmp_path)
+    path.parent.mkdir()
+    path.write_text(json.dumps({field_name: settings}), encoding="utf-8")
+
+    with pytest.raises(
+        ProjectConfigError,
+        match=rf"{field_name}\.{error_suffix}",
+    ):
+        load_project_config(tmp_path, create=False)
 
 
 def test_project_config_save_shape(tmp_path: Path) -> None:
@@ -118,9 +300,15 @@ def test_project_config_save_shape(tmp_path: Path) -> None:
     assert payload["max_completion_returns_before_adversary"] == 1
     assert payload["max_completion_returns_after_adversary"] == 0
     assert payload["cheap_runtime"] is True
+    assert payload["revision_coder_enabled"] is False
+    assert payload["revision_coder_mod"] == DEFAULT_MODEL
+    assert payload["revision_coder_intelligence"] == DEFAULT_INTELLIGENCE
     assert payload["runtime_mod"] == DEFAULT_MODEL
     assert payload["completion_mod"] == DEFAULT_MODEL
     assert payload["adversary_mod"] == DEFAULT_MODEL
+    assert payload["multi_agent"] == MultiAgentConfig().to_json_data()
+    assert payload["completion_multi_agent"] == MultiAgentConfig().to_json_data()
+    assert payload["adversary_multi_agent"] == MultiAgentConfig().to_json_data()
 
 
 def test_project_config_loads_runtime_config_shape(tmp_path: Path) -> None:
@@ -154,6 +342,9 @@ def test_project_config_loads_runtime_config_shape(tmp_path: Path) -> None:
     assert config.completion_mod == "gpt-supervisor"
     assert config.adversary_mod == DEFAULT_MODEL
     assert config.coder_intelligence == "low"
+    assert config.revision_coder_enabled is False
+    assert config.revision_coder_mod == "gpt-coder"
+    assert config.revision_coder_intelligence == "low"
     assert config.runtime_intelligence == "high"
     assert config.completion_intelligence == "high"
     assert config.adversary_intelligence == DEFAULT_INTELLIGENCE
@@ -227,6 +418,49 @@ def test_project_config_loads_independent_role_models_and_efforts(tmp_path: Path
     assert config.adversary_intelligence == "max"
 
 
+def test_project_config_loads_and_round_trips_revision_coder_profile(tmp_path: Path) -> None:
+    _write_config_payload(
+        tmp_path,
+        json.dumps(
+            {
+                "coder_mod": MODEL_GPT_5_6_SOL,
+                "coder_intelligence": "ultra",
+                "revision_coder_enabled": True,
+                "revision_coder_mod": MODEL_GPT_5_6_LUNA,
+                "revision_coder_intelligence": "xhigh",
+            }
+        ),
+    )
+
+    config = load_project_config(tmp_path, create=False)
+
+    assert config.revision_coder_enabled is True
+    assert config.revision_coder_mod == MODEL_GPT_5_6_LUNA
+    assert config.revision_coder_intelligence == "xhigh"
+    save_project_config(tmp_path, config)
+    runtime_config = StateStore(tmp_path).get_bello_config()
+    assert runtime_config.revision_coder_enabled is True
+    assert runtime_config.revision_coder_mod == MODEL_GPT_5_6_LUNA
+    assert runtime_config.revision_coder_intelligence == "xhigh"
+    assert runtime_config.revision_coder_active is False
+
+
+def test_project_config_rejects_unsupported_revision_coder_effort(tmp_path: Path) -> None:
+    _write_config_payload(
+        tmp_path,
+        json.dumps(
+            {
+                "revision_coder_enabled": True,
+                "revision_coder_mod": MODEL_GPT_5_6_LUNA,
+                "revision_coder_intelligence": "ultra",
+            }
+        ),
+    )
+
+    with pytest.raises(ProjectConfigError, match="revision_coder_intelligence"):
+        load_project_config(tmp_path, create=False)
+
+
 def test_config_initializes_supervisor_state_when_missing(tmp_path: Path) -> None:
     config = ProjectConfig(speed="fast", adversary=False)
 
@@ -245,6 +479,10 @@ def test_config_initializes_supervisor_state_when_missing(tmp_path: Path) -> Non
     assert runtime_config.max_completion_returns_before_adversary == 1
     assert runtime_config.max_completion_returns_after_adversary == 0
     assert runtime_config.cheap_runtime is True
+    assert runtime_config.revision_coder_enabled is False
+    assert runtime_config.revision_coder_mod == DEFAULT_MODEL
+    assert runtime_config.revision_coder_intelligence == DEFAULT_INTELLIGENCE
+    assert runtime_config.revision_coder_active is False
 
 
 def test_config_does_not_touch_existing_supervisor_state_by_default(tmp_path: Path) -> None:
@@ -311,6 +549,114 @@ def test_changed_project_config_fields_tracks_cheap_runtime() -> None:
     assert changed_project_config_fields(before, after) == ("cheap_runtime",)
 
 
+def test_changed_project_config_fields_tracks_multi_agent_as_one_structured_setting() -> None:
+    before = ProjectConfig()
+    after = ProjectConfig(multi_agent=MultiAgentConfig(enabled=True))
+
+    assert changed_project_config_fields(before, after) == ("multi_agent",)
+
+
+def test_changed_project_config_fields_tracks_reviewer_multi_agent_independently() -> None:
+    before = ProjectConfig()
+    completion_changed = ProjectConfig(
+        completion_multi_agent=MultiAgentConfig(enabled=True)
+    )
+    adversary_changed = ProjectConfig(
+        adversary_multi_agent=MultiAgentConfig(enabled=True)
+    )
+
+    assert changed_project_config_fields(before, completion_changed) == (
+        "completion_multi_agent",
+    )
+    assert changed_project_config_fields(before, adversary_changed) == (
+        "adversary_multi_agent",
+    )
+
+
+def test_reviewer_multi_agent_syncs_to_runtime_mirrors(tmp_path: Path) -> None:
+    store = StateStore(tmp_path)
+    store.write_json_locked(
+        CONFIG,
+        BelloConfig(project_root=str(tmp_path), task_path="TASK.md"),
+    )
+    completion = MultiAgentConfig(enabled=True, max_concurrent=2)
+    adversary = MultiAgentConfig(
+        enabled=True,
+        max_concurrent=5,
+        default=SubagentDefaultConfig(MODEL_GPT_5_6_TERRA, "high"),
+        allowed={MODEL_GPT_5_6_TERRA: ("high",)},
+    )
+    config = ProjectConfig(
+        completion_multi_agent=completion,
+        adversary_multi_agent=adversary,
+    )
+
+    sync_runtime_config_fields(
+        tmp_path,
+        config,
+        ("completion_multi_agent", "adversary_multi_agent"),
+    )
+
+    runtime_config = store.get_bello_config()
+    assert runtime_config.multi_agent == MultiAgentConfig().to_json_data()
+    assert runtime_config.completion_multi_agent == completion.to_json_data()
+    assert runtime_config.adversary_multi_agent == adversary.to_json_data()
+
+
+def test_revision_coder_config_sync_preserves_runtime_owned_active_state(tmp_path: Path) -> None:
+    store = StateStore(tmp_path)
+    store.write_json_locked(
+        CONFIG,
+        BelloConfig(
+            project_root=str(tmp_path),
+            task_path="TASK.md",
+            generation=4,
+            coder_thread_id="revision-thread",
+            active_coder_turn_id="revision-turn",
+            revision_coder_active=True,
+        ),
+    )
+    config = ProjectConfig(
+        revision_coder_enabled=True,
+        revision_coder_mod=MODEL_GPT_5_6_LUNA,
+        revision_coder_intelligence="xhigh",
+    )
+
+    sync_runtime_config_fields(
+        tmp_path,
+        config,
+        (
+            "revision_coder_enabled",
+            "revision_coder_mod",
+            "revision_coder_intelligence",
+        ),
+    )
+
+    runtime_config = store.get_bello_config()
+    assert runtime_config.revision_coder_enabled is True
+    assert runtime_config.revision_coder_mod == MODEL_GPT_5_6_LUNA
+    assert runtime_config.revision_coder_intelligence == "xhigh"
+    assert runtime_config.revision_coder_active is True
+    assert runtime_config.generation == 4
+    assert runtime_config.coder_thread_id == "revision-thread"
+    assert runtime_config.active_coder_turn_id == "revision-turn"
+
+
+def test_changed_project_config_fields_tracks_revision_coder_settings() -> None:
+    before = ProjectConfig()
+    after = ProjectConfig(
+        revision_coder_enabled=True,
+        revision_coder_mod=MODEL_GPT_5_6_LUNA,
+        revision_coder_intelligence="high",
+    )
+
+    assert changed_project_config_fields(before, after) == (
+        "revision_coder_enabled",
+        "revision_coder_mod",
+        "revision_coder_intelligence",
+    )
+
+
 def test_config_editor_state_expands_selects_and_advances() -> None:
     config = ProjectConfig()
     params = parameter_defs(config)
@@ -366,6 +712,68 @@ def test_config_editor_choice_can_update_boolean() -> None:
     assert action is None
     assert config.clean is True
     assert state.parameter_index == clean_index + 1
+
+
+def test_config_editor_multi_agent_toggle_reveals_structured_settings() -> None:
+    config = ProjectConfig()
+    parameters = parameter_defs(config)
+    toggle_index = [parameter.key for parameter in parameters].index("multi_agent_enabled")
+
+    config, state, action = select_current(
+        config,
+        EditorState(parameter_index=toggle_index, expanded_index=toggle_index, option_index=0),
+    )
+
+    assert action is None
+    assert config.multi_agent.enabled is True
+    updated = parameter_defs(config)
+    assert "multi_agent_max_concurrent" in {parameter.key for parameter in updated}
+    assert updated[state.parameter_index].key == "multi_agent_max_concurrent"
+
+
+def test_config_editor_multi_agent_max_concurrent_requires_positive_integer() -> None:
+    config = ProjectConfig(multi_agent=MultiAgentConfig(enabled=True))
+    parameters = parameter_defs(config)
+    max_index = [parameter.key for parameter in parameters].index("multi_agent_max_concurrent")
+
+    config, state, _ = select_current(config, EditorState(parameter_index=max_index))
+    assert state.edit_kind == "positive_int"
+    assert state.edit_value == "4"
+
+    config, state, _ = select_current(config, replace(state, edit_value="0"))
+    assert config.multi_agent.max_concurrent == 4
+    assert state.edit_error == "enter a positive integer"
+
+    config, state, _ = select_current(config, replace(state, edit_value="6"))
+    assert config.multi_agent.max_concurrent == 6
+    assert state.editing is False
+
+
+def test_config_editor_toggles_allowed_efforts_but_protects_default() -> None:
+    config = ProjectConfig(multi_agent=MultiAgentConfig(enabled=True))
+    parameters = parameter_defs(config)
+    allowed_key = f"multi_agent_allowed:{MODEL_GPT_5_6_LUNA}"
+    allowed_index = [parameter.key for parameter in parameters].index(allowed_key)
+    allowed_parameter = parameters[allowed_index]
+    low_index = [option.label for option in allowed_parameter.options].index("low")
+
+    config, state, _ = select_current(
+        config,
+        EditorState(parameter_index=allowed_index, expanded_index=allowed_index, option_index=low_index),
+    )
+
+    assert config.multi_agent.allowed[MODEL_GPT_5_6_LUNA] == ("low", "medium", "high", "xhigh")
+    assert parameter_defs(config)[state.parameter_index].key == allowed_key
+    assert state.expanded_index == state.parameter_index
+
+    parameters = parameter_defs(config)
+    allowed_index = [parameter.key for parameter in parameters].index(allowed_key)
+    high_index = [option.label for option in parameters[allowed_index].options].index("high")
+    unchanged, _, _ = select_current(
+        config,
+        EditorState(parameter_index=allowed_index, expanded_index=allowed_index, option_index=high_index),
+    )
+    assert unchanged == config
 
 
 def test_config_editor_can_disable_cheap_runtime() -> None:
@@ -581,6 +989,25 @@ def test_config_editor_switching_variants_clamps_incompatible_reasoning() -> Non
     assert [option.label for option in coder_effort.options] == ["low", "medium", "high", "xhigh", "max"]
 
 
+def test_config_editor_switching_revision_variant_clamps_incompatible_reasoning() -> None:
+    config = ProjectConfig(
+        revision_coder_enabled=True,
+        revision_coder_mod=MODEL_GPT_5_6_SOL,
+        revision_coder_intelligence="ultra",
+    )
+    params = parameter_defs(config)
+    variant_index = [param.key for param in params].index("revision_coder_mod_variant")
+    luna_index = [option.label for option in params[variant_index].options].index("Luna")
+
+    config, _state, _action = select_current(
+        config,
+        EditorState(parameter_index=variant_index, expanded_index=variant_index, option_index=luna_index),
+    )
+
+    assert config.revision_coder_mod == MODEL_GPT_5_6_LUNA
+    assert config.revision_coder_intelligence == "max"
+
+
 def test_config_editor_switching_to_gpt_55_hides_variant_and_clamps_reasoning() -> None:
     config = ProjectConfig(coder_mod=MODEL_GPT_5_6_SOL, coder_intelligence="ultra")
     params = parameter_defs(config)
@@ -599,7 +1026,7 @@ def test_config_editor_switching_to_gpt_55_hides_variant_and_clamps_reasoning() 
 
 def test_available_model_choices_falls_back_to_codex_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr("supervisor.config_editor._available_models_from_app_server", lambda project_root: ())
-    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     cache = tmp_path / ".codex" / "models_cache.json"
     cache.parent.mkdir()
     cache.write_text(
@@ -655,6 +1082,7 @@ def test_config_command_invokes_editor(monkeypatch: pytest.MonkeyPatch, tmp_path
 
     assert result.exit_code == 0
     assert "Saved Bello config:" in result.output
+    assert "revision-coder: off" in result.output
     assert "coder-mod: gpt-coder" in result.output
     assert f"runtime-mod: {DEFAULT_MODEL}" in result.output
     assert f"completion-mod: {DEFAULT_MODEL}" in result.output

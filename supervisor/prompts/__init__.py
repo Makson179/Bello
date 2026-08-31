@@ -6,6 +6,7 @@ from supervisor.prompts.supervisor import (
     build_completion_review_prompt,
     build_coder_prompt,
     build_restart_prompt,
+    build_revision_prompt,
     build_stateless_supervisor_prompt,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "build_completion_review_prompt",
     "build_coder_prompt",
     "build_restart_prompt",
+    "build_revision_prompt",
     "build_stateless_supervisor_prompt",
 ]

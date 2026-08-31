@@ -5,11 +5,24 @@ import json
 import os
 import shutil
 import signal
+import stat
+import subprocess
 import tempfile
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from supervisor.filesystem_safety import (
+    is_link_or_reparse,
+    remove_path_tree,
+    windows_path_component_issue,
+)
+from supervisor.executables import (
+    ExecutableResolutionError,
+    require_trusted_executable,
+    windows_system_executable,
+)
 
 CODEX_NO_WEB_SEARCH_CONFIG_FLAGS = ["-c", 'web_search="disabled"']
 
@@ -82,6 +95,211 @@ APP_SERVER_PREFLIGHT_RPC_TIMEOUT_SECONDS = 30.0
 APP_SERVER_RESPOND_TIMEOUT_SECONDS = 15.0
 APP_SERVER_CLEANUP_RPC_TIMEOUT_SECONDS = 10.0
 APP_SERVER_CODER_RPC_TIMEOUT_SECONDS = 3600.0
+APP_SERVER_PROCESS_EXIT_TIMEOUT_SECONDS = 3.0
+
+_IS_WINDOWS = os.name == "nt"
+_WINDOWS_CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+_WINDOWS_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+_WINDOWS_CREATE_SUSPENDED = getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
+_WINDOWS_CTRL_BREAK_EVENT = getattr(signal, "CTRL_BREAK_EVENT", 1)
+_WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_CLOSE = 0x00002000
+
+
+def _app_server_process_kwargs() -> dict[str, Any]:
+    if _IS_WINDOWS:
+        return {"creationflags": _WINDOWS_CREATE_NEW_PROCESS_GROUP | _WINDOWS_CREATE_SUSPENDED}
+    return {"start_new_session": True}
+
+
+def _app_server_command(
+    command: list[str],
+    *,
+    cwd: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> list[str]:
+    if not _IS_WINDOWS or not command:
+        return command
+    try:
+        executable = require_trusted_executable(
+            command[0],
+            cwd=cwd or Path.cwd(),
+            environ=environ,
+            windows=True,
+        )
+    except ExecutableResolutionError as exc:
+        raise AppServerError(str(exc)) from exc
+    return [executable, *command[1:]]
+
+
+def _resume_windows_process(pid: int) -> None:
+    """Resume a process created with CREATE_SUSPENDED after job assignment."""
+
+    if not _IS_WINDOWS:  # pragma: no cover - guarded by AppServerClient.start
+        raise RuntimeError("Windows thread APIs are unavailable on this platform")
+
+    import ctypes
+    from ctypes import wintypes
+
+    class _ThreadEntry32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ThreadID", wintypes.DWORD),
+            ("th32OwnerProcessID", wintypes.DWORD),
+            ("tpBasePri", wintypes.LONG),
+            ("tpDeltaPri", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32)]
+    kernel32.Thread32First.restype = wintypes.BOOL
+    kernel32.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32)]
+    kernel32.Thread32Next.restype = wintypes.BOOL
+    kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenThread.restype = wintypes.HANDLE
+    kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+    kernel32.ResumeThread.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000004, 0)
+    if snapshot == wintypes.HANDLE(-1).value:
+        _raise_windows_api_error(ctypes, "enumerating suspended app-server threads")
+    resumed = False
+    try:
+        entry = _ThreadEntry32()
+        entry.dwSize = ctypes.sizeof(entry)
+        has_entry = bool(kernel32.Thread32First(snapshot, ctypes.byref(entry)))
+        while has_entry:
+            if entry.th32OwnerProcessID == pid:
+                thread = kernel32.OpenThread(0x0002, False, entry.th32ThreadID)
+                if not thread:
+                    _raise_windows_api_error(ctypes, "opening suspended app-server thread")
+                try:
+                    previous_suspend_count = kernel32.ResumeThread(thread)
+                    if previous_suspend_count == 0xFFFFFFFF:
+                        _raise_windows_api_error(ctypes, "resuming app-server process")
+                    resumed = resumed or previous_suspend_count > 0
+                finally:
+                    kernel32.CloseHandle(thread)
+            has_entry = bool(kernel32.Thread32Next(snapshot, ctypes.byref(entry)))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    if not resumed:
+        raise ProcessLookupError(f"could not find a suspended primary thread for app-server process {pid}")
+
+
+def _raise_windows_api_error(ctypes_module: Any, action: str) -> None:
+    error = ctypes_module.get_last_error()
+    raise OSError(error, f"Windows error while {action}: {ctypes_module.FormatError(error).strip()}")
+
+
+class _WindowsKillJob:
+    """A Windows Job Object that kills the entire child tree when closed."""
+
+    def __init__(self, handle: Any, kernel32: Any):
+        self._handle = handle
+        self._kernel32 = kernel32
+
+    @classmethod
+    def create(cls, pid: int) -> "_WindowsKillJob":
+        if not _IS_WINDOWS:  # pragma: no cover - guarded by AppServerClient.start
+            raise RuntimeError("Windows Job Objects are unavailable on this platform")
+
+        import ctypes
+        from ctypes import wintypes
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class _BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BasicLimitInformation),
+                ("IoInfo", _IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        job_handle = kernel32.CreateJobObjectW(None, None)
+        if not job_handle:
+            cls._raise_last_windows_error(ctypes, "creating app-server cleanup job")
+        try:
+            limits = _ExtendedLimitInformation()
+            limits.BasicLimitInformation.LimitFlags = _WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_CLOSE
+            if not kernel32.SetInformationJobObject(job_handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+                cls._raise_last_windows_error(ctypes, "configuring app-server cleanup job")
+
+            # AssignProcessToJobObject requires PROCESS_TERMINATE and
+            # PROCESS_SET_QUOTA.  Opening a separate handle avoids depending
+            # on asyncio/subprocess implementation details.
+            process_handle = kernel32.OpenProcess(0x0001 | 0x0100, False, pid)
+            if not process_handle:
+                cls._raise_last_windows_error(ctypes, "opening app-server process")
+            try:
+                if not kernel32.AssignProcessToJobObject(job_handle, process_handle):
+                    cls._raise_last_windows_error(ctypes, "assigning app-server cleanup job")
+            finally:
+                kernel32.CloseHandle(process_handle)
+        except BaseException:
+            kernel32.CloseHandle(job_handle)
+            raise
+        return cls(job_handle, kernel32)
+
+    @staticmethod
+    def _raise_last_windows_error(ctypes_module: Any, action: str) -> None:
+        _raise_windows_api_error(ctypes_module, action)
+
+    def close(self) -> None:
+        if self._handle is None:
+            return
+        handle = self._handle
+        self._handle = None
+        if not self._kernel32.CloseHandle(handle):
+            import ctypes
+
+            self._raise_last_windows_error(ctypes, "closing app-server cleanup job")
 
 
 class AppServerClient:
@@ -110,33 +328,53 @@ class AppServerClient:
         self.incoming: asyncio.Queue[AppServerMessage] = asyncio.Queue()
         self.reader_error: BaseException | None = None
         self._isolated_codex_home: Path | None = None
+        self._process_group_id: int | None = None
+        self._windows_job: _WindowsKillJob | None = None
 
-    async def start(self) -> None:
+    async def start(self, *, reuse_isolated_codex_home: bool = False) -> None:
         if self.process is not None:
             return
         env = _app_server_environment()
+        resolved_command = _app_server_command(self.command, cwd=self.cwd, environ=env)
         source_codex_home = _codex_home_from_environment(env)
-        if source_codex_home.is_dir():
+        if reuse_isolated_codex_home:
+            isolated = self._isolated_codex_home
+            if isolated is None or not isolated.is_dir():
+                raise AppServerError(
+                    "cannot restart app-server: isolated CODEX_HOME is unavailable"
+                )
+            env["CODEX_HOME"] = str(isolated)
+        elif source_codex_home.is_dir():
             self._isolated_codex_home = _create_isolated_codex_home(source_codex_home)
             env["CODEX_HOME"] = str(self._isolated_codex_home)
         try:
             self.process = await asyncio.create_subprocess_exec(
-                *self.command,
+                *resolved_command,
                 cwd=str(self.cwd) if self.cwd else None,
                 env=env,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=self.stdout_limit,
-                start_new_session=True,
+                **_app_server_process_kwargs(),
             )
+            if _IS_WINDOWS:
+                self._windows_job = _WindowsKillJob.create(self.process.pid)
+                _resume_windows_process(self.process.pid)
+            else:
+                # start_new_session makes the app-server PID its process-group
+                # ID.  Save it now so descendants can still be killed after
+                # the direct child has already exited.
+                self._process_group_id = self.process.pid
         except BaseException:
-            self._cleanup_isolated_codex_home()
+            await self._abort_failed_start()
+            if not reuse_isolated_codex_home:
+                self._cleanup_isolated_codex_home()
             raise
         self._reader_task = asyncio.create_task(self._read_loop())
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
-    async def stop(self) -> None:
+    async def stop(self, *, preserve_isolated_codex_home: bool = False) -> None:
         try:
             if self._reader_task:
                 self._reader_task.cancel()
@@ -154,41 +392,167 @@ class AppServerClient:
                 self._stderr_task = None
             if self.process:
                 if self.process.returncode is None:
-                    self._terminate_process_group(signal.SIGTERM)
+                    self._request_process_tree_shutdown()
                     try:
-                        await asyncio.wait_for(self.process.wait(), timeout=3)
+                        await asyncio.wait_for(
+                            self.process.wait(),
+                            timeout=APP_SERVER_PROCESS_EXIT_TIMEOUT_SECONDS,
+                        )
                     except asyncio.TimeoutError:
-                        self._terminate_process_group(signal.SIGKILL)
+                        self._force_process_tree_shutdown()
                         await self.process.wait()
-                self.process = None
         finally:
-            self._cleanup_isolated_codex_home()
+            # A graceful app-server exit does not prove its descendants also
+            # exited.  Force-clean the saved POSIX group or close the Windows
+            # kill-on-close Job Object before dropping our process reference.
+            self._force_process_tree_shutdown()
+            self.process = None
+            self._process_group_id = None
+            if not preserve_isolated_codex_home:
+                self._cleanup_isolated_codex_home()
+
+    async def restart(self) -> None:
+        """Replace a failed transport while preserving persisted Codex threads.
+
+        The isolated CODEX_HOME contains links (or Windows copies) of the user's
+        persistent Codex state. Removing that temporary directory does not remove
+        thread rollouts from the source CODEX_HOME, so a subsequent app-server can
+        rejoin them with ``thread/resume``.
+        """
+
+        # Codex persists the rollout path with the isolated CODEX_HOME prefix.
+        # Keep that directory across the transport replacement so thread/resume
+        # can still resolve the exact rollout instead of falling back to a new
+        # coder thread. A later normal stop removes it.
+        await self.stop(preserve_isolated_codex_home=True)
+        restart_error = AppServerError("app-server transport restarted")
+        for pending_future in list(self._pending.values()):
+            if not pending_future.done():
+                pending_future.set_exception(restart_error)
+        for _, waiter_future in list(self._waiters):
+            if not waiter_future.done():
+                waiter_future.set_exception(restart_error)
+        self._pending.clear()
+        self._waiters.clear()
+        self.incoming = asyncio.Queue()
+        self.reader_error = None
+        await self.start(reuse_isolated_codex_home=True)
 
     def _cleanup_isolated_codex_home(self) -> None:
         if self._isolated_codex_home is None:
             return
-        shutil.rmtree(self._isolated_codex_home, ignore_errors=True)
+        isolated = self._isolated_codex_home
+        _remove_codex_home_tree(isolated)
+        if isolated.exists() or isolated.is_symlink():
+            raise AppServerError(f"failed to remove isolated CODEX_HOME: {isolated}")
         self._isolated_codex_home = None
 
-    def _terminate_process_group(self, sig: int) -> None:
+    async def _abort_failed_start(self) -> None:
+        process = self.process
+        if process is None:
+            return
+        self._force_process_tree_shutdown()
+        if process.returncode is None:
+            try:
+                await asyncio.wait_for(
+                    process.wait(),
+                    timeout=APP_SERVER_PROCESS_EXIT_TIMEOUT_SECONDS,
+                )
+            except (asyncio.TimeoutError, ProcessLookupError):
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+        self.process = None
+        self._process_group_id = None
+
+    def _request_process_tree_shutdown(self) -> None:
         process = self.process
         if process is None or process.returncode is not None:
             return
+        if _IS_WINDOWS:
+            try:
+                process.send_signal(_WINDOWS_CTRL_BREAK_EVENT)
+            except (OSError, ValueError):
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+            return
+        self._signal_posix_process_group(signal.SIGTERM)
+
+    def _force_process_tree_shutdown(self) -> None:
+        process = self.process
+        if _IS_WINDOWS:
+            job = self._windows_job
+            self._windows_job = None
+            if job is not None:
+                try:
+                    job.close()
+                    return
+                except OSError:
+                    # Fall through to taskkill if closing the kernel handle
+                    # unexpectedly fails.
+                    pass
+            if process is not None and process.returncode is None:
+                self._force_windows_process_tree_without_job(process)
+            return
+        self._signal_posix_process_group(signal.SIGKILL)
+
+    def _signal_posix_process_group(self, sig: int) -> None:
+        process = self.process
+        if process is None:
+            return
+        group_id = self._process_group_id
+        if group_id is None and process.returncode is None:
+            group_id = process.pid
         try:
-            os.killpg(os.getpgid(process.pid), sig)
+            if group_id is None:
+                return
+            os.killpg(group_id, sig)
         except ProcessLookupError:
             return
-        except Exception:
-            if sig == signal.SIGTERM:
-                process.terminate()
-            else:
+        except OSError:
+            if process.returncode is not None:
+                return
+            try:
+                if sig == signal.SIGTERM:
+                    process.terminate()
+                else:
+                    process.kill()
+            except ProcessLookupError:
+                pass
+
+    @staticmethod
+    def _force_windows_process_tree_without_job(process: asyncio.subprocess.Process) -> None:
+        # This is a fail-safe for the narrow window where process creation
+        # succeeded but Job Object assignment did not.  Normal Windows cleanup
+        # closes the Job Object and never launches taskkill.
+        try:
+            taskkill = windows_system_executable("taskkill.exe")
+            subprocess.run(
+                [taskkill, "/PID", str(process.pid), "/T", "/F"],
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                creationflags=_WINDOWS_CREATE_NO_WINDOW,
+            )
+        except (ExecutableResolutionError, OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+        if process.returncode is None:
+            try:
                 process.kill()
+            except ProcessLookupError:
+                pass
 
     async def initialize(self, *, timeout: float = APP_SERVER_PREFLIGHT_RPC_TIMEOUT_SECONDS) -> dict[str, Any]:
         result = await self.request(
             "initialize",
             {
-                "clientInfo": {"name": "bello", "title": "Bello", "version": "0.4.1"},
+                "clientInfo": {"name": "bello", "title": "Bello", "version": "0.5.0"},
                 "capabilities": {"experimentalApi": True, "requestAttestation": False},
             },
             timeout=timeout,
@@ -300,17 +664,36 @@ class AppServerClient:
     ) -> dict[str, Any]:
         return await self.request("thread/read", {"threadId": thread_id, "includeTurns": include_turns}, timeout=timeout)
 
+    async def thread_list(
+        self,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float = APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        return await self.request("thread/list", dict(params or {}), timeout=timeout)
+
     async def thread_turns_list(
         self,
         thread_id: str,
         *,
         limit: int = 10,
         items_view: str = "full",
+        cursor: str | None = None,
+        sort_direction: str | None = None,
         timeout: float = APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "limit": limit,
+            "itemsView": items_view,
+        }
+        if cursor is not None:
+            params["cursor"] = cursor
+        if sort_direction is not None:
+            params["sortDirection"] = sort_direction
         return await self.request(
             "thread/turns/list",
-            {"threadId": thread_id, "limit": limit, "itemsView": items_view},
+            params,
             timeout=timeout,
         )
 
@@ -479,24 +862,154 @@ def _app_server_environment(environ: Mapping[str, str] | None = None) -> dict[st
 def _codex_home_from_environment(environ: Mapping[str, str]) -> Path:
     configured = environ.get("CODEX_HOME")
     if configured:
-        return Path(configured).expanduser().resolve(strict=False)
-    home = Path(environ.get("HOME") or Path.home()).expanduser()
-    return (home / ".codex").resolve(strict=False)
+        # Keep the lexical entry until `_create_isolated_codex_home` has
+        # inspected it.  Resolving here would erase a root junction/symlink
+        # before the native-Windows reparse check can reject it.
+        return Path(configured).expanduser().absolute()
+    if _IS_WINDOWS:
+        windows_profile = environ.get("USERPROFILE")
+        if not windows_profile and environ.get("HOMEDRIVE") and environ.get("HOMEPATH"):
+            windows_profile = environ["HOMEDRIVE"] + environ["HOMEPATH"]
+        home = Path(windows_profile or Path.home()).expanduser()
+    else:
+        home = Path(environ.get("HOME") or Path.home()).expanduser()
+    return (home / ".codex").absolute()
 
 
 def _create_isolated_codex_home(source: Path) -> Path:
-    source = source.resolve(strict=True)
+    lexical_source = source.expanduser().absolute()
+    if _IS_WINDOWS and is_link_or_reparse(lexical_source):
+        raise AppServerError(
+            f"native Windows CODEX_HOME cannot be a symlink, junction, or reparse point: {source}"
+        )
+    source = lexical_source.resolve(strict=True)
+    if not source.is_dir():
+        raise AppServerError(f"CODEX_HOME is not a directory: {source}")
     isolated = Path(tempfile.mkdtemp(prefix="bello-codex-home-")).resolve()
     try:
-        for child in source.iterdir():
-            if child.name == "rules":
+        children = list(source.iterdir())
+        if _IS_WINDOWS:
+            _validate_windows_codex_home_names(source, [child.name for child in children])
+        for child in children:
+            if child.name == "rules" or (_IS_WINDOWS and child.name.casefold() == "rules"):
                 continue
-            os.symlink(str(child), isolated / child.name, target_is_directory=child.is_dir())
+            destination = isolated / child.name
+            if _IS_WINDOWS:
+                _copy_windows_codex_home_entry(child, destination)
+            else:
+                os.symlink(str(child), destination, target_is_directory=child.is_dir())
         (isolated / "rules").mkdir(mode=0o700)
         return isolated
     except BaseException:
-        shutil.rmtree(isolated, ignore_errors=True)
+        try:
+            _remove_codex_home_tree(isolated)
+        except OSError:
+            pass
         raise
+
+
+def _validate_windows_codex_home_names(directory: Path, names: list[str]) -> None:
+    seen: dict[str, str] = {}
+    for name in names:
+        if issue := windows_path_component_issue(name):
+            raise AppServerError(f"unsafe Windows CODEX_HOME path {directory / name}: {issue}")
+        key = name.casefold()
+        previous = seen.get(key)
+        if previous is not None and previous != name:
+            raise AppServerError(
+                f"Windows CODEX_HOME contains case-colliding names: {previous!r} and {name!r}"
+            )
+        seen[key] = name
+
+
+def _copy_windows_codex_home_entry(source: Path, destination: Path) -> None:
+    _validate_windows_codex_home_entry(source)
+    metadata = source.lstat()
+    metadata = _assert_stable_codex_entry(
+        source, metadata, require_directory=stat.S_ISDIR(metadata.st_mode)
+    )
+    if stat.S_ISDIR(metadata.st_mode):
+        shutil.copytree(source, destination, symlinks=False, copy_function=shutil.copy2)
+        _assert_stable_codex_entry(source, metadata, require_directory=True)
+        _validate_windows_codex_home_entry(destination)
+        _make_codex_home_copy_writable(destination)
+        return
+    if stat.S_ISREG(metadata.st_mode):
+        shutil.copy2(source, destination, follow_symlinks=False)
+        _assert_stable_codex_entry(source, metadata, require_directory=False)
+        _validate_windows_codex_home_entry(destination)
+        _make_codex_home_copy_writable(destination)
+        return
+    raise AppServerError(f"unsupported Windows CODEX_HOME entry: {source}")
+
+
+def _validate_windows_codex_home_entry(source: Path) -> None:
+    metadata = source.lstat()
+    if is_link_or_reparse(source, stat_result=metadata):
+        raise AppServerError(
+            "native Windows isolated CODEX_HOME refuses symlinks, junctions, mount points, "
+            f"and other reparse entries: {source}"
+        )
+    if stat.S_ISREG(metadata.st_mode):
+        _assert_stable_codex_entry(source, metadata, require_directory=False)
+        return
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise AppServerError(f"unsupported Windows CODEX_HOME entry: {source}")
+    metadata = _assert_stable_codex_entry(source, metadata, require_directory=True)
+    children = list(source.iterdir())
+    metadata = _assert_stable_codex_entry(source, metadata, require_directory=True)
+    _validate_windows_codex_home_names(source, [child.name for child in children])
+    for child in children:
+        _assert_stable_codex_entry(source, metadata, require_directory=True)
+        _validate_windows_codex_home_entry(child)
+    _assert_stable_codex_entry(source, metadata, require_directory=True)
+
+
+def _make_codex_home_copy_writable(path: Path) -> None:
+    metadata = path.lstat()
+    if is_link_or_reparse(path, stat_result=metadata):
+        raise AppServerError(f"isolated CODEX_HOME copy unexpectedly contains a link: {path}")
+    if _IS_WINDOWS and stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
+        raise AppServerError(
+            f"isolated CODEX_HOME copy unexpectedly contains a hardlinked file: {path}"
+        )
+    permissions = stat.S_IMODE(metadata.st_mode) | stat.S_IRUSR | stat.S_IWUSR
+    if stat.S_ISDIR(metadata.st_mode):
+        permissions |= stat.S_IXUSR
+        metadata = _assert_stable_codex_entry(path, metadata, require_directory=True)
+        os.chmod(path, permissions)
+        metadata = _assert_stable_codex_entry(path, metadata, require_directory=True)
+        children = list(path.iterdir())
+        metadata = _assert_stable_codex_entry(path, metadata, require_directory=True)
+        for child in children:
+            _assert_stable_codex_entry(path, metadata, require_directory=True)
+            _make_codex_home_copy_writable(child)
+        return
+    _assert_stable_codex_entry(path, metadata, require_directory=False)
+    os.chmod(path, permissions)
+
+
+def _remove_codex_home_tree(path: Path) -> None:
+    remove_path_tree(path)
+
+
+def _assert_stable_codex_entry(
+    path: Path,
+    expected: os.stat_result,
+    *,
+    require_directory: bool,
+) -> os.stat_result:
+    current = path.lstat()
+    if (
+        is_link_or_reparse(path, stat_result=current)
+        or stat.S_IFMT(current.st_mode) != stat.S_IFMT(expected.st_mode)
+        or (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino)
+        or require_directory != stat.S_ISDIR(current.st_mode)
+    ):
+        raise AppServerError(
+            f"CODEX_HOME entry changed or was redirected during isolated copy/cleanup: {path}"
+        )
+    return current
 
 
 def last_agent_message_text(turn: dict[str, Any]) -> str | None:

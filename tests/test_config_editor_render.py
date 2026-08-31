@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import supervisor.config_editor as config_editor_module
 from supervisor.config_editor import (
     ULTRA_WAVE_BACKGROUNDS,
     EditorState,
@@ -13,13 +14,22 @@ from supervisor.config_editor import (
     WidthUtils,
     parameter_defs,
     render_editor,
+    select_current,
 )
-from supervisor.project_config import MODEL_GPT_5_5, MODEL_GPT_5_6_LUNA, MODEL_GPT_5_6_SOL, MODEL_GPT_5_6_TERRA, ProjectConfig
+from supervisor.project_config import (
+    MODEL_GPT_5_5,
+    MODEL_GPT_5_6_LUNA,
+    MODEL_GPT_5_6_SOL,
+    MODEL_GPT_5_6_TERRA,
+    MultiAgentConfig,
+    ProjectConfig,
+)
 
 
 @pytest.fixture(autouse=True)
 def _default_unicode_symbols(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("BELLO_CONFIG_ASCII", raising=False)
+    monkeypatch.setattr(config_editor_module, "_terminal_supports_unicode", lambda: True)
 
 
 def _render(
@@ -209,7 +219,13 @@ def test_config_editor_default_surface_is_everyday() -> None:
 
     assert next(param for param in params if param.key == "completion_review").value == "false"
     assert next(param for param in params if param.key == "start_over").value == "false"
-    assert {"coder_mod", "runtime_mod", "cheap_runtime", "completion_review"}.issubset(keys)
+    assert {
+        "coder_mod",
+        "revision_coder_enabled",
+        "runtime_mod",
+        "cheap_runtime",
+        "completion_review",
+    }.issubset(keys)
     assert {
         "completion_mod",
         "completion_intelligence",
@@ -220,6 +236,32 @@ def test_config_editor_default_surface_is_everyday() -> None:
         "completion_returns_before_adversary",
         "completion_returns_after_adversary",
     }.isdisjoint(keys)
+
+
+def test_config_editor_hides_revision_profile_until_enabled() -> None:
+    disabled = ProjectConfig()
+    disabled_keys = {parameter.key for parameter in parameter_defs(disabled)}
+
+    assert "revision_coder_enabled" in disabled_keys
+    assert "revision_coder_mod" not in disabled_keys
+    assert "revision_coder_intelligence" not in disabled_keys
+
+    enabled = ProjectConfig(
+        revision_coder_enabled=True,
+        revision_coder_mod=MODEL_GPT_5_6_LUNA,
+        revision_coder_intelligence="xhigh",
+    )
+    enabled_parameters = parameter_defs(enabled)
+    enabled_keys = {parameter.key for parameter in enabled_parameters}
+
+    assert "revision_coder_mod" in enabled_keys
+    assert "revision_coder_mod_variant" in enabled_keys
+    assert "revision_coder_intelligence" in enabled_keys
+    assert next(
+        parameter.value
+        for parameter in enabled_parameters
+        if parameter.key == "revision_coder_intelligence"
+    ) == "xhigh"
 
 
 def test_config_editor_hides_only_adversary_dependencies_when_adversary_is_disabled() -> None:
@@ -307,6 +349,233 @@ def test_config_editor_render_has_independent_rows_for_all_agent_roles() -> None
         assert f"{role}-mod" in output
         assert f"{role}-5.6-variant" in output
         assert f"{role}-intelligence" in output
+
+
+def test_config_editor_hides_multi_agent_details_until_enabled() -> None:
+    disabled = ProjectConfig()
+    disabled_keys = {parameter.key for parameter in parameter_defs(disabled)}
+
+    assert "multi_agent_enabled" in disabled_keys
+    assert "multi_agent_max_concurrent" not in disabled_keys
+    assert not any(key.startswith("multi_agent_allowed:") for key in disabled_keys)
+
+    enabled = ProjectConfig(multi_agent=MultiAgentConfig(enabled=True))
+    enabled_parameters = parameter_defs(enabled)
+    enabled_keys = {parameter.key for parameter in enabled_parameters}
+
+    assert "multi_agent_max_concurrent" in enabled_keys
+    assert "multi_agent_default_model" in enabled_keys
+    assert "multi_agent_default_model_variant" in enabled_keys
+    assert "multi_agent_default_intelligence" in enabled_keys
+    assert f"multi_agent_allowed:{MODEL_GPT_5_6_LUNA}" in enabled_keys
+    assert f"multi_agent_allowed:{MODEL_GPT_5_6_TERRA}" in enabled_keys
+
+
+def test_config_editor_multi_agent_allowed_row_is_a_model_to_efforts_toggle() -> None:
+    config = ProjectConfig(multi_agent=MultiAgentConfig(enabled=True))
+    parameters = parameter_defs(config)
+    allowed_key = f"multi_agent_allowed:{MODEL_GPT_5_6_LUNA}"
+    allowed_index = [parameter.key for parameter in parameters].index(allowed_key)
+    output = _render(
+        config,
+        EditorState(parameter_index=allowed_index, expanded_index=allowed_index),
+        width=120,
+        height=24,
+    )
+
+    assert "subagent-allowed-Luna" in output
+    assert "medium, high, xhigh" in output
+    assert "low" in output
+    assert "max" in output
+
+
+def test_config_editor_reviewer_multi_agent_controls_follow_active_review_stages() -> None:
+    runtime_only_keys = {parameter.key for parameter in parameter_defs(ProjectConfig())}
+
+    assert "completion_multi_agent_enabled" not in runtime_only_keys
+    assert "adversary_multi_agent_enabled" not in runtime_only_keys
+
+    completion_only = ProjectConfig(completion_review=True, adversary=False)
+    completion_only_keys = {parameter.key for parameter in parameter_defs(completion_only)}
+
+    assert "completion_multi_agent_enabled" in completion_only_keys
+    assert "completion_multi_agent_max_concurrent" not in completion_only_keys
+    assert "adversary_multi_agent_enabled" not in completion_only_keys
+
+    completion_and_adversary = ProjectConfig(completion_review=True, adversary=True)
+    active_keys = {parameter.key for parameter in parameter_defs(completion_and_adversary)}
+
+    assert "completion_multi_agent_enabled" in active_keys
+    assert "adversary_multi_agent_enabled" in active_keys
+    assert "completion_multi_agent_max_concurrent" not in active_keys
+    assert "adversary_multi_agent_max_concurrent" not in active_keys
+
+
+def test_config_editor_reviewer_multi_agent_details_are_independent() -> None:
+    config = ProjectConfig(
+        completion_review=True,
+        adversary=True,
+        completion_multi_agent=MultiAgentConfig(enabled=True),
+        adversary_multi_agent=MultiAgentConfig(enabled=False),
+    )
+    completion_keys = {parameter.key for parameter in parameter_defs(config)}
+
+    assert "completion_multi_agent_max_concurrent" in completion_keys
+    assert "completion_multi_agent_default_model" in completion_keys
+    assert "completion_multi_agent_default_model_variant" in completion_keys
+    assert "completion_multi_agent_default_intelligence" in completion_keys
+    assert f"completion_multi_agent_allowed:{MODEL_GPT_5_6_LUNA}" in completion_keys
+    assert "adversary_multi_agent_enabled" in completion_keys
+    assert "adversary_multi_agent_max_concurrent" not in completion_keys
+    assert "multi_agent_max_concurrent" not in completion_keys
+
+    adversary_enabled = ProjectConfig(
+        completion_review=True,
+        adversary=True,
+        completion_multi_agent=MultiAgentConfig(enabled=False),
+        adversary_multi_agent=MultiAgentConfig(enabled=True),
+    )
+    adversary_keys = {parameter.key for parameter in parameter_defs(adversary_enabled)}
+
+    assert "completion_multi_agent_max_concurrent" not in adversary_keys
+    assert "adversary_multi_agent_max_concurrent" in adversary_keys
+    assert "adversary_multi_agent_default_model" in adversary_keys
+    assert "adversary_multi_agent_default_model_variant" in adversary_keys
+    assert "adversary_multi_agent_default_intelligence" in adversary_keys
+    assert f"adversary_multi_agent_allowed:{MODEL_GPT_5_6_TERRA}" in adversary_keys
+    assert "multi_agent_max_concurrent" not in adversary_keys
+
+
+@pytest.mark.parametrize(
+    ("config_field", "toggle_key"),
+    [
+        ("completion_multi_agent", "completion_multi_agent_enabled"),
+        ("adversary_multi_agent", "adversary_multi_agent_enabled"),
+    ],
+)
+def test_config_editor_reviewer_multi_agent_toggle_updates_only_its_role(
+    config_field: str,
+    toggle_key: str,
+) -> None:
+    config = ProjectConfig(completion_review=True, adversary=True)
+    parameters = parameter_defs(config)
+    toggle_index = [parameter.key for parameter in parameters].index(toggle_key)
+
+    updated, _state, action = select_current(
+        config,
+        EditorState(parameter_index=toggle_index, expanded_index=toggle_index, option_index=0),
+    )
+
+    assert action is None
+    assert getattr(updated, config_field).enabled is True
+    assert updated.multi_agent.enabled is False
+    other_field = (
+        "adversary_multi_agent"
+        if config_field == "completion_multi_agent"
+        else "completion_multi_agent"
+    )
+    assert getattr(updated, other_field).enabled is False
+
+
+def test_config_editor_reviewer_allowed_profiles_do_not_mutate_coder_policy() -> None:
+    config = ProjectConfig(
+        completion_review=True,
+        adversary=True,
+        completion_multi_agent=MultiAgentConfig(enabled=True),
+    )
+    parameters = parameter_defs(config)
+    allowed_key = f"completion_multi_agent_allowed:{MODEL_GPT_5_6_LUNA}"
+    allowed_index = [parameter.key for parameter in parameters].index(allowed_key)
+    low_index = [option.label for option in parameters[allowed_index].options].index("low")
+
+    updated, state, action = select_current(
+        config,
+        EditorState(
+            parameter_index=allowed_index,
+            expanded_index=allowed_index,
+            option_index=low_index,
+        ),
+    )
+
+    assert action is None
+    assert "low" in updated.completion_multi_agent.allowed[MODEL_GPT_5_6_LUNA]
+    assert "low" not in updated.multi_agent.allowed[MODEL_GPT_5_6_LUNA]
+    assert state.expanded_index == state.parameter_index
+
+
+@pytest.mark.parametrize(
+    "config_field",
+    ["completion_multi_agent", "adversary_multi_agent"],
+)
+def test_config_editor_reviewer_max_concurrent_edits_only_its_role(config_field: str) -> None:
+    config = ProjectConfig(
+        completion_review=True,
+        adversary=True,
+        completion_multi_agent=MultiAgentConfig(enabled=True),
+        adversary_multi_agent=MultiAgentConfig(enabled=True),
+    )
+    parameters = parameter_defs(config)
+    parameter_key = f"{config_field}_max_concurrent"
+    parameter_index = [parameter.key for parameter in parameters].index(parameter_key)
+
+    updated, state, action = select_current(
+        config,
+        EditorState(
+            parameter_index=parameter_index,
+            editing=True,
+            edit_kind="positive_int",
+            edit_value="7",
+        ),
+    )
+
+    assert action is None
+    assert state.editing is False
+    assert getattr(updated, config_field).max_concurrent == 7
+    assert updated.multi_agent.max_concurrent == 4
+    other_field = (
+        "adversary_multi_agent"
+        if config_field == "completion_multi_agent"
+        else "completion_multi_agent"
+    )
+    assert getattr(updated, other_field).max_concurrent == 4
+
+
+def test_config_editor_renders_role_specific_reviewer_subagent_labels() -> None:
+    config = ProjectConfig(
+        completion_review=True,
+        adversary=True,
+        completion_multi_agent=MultiAgentConfig(enabled=True),
+        adversary_multi_agent=MultiAgentConfig(enabled=True),
+    )
+    parameters = parameter_defs(config)
+    completion_allowed_key = f"completion_multi_agent_allowed:{MODEL_GPT_5_6_LUNA}"
+    completion_allowed_index = [parameter.key for parameter in parameters].index(completion_allowed_key)
+    adversary_allowed_key = f"adversary_multi_agent_allowed:{MODEL_GPT_5_6_LUNA}"
+    adversary_allowed_index = [parameter.key for parameter in parameters].index(adversary_allowed_key)
+
+    completion_output = _render(
+        config,
+        EditorState(
+            parameter_index=completion_allowed_index,
+            expanded_index=completion_allowed_index,
+        ),
+        width=160,
+        height=40,
+    )
+    adversary_output = _render(
+        config,
+        EditorState(
+            parameter_index=adversary_allowed_index,
+            expanded_index=adversary_allowed_index,
+        ),
+        width=160,
+        height=40,
+    )
+
+    assert "completion-multi-agent" in completion_output
+    assert "completion-subagent-allowed-Luna" in completion_output
+    assert "adversary-multi-agent" in adversary_output
+    assert "adversary-subagent-allowed-Luna" in adversary_output
 
 
 def test_config_editor_render_variant_row_has_sol_terra_luna_options() -> None:
@@ -577,13 +846,24 @@ def test_config_editor_uses_unicode_borders_by_default() -> None:
     assert "◇ BELLO PROJECT CONFIG" in output
 
 
-def test_config_editor_ascii_borders_are_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_config_editor_ascii_borders_can_be_forced(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BELLO_CONFIG_ASCII", "1")
 
     output = _render(width=120, height=12)
 
     assert "+---" in output
     assert "|" in output
+    assert "│" not in output
+
+
+def test_config_editor_uses_ascii_when_terminal_encoding_cannot_render_unicode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config_editor_module, "_terminal_supports_unicode", lambda: False)
+
+    output = _render(width=120, height=12)
+
+    assert "+---" in output
     assert "│" not in output
 
 

@@ -5,12 +5,18 @@ import json
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Awaitable, Callable, Literal
 
 from pydantic import ValidationError
 
 from supervisor.appserver import AppServerClient, AppServerError, last_agent_message_text, text_input
-from supervisor.coder import DEFAULT_INTELLIGENCE, apply_intelligence, codex_service_tier
+from supervisor.coder import (
+    DEFAULT_INTELLIGENCE,
+    apply_intelligence,
+    apply_multi_agent_thread_start_params,
+    codex_service_tier,
+)
+from supervisor.project_config import MultiAgentConfig
 from supervisor.prompts import (
     build_adv_report_controller_prompt,
     build_completion_review_prompt,
@@ -36,6 +42,7 @@ from supervisor.schemas import (
     InspectionRun,
     PriorIntervention,
     RestartHandoff,
+    SubagentSummary,
     SupervisorDecision,
     SupervisorWakePacket,
     TriggeringAction,
@@ -51,6 +58,7 @@ from supervisor.state import DECISIONS, HANDOFF, PROGRESS, STATE_DIR_NAME, State
 from supervisor.workspace_snapshot import (
     VerificationWorkspaceSnapshot,
     WorkspaceSnapshot,
+    WorkspaceSnapshotError,
     create_verification_workspace_snapshot,
 )
 
@@ -97,6 +105,9 @@ class StatelessSupervisorAgent:
         completion_timeout_seconds: float = DEFAULT_COMPLETION_REVIEW_TIMEOUT_SECONDS,
         completion_workspace_write: bool = False,
         completion_source_snapshot: WorkspaceSnapshot | None = None,
+        completion_multi_agent: MultiAgentConfig | None = None,
+        before_completion_thread_cleanup: Callable[[str, Path], Awaitable[None]] | None = None,
+        on_thread_start: Callable[[str], None] | None = None,
     ):
         self.client = client
         self.store = store
@@ -110,6 +121,9 @@ class StatelessSupervisorAgent:
         self.completion_timeout_seconds = completion_timeout_seconds
         self.completion_workspace_write = completion_workspace_write
         self.completion_source_snapshot = completion_source_snapshot
+        self.completion_multi_agent = completion_multi_agent or MultiAgentConfig()
+        self.before_completion_thread_cleanup = before_completion_thread_cleanup
+        self.on_thread_start = on_thread_start
         self.completion_thread_id: str | None = None
         self.completion_workspace_snapshot: VerificationWorkspaceSnapshot | None = None
 
@@ -188,7 +202,11 @@ class StatelessSupervisorAgent:
             raise SupervisorAgentError(
                 "adv_report_controller requires a non-empty adversary_report"
             )
+        review_snapshot: VerificationWorkspaceSnapshot | None = None
         try:
+            review_snapshot = await self._create_disposable_review_workspace_snapshot(
+                prefix="bello-adv-report-review-"
+            )
             task_contents = (
                 self.task_contents
                 if self.task_contents is not None
@@ -212,12 +230,21 @@ class StatelessSupervisorAgent:
                     model_cls=AdvReportControllerDecision,
                     use_case="adv_report_controller",
                     timeout_seconds=self.completion_timeout_seconds,
+                    workspace_root_override=review_snapshot.snapshot_root,
                     additional_runtime_roots=[input_root],
                 )
-        except OSError as exc:
+        except (OSError, WorkspaceSnapshotError) as exc:
             raise SupervisorAgentError(
                 "failed to prepare isolated adv_report_controller inputs"
             ) from exc
+        finally:
+            if review_snapshot is not None:
+                try:
+                    await asyncio.to_thread(review_snapshot.cleanup)
+                except WorkspaceSnapshotError as exc:
+                    raise SupervisorAgentError(
+                        "failed to remove isolated adv_report_controller workspace"
+                    ) from exc
         if not isinstance(decision, AdvReportControllerDecision):
             raise SupervisorAgentError(
                 "adversary report controller returned a different decision type"
@@ -257,6 +284,7 @@ class StatelessSupervisorAgent:
         timeout_seconds: float,
         persistent_completion_thread: bool = False,
         additional_runtime_roots: list[Path] | None = None,
+        workspace_root_override: Path | None = None,
     ) -> SupervisorDecision | CompletionReviewDecision | AdvReportControllerDecision:
         thread_id: str | None = None
         turn_id: str | None = None
@@ -265,7 +293,11 @@ class StatelessSupervisorAgent:
             SupervisorDecision | CompletionReviewDecision | AdvReportControllerDecision | None
         ) = None
         audit_error: str | None = None
-        decision_workspace_root = self.workspace_root
+        decision_workspace_root = (
+            workspace_root_override.resolve()
+            if workspace_root_override is not None
+            else self.workspace_root
+        )
         try:
             if persistent_completion_thread and self.completion_workspace_write:
                 if self.completion_workspace_snapshot is None:
@@ -280,6 +312,8 @@ class StatelessSupervisorAgent:
                     runtime_workspace_roots.append(resolved)
             if persistent_completion_thread and self.completion_thread_id:
                 thread_id = self.completion_thread_id
+                if self.on_thread_start is not None:
+                    self.on_thread_start(thread_id)
             else:
                 thread_response = await self._await_rpc(
                     "supervisor thread/start response",
@@ -289,6 +323,11 @@ class StatelessSupervisorAgent:
                             writable=persistent_completion_thread
                             and self.completion_workspace_write,
                             runtime_workspace_roots=runtime_workspace_roots,
+                            multi_agent=(
+                                self.completion_multi_agent
+                                if persistent_completion_thread
+                                else None
+                            ),
                         ),
                         timeout=timeout_seconds,
                     ),
@@ -298,6 +337,8 @@ class StatelessSupervisorAgent:
                 thread_id = thread.get("id") if isinstance(thread, dict) else None
                 if not isinstance(thread_id, str):
                     raise SupervisorAgentError("supervisor thread/start did not return thread id")
+                if self.on_thread_start is not None:
+                    self.on_thread_start(thread_id)
                 if persistent_completion_thread:
                     self.completion_thread_id = thread_id
             turn_prompt = prompt
@@ -444,6 +485,7 @@ class StatelessSupervisorAgent:
             if thread_id:
                 if persistent_completion_thread:
                     if audit_error is not None:
+                        await self._cleanup_completion_descendants(thread_id)
                         await self._cleanup_thread(thread_id, turn_id, timeout_seconds)
                         if self.completion_thread_id == thread_id:
                             self.completion_thread_id = None
@@ -475,14 +517,59 @@ class StatelessSupervisorAgent:
                 await asyncio.to_thread(abandoned.cleanup)
             raise
 
+    async def _create_disposable_review_workspace_snapshot(
+        self,
+        *,
+        prefix: str,
+    ) -> VerificationWorkspaceSnapshot:
+        creation = asyncio.create_task(
+            asyncio.to_thread(
+                create_verification_workspace_snapshot,
+                self.workspace_root,
+                source_snapshot=self.completion_source_snapshot,
+                prefix=prefix,
+            )
+        )
+        try:
+            return await asyncio.shield(creation)
+        except asyncio.CancelledError:
+            try:
+                abandoned = await creation
+            except Exception:
+                pass
+            else:
+                await asyncio.to_thread(abandoned.cleanup)
+            raise
+
     async def close_completion_review(self) -> None:
         thread_id = self.completion_thread_id
         self.completion_thread_id = None
         try:
             if thread_id:
+                await self._cleanup_completion_descendants(thread_id)
                 await self._cleanup_thread(thread_id, None, self.completion_timeout_seconds)
         finally:
             await self._cleanup_completion_workspace_snapshot()
+
+    async def abandon_completion_review_after_transport_loss(self) -> None:
+        """Drop dead app-server ownership without issuing cleanup RPCs.
+
+        A transport loss has already terminated the reviewer process tree. The
+        disposable verification workspace is local state and still must be
+        removed, but attempting archive/interrupt RPCs against the dead server
+        only turns recovery into another provider failure.
+        """
+
+        self.completion_thread_id = None
+        await self._cleanup_completion_workspace_snapshot()
+
+    async def _cleanup_completion_descendants(self, thread_id: str) -> None:
+        callback = self.before_completion_thread_cleanup
+        if callback is None:
+            return
+        snapshot = self.completion_workspace_snapshot
+        workspace_root = snapshot.snapshot_root if snapshot is not None else self.workspace_root
+        await callback(thread_id, workspace_root)
 
     async def _cleanup_completion_workspace_snapshot(self) -> None:
         snapshot = self.completion_workspace_snapshot
@@ -601,6 +688,7 @@ class StatelessSupervisorAgent:
         pending_approvals: list[ApprovalWakeContext] | None = None,
         triggering_action: TriggeringAction | None = None,
         runtime_triggering_actions: list[TriggeringAction] | None = None,
+        subagents: list[SubagentSummary] | None = None,
         last_coder_message: CoderMessage | None = None,
         validations: list[ValidationRun] | None = None,
         inspections: list[InspectionRun] | None = None,
@@ -627,7 +715,6 @@ class StatelessSupervisorAgent:
         completion_payload_mode: Literal["full", "delta", "full_fallback"] | None = None,
         completion_payload_since_sequence: int | None = None,
         completion_review_thread_id: str | None = None,
-        pending_accept_gate_rejection: dict[str, Any] | None = None,
         adversary_report: AdversaryReport | None = None,
         behavior_surface: list[BehaviorSurfaceItem] | None = None,
         prior_uncovered_edge_candidates: list[str] | None = None,
@@ -663,6 +750,7 @@ class StatelessSupervisorAgent:
             pending_approvals=pending_approvals or [],
             triggering_action=triggering_action,
             runtime_triggering_actions=runtime_triggering_actions or [],
+            subagents=subagents or [],
             last_coder_message=last_coder_message,
             validations=validations or [],
             inspections=inspections or [],
@@ -689,7 +777,6 @@ class StatelessSupervisorAgent:
             completion_payload_mode=completion_payload_mode,
             completion_payload_since_sequence=completion_payload_since_sequence,
             completion_review_thread_id=completion_review_thread_id,
-            pending_accept_gate_rejection=pending_accept_gate_rejection,
             adversary_report=adversary_report,
             behavior_surface=behavior_surface or [],
             prior_uncovered_edge_candidates=prior_uncovered_edge_candidates or [],
@@ -701,6 +788,7 @@ class StatelessSupervisorAgent:
         workspace_root: Path | None = None,
         writable: bool = False,
         runtime_workspace_roots: list[Path] | None = None,
+        multi_agent: MultiAgentConfig | None = None,
     ) -> dict[str, Any]:
         active_root = (workspace_root or self.workspace_root).resolve()
         active_runtime_roots = runtime_workspace_roots or [active_root]
@@ -714,7 +802,13 @@ class StatelessSupervisorAgent:
             "ephemeral": False,
             "experimentalRawEvents": False,
             "persistExtendedHistory": False,
+            "config": {},
         }
+        apply_multi_agent_thread_start_params(
+            params,
+            multi_agent or MultiAgentConfig(),
+            role="completion_review",
+        )
         if self.model:
             params["model"] = self.model
         return params
@@ -867,7 +961,7 @@ def _completion_review_repair_json_prompt(
         "uncovered_behaviors, validation_gaps, claim_evidence_mismatches, packet_or_access_limitations, "
         "or changed_test_risks, plus the minimal message_to_coder needed to get that issue fixed. "
         "For restart, include a valid handoff and set message_to_coder=null. "
-        "For decision=\"accept\", include only the evidence needed for the accept gates.\n\n"
+        "For decision=\"accept\", include only the concise evidence needed by the completion output contract.\n\n"
         "Previous invalid response excerpt, for context only:\n"
         "```text\n"
         f"{excerpt}\n"
@@ -892,7 +986,7 @@ def _minimal_completion_review_retry_prompt(
         "If the decision is return or restart, avoid the full evidence matrix: use files_reviewed=[] and "
         "behavior_evidence_matrix=[]. For return, include only the concrete blocker and the minimal message_to_coder "
         "needed to resolve it. For restart, include a valid handoff and set message_to_coder=null. "
-        "If the decision is accept, include only evidence required by the accept gates."
+        "If the decision is accept, include only concise evidence required by the completion output contract."
     )
 
 
@@ -997,12 +1091,11 @@ def _slim_completion_packet(packet: SupervisorWakePacket) -> SupervisorWakePacke
     The completion-review supervisor reads source and re-runs checks itself (it
     already issues rg/sed/git exec_command calls during review), so we drop from the
     prompt everything redundant or recoverable and keep only the evidence skeleton
-    the accept gate / behavior_evidence_matrix bind to:
+    useful to the completion reviewer and final report:
 
     - drop inlined file diffs/contexts (changed_file_diffs/changed_file_contexts) — it runs `git diff`;
     - drop validation_outputs/inspection_outputs entirely — after captured_output is
-      emptied they are near-duplicates of the validations/inspections ledgers, and the
-      accept gate does not consume them (it binds validation_ids from `validations`);
+      emptied they are near-duplicates of the validations/inspections ledgers;
     - in each ledger item: empty captured_output, drop the duplicate raw/normalized
       command, blank the constant cwd, and bound command + summary;
     - in evidence_provenance_summary keep the risk flags but drop the third copy of the
@@ -1040,6 +1133,9 @@ def _slim_completion_packet(packet: SupervisorWakePacket) -> SupervisorWakePacke
             "inspections": [slim_run(v) for v in packet.inspections],
             "validation_outputs": [],
             "inspection_outputs": [],
+            # Child-agent orchestration is runtime evidence. Completion reviews use
+            # the resulting workspace and shared validation ledger instead.
+            "subagents": [],
             "changed_file_diffs": [],
             "changed_file_contexts": [],
             "evidence_provenance_summary": provenance,

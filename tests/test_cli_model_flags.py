@@ -21,6 +21,7 @@ def test_role_models_default_to_gpt_56_sol() -> None:
     settings = _resolve_run_settings(project_config=ProjectConfig())
 
     assert DEFAULT_MODEL == MODEL_GPT_5_6_SOL
+    assert settings.plan_path is None
     assert settings.coder_model == MODEL_GPT_5_6_SOL
     assert settings.runtime_model == MODEL_GPT_5_6_SOL
     assert settings.completion_model == MODEL_GPT_5_6_SOL
@@ -40,6 +41,7 @@ def test_four_role_flags_are_registered() -> None:
 
     assert result.exit_code == 0
     for option in (
+        "--plan",
         "--coder-mod",
         "--runtime-mod",
         "--completion-mod",
@@ -55,6 +57,8 @@ def test_four_role_flags_are_registered() -> None:
 def test_cli_passes_independent_role_models_and_efforts_to_runner(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
+    plan = tmp_path / "PLAN.md"
+    plan.write_text("# Plan\n", encoding="utf-8")
     captured = []
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("supervisor.main._startup_update_gate", lambda: None)
@@ -74,6 +78,8 @@ def test_cli_passes_independent_role_models_and_efforts_to_runner(monkeypatch: p
         [
             "--task",
             str(task),
+            "--plan",
+            str(plan),
             "--coder-mod",
             MODEL_GPT_5_6_SOL,
             "--runtime-mod",
@@ -96,6 +102,7 @@ def test_cli_passes_independent_role_models_and_efforts_to_runner(monkeypatch: p
     assert result.exit_code == 0
     assert len(captured) == 1
     settings = captured[0]
+    assert settings.plan_path == plan
     assert settings.coder_model == MODEL_GPT_5_6_SOL
     assert settings.runtime_model == MODEL_GPT_5_5
     assert settings.completion_model == MODEL_GPT_5_6_SOL
@@ -196,6 +203,7 @@ def test_run_settings_reject_ultra_for_luna_per_role(role: str) -> None:
 
 def test_run_settings_cli_values_override_each_role_for_current_run(tmp_path) -> None:
     task = tmp_path / "TASK.md"
+    plan = tmp_path / "PLAN.md"
     settings = _resolve_run_settings(
         project_config=ProjectConfig(
             task="CONFIG_TASK.md",
@@ -210,6 +218,7 @@ def test_run_settings_cli_values_override_each_role_for_current_run(tmp_path) ->
             protected_path=("hidden",),
         ),
         task_path=task,
+        plan_path=plan,
         coder_model="cli-coder",
         runtime_model="cli-runtime",
         completion_model="cli-completion",
@@ -226,6 +235,7 @@ def test_run_settings_cli_values_override_each_role_for_current_run(tmp_path) ->
     )
 
     assert settings.task_path == task
+    assert settings.plan_path == plan
     assert settings.coder_model == "cli-coder"
     assert settings.runtime_model == "cli-runtime"
     assert settings.completion_model == "cli-completion"
@@ -339,11 +349,15 @@ def test_controller_runtime_settings_summary_uses_all_effective_role_values(tmp_
         "completion-mod=cli-completion "
         "adversary-mod=cli-adversary "
         "coder-intelligence=ultra "
+        "revision-coder=off "
         "runtime-intelligence=xhigh "
         "completion-intelligence=ultra "
         "adversary-intelligence=ultra "
         "speed=fast "
         "cheap-runtime=true "
+        "multi-agent=off "
+        "completion-multi-agent=off "
+        "adversary-multi-agent=off "
         "start-over=false "
         "clean=false "
         "completion-review=true "

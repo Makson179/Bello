@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import fnmatch
+import ntpath
 import os
 import re
 import shlex
 import subprocess
+import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from supervisor.schemas import PolicyDecision
+from supervisor.filesystem_safety import windows_path_component_issue
+from supervisor.executables import require_trusted_executable
+from supervisor.schemas import PolicyDecision, PolicyDecisionKind
 
 
 SECRET_FILE_GLOBS = {
@@ -113,6 +117,54 @@ SHELL_OPERATORS = {"|", "&&", "||", ";", "&"}
 SHELL_REDIRECT_OPERATORS = {">", ">>", "<", "<<", "<<<", "<>", ">|", "&>", "2>", "2>>"}
 NETWORK_COMMANDS = {"curl", "wget"}
 SHELL_COMMANDS = {"bash", "fish", "sh", "zsh"}
+WINDOWS_SHELL_COMMANDS = {"cmd", "powershell", "pwsh"}
+ShellKind = Literal["posix", "powershell", "cmd"]
+
+# These names are aliases/built-ins in the native Windows shells.  They are
+# mapped to the existing policy vocabulary only after the Windows lexer has
+# accepted the command as a single, expansion-free command.  This keeps the
+# POSIX allow list and parser completely unchanged.
+WINDOWS_COMMAND_ALIASES = {
+    "cd": "pwd",
+    "chdir": "pwd",
+    "dir": "ls",
+    "get-childitem": "ls",
+    "get-content": "cat",
+    "get-location": "pwd",
+    "select-string": "grep",
+    "type": "cat",
+}
+WINDOWS_DESTRUCTIVE_COMMANDS = {
+    "clear-content",
+    "del",
+    "erase",
+    "remove-item",
+}
+WINDOWS_WRITE_COMMANDS = {
+    "add-content",
+    "copy",
+    "copy-item",
+    "md",
+    "mkdir",
+    "move",
+    "move-item",
+    "new-item",
+    "out-file",
+    "ren",
+    "rename",
+    "rename-item",
+    "set-content",
+}
+WINDOWS_NETWORK_COMMANDS = {"invoke-restmethod", "invoke-webrequest", "irm", "iwr"}
+WINDOWS_PROCESS_CONTROL_COMMANDS = {
+    "restart-service",
+    "sc",
+    "start",
+    "start-process",
+    "stop-process",
+    "stop-service",
+    "taskkill",
+}
 DESTRUCTIVE_COMMANDS = {"rm", "rmdir", "unlink"}
 PERMISSION_COMMANDS = {"chmod", "chown", "chgrp", "sudo"}
 PROCESS_CONTROL_COMMANDS = {"kill", "killall", "pkill", "service", "systemctl", "supervisorctl"}
@@ -161,6 +213,122 @@ def command_analysis_from_policy_decision(evaluation: PolicyDecision) -> Command
     return None
 
 
+def native_shell_kind() -> ShellKind:
+    """Return the command language used for unwrapped native commands.
+
+    Codex uses PowerShell for its native Windows shell surface.  Explicit
+    ``cmd.exe /c`` commands are detected separately.  Keeping this decision in
+    one small helper also lets non-Windows tests exercise the native branch
+    without mutating ``os.name`` (which would confuse ``pathlib``).
+    """
+
+    return "powershell" if sys.platform == "win32" else "posix"
+
+
+def is_windows_shell_kind(shell_kind: ShellKind) -> bool:
+    return shell_kind in {"powershell", "cmd"}
+
+
+def _resolved_shell_kind(shell_kind: ShellKind | None) -> ShellKind:
+    return shell_kind or native_shell_kind()
+
+
+def windows_path_syntax_problem(raw: str | os.PathLike[str]) -> str | None:
+    """Reject Win32 spellings whose target cannot be established safely.
+
+    In particular, drive-relative paths, device namespaces, alternate data
+    streams, reserved DOS devices, and Win32-normalized trailing dots/spaces
+    must never become a second spelling that bypasses a protected root check.
+    """
+
+    text = os.fspath(raw)
+    if not text or text.startswith(("http://", "https://")):
+        return None
+    if "\x00" in text:
+        return "NUL in Windows path"
+    normalized = text.replace("/", "\\")
+    if normalized.startswith(("\\\\?\\", "\\\\.\\")):
+        return "Windows device/extended path is ambiguous"
+    drive, tail = ntpath.splitdrive(normalized)
+    if drive and not (
+        (len(drive) == 2 and drive[0].isalpha() and drive[1] == ":")
+        or drive.startswith("\\\\")
+    ):
+        return "Windows provider or malformed drive path is ambiguous"
+    if drive and len(drive) == 2 and drive[1] == ":" and (not tail or not tail.startswith("\\")):
+        return "drive-relative Windows path is ambiguous"
+    if ":" in tail:
+        return "Windows alternate data stream path is ambiguous"
+    for part in (part for part in normalized.split("\\") if part):
+        if part in {".", ".."} or part == drive:
+            continue
+        issue = windows_path_component_issue(part)
+        if issue is not None:
+            return issue
+    return None
+
+
+def _path_for_platform(raw: str | os.PathLike[str], *, windows_paths: bool) -> Path | None:
+    text = os.fspath(raw)
+    if windows_paths:
+        if windows_path_syntax_problem(text) is not None:
+            return None
+        # On a real Windows host pathlib already implements drive and UNC
+        # semantics.  On POSIX, this conversion lets tests exercise relative
+        # backslash paths while absolute drive/UNC inputs stay fail-closed.
+        if os.name != "nt" and ntpath.isabs(text):
+            return None
+        if os.name != "nt":
+            text = text.replace("\\", "/")
+    try:
+        return Path(text).expanduser()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _path_comparison_key(path: Path, *, windows_paths: bool) -> str:
+    text = str(path)
+    if windows_paths:
+        return ntpath.normcase(text.replace("/", "\\")).rstrip("\\")
+    return text
+
+
+def _path_is_within(path: Path, root: Path, *, windows_paths: bool) -> bool:
+    if not windows_paths:
+        return _is_relative_to(path, root)
+    candidate = _path_comparison_key(path, windows_paths=True)
+    boundary = _path_comparison_key(root, windows_paths=True)
+    if candidate == boundary:
+        return True
+    return bool(boundary and candidate.startswith(boundary + "\\"))
+
+
+def path_root_hit(
+    raw: str | os.PathLike[str],
+    *,
+    cwd: Path,
+    roots: Iterable[Path],
+    windows_paths: bool = False,
+) -> str | None:
+    path = _path_for_platform(raw, windows_paths=windows_paths)
+    if path is None:
+        return None
+    if not path.is_absolute():
+        path = cwd / path
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError:
+        return None
+    for root in roots:
+        try:
+            resolved_root = root.resolve(strict=False)
+        except OSError:
+            continue
+        if _path_is_within(resolved, resolved_root, windows_paths=windows_paths):
+            return str(resolved_root)
+    return None
+
+
 def _parts_lower(path: Path) -> list[str]:
     return [part.lower() for part in path.parts]
 
@@ -198,11 +366,22 @@ def is_protected_path(workspace: Path, path: Path) -> bool:
     return is_secret_path(path) or is_workspace_cheating_path(workspace, path)
 
 
-def _resolve_outside_candidate(raw: str | os.PathLike[str], *, cwd: Path) -> Path | None:
-    text = os.fspath(raw).strip().strip("'\"")
+def _resolve_outside_candidate(
+    raw: str | os.PathLike[str],
+    *,
+    cwd: Path,
+    windows_paths: bool | None = None,
+) -> Path | None:
+    # Leading/trailing whitespace is part of a Win32 path spelling.  Trimming
+    # it before validation would turn an unsafe alias such as ``"file "``
+    # into the different, apparently safe path ``"file"``.
+    text = os.fspath(raw).strip("'\"")
     if not text or text.startswith(("http://", "https://")):
         return None
-    path = Path(text).expanduser()
+    windows = (sys.platform == "win32") if windows_paths is None else windows_paths
+    path = _path_for_platform(text, windows_paths=windows)
+    if path is None:
+        return None
     if not path.is_absolute():
         path = cwd / path
     try:
@@ -219,16 +398,16 @@ def _is_relative_to(path: Path, root: Path) -> bool:
         return False
 
 
-def _declared_grading_path_hit(raw: str | os.PathLike[str], *, cwd: Path, roots: tuple[Path, ...]) -> str | None:
+def _declared_grading_path_hit(
+    raw: str | os.PathLike[str],
+    *,
+    cwd: Path,
+    roots: tuple[Path, ...],
+    windows_paths: bool = False,
+) -> str | None:
     if not roots:
         return None
-    resolved = _resolve_outside_candidate(raw, cwd=cwd)
-    if resolved is None:
-        return None
-    for root in roots:
-        if resolved == root or _is_relative_to(resolved, root):
-            return str(resolved)
-    return None
+    return path_root_hit(raw, cwd=cwd, roots=roots, windows_paths=windows_paths)
 
 
 def _declared_roots_from_env() -> tuple[Path, ...]:
@@ -245,57 +424,90 @@ def _declared_roots_from_env() -> tuple[Path, ...]:
     return tuple(dict.fromkeys(roots))
 
 
-def normalize_path(workspace: Path, raw: str | os.PathLike[str]) -> Path | None:
-    path = Path(raw)
-    if not path.is_absolute():
-        path = workspace / path
-    parent = path if path.exists() else path.parent
-    try:
-        resolved_parent = parent.resolve(strict=True)
-    except FileNotFoundError:
-        try:
-            resolved_parent = parent.resolve(strict=False)
-        except OSError:
-            return None
-    resolved = resolved_parent if path.exists() else resolved_parent / path.name
-    try:
-        resolved.relative_to(workspace.resolve())
-    except ValueError:
+def normalize_path(
+    workspace: Path,
+    raw: str | os.PathLike[str],
+    *,
+    windows_paths: bool | None = None,
+) -> Path | None:
+    windows = (sys.platform == "win32") if windows_paths is None else windows_paths
+    return _normalize_path(workspace, workspace, raw, windows_paths=windows)
+
+
+def _normalize_path(
+    workspace: Path,
+    cwd: Path,
+    raw: str | os.PathLike[str],
+    *,
+    windows_paths: bool,
+) -> Path | None:
+    raw_text = os.fspath(raw)
+    simulated_host_absolute = windows_paths and os.name != "nt" and Path(raw_text).is_absolute()
+    if not windows_paths:
+        # Preserve the established POSIX contract: command path normalization
+        # treats ``~`` lexically here (the shell will expand it later), which
+        # lets secret-name checks see components such as ``.ssh``.
+        path = Path(raw_text)
+    else:
+        path = Path(raw_text).expanduser() if simulated_host_absolute else _path_for_platform(raw, windows_paths=True)
+    if path is None:
         return None
-    return resolved
-
-
-def normalize_path_from_cwd(workspace: Path, cwd: Path, raw: str | os.PathLike[str]) -> Path | None:
-    path = Path(raw)
     if not path.is_absolute():
         path = cwd / path
-    parent = path if path.exists() else path.parent
+    try:
+        path_exists = path.exists()
+    except (OSError, ValueError):
+        # Win32 rejects wildcard and otherwise malformed components before a
+        # filesystem lookup.  Treat those spellings as ambiguous instead of
+        # letting policy evaluation crash; lexical protected-path checks still
+        # get a chance to hard-deny names such as ``.super*``.
+        return None
+    parent = path if path_exists else path.parent
     try:
         resolved_parent = parent.resolve(strict=True)
-    except FileNotFoundError:
+    except (OSError, ValueError):
         try:
             resolved_parent = parent.resolve(strict=False)
-        except OSError:
+        except (OSError, ValueError):
             return None
-    resolved = resolved_parent if path.exists() else resolved_parent / path.name
-    try:
-        resolved.relative_to(workspace.resolve())
-    except ValueError:
+    resolved = resolved_parent if path_exists else resolved_parent / path.name
+    if not _path_is_within(resolved, workspace.resolve(), windows_paths=windows_paths):
         return None
     return resolved
 
 
-def _workspace_relative(workspace: Path, path: Path) -> str:
+def normalize_path_from_cwd(
+    workspace: Path,
+    cwd: Path,
+    raw: str | os.PathLike[str],
+    *,
+    windows_paths: bool | None = None,
+) -> Path | None:
+    windows = (sys.platform == "win32") if windows_paths is None else windows_paths
+    return _normalize_path(workspace, cwd, raw, windows_paths=windows)
+
+
+def _workspace_relative(workspace: Path, path: Path, *, windows_paths: bool = False) -> str:
+    if not _path_is_within(path, workspace.resolve(), windows_paths=windows_paths):
+        return str(path)
     try:
         return path.relative_to(workspace.resolve()).as_posix()
     except ValueError:
+        # The POSIX simulation of a case-insensitive Windows path may differ
+        # only by case.  It is still contained according to the comparison
+        # above; retain the resolved spelling for diagnostics.
         return str(path)
 
 
-def _command_working_directory(workspace: Path, cwd: str | None) -> tuple[Path, set[str], str | None]:
+def _command_working_directory(
+    workspace: Path,
+    cwd: str | None,
+    *,
+    windows_paths: bool = False,
+) -> tuple[Path, set[str], str | None]:
     if cwd is None:
         return workspace.resolve(), set(), None
-    resolved = normalize_path(workspace, cwd)
+    resolved = _normalize_path(workspace, workspace, cwd, windows_paths=windows_paths)
     if resolved is None:
         return workspace.resolve(), {"workspace_escape"}, "command working directory escapes workspace or is ambiguous"
     if is_protected_path(workspace, resolved):
@@ -315,12 +527,162 @@ def _lex_shell_command(command: str) -> tuple[list[str] | None, str | None]:
         return None, f"cannot parse shell command: {exc}"
 
 
+def lex_windows_command(
+    command: str,
+    shell_kind: ShellKind,
+    *,
+    cross_shell_safe: bool = False,
+) -> tuple[list[str] | None, str | None]:
+    """Tokenize the deliberately small Windows command subset we can prove safe.
+
+    This is not an attempted PowerShell or ``cmd.exe`` grammar.  Expansion,
+    composition, escaping, script blocks, redirection, and multiline input are
+    rejected, which is the security boundary needed for deterministic approval.
+    The full supervisor can still judge every rejected command.
+    """
+
+    if not is_windows_shell_kind(shell_kind):
+        raise ValueError("lex_windows_command requires a Windows shell kind")
+    if not command.strip():
+        return None, "empty Windows command"
+    if "\n" in command or "\r" in command:
+        return None, f"multiline {shell_kind} command requires supervisor judgment"
+
+    tokens: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    token_started = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if (shell_kind == "powershell" or cross_shell_safe) and char in {"$", "`"}:
+            return None, "PowerShell expansion/escaping requires supervisor judgment"
+        if (shell_kind == "cmd" or cross_shell_safe) and char in {"%", "!", "^"}:
+            return None, "cmd.exe expansion/escaping requires supervisor judgment"
+        if char in {"*", "?", "[", "]", ","}:
+            return None, f"{shell_kind} wildcard/argument expansion requires supervisor judgment"
+
+        if quote is not None:
+            if char == quote:
+                if index + 1 < len(command) and command[index + 1] == quote:
+                    return None, f"{shell_kind} doubled-quote escaping requires supervisor judgment"
+                quote = None
+            else:
+                if shell_kind == "cmd" and char == "\\" and index + 1 < len(command) and command[index + 1] == '"':
+                    return None, "cmd.exe backslash/quote boundary requires supervisor judgment"
+                current.append(char)
+            token_started = True
+            index += 1
+            continue
+
+        if char.isspace():
+            if token_started:
+                tokens.append("".join(current))
+                current = []
+                token_started = False
+            index += 1
+            continue
+        if char == '"' or (shell_kind == "powershell" and char == "'"):
+            if index + 1 < len(command) and command[index + 1] == char:
+                return None, f"{shell_kind} doubled-quote boundary requires supervisor judgment"
+            quote = char
+            token_started = True
+            index += 1
+            continue
+        if char in "<>":
+            return None, f"{shell_kind} redirection requires supervisor judgment"
+        if char in "|&;(){}":
+            return None, f"{shell_kind} composition/grouping requires supervisor judgment"
+        if shell_kind == "powershell" and char in {"@", "#"}:
+            return None, "PowerShell splatting/comment syntax requires supervisor judgment"
+        current.append(char)
+        token_started = True
+        index += 1
+
+    if quote is not None:
+        return None, f"unterminated {shell_kind} quoted string requires supervisor judgment"
+    if token_started:
+        tokens.append("".join(current))
+    if not tokens or not tokens[0]:
+        return None, f"empty {shell_kind} executable requires supervisor judgment"
+    return tokens, None
+
+
+def _leading_windows_executable(command: str) -> str:
+    text = command.lstrip()
+    if not text:
+        return ""
+    if text[0] in {'"', "'"}:
+        quote = text[0]
+        end = text.find(quote, 1)
+        return text[1:end] if end >= 0 else text[1:]
+    return text.split(None, 1)[0]
+
+
+def command_is_windows_shell_wrapper(command: str) -> bool:
+    return _executable_basename(_leading_windows_executable(command)) in WINDOWS_SHELL_COMMANDS
+
+
+def windows_shell_wrapper_payload(
+    command: str,
+) -> tuple[ShellKind, str | None, str | None] | None:
+    """Return a conservatively extracted PowerShell/cmd payload.
+
+    A returned tuple always identifies the wrapper.  ``payload`` is ``None``
+    when the wrapper shape is ambiguous, allowing callers to fail closed rather
+    than falling through to a POSIX parser.
+    """
+
+    if not command_is_windows_shell_wrapper(command):
+        return None
+    leading = _executable_basename(_leading_windows_executable(command))
+    shell_kind: ShellKind = "cmd" if leading == "cmd" else "powershell"
+    tokens, problem = lex_windows_command(command, shell_kind)
+    if tokens is None:
+        return shell_kind, None, problem
+
+    if shell_kind == "powershell":
+        command_flags = {"-c", "-command"}
+        forbidden_flags = {"-e", "-ec", "-enc", "-encodedcommand", "-file"}
+        lowered = [token.casefold() for token in tokens]
+        if any(token in forbidden_flags for token in lowered[1:]):
+            return shell_kind, None, "PowerShell encoded/file command requires supervisor judgment"
+        indexes = [index for index, token in enumerate(lowered[1:], start=1) if token in command_flags]
+    else:
+        lowered = [token.casefold() for token in tokens]
+        if "/k" in lowered[1:]:
+            return shell_kind, None, "persistent cmd.exe session requires supervisor judgment"
+        indexes = [index for index, token in enumerate(lowered[1:], start=1) if token == "/c"]
+
+    if len(indexes) != 1:
+        return shell_kind, None, f"{shell_kind} wrapper command flag is missing or ambiguous"
+    payload_index = indexes[0] + 1
+    if payload_index != len(tokens) - 1 or not tokens[payload_index].strip():
+        return shell_kind, None, f"{shell_kind} wrapper payload boundaries are ambiguous"
+    return shell_kind, tokens[payload_index], None
+
+
 def _initial_risk_tags(command: str) -> set[str]:
     tags: set[str] = set()
     if "$(" in command or "`" in command:
         tags.add("command_substitution")
     if "<(" in command or ">(" in command:
         tags.add("process_substitution")
+    return tags
+
+
+def _windows_initial_risk_tags(command: str, shell_kind: ShellKind) -> set[str]:
+    tags: set[str] = set()
+    if "$(" in command:
+        tags.add("command_substitution")
+    if any(char in command for char in (">", "<")):
+        tags.add("shell_redirection")
+    if "|" in command or ";" in command or "(" in command or ")" in command:
+        tags.add("ambiguous_parse")
+    if shell_kind == "powershell" and any(char in command for char in ("$", "`", "@", "#")):
+        tags.add("ambiguous_parse")
+    if shell_kind == "cmd" and any(char in command for char in ("%", "!", "^")):
+        tags.add("ambiguous_parse")
     return tags
 
 
@@ -370,16 +732,18 @@ def _resolve_segment_paths(
     cwd: Path,
     raw_paths: Iterable[str],
     tags: set[str],
+    *,
+    windows_paths: bool = False,
 ) -> list[str]:
     resolved_paths: list[str] = []
     for raw in raw_paths:
-        resolved = normalize_path_from_cwd(workspace, cwd, raw)
+        resolved = normalize_path_from_cwd(workspace, cwd, raw, windows_paths=windows_paths)
         if resolved is None:
             tags.add("workspace_escape")
             continue
         if is_protected_path(workspace, resolved):
             tags.add("secret_path")
-        resolved_paths.append(_workspace_relative(workspace, resolved))
+        resolved_paths.append(_workspace_relative(workspace, resolved, windows_paths=windows_paths))
     return resolved_paths
 
 
@@ -409,7 +773,7 @@ def _find_paths_and_bounds(args: list[str]) -> tuple[list[str], bool]:
     return paths, bounded
 
 
-def _grep_like_paths(args: list[str], cwd: Path) -> tuple[list[str], bool]:
+def _grep_like_paths(args: list[str], cwd: Path, *, windows_paths: bool = False) -> tuple[list[str], bool]:
     paths: list[str] = []
     pattern_seen = False
     explicit_secret_search = False
@@ -446,7 +810,7 @@ def _grep_like_paths(args: list[str], cwd: Path) -> tuple[list[str], bool]:
             pattern_seen = True
             index += 1
             continue
-        if _looks_like_path_argument(arg, cwd):
+        if _looks_like_path_argument(arg, cwd, windows_paths=windows_paths):
             paths.append(arg)
         index += 1
     return paths, explicit_secret_search
@@ -454,6 +818,29 @@ def _grep_like_paths(args: list[str], cwd: Path) -> tuple[list[str], bool]:
 
 def _version_report_only(args: list[str]) -> bool:
     return bool(args) and all(arg in VERSION_FLAGS for arg in args)
+
+
+def _windows_python_executable(executable: str) -> bool:
+    return executable == "py" or bool(re.fullmatch(r"python(?:3(?:\.\d+)?)?", executable))
+
+
+def _windows_py_launcher_args(args: list[str]) -> tuple[list[str] | None, str | None]:
+    remaining = list(args)
+    if remaining and re.fullmatch(r"-3(?:\.\d+)?", remaining[0]):
+        remaining = remaining[1:]
+    elif remaining and (
+        re.match(r"^-\d", remaining[0])
+        or remaining[0].casefold().startswith(("-v:", "--list", "--company", "--tag"))
+    ):
+        return None, "Python launcher selector requires supervisor judgment"
+    return remaining, None
+
+
+def _windows_python_version_report_only(executable: str, args: list[str]) -> bool:
+    if executable != "py":
+        return _version_report_only(args)
+    remaining, problem = _windows_py_launcher_args(args)
+    return problem is None and remaining is not None and _version_report_only(remaining)
 
 
 def _git_path_args(args: list[str]) -> list[str]:
@@ -476,8 +863,13 @@ def _classify_segment(
     workspace: Path,
     cwd: Path,
     receives_stdin: bool,
+    shell_kind: ShellKind = "posix",
 ) -> tuple[ParsedCommandSegment, set[str]]:
-    executable = segment_tokens[0] if segment_tokens else ""
+    raw_executable = segment_tokens[0] if segment_tokens else ""
+    executable = raw_executable
+    if is_windows_shell_kind(shell_kind) and raw_executable:
+        executable = _executable_basename(raw_executable)
+        executable = WINDOWS_COMMAND_ALIASES.get(executable, executable)
     args = segment_tokens[1:]
     tags: set[str] = set()
     raw_paths: list[str] = []
@@ -485,17 +877,19 @@ def _classify_segment(
 
     if not executable:
         tags.add("ambiguous_parse")
-    elif executable in NETWORK_COMMANDS or any(arg.startswith(("http://", "https://")) for arg in args):
+    elif executable in NETWORK_COMMANDS | WINDOWS_NETWORK_COMMANDS or any(
+        arg.startswith(("http://", "https://")) for arg in args
+    ):
         tags.add("network")
         tags.add("external_side_effect")
-    elif executable in SHELL_COMMANDS:
+    elif executable in SHELL_COMMANDS | WINDOWS_SHELL_COMMANDS:
         tags.add("interpreter_execution")
-    elif executable in DESTRUCTIVE_COMMANDS:
+    elif executable in DESTRUCTIVE_COMMANDS | WINDOWS_DESTRUCTIVE_COMMANDS:
         tags.add("destructive")
         tags.add("filesystem_write")
     elif executable in PERMISSION_COMMANDS:
         tags.add("permission_change")
-    elif executable in PROCESS_CONTROL_COMMANDS:
+    elif executable in PROCESS_CONTROL_COMMANDS | WINDOWS_PROCESS_CONTROL_COMMANDS:
         tags.add("process_or_service_control")
     elif executable in DEPLOY_COMMANDS or executable in {"npm"} and any(arg in {"publish", "release"} for arg in args):
         tags.add("deploy_publish_release")
@@ -528,14 +922,23 @@ def _classify_segment(
         if not bounded:
             tags.add("ambiguous_parse")
     elif executable in {"rg", "grep"}:
-        raw_paths, explicit_secret_search = _grep_like_paths(args, cwd)
+        raw_paths, explicit_secret_search = _grep_like_paths(
+            args,
+            cwd,
+            windows_paths=is_windows_shell_kind(shell_kind),
+        )
         read_only = True
         if explicit_secret_search:
             tags.add("secret_path")
         if not raw_paths and not receives_stdin:
             tags.add("ambiguous_parse")
     elif executable in READ_FILE_COMMANDS:
-        raw_paths, read_problem = extract_read_command_paths(segment_tokens, cwd)
+        normalized_tokens = [executable, *args] if is_windows_shell_kind(shell_kind) else segment_tokens
+        raw_paths, read_problem = extract_read_command_paths(
+            normalized_tokens,
+            cwd,
+            windows_paths=is_windows_shell_kind(shell_kind),
+        )
         if read_problem:
             tags.add("filesystem_write")
         if raw_paths or receives_stdin:
@@ -548,15 +951,25 @@ def _classify_segment(
             read_only = True
         else:
             tags.add("ambiguous_parse")
-    elif executable in BOUNDED_FILESYSTEM_WRITE_COMMANDS:
+    elif executable in BOUNDED_FILESYSTEM_WRITE_COMMANDS | WINDOWS_WRITE_COMMANDS:
         # Resolve all path args so workspace_escape / GRADING_PATH_RISK_TAG are raised
         # for any path that leaves the workspace or touches grading material.
         raw_paths = _plain_path_args(args)
         tags.add("filesystem_write")
         if not raw_paths:
             tags.add("ambiguous_parse")
-    elif executable in VERSION_REPORT_COMMANDS:
-        if _version_report_only(args):
+    elif executable in VERSION_REPORT_COMMANDS or (
+        is_windows_shell_kind(shell_kind) and _windows_python_executable(executable)
+    ):
+        py_args, py_problem = (
+            _windows_py_launcher_args(args)
+            if is_windows_shell_kind(shell_kind) and executable == "py"
+            else (args, None)
+        )
+        if py_problem is not None:
+            tags.add("ambiguous_parse")
+            tags.add("interpreter_execution")
+        elif py_args is not None and _version_report_only(py_args):
             read_only = True
         else:
             tags.add("interpreter_execution")
@@ -567,7 +980,13 @@ def _classify_segment(
             tags.add("environment_mutation")
         tags.add("unknown_executable")
 
-    resolved_paths = _resolve_segment_paths(workspace, cwd, raw_paths, tags)
+    resolved_paths = _resolve_segment_paths(
+        workspace,
+        cwd,
+        raw_paths,
+        tags,
+        windows_paths=is_windows_shell_kind(shell_kind),
+    )
     return (
         ParsedCommandSegment(
             executable=executable,
@@ -581,11 +1000,27 @@ def _classify_segment(
     )
 
 
-def analyze_command(workspace: Path, command: str, cwd: str | None = None) -> CommandAnalysis:
+def analyze_command(
+    workspace: Path,
+    command: str,
+    cwd: str | None = None,
+    *,
+    shell_kind: ShellKind | None = None,
+) -> CommandAnalysis:
+    resolved_shell = _resolved_shell_kind(shell_kind)
+    windows_paths = is_windows_shell_kind(resolved_shell)
     workspace = workspace.resolve()
-    cwd_path, cwd_tags, cwd_problem = _command_working_directory(workspace, cwd)
-    tokens, lex_problem = _lex_shell_command(command)
-    risk_tags = _initial_risk_tags(command) | cwd_tags
+    cwd_path, cwd_tags, cwd_problem = _command_working_directory(
+        workspace,
+        cwd,
+        windows_paths=windows_paths,
+    )
+    if windows_paths:
+        tokens, lex_problem = lex_windows_command(command, resolved_shell, cross_shell_safe=True)
+        risk_tags = _windows_initial_risk_tags(command, resolved_shell) | cwd_tags
+    else:
+        tokens, lex_problem = _lex_shell_command(command)
+        risk_tags = _initial_risk_tags(command) | cwd_tags
     segments: list[ParsedCommandSegment] = []
     operators: list[str] = []
     parse_error = cwd_problem or lex_problem
@@ -603,15 +1038,19 @@ def analyze_command(workspace: Path, command: str, cwd: str | None = None) -> Co
             parse_error=parse_error,
         )
 
-    raw_segments, operators, split_tags, split_problem = _split_command_segments(tokens)
-    risk_tags |= split_tags
-    parse_error = parse_error or split_problem
+    if windows_paths:
+        raw_segments = [tokens]
+    else:
+        raw_segments, operators, split_tags, split_problem = _split_command_segments(tokens)
+        risk_tags |= split_tags
+        parse_error = parse_error or split_problem
     for index, raw_segment in enumerate(raw_segments):
         segment, segment_tags = _classify_segment(
             raw_segment,
             workspace=workspace,
             cwd=cwd_path,
             receives_stdin=index > 0 and operators[index - 1] == "|",
+            shell_kind=resolved_shell,
         )
         segments.append(segment)
         risk_tags |= segment_tags
@@ -647,10 +1086,16 @@ def extract_paths(payload: dict[str, Any]) -> list[str]:
     return candidates
 
 
-def resolve_all_paths(workspace: Path, raw_paths: Iterable[str]) -> tuple[list[Path], str | None]:
+def resolve_all_paths(
+    workspace: Path,
+    raw_paths: Iterable[str],
+    *,
+    windows_paths: bool | None = None,
+) -> tuple[list[Path], str | None]:
+    windows = (sys.platform == "win32") if windows_paths is None else windows_paths
     resolved: list[Path] = []
     for raw in raw_paths:
-        path = normalize_path(workspace, raw)
+        path = _normalize_path(workspace, workspace, raw, windows_paths=windows)
         if path is None:
             return [], f"path escapes workspace or is ambiguous: {raw}"
         resolved.append(path)
@@ -667,7 +1112,14 @@ def _git_read_only(args: list[str]) -> bool:
     return not any(arg in destructive_or_network for arg in args)
 
 
-def parse_command(command: str) -> tuple[list[str] | None, str | None]:
+def parse_command(
+    command: str,
+    *,
+    shell_kind: ShellKind | None = None,
+) -> tuple[list[str] | None, str | None]:
+    resolved_shell = _resolved_shell_kind(shell_kind)
+    if is_windows_shell_kind(resolved_shell):
+        return lex_windows_command(command, resolved_shell, cross_shell_safe=True)
     try:
         tokens = shlex.split(command)
     except ValueError as exc:
@@ -714,11 +1166,18 @@ def _strip_pytest_selector(value: str) -> str:
     return value.split("::", 1)[0]
 
 
-def _resolve_candidate_path(raw: str, *, cwd: Path) -> Path | None:
-    text = raw.strip().strip("'\"")
+def _resolve_candidate_path(
+    raw: str,
+    *,
+    cwd: Path,
+    windows_paths: bool = False,
+) -> Path | None:
+    text = raw.strip("'\"")
     if not text:
         return None
-    path = Path(text).expanduser()
+    path = _path_for_platform(text, windows_paths=windows_paths)
+    if path is None:
+        return None
     if not path.is_absolute():
         path = cwd / path
     try:
@@ -756,16 +1215,29 @@ def extract_apply_patch_paths(command: str) -> list[str] | None:
     return paths
 
 
-def _looks_like_path_argument(token: str, workspace: Path) -> bool:
+def _looks_like_path_argument(token: str, workspace: Path, *, windows_paths: bool = False) -> bool:
     if token in {"-", "--"} or token.startswith("-"):
         return False
     if token.startswith(("http://", "https://")):
         return False
-    path = Path(token)
-    return path.is_absolute() or "/" in token or "." in token or (workspace / token).exists()
+    path = _path_for_platform(token, windows_paths=windows_paths)
+    if path is None:
+        return True
+    return (
+        path.is_absolute()
+        or "/" in token
+        or (windows_paths and "\\" in token)
+        or "." in token
+        or (workspace / path).exists()
+    )
 
 
-def _sed_read_paths(args: list[str], workspace: Path) -> tuple[list[str], str | None]:
+def _sed_read_paths(
+    args: list[str],
+    workspace: Path,
+    *,
+    windows_paths: bool = False,
+) -> tuple[list[str], str | None]:
     if any(arg == "-i" or arg.startswith("-i") or arg == "--in-place" for arg in args):
         return [], "sed in-place edit requires LLM review"
     candidates: list[str] = []
@@ -790,17 +1262,22 @@ def _sed_read_paths(args: list[str], workspace: Path) -> tuple[list[str], str | 
             script_seen = True
             index += 1
             continue
-        if _looks_like_path_argument(arg, workspace):
+        if _looks_like_path_argument(arg, workspace, windows_paths=windows_paths):
             candidates.append(arg)
         index += 1
     return candidates, None
 
 
-def extract_read_command_paths(tokens: list[str], workspace: Path) -> tuple[list[str], str | None]:
+def extract_read_command_paths(
+    tokens: list[str],
+    workspace: Path,
+    *,
+    windows_paths: bool = False,
+) -> tuple[list[str], str | None]:
     if not tokens or tokens[0] not in READ_FILE_COMMANDS:
         return [], None
     if tokens[0] == "sed":
-        return _sed_read_paths(tokens[1:], workspace)
+        return _sed_read_paths(tokens[1:], workspace, windows_paths=windows_paths)
     candidates: list[str] = []
     skip_next = False
     options_with_values = {"-n", "--lines", "-c", "--bytes"}
@@ -813,7 +1290,7 @@ def extract_read_command_paths(tokens: list[str], workspace: Path) -> tuple[list
             continue
         if arg.startswith("-"):
             continue
-        if _looks_like_path_argument(arg, workspace):
+        if _looks_like_path_argument(arg, workspace, windows_paths=windows_paths):
             candidates.append(arg)
     return candidates, None
 
@@ -907,9 +1384,14 @@ def tracked_delete_problem(tokens: list[str], workspace: Path) -> str | None:
 def _git_path_is_tracked_or_contains_tracked(workspace: Path, rel_path: str, *, is_dir: bool) -> bool:
     env = _isolated_git_query_environment()
     try:
+        git = (
+            require_trusted_executable("git", cwd=workspace, environ=env, windows=True)
+            if sys.platform == "win32"
+            else "git"
+        )
         if is_dir:
             completed = subprocess.run(
-                ["git", "-c", "core.fsmonitor=false", "ls-files", "--", rel_path.rstrip("/") + "/"],
+                [git, "-c", "core.fsmonitor=false", "ls-files", "--", rel_path.rstrip("/") + "/"],
                 cwd=workspace,
                 env=env,
                 capture_output=True,
@@ -919,7 +1401,7 @@ def _git_path_is_tracked_or_contains_tracked(workspace: Path, rel_path: str, *, 
             )
             return bool(completed.stdout.strip())
         completed = subprocess.run(
-            ["git", "-c", "core.fsmonitor=false", "ls-files", "--error-unmatch", "--", rel_path],
+            [git, "-c", "core.fsmonitor=false", "ls-files", "--error-unmatch", "--", rel_path],
             cwd=workspace,
             env=env,
             capture_output=True,
@@ -929,7 +1411,9 @@ def _git_path_is_tracked_or_contains_tracked(workspace: Path, rel_path: str, *, 
         )
         return completed.returncode == 0
     except Exception:
-        return False
+        # Failure to establish trusted repository state must not turn a
+        # recursive deletion into an auto-approved command.
+        return True
 
 
 def _isolated_git_query_environment() -> dict[str, str]:
@@ -960,9 +1444,11 @@ BELLO_CLI_NAMES = {"bello", "supervisor"}
 
 
 def _executable_basename(executable: str) -> str:
-    name = executable.replace("\\", "/").rsplit("/", 1)[-1].lower()
-    if name.endswith(".exe"):
-        name = name[:-4]
+    name = executable.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    for suffix in (".exe", ".cmd", ".bat", ".com"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
     return name
 
 
@@ -989,14 +1475,54 @@ def command_invokes_bello_cli(analysis: CommandAnalysis) -> bool:
     if any(_tokens_invoke_bello_cli(segment.tokens) for segment in analysis.segments):
         return True
     shell_payload = _shell_payload_from_tokens(analysis.tokens)
-    if shell_payload is None:
+    if shell_payload is not None:
+        # ``_shell_payload_from_tokens`` only recognizes POSIX shells
+        # (bash/zsh/sh).  Do not reinterpret their payload with the native
+        # PowerShell lexer when Bello itself runs on Windows.
+        tokens, _problem = parse_command(shell_payload, shell_kind="posix")
+        if tokens and _token_segments_invoke_bello_cli(tokens):
+            return True
+    wrapper = windows_shell_wrapper_payload(analysis.command)
+    if wrapper is None:
         return False
-    tokens, _problem = parse_command(shell_payload)
-    return bool(tokens and _token_segments_invoke_bello_cli(tokens))
+    shell_kind, payload, _problem = wrapper
+    if payload is None:
+        return False
+    tokens, _problem = parse_command(payload, shell_kind=shell_kind)
+    return bool(tokens and _tokens_invoke_bello_cli(tokens))
 
 
 def command_mentions_supervisor(command: str) -> bool:
     return "supervisor" in command.lower()
+
+
+def windows_command_may_invoke_bello(command: str, *, _depth: int = 0) -> bool:
+    if _depth > 3:
+        return False
+    candidate = command
+    shell_kind: ShellKind = "powershell"
+    wrapper = windows_shell_wrapper_payload(command)
+    if wrapper is not None:
+        shell_kind, payload, _problem = wrapper
+        if payload is not None:
+            candidate = payload
+        else:
+            flag = r"/c" if shell_kind == "cmd" else r"-(?:c|command)"
+            match = re.search(rf"(?is)(?:^|\s){flag}\s+(.+)$", command)
+            if match:
+                candidate = match.group(1).strip()
+                if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in {'\"', "'"}:
+                    candidate = candidate[1:-1]
+    if candidate != command and command_is_windows_shell_wrapper(candidate):
+        if windows_command_may_invoke_bello(candidate, _depth=_depth + 1):
+            return True
+    for raw_segment in re.split(r"[;&|()]", candidate):
+        segment = raw_segment.strip()
+        if shell_kind == "cmd" and segment.casefold().startswith("call "):
+            segment = segment[5:].lstrip()
+        if _executable_basename(_leading_windows_executable(segment)) in BELLO_CLI_NAMES:
+            return True
+    return False
 
 
 class PolicyEngine:
@@ -1006,8 +1532,11 @@ class PolicyEngine:
         *,
         declared_grading_roots: Iterable[str | os.PathLike[str]] | None = None,
         immutable_paths: Iterable[str | os.PathLike[str]] | None = None,
+        shell_kind: ShellKind | None = None,
     ):
         self.workspace = workspace.resolve()
+        self.shell_kind = _resolved_shell_kind(shell_kind)
+        self.windows_paths = is_windows_shell_kind(self.shell_kind)
         roots: list[Path] = []
         for raw in declared_grading_roots or ():
             resolved = _resolve_outside_candidate(raw, cwd=self.workspace)
@@ -1027,7 +1556,11 @@ class PolicyEngine:
         tool_name = payload.get("tool_name")
         operation = payload.get("operation")
         cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
-        cwd_path = _resolve_outside_candidate(cwd, cwd=self.workspace) if cwd else self.workspace
+        cwd_path = (
+            _resolve_outside_candidate(cwd, cwd=self.workspace, windows_paths=self.windows_paths)
+            if cwd
+            else self.workspace
+        )
 
         raw_paths = extract_paths(payload)
         immutable_hit = self._immutable_hit_for_raw_paths(raw_paths, cwd=cwd_path or self.workspace)
@@ -1036,7 +1569,11 @@ class PolicyEngine:
         grading_hit = self._declared_grading_hit_for_raw_paths(raw_paths, cwd=cwd_path or self.workspace)
         if grading_hit is not None:
             return PolicyDecision.deny(f"declared grading/hidden path access denied: {grading_hit}")
-        paths, path_problem = resolve_all_paths(self.workspace, raw_paths)
+        paths, path_problem = resolve_all_paths(
+            self.workspace,
+            raw_paths,
+            windows_paths=self.windows_paths,
+        )
         if path_problem and raw_paths:
             return PolicyDecision.route_llm(path_problem)
 
@@ -1080,33 +1617,94 @@ class PolicyEngine:
 
     def _declared_grading_hit_for_raw_paths(self, raw_paths: Iterable[str], *, cwd: Path) -> str | None:
         for raw in raw_paths:
-            hit = _declared_grading_path_hit(raw, cwd=cwd, roots=self.declared_grading_roots)
+            hit = _declared_grading_path_hit(
+                raw,
+                cwd=cwd,
+                roots=self.declared_grading_roots,
+                windows_paths=self.windows_paths,
+            )
             if hit is not None:
                 return hit
         return None
 
     def _immutable_hit_for_raw_paths(self, raw_paths: Iterable[str], *, cwd: Path) -> str | None:
         for raw in raw_paths:
-            hit = _declared_grading_path_hit(raw, cwd=cwd, roots=self.immutable_paths)
+            hit = _declared_grading_path_hit(
+                raw,
+                cwd=cwd,
+                roots=self.immutable_paths,
+                windows_paths=self.windows_paths,
+            )
             if hit is not None:
                 return hit
+        return None
+
+    def _raw_windows_command_path_hit(
+        self,
+        command: str,
+        roots: tuple[Path, ...],
+    ) -> str | None:
+        """Find literal protected paths even when Windows shell syntax is ambiguous."""
+
+        # Shell grammar and filesystem grammar are independent.  Tests may
+        # deliberately exercise the legacy POSIX command corpus on a Windows
+        # host, while its interpolated paths are still native ``C:\\...``
+        # spellings.  Conversely, explicit PowerShell/cmd policy tests on a
+        # POSIX host need the same conservative literal check.
+        if sys.platform != "win32" and not self.windows_paths:
+            return None
+        normalized_command = re.sub(r"\\+", r"\\", command.replace("/", "\\").casefold())
+        for root in roots:
+            spellings = [str(root)]
+            if _path_is_within(root, self.workspace, windows_paths=True):
+                try:
+                    relative = root.relative_to(self.workspace)
+                except ValueError:
+                    relative = None
+                if relative is not None and str(relative) not in {"", "."}:
+                    spellings.append(str(relative))
+            for spelling in spellings:
+                candidate = re.sub(
+                    r"\\+",
+                    r"\\",
+                    spelling.replace("/", "\\").rstrip("\\").casefold(),
+                )
+                if not candidate:
+                    continue
+                if re.search(
+                    rf"(?<![\w.\\-]){re.escape(candidate)}(?=$|[\\\s'\";&|()<>{{}}])",
+                    normalized_command,
+                ):
+                    return str(root)
         return None
 
     def _command_immutable_hit(self, analysis: CommandAnalysis, *, cwd: str | None) -> str | None:
         if not self.immutable_paths:
             return None
+        raw_hit = self._raw_windows_command_path_hit(
+            analysis.command,
+            self.immutable_paths,
+        )
+        if raw_hit is not None:
+            return raw_hit
         for immutable in self.immutable_paths:
             immutable_text = str(immutable).rstrip(os.sep) or os.sep
             escaped = re.escape(immutable_text)
-            if re.search(rf"(?<![\w./-]){escaped}(?=$|[/\s'\";&|()])", analysis.command):
+            flags = re.IGNORECASE if self.windows_paths else 0
+            if re.search(rf"(?<![\w./\\-]){escaped}(?=$|[/\\\s'\";&|()])", analysis.command, flags):
                 return str(immutable)
-        cwd_path = _resolve_outside_candidate(cwd, cwd=self.workspace) if cwd else self.workspace
+        cwd_path = (
+            _resolve_outside_candidate(cwd, cwd=self.workspace, windows_paths=self.windows_paths)
+            if cwd
+            else self.workspace
+        )
         if cwd_path is None:
             cwd_path = self.workspace
         candidates = list(analysis.tokens)
         shell_payload = _shell_payload_from_tokens(analysis.tokens)
         if shell_payload:
-            nested_tokens, _problem = parse_command(shell_payload)
+            # This helper extracts only bash/zsh/sh ``-c`` payloads.
+            nested_tokens, _problem = parse_command(shell_payload, shell_kind="posix")
             if nested_tokens:
                 candidates.extend(nested_tokens)
         for token in candidates:
@@ -1114,7 +1712,9 @@ class PolicyEngine:
                 continue
             if token.startswith("-") or "=" in token and "/" not in token:
                 continue
-            token_path = Path(token.strip("'\"")).expanduser()
+            token_path = _path_for_platform(token.strip("'\""), windows_paths=self.windows_paths)
+            if token_path is None:
+                continue
             roots = self.immutable_paths
             if not token_path.is_absolute():
                 roots = tuple(
@@ -1122,16 +1722,36 @@ class PolicyEngine:
                     for root in roots
                     if not (root.is_dir() and not _is_relative_to(root, self.workspace))
                 )
-            hit = _declared_grading_path_hit(token, cwd=cwd_path, roots=roots)
+            hit = _declared_grading_path_hit(
+                token,
+                cwd=cwd_path,
+                roots=roots,
+                windows_paths=self.windows_paths,
+            )
             if hit is not None:
                 return hit
         return None
 
     def _command_declared_grading_hit(self, command: str, analysis: CommandAnalysis, *, cwd: str | None) -> str | None:
-        cwd_path = _resolve_outside_candidate(cwd, cwd=self.workspace) if cwd else self.workspace
+        raw_hit = self._raw_windows_command_path_hit(
+            command,
+            self.declared_grading_roots,
+        )
+        if raw_hit is not None:
+            return raw_hit
+        cwd_path = (
+            _resolve_outside_candidate(cwd, cwd=self.workspace, windows_paths=self.windows_paths)
+            if cwd
+            else self.workspace
+        )
         if cwd_path is None:
             cwd_path = self.workspace
-        cwd_hit = _declared_grading_path_hit(str(cwd_path), cwd=self.workspace, roots=self.declared_grading_roots)
+        cwd_hit = _declared_grading_path_hit(
+            str(cwd_path),
+            cwd=self.workspace,
+            roots=self.declared_grading_roots,
+            windows_paths=self.windows_paths,
+        )
         if cwd_hit is not None:
             return cwd_hit
         for token in analysis.tokens:
@@ -1139,16 +1759,25 @@ class PolicyEngine:
                 continue
             if token.startswith("-") or "=" in token and "/" not in token:
                 continue
-            pathish = token.startswith(("~", "/", ".")) or "/" in token
+            pathish = token.startswith(("~", "/", ".")) or "/" in token or (self.windows_paths and "\\" in token)
             if not pathish:
                 continue
-            hit = _declared_grading_path_hit(token, cwd=cwd_path, roots=self.declared_grading_roots)
+            hit = _declared_grading_path_hit(
+                token,
+                cwd=cwd_path,
+                roots=self.declared_grading_roots,
+                windows_paths=self.windows_paths,
+            )
             if hit is not None:
                 return hit
         return None
 
     def _command_targets_supervisor_runtime(self, analysis: CommandAnalysis, *, cwd: str | None) -> bool:
-        cwd_path = _resolve_outside_candidate(cwd, cwd=self.workspace) if cwd else self.workspace
+        cwd_path = (
+            _resolve_outside_candidate(cwd, cwd=self.workspace, windows_paths=self.windows_paths)
+            if cwd
+            else self.workspace
+        )
         if cwd_path is None:
             cwd_path = self.workspace
         for token in analysis.tokens:
@@ -1156,7 +1785,7 @@ class PolicyEngine:
                 continue
             if token.startswith("-"):
                 continue
-            pathish = token.startswith(("~", "/", ".")) or "/" in token
+            pathish = token.startswith(("~", "/", ".")) or "/" in token or (self.windows_paths and "\\" in token)
             if not pathish:
                 continue
             if self._references_supervisor_runtime(token, cwd=cwd_path):
@@ -1164,18 +1793,58 @@ class PolicyEngine:
         return False
 
     def _references_supervisor_runtime(self, raw: str, *, cwd: Path) -> bool:
-        resolved = _resolve_candidate_path(raw, cwd=cwd)
+        resolved = _resolve_candidate_path(raw, cwd=cwd, windows_paths=self.windows_paths)
         if resolved is not None and is_supervisor_runtime_path(self.workspace, resolved):
             return True
-        text = raw.strip().strip("'\"")
-        for part in Path(text).parts:
+        text = raw.strip("'\"")
+        parts = re.split(r"[\\/]", text) if self.windows_paths else Path(text).parts
+        for part in parts:
             lowered = part.lower()
             if lowered.startswith(".") and fnmatch.fnmatch(".supervisor", lowered):
                 return True
         return False
 
-    def _evaluate_command(self, command: str, paths: list[Path], *, cwd: str | None = None) -> PolicyDecision:
-        analysis = analyze_command(self.workspace, command, cwd)
+    def _evaluate_command(
+        self,
+        command: str,
+        paths: list[Path],
+        *,
+        cwd: str | None = None,
+        _wrapper_depth: int = 0,
+    ) -> PolicyDecision:
+        # A native Windows wrapper is only a transport for another command.
+        # Re-run the hard-deny checks against a safely delimited payload so
+        # `powershell -Command "Set-Content TASK.md ..."` and `cmd /c ...`
+        # cannot hide immutable, grading, runtime, or Bello access behind the
+        # outer interpreter token.  Ambiguous/encoded wrappers still fall
+        # through to normal LLM routing and are never auto-approved.
+        if self.windows_paths and _wrapper_depth < 4:
+            wrapper = windows_shell_wrapper_payload(command)
+            if wrapper is not None:
+                nested_shell, nested_command, _wrapper_problem = wrapper
+                if nested_command is not None:
+                    nested_policy = PolicyEngine(
+                        self.workspace,
+                        declared_grading_roots=self.declared_grading_roots,
+                        immutable_paths=self.immutable_paths,
+                        shell_kind=nested_shell,
+                    )
+                    nested = nested_policy._evaluate_command(
+                        nested_command,
+                        [],
+                        cwd=cwd,
+                        _wrapper_depth=_wrapper_depth + 1,
+                    )
+                    if nested.kind == PolicyDecisionKind.DENY:
+                        reason = nested.reason
+                        if reason != "commands invoking Bello are denied":
+                            reason = f"nested {nested_shell} command denied: {reason}"
+                        return PolicyDecision.deny(
+                            reason,
+                            nested_command=nested_command,
+                            nested_shell_kind=nested_shell,
+                        )
+        analysis = analyze_command(self.workspace, command, cwd, shell_kind=self.shell_kind)
         analysis_payload = analysis.policy_payload()
         payload = {
             "command_analysis": analysis_payload,
@@ -1191,7 +1860,9 @@ class PolicyEngine:
         immutable_hit = self._command_immutable_hit(analysis, cwd=cwd)
         if immutable_hit is not None:
             return PolicyDecision.deny(f"immutable path access escalation denied: {immutable_hit}", **payload)
-        if command_invokes_bello_cli(analysis):
+        if command_invokes_bello_cli(analysis) or (
+            self.windows_paths and windows_command_may_invoke_bello(command)
+        ):
             return PolicyDecision.deny("commands invoking Bello are denied", **payload)
         if command_mentions_supervisor(command):
             return PolicyDecision.deny("commands containing supervisor are denied", **payload)
@@ -1202,17 +1873,21 @@ class PolicyEngine:
             return self._evaluate_patch_paths(patch_paths)
         if is_remote_execution_pipeline(command):
             return PolicyDecision.deny("remote code execution pipeline denied", **payload)
-        tokens, problem = parse_command(command)
+        tokens, problem = parse_command(command, shell_kind=self.shell_kind)
         if tokens is None:
             return PolicyDecision.route_llm(problem or "unparsed command", **payload)
-        if is_force_push_protected(tokens):
+        policy_tokens = list(tokens)
+        if self.windows_paths:
+            executable = _executable_basename(policy_tokens[0])
+            policy_tokens[0] = WINDOWS_COMMAND_ALIASES.get(executable, executable)
+        if is_force_push_protected(policy_tokens):
             return PolicyDecision.deny("force push to protected branch denied", **payload)
-        if is_broad_chmod(tokens, self.workspace):
+        if is_broad_chmod(policy_tokens, self.workspace):
             return PolicyDecision.deny("broad permission change denied", **payload)
-        tracked_problem = tracked_delete_problem(tokens, self.workspace)
+        tracked_problem = tracked_delete_problem(policy_tokens, self.workspace)
         if tracked_problem:
             return PolicyDecision.deny(tracked_problem, **payload)
-        if is_recursive_delete_outside(tokens, self.workspace):
+        if is_recursive_delete_outside(policy_tokens, self.workspace):
             return PolicyDecision.deny("recursive deletion outside workspace denied", **payload)
         block_reason = auto_allow_block_reason(analysis.risk_tags)
         if block_reason is not None:
@@ -1220,20 +1895,35 @@ class PolicyEngine:
         if problem:
             return PolicyDecision.route_llm(problem, **payload)
 
-        cmd = tokens[0]
-        if cmd == "git" and _git_read_only(tokens[1:]):
+        cmd = policy_tokens[0]
+        if cmd == "git" and _git_read_only(policy_tokens[1:]):
             return PolicyDecision.allow("read-only git command", **payload)
-        if cmd in {"python", "python3", "node", "pytest", "npm"} and any(flag in tokens[1:] for flag in VERSION_FLAGS):
+        if (
+            cmd in {"python", "python3", "node", "pytest", "npm"}
+            and any(flag in policy_tokens[1:] for flag in VERSION_FLAGS)
+        ) or (
+            self.windows_paths
+            and _windows_python_executable(cmd)
+            and _windows_python_version_report_only(cmd, policy_tokens[1:])
+        ):
             return PolicyDecision.allow("version check", **payload)
         if cmd in {"ls", "pwd"}:
             return PolicyDecision.allow("informational shell command", **payload)
         if cmd == "find":
             return PolicyDecision.allow("bounded find inside workspace", **payload)
         if cmd in READ_FILE_COMMANDS:
-            raw_paths, read_problem = extract_read_command_paths(tokens, self.workspace)
+            raw_paths, read_problem = extract_read_command_paths(
+                policy_tokens,
+                self.workspace,
+                windows_paths=self.windows_paths,
+            )
             if read_problem:
                 return PolicyDecision.route_llm(read_problem, **payload)
-            resolved, path_problem = resolve_all_paths(self.workspace, raw_paths)
+            resolved, path_problem = resolve_all_paths(
+                self.workspace,
+                raw_paths,
+                windows_paths=self.windows_paths,
+            )
             if path_problem:
                 return PolicyDecision.route_llm(path_problem, **payload)
             if not resolved:
@@ -1263,7 +1953,11 @@ class PolicyEngine:
         grading_hit = self._declared_grading_hit_for_raw_paths(raw_paths, cwd=self.workspace)
         if grading_hit is not None:
             return PolicyDecision.deny(f"declared grading/hidden path access denied: {grading_hit}")
-        paths, path_problem = resolve_all_paths(self.workspace, raw_paths)
+        paths, path_problem = resolve_all_paths(
+            self.workspace,
+            raw_paths,
+            windows_paths=self.windows_paths,
+        )
         if path_problem:
             return PolicyDecision.route_llm(path_problem)
         if any(is_protected_path(self.workspace, path) for path in paths):

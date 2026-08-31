@@ -3,17 +3,23 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from supervisor.appserver import (
     APP_SERVER_CLEANUP_RPC_TIMEOUT_SECONDS,
     APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
     AppServerClient,
     AppServerError,
+    AppServerTimeoutError,
     last_agent_message_text,
     text_input,
 )
-from supervisor.coder import DEFAULT_INTELLIGENCE, apply_intelligence
+from supervisor.coder import (
+    DEFAULT_INTELLIGENCE,
+    apply_intelligence,
+    apply_multi_agent_thread_start_params,
+)
+from supervisor.project_config import MultiAgentConfig
 from supervisor.prompts import build_adversary_prompt
 from supervisor.schemas import SupervisorWakePacket
 
@@ -60,6 +66,8 @@ class AdversaryAgent:
         on_thread_start: Callable[[str], None] | None = None,
         on_thread_done: Callable[[str], None] | None = None,
         denied_probes: Callable[[], list[str]] | None = None,
+        multi_agent: MultiAgentConfig | None = None,
+        before_thread_cleanup: Callable[[str, Path], Awaitable[None]] | None = None,
     ):
         self.client = client
         self.project_root = project_root.resolve()
@@ -69,6 +77,8 @@ class AdversaryAgent:
         self.on_thread_start = on_thread_start
         self.on_thread_done = on_thread_done
         self.denied_probes = denied_probes
+        self.multi_agent = multi_agent or MultiAgentConfig()
+        self.before_thread_cleanup = before_thread_cleanup
 
     async def run(
         self,
@@ -134,17 +144,30 @@ class AdversaryAgent:
             if status != "completed":
                 try:
                     completed = await self.client.wait_for_notification(
-                        lambda message: message.method == "turn/completed"
-                        and message.params.get("threadId") == thread_id
-                        and isinstance(message.params.get("turn"), dict)
-                        and message.params["turn"].get("id") == turn_id,
+                        lambda message: _is_terminal_turn_notification(
+                            message,
+                            thread_id=thread_id,
+                            turn_id=turn_id,
+                        ),
                         timeout=self.timeout_seconds,
                     )
                 except (asyncio.TimeoutError, AppServerError) as exc:
-                    raise AdversaryAgentError(
-                        f"adversary turn/completed notification timed out after {self.timeout_seconds:g}s "
+                    if isinstance(exc, (asyncio.TimeoutError, AppServerTimeoutError)):
+                        detail = f"timed out after {self.timeout_seconds:g}s"
+                    else:
+                        detail = f"failed with {exc.__class__.__name__}: {exc}"
+                    raise AdversaryAttemptError(
+                        f"adversary turn completion wait {detail} "
                         f"thread_id={thread_id} turn_id={turn_id}"
                     ) from exc
+                if completed.method == "error":
+                    raise AdversaryAttemptError(
+                        _turn_error_notification_message(
+                            completed.params,
+                            thread_id=thread_id,
+                            turn_id=turn_id,
+                        )
+                    )
                 turn = completed.params.get("turn", {})
             if turn.get("status") != "completed":
                 raise AdversaryAttemptError(_turn_failure_message(turn, thread_id=thread_id, turn_id=turn_id))
@@ -178,6 +201,11 @@ class AdversaryAgent:
             raise AdversaryAgentError(f"{exc.__class__.__name__}: {exc}") from exc
         finally:
             if thread_id is not None:
+                if self.before_thread_cleanup is not None:
+                    try:
+                        await self.before_thread_cleanup(thread_id, self.project_root)
+                    except Exception:
+                        pass
                 try:
                     await self.client.thread_archive(thread_id, timeout=APP_SERVER_CLEANUP_RPC_TIMEOUT_SECONDS)
                 except Exception:
@@ -201,7 +229,13 @@ class AdversaryAgent:
             "ephemeral": False,
             "experimentalRawEvents": False,
             "persistExtendedHistory": False,
+            "config": {},
         }
+        apply_multi_agent_thread_start_params(
+            params,
+            self.multi_agent,
+            role="adversary",
+        )
         if self.model:
             params["model"] = self.model
         return params
@@ -247,6 +281,46 @@ def _agent_message_text_from_turns(data: Any, *, turn_id: str | None) -> str | N
         if text:
             return text
     return None
+
+
+def _is_terminal_turn_notification(message: Any, *, thread_id: str, turn_id: str) -> bool:
+    params = message.params
+    if params.get("threadId") != thread_id:
+        return False
+    if message.method == "turn/completed":
+        turn = params.get("turn")
+        return isinstance(turn, dict) and turn.get("id") == turn_id
+    if message.method != "error" or params.get("turnId") != turn_id:
+        return False
+    # Codex can emit a transient error while it is already retrying the same turn.
+    # Let that built-in retry finish; only a terminal error should consume one of
+    # Bello's two fresh-thread adversary attempts.
+    return params.get("willRetry") is not True
+
+
+def _turn_error_notification_message(params: dict[str, Any], *, thread_id: str, turn_id: str) -> str:
+    error = params.get("error")
+    details: list[str] = []
+    if isinstance(error, dict):
+        message = error.get("message")
+        if isinstance(message, str) and message.strip():
+            details.append(message.strip())
+        codex_error_info = error.get("codexErrorInfo")
+        if codex_error_info is not None:
+            details.append(f"codexErrorInfo={codex_error_info!r}")
+        additional = error.get("additionalDetails")
+        if isinstance(additional, str) and additional.strip():
+            details.append(additional.strip())
+    elif isinstance(error, str) and error.strip():
+        details.append(error.strip())
+    message = params.get("message")
+    if not details and isinstance(message, str) and message.strip():
+        details.append(message.strip())
+    detail_text = f": {'; '.join(details)}" if details else ""
+    return (
+        "adversary turn received terminal app-server error "
+        f"thread_id={thread_id} turn_id={turn_id}{detail_text}"
+    )
 
 
 def _turn_failure_message(turn: Any, *, thread_id: str, turn_id: str) -> str:
