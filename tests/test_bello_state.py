@@ -9838,7 +9838,11 @@ async def test_controller_idle_guard_forces_completion_review_for_stalled_no_act
         )
     )
 
-    await controller._handle_controller_idle_guard(now=301.0)
+    await controller._handle_controller_idle_guard(now=119.0)
+
+    assert getattr(controller, "_supervisor_task", None) is None
+
+    await controller._handle_controller_idle_guard(now=121.0)
     await controller._supervisor_task
 
     assert coder.messages == ["not used"]

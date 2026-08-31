@@ -160,7 +160,7 @@ MANDATORY_FULL_RUNTIME_WAKE_REASONS = {
     "runtime_decision_retry",
 }
 CONTROLLER_IDLE_GUARD_INTERVAL_SECONDS = 60.0
-CONTROLLER_IDLE_GUARD_STALL_SECONDS = 300.0
+CONTROLLER_IDLE_GUARD_STALL_SECONDS = 120.0
 # Provider no_message (empty-completion) recovery for the completion review. A transient
 # backend blip can return empty "completed" turns for a couple of minutes; ride it out with
 # backed-off retries before declaring the run infra-invalid. The budget is CONSECUTIVE
