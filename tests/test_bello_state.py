@@ -743,7 +743,7 @@ async def test_controller_stages_plan_only_in_disposable_coder_workspace(tmp_pat
     task = tmp_path / "TASK.md"
     task.write_text("# Task\n", encoding="utf-8")
     plan = tmp_path / "PLAN.md"
-    plan.write_text("PRIVATE PLAN CONTENT\npytest -q\n", encoding="utf-8")
+    plan.write_bytes(b"PRIVATE PLAN CONTENT\r\npytest -q\r\n")
     source = tmp_path / "app.py"
     source.write_text("value = 1\n", encoding="utf-8")
 
@@ -872,8 +872,9 @@ async def test_controller_stages_plan_only_in_disposable_coder_workspace(tmp_pat
         assert "PLAN.md" in raw_state
         assert "PRIVATE PLAN CONTENT" not in safe_state
         assert "PLAN.md" not in safe_state
-        assert str(snapshot.plan_source_path) in raw_state
-        assert str(snapshot.plan_source_path) not in safe_state
+        encoded_plan_source_path = json.dumps(str(snapshot.plan_source_path))[1:-1]
+        assert encoded_plan_source_path in raw_state
+        assert encoded_plan_source_path not in safe_state
     finally:
         snapshot.cleanup()
 
@@ -8371,7 +8372,7 @@ async def test_preflight_appserver_timeout_writes_provider_failure_final_report(
         async def account_read(self):
             raise AppServerTimeoutError("app-server RPC account/read response timed out after 30s")
 
-    monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
+    _mock_codex_probe(monkeypatch)
     controller = BelloController(
         tmp_path,
         task_path=task,
@@ -8426,7 +8427,7 @@ async def test_missing_selected_model_interrupts_before_coder_and_writes_final_r
             raise AssertionError("coder must not start with an unavailable model")
 
     client = MissingModelClient()
-    monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
+    _mock_codex_probe(monkeypatch)
     controller = BelloController(
         tmp_path,
         task_path=task,
@@ -8487,7 +8488,7 @@ async def test_missing_fixed_adversary_model_interrupts_before_coder_and_writes_
             raise AssertionError("coder must not start with an unavailable adversary model")
 
     client = MissingAdversaryModelClient()
-    monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
+    _mock_codex_probe(monkeypatch)
     controller = BelloController(
         tmp_path,
         task_path=task,
@@ -8552,7 +8553,7 @@ async def test_preflight_probe_cleanup_unsubscribes_and_logs_without_failing(
             raise AppServerError("unsubscribe cleanup failed")
 
     client = ProbeCleanupClient()
-    monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
+    _mock_codex_probe(monkeypatch)
     controller = BelloController(
         tmp_path,
         task_path=task,
@@ -8616,7 +8617,7 @@ async def test_preflight_rate_limit_probe_failure_warns_and_continues(tmp_path: 
 
     client = RateLimitFailureClient()
     tui = _FakeTUI()
-    monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
+    _mock_codex_probe(monkeypatch)
     controller = BelloController(
         tmp_path,
         task_path=task,
@@ -8680,7 +8681,7 @@ async def test_preflight_accepts_configured_danger_full_access_sandbox(tmp_path:
 
     client = DangerSandboxClient()
     monkeypatch.setenv("BELLO_CODER_SANDBOX", "danger-full-access")
-    monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
+    _mock_codex_probe(monkeypatch)
     controller = BelloController(
         tmp_path,
         task_path=task,
@@ -9499,7 +9500,7 @@ async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path:
             return {"turn": {"id": "turn-1", "status": "running"}}
 
     client = ShutdownClient()
-    monkeypatch.setattr("supervisor.controller._run_probe", lambda args: (True, "codex-cli test"))
+    _mock_codex_probe(monkeypatch)
     controller = BelloController(
         tmp_path,
         task_path=task,
@@ -9575,6 +9576,19 @@ def test_run_async_cleanly_exits_zero_after_loop_cleanup() -> None:
 
 async def _async_noop() -> None:
     return None
+
+
+def _mock_codex_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        controller_module,
+        "_controller_executable",
+        lambda name, cwd, **kwargs: name,
+    )
+    monkeypatch.setattr(
+        controller_module,
+        "_run_probe",
+        lambda args: (True, "codex-cli test"),
+    )
 
 
 async def _async_schema_hash() -> str:

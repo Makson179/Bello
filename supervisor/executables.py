@@ -30,7 +30,8 @@ def resolve_trusted_executable(
 
     POSIX deliberately retains ``shutil.which`` behavior.  On Windows we scan
     absolute PATH entries ourselves, reject relative/empty entries and
-    reparse-backed candidates, and never return a bare command name.
+    reparse-backed executable leaves, canonicalize directory links before the
+    ancestor check, and never return a bare command name.
     """
 
     use_windows = is_native_windows() if windows is None else windows
@@ -79,7 +80,11 @@ def resolve_trusted_executable(
             resolved = lexical.resolve(strict=True)
             if _path_is_blocked(lexical, blocked) or _path_is_blocked(resolved, blocked):
                 continue
-            if _has_reparse_ancestor(lexical.parent):
+            # Launch the canonical path returned below.  A lexical parent may be
+            # a legitimate junction (for example actions/setup-python's hosted
+            # tool cache); its resolved target must still have an ordinary,
+            # trusted ancestor chain.
+            if _has_reparse_ancestor(resolved.parent):
                 continue
             return str(resolved)
         except (FileNotFoundError, NotADirectoryError):

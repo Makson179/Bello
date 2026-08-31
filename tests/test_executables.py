@@ -55,6 +55,26 @@ def test_windows_resolver_accepts_balanced_quoted_absolute_path_entry(
     assert resolved == str(expected.resolve())
 
 
+def test_windows_resolver_launches_canonical_target_below_linked_parent(
+    tmp_path: Path,
+) -> None:
+    canonical = tmp_path / "canonical-bin"
+    expected = _touch(canonical / "python.EXE")
+    linked = tmp_path / "linked-bin"
+    try:
+        linked.symlink_to(canonical, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory links unavailable: {exc}")
+
+    resolved = resolve_trusted_executable(
+        str(linked / "python.EXE"),
+        cwd=tmp_path / "workspace",
+        windows=True,
+    )
+
+    assert resolved == str(expected.resolve())
+
+
 def test_windows_resolver_fails_closed_when_only_candidate_is_in_workspace(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

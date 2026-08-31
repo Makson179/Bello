@@ -939,7 +939,13 @@ class BelloController:
                     private_texts.append(candidate)
         plan_bytes = getattr(snapshot, "plan_bytes", None)
         if isinstance(plan_bytes, bytes) and plan_bytes and private_texts:
-            plan_text = plan_bytes.decode("utf-8", errors="replace")
+            def normalized_newlines(text: str) -> str:
+                return text.replace("\r\n", "\n").replace("\r", "\n")
+
+            plan_text = normalized_newlines(
+                plan_bytes.decode("utf-8", errors="replace")
+            )
+            private_texts = [normalized_newlines(text) for text in private_texts]
             markers = {plan_text, plan_text.strip()}
             if len(plan_text) > 512:
                 markers.update(
@@ -9227,9 +9233,6 @@ def _workspace_path_fingerprint(
         file_stat.st_ctime_ns,
         file_stat.st_ino,
     )
-    cached = cache.get(relative_path)
-    if cached is not None and cached[0] == stat_key:
-        return cached[1]
     if not stat.S_ISREG(file_stat.st_mode):
         fingerprint = hashlib.sha256(repr(stat_key).encode("ascii")).hexdigest()
     else:
