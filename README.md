@@ -34,30 +34,34 @@
 
 ## TL;DR
 
-Using the strongest model for every part of a coding task is expensive. Bello
-lets you use separate models for implementation, runtime supervision,
-completion review, and adversarial testing. In our Efficient Budget comparison,
-Raw GPT-5.6 Sol XHigh consumed 2.966 times as much of the weekly Codex limit.
-Bello also scored 0.697 percentage points higher on average across four
-ProgramBench tasks.
+Bello turns a Codex run into a configurable, supervised engineering pipeline.
+Instead of asking one model to implement, monitor, review, and validate its own
+work, Bello separates those responsibilities between a coder, a live runtime
+supervisor, an independent completion reviewer, and an adversary. Each role can
+use its own model and reasoning level. The same system can therefore reduce the
+cost of a complete run, push completion quality beyond Raw Codex, and protect an
+autonomous coding session from hallucinations, task drift, and harmful actions.
 
-Bello also protects the run while it works. The coder operates inside a
-disposable sandbox, and a runtime supervisor watches the live agent. It catches
-hallucinations and task drift, blocks harmful actions before they reach the
-project or production systems, and can restart a failing run without losing the
-workspace. On three workplace-style tasks, `runtime-only` scored about 9%
-higher than Raw Codex at about the same cost and wall time. Optional completion
-review checks the finished diff against the task, and an adversary tries to
-break the result without seeing how it was developed.
+Cost is the clearest measured advantage of Efficient Budget. Across four
+ProgramBench tasks, Raw GPT-5.6 Sol XHigh consumed **2.966 times** as much of the
+weekly Codex limit, while Bello scored **0.697 percentage points higher** on
+average. When quality takes priority over cost, the deeper configuration scored
+**36.4% higher** than Raw Codex across nine matched runs.
 
-You choose the tradeoff for each task. The Codex plugin can inspect the task and
-recommend a configuration for lower cost, higher quality, or shorter wall time.
-Faster configurations use quicker reasoning where latency matters and reserve
-stronger models for the decisions that need them. This can cut wall time while
-keeping the total cost and expected result close to a slower configuration.
-Efficient Budget favors cost while preserving average completion quality, and
-the setup that prioritizes quality scored 36.4% higher than Raw Codex across its
-nine matched runs.
+Protection remains active even in the lightest configuration. The coder works
+inside a disposable sandbox while the runtime supervisor follows the live run,
+redirects hallucinated or off-task work, blocks dangerous actions before they
+reach the project or production systems, and can restart a failing generation
+without losing the workspace. On three workplace-style tasks, `runtime-only`
+scored about **9% higher** than Raw Codex at about the same cost and wall time.
+
+These outcomes are not tied to fixed presets. Every role can use a different
+model, reasoning level, review budget, and service tier. One configuration can
+reserve expensive reasoning for decisive reviews, another can spend more to
+maximize completion, and another can use faster profiles to reduce wall time
+while preserving a similar balance of price and quality. The Codex plugin can
+inspect the task and recommend a complete configuration around the user's
+priorities.
 
 Install the plugin or standalone command in [Install](#install), then provide a
 task file as shown in [Quick start](#quick-start). Bello runs the selected
