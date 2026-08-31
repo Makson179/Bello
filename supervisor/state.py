@@ -41,6 +41,7 @@ EVENTS = "events.jsonl"
 SUPERVISOR_WAKES = "supervisor_wakes.jsonl"
 RUNTIME_TRACE = "runtime_trace.jsonl"
 RUNTIME_METRICS = "runtime_metrics.json"
+RUN_CHECKPOINT = "run_checkpoint.json"
 AGENT_SETTINGS = "agent-settings.json"
 PREVIOUS_RUNS = "previous_runs"
 RECOVERY = "recovery"
@@ -255,6 +256,22 @@ class StateStore:
         with self.locked(name):
             self.atomic_write_json(self.path(name), data)
 
+    def get_run_checkpoint(self) -> dict[str, Any]:
+        value = self.read_json(RUN_CHECKPOINT, {})
+        return value if isinstance(value, dict) else {}
+
+    def write_run_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        """Durably replace the small run-state checkpoint.
+
+        The coder workspace already lives on disk, so a checkpoint records only
+        orchestration metadata. ``atomic_write_json`` fsyncs the temporary file
+        before replacing the previous checkpoint; a crash can therefore expose
+        either the old complete checkpoint or the new complete checkpoint, never
+        a partially-written JSON document.
+        """
+
+        self.write_json_locked(RUN_CHECKPOINT, checkpoint)
+
     def get_health(self) -> HealthState:
         return HealthState.model_validate(self.read_json(HEALTH, HealthState().model_dump()))
 
@@ -279,14 +296,16 @@ class StateStore:
         if mode == "fresh":
             self._clear_state_dir(preserve=set())
         elif mode == "resume":
-            self._clear_state_dir(preserve={EVENTS, LOG, PREVIOUS_RUNS, RECOVERY})
+            self._clear_state_dir(
+                preserve={EVENTS, LOG, PREVIOUS_RUNS, RECOVERY, RUN_CHECKPOINT}
+            )
         else:
             raise ValueError(f"unknown bello initialization mode: {mode}")
 
         files = self._initial_state_files(config)
         for name, value in files.items():
             path = self.path(name)
-            if name in {EVENTS, LOG} and mode == "resume" and path.exists():
+            if name in {EVENTS, LOG, RUN_CHECKPOINT} and mode == "resume" and path.exists():
                 continue
             if isinstance(value, BaseModel):
                 self.atomic_write_json(path, value)
@@ -308,6 +327,7 @@ class StateStore:
             SUPERVISOR_WAKES: "",
             RUNTIME_TRACE: "",
             RUNTIME_METRICS: "{}\n",
+            RUN_CHECKPOINT: "{}\n",
         }
 
     def _clear_state_dir(self, *, preserve: set[str]) -> None:

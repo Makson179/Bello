@@ -34,6 +34,26 @@ def test_appserver_environment_drops_parent_codex_execution_context() -> None:
     assert result == {"PATH": "/usr/bin", "CODEX_HOME": "/tmp/codex-home"}
 
 
+async def test_transport_restart_reuses_isolated_codex_home(tmp_path: Path) -> None:
+    client = AppServerClient()
+    client._isolated_codex_home = tmp_path
+    calls: list[tuple[str, bool]] = []
+
+    async def fake_stop(*, preserve_isolated_codex_home: bool = False) -> None:
+        calls.append(("stop", preserve_isolated_codex_home))
+
+    async def fake_start(*, reuse_isolated_codex_home: bool = False) -> None:
+        calls.append(("start", reuse_isolated_codex_home))
+
+    client.stop = fake_stop  # type: ignore[method-assign]
+    client.start = fake_start  # type: ignore[method-assign]
+
+    await client.restart()
+
+    assert calls == [("stop", True), ("start", True)]
+    assert client._isolated_codex_home == tmp_path
+
+
 def test_windows_default_codex_home_uses_userprofile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

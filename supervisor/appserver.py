@@ -331,13 +331,20 @@ class AppServerClient:
         self._process_group_id: int | None = None
         self._windows_job: _WindowsKillJob | None = None
 
-    async def start(self) -> None:
+    async def start(self, *, reuse_isolated_codex_home: bool = False) -> None:
         if self.process is not None:
             return
         env = _app_server_environment()
         resolved_command = _app_server_command(self.command, cwd=self.cwd, environ=env)
         source_codex_home = _codex_home_from_environment(env)
-        if source_codex_home.is_dir():
+        if reuse_isolated_codex_home:
+            isolated = self._isolated_codex_home
+            if isolated is None or not isolated.is_dir():
+                raise AppServerError(
+                    "cannot restart app-server: isolated CODEX_HOME is unavailable"
+                )
+            env["CODEX_HOME"] = str(isolated)
+        elif source_codex_home.is_dir():
             self._isolated_codex_home = _create_isolated_codex_home(source_codex_home)
             env["CODEX_HOME"] = str(self._isolated_codex_home)
         try:
@@ -361,12 +368,13 @@ class AppServerClient:
                 self._process_group_id = self.process.pid
         except BaseException:
             await self._abort_failed_start()
-            self._cleanup_isolated_codex_home()
+            if not reuse_isolated_codex_home:
+                self._cleanup_isolated_codex_home()
             raise
         self._reader_task = asyncio.create_task(self._read_loop())
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
-    async def stop(self) -> None:
+    async def stop(self, *, preserve_isolated_codex_home: bool = False) -> None:
         try:
             if self._reader_task:
                 self._reader_task.cancel()
@@ -400,7 +408,35 @@ class AppServerClient:
             self._force_process_tree_shutdown()
             self.process = None
             self._process_group_id = None
-            self._cleanup_isolated_codex_home()
+            if not preserve_isolated_codex_home:
+                self._cleanup_isolated_codex_home()
+
+    async def restart(self) -> None:
+        """Replace a failed transport while preserving persisted Codex threads.
+
+        The isolated CODEX_HOME contains links (or Windows copies) of the user's
+        persistent Codex state. Removing that temporary directory does not remove
+        thread rollouts from the source CODEX_HOME, so a subsequent app-server can
+        rejoin them with ``thread/resume``.
+        """
+
+        # Codex persists the rollout path with the isolated CODEX_HOME prefix.
+        # Keep that directory across the transport replacement so thread/resume
+        # can still resolve the exact rollout instead of falling back to a new
+        # coder thread. A later normal stop removes it.
+        await self.stop(preserve_isolated_codex_home=True)
+        restart_error = AppServerError("app-server transport restarted")
+        for pending_future in list(self._pending.values()):
+            if not pending_future.done():
+                pending_future.set_exception(restart_error)
+        for _, waiter_future in list(self._waiters):
+            if not waiter_future.done():
+                waiter_future.set_exception(restart_error)
+        self._pending.clear()
+        self._waiters.clear()
+        self.incoming = asyncio.Queue()
+        self.reader_error = None
+        await self.start(reuse_isolated_codex_home=True)
 
     def _cleanup_isolated_codex_home(self) -> None:
         if self._isolated_codex_home is None:
