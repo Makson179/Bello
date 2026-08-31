@@ -781,6 +781,14 @@ while True:
         "_app_server_environment",
         lambda: {"CODEX_HOME": str(tmp_path / "missing-codex-home")},
     )
+    # This test targets descendant cleanup, not executable trust.  Hosted
+    # Windows runners may expose sys.executable through runner-managed reparse
+    # points that the production Codex resolver intentionally rejects.
+    monkeypatch.setattr(
+        appserver_module,
+        "_app_server_command",
+        lambda command, **kwargs: command,
+    )
     client = AppServerClient(
         command=[sys.executable, str(parent_script), str(child_script), str(child_marker)]
     )
