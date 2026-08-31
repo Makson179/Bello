@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="720" viewBox="0 0 1160 720" role="img" aria-labelledby="budget-quality-cost-title budget-quality-cost-desc">
+<title id="budget-quality-cost-title">Efficient Budget quality and weekly limit use</title>
+<desc id="budget-quality-cost-desc">Two panels compare completion score and weekly limit use for Raw GPT-5.6 Sol XHigh and Bello Efficient Budget on four ProgramBench tasks and their mean.</desc>
+<rect width="1160" height="720" fill="#FFFFFF"/>
+<text x="48.0" y="38.0" font-family="Georgia, 'Times New Roman', serif" font-size="21" font-weight="bold" text-anchor="start" fill="#1B1B1B">Efficient Budget compared with Raw GPT-5.6 Sol XHigh</text>
+<text x="48.0" y="62.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="normal" text-anchor="start" fill="#5B5B5B">Four ProgramBench tasks, three runs per system and task</text>
+<rect x="650.0" y="43.0" width="24.0" height="16.0" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.5"/>
+<text x="684.0" y="56.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" text-anchor="start" fill="#1B1B1B">Raw GPT-5.6 Sol XHigh</text>
+<rect x="855.0" y="43.0" width="24.0" height="16.0" fill="#C7654D" stroke="#B24A33" stroke-width="1.5"/>
+<text x="889.0" y="56.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" text-anchor="start" fill="#1B1B1B">Bello Efficient Budget</text>
+<text x="92.0" y="102.0" font-family="Georgia, 'Times New Roman', serif" font-size="17" font-weight="bold" text-anchor="start" fill="#1B1B1B">Completion score</text>
+<text x="92.0" y="119.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" text-anchor="start" fill="#1B1B1B">Score (%)</text>
+<line x1="92.0" y1="334.0" x2="1052.0" y2="334.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="80.0" y="338.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" text-anchor="end" fill="#5B5B5B">0</text>
+<line x1="92.0" y1="293.0" x2="1052.0" y2="293.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="80.0" y="297.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" text-anchor="end" fill="#5B5B5B">14</text>
+<line x1="92.0" y1="252.0" x2="1052.0" y2="252.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="80.0" y="256.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" text-anchor="end" fill="#5B5B5B">28</text>
+<line x1="92.0" y1="211.0" x2="1052.0" y2="211.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="80.0" y="215.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" text-anchor="end" fill="#5B5B5B">42</text>
+<line x1="92.0" y1="170.0" x2="1052.0" y2="170.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="80.0" y="174.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" text-anchor="end" fill="#5B5B5B">56</text>
+<line x1="92.0" y1="129.0" x2="1052.0" y2="129.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="80.0" y="133.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" text-anchor="end" fill="#5B5B5B">70</text>
+<line x1="92.0" y1="129.0" x2="92.0" y2="334.0" stroke="#1B1B1B" stroke-width="1.2"/>
+<line x1="92.0" y1="334.0" x2="1052.0" y2="334.0" stroke="#1B1B1B" stroke-width="1.2"/>
+<rect x="120.5" y="214.0" width="45.0" height="120.0" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.6"/>
+<text x="143.0" y="207.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="bold" text-anchor="middle" fill="#355F8A">41.0%</text>
+<rect x="174.5" y="200.7" width="45.0" height="133.3" fill="#C7654D" stroke="#B24A33" stroke-width="1.6"/>
+<text x="197.0" y="193.7" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="bold" text-anchor="middle" fill="#B24A33">45.5%</text>
+<text x="170.0" y="358.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1B1B1B">Revive</text>
+<rect x="315.5" y="167.6" width="45.0" height="166.4" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.6"/>
+<text x="338.0" y="160.6" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="bold" text-anchor="middle" fill="#355F8A">56.8%</text>
+<rect x="369.5" y="173.9" width="45.0" height="160.1" fill="#C7654D" stroke="#B24A33" stroke-width="1.6"/>
+<text x="392.0" y="166.9" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="bold" text-anchor="middle" fill="#B24A33">54.7%</text>
+<text x="365.0" y="358.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1B1B1B">JSONSchema</text>
+<rect x="510.5" y="156.1" width="45.0" height="177.9" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.6"/>
+<text x="533.0" y="149.1" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="bold" text-anchor="middle" fill="#355F8A">60.8%</text>
+<rect x="564.5" y="157.4" width="45.0" height="176.6" fill="#C7654D" stroke="#B24A33" stroke-width="1.6"/>
+<text x="587.0" y="150.4" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="bold" text-anchor="middle" fill="#B24A33">60.3%</text>
+<text x="560.0" y="358.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1B1B1B">LightningCSS</text>
+<rect x="705.5" y="234.9" width="45.0" height="99.1" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.6"/>
+<text x="728.0" y="227.9" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="bold" text-anchor="middle" fill="#355F8A">33.8%</text>
+<rect x="759.5" y="232.4" width="45.0" height="101.6" fill="#C7654D" stroke="#B24A33" stroke-width="1.6"/>
+<text x="782.0" y="225.4" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="bold" text-anchor="middle" fill="#B24A33">34.7%</text>
+<text x="755.0" y="358.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1B1B1B">Miller</text>
+<line x1="858.0" y1="129.0" x2="858.0" y2="368.0" stroke="#D7D7D7" stroke-width="1"/>
+<rect x="900.5" y="193.1" width="45.0" height="140.9" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.6"/>
+<text x="923.0" y="186.1" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="bold" text-anchor="middle" fill="#355F8A">48.1%</text>
+<rect x="954.5" y="191.1" width="45.0" height="142.9" fill="#C7654D" stroke="#B24A33" stroke-width="1.6"/>
+<text x="977.0" y="184.1" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="bold" text-anchor="middle" fill="#B24A33">48.8%</text>
+<text x="950.0" y="358.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" text-anchor="middle" fill="#1B1B1B">Mean</text>
+<text x="92.0" y="415.0" font-family="Georgia, 'Times New Roman', serif" font-size="17" font-weight="bold" text-anchor="start" fill="#1B1B1B">Weekly limit use</text>
+<text x="92.0" y="432.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" text-anchor="start" fill="#1B1B1B">Weekly limit (%)</text>
+<line x1="92.0" y1="647.0" x2="1052.0" y2="647.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="80.0" y="651.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" text-anchor="end" fill="#5B5B5B">0</text>
+<line x1="92.0" y1="606.0" x2="1052.0" y2="606.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="80.0" y="610.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" text-anchor="end" fill="#5B5B5B">3.2</text>
+<line x1="92.0" y1="565.0" x2="1052.0" y2="565.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="80.0" y="569.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" text-anchor="end" fill="#5B5B5B">6.4</text>
+<line x1="92.0" y1="524.0" x2="1052.0" y2="524.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="80.0" y="528.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" text-anchor="end" fill="#5B5B5B">9.6</text>
+<line x1="92.0" y1="483.0" x2="1052.0" y2="483.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="80.0" y="487.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" text-anchor="end" fill="#5B5B5B">12.8</text>
+<line x1="92.0" y1="442.0" x2="1052.0" y2="442.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="80.0" y="446.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" text-anchor="end" fill="#5B5B5B">16</text>
+<line x1="92.0" y1="442.0" x2="92.0" y2="647.0" stroke="#1B1B1B" stroke-width="1.2"/>
+<line x1="92.0" y1="647.0" x2="1052.0" y2="647.0" stroke="#1B1B1B" stroke-width="1.2"/>
+<rect x="120.5" y="605.0" width="45.0" height="42.0" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.6"/>
+<text x="143.0" y="598.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="bold" text-anchor="middle" fill="#355F8A">3.28%</text>
+<rect x="174.5" y="633.5" width="45.0" height="13.5" fill="#C7654D" stroke="#B24A33" stroke-width="1.6"/>
+<text x="197.0" y="626.5" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="bold" text-anchor="middle" fill="#B24A33">1.06%</text>
+<text x="170.0" y="671.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1B1B1B">Revive</text>
+<rect x="315.5" y="608.5" width="45.0" height="38.5" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.6"/>
+<text x="338.0" y="601.5" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="bold" text-anchor="middle" fill="#355F8A">3.01%</text>
+<rect x="369.5" y="636.6" width="45.0" height="10.4" fill="#C7654D" stroke="#B24A33" stroke-width="1.6"/>
+<text x="392.0" y="629.6" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="bold" text-anchor="middle" fill="#B24A33">0.81%</text>
+<text x="365.0" y="671.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1B1B1B">JSONSchema</text>
+<rect x="510.5" y="569.8" width="45.0" height="77.2" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.6"/>
+<text x="533.0" y="562.8" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="bold" text-anchor="middle" fill="#355F8A">6.03%</text>
+<rect x="564.5" y="618.1" width="45.0" height="28.9" fill="#C7654D" stroke="#B24A33" stroke-width="1.6"/>
+<text x="587.0" y="611.1" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="bold" text-anchor="middle" fill="#B24A33">2.26%</text>
+<text x="560.0" y="671.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1B1B1B">LightningCSS</text>
+<rect x="705.5" y="604.5" width="45.0" height="42.5" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.6"/>
+<text x="728.0" y="597.5" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="bold" text-anchor="middle" fill="#355F8A">3.32%</text>
+<rect x="759.5" y="632.4" width="45.0" height="14.6" fill="#C7654D" stroke="#B24A33" stroke-width="1.6"/>
+<text x="782.0" y="625.4" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="bold" text-anchor="middle" fill="#B24A33">1.14%</text>
+<text x="755.0" y="671.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1B1B1B">Miller</text>
+<line x1="858.0" y1="442.0" x2="858.0" y2="681.0" stroke="#D7D7D7" stroke-width="1"/>
+<rect x="900.5" y="446.7" width="45.0" height="200.3" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.6"/>
+<text x="923.0" y="439.7" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="bold" text-anchor="middle" fill="#355F8A">15.63%</text>
+<rect x="954.5" y="579.5" width="45.0" height="67.5" fill="#C7654D" stroke="#B24A33" stroke-width="1.6"/>
+<text x="977.0" y="572.5" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="bold" text-anchor="middle" fill="#B24A33">5.27%</text>
+<text x="950.0" y="671.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" text-anchor="middle" fill="#1B1B1B">All 12</text>
+</svg>
