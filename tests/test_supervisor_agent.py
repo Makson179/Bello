@@ -11,6 +11,7 @@ import pytest
 
 from supervisor.appserver import AppServerError, AppServerMessage
 from supervisor.prompts import build_completion_review_prompt
+from supervisor.project_config import MultiAgentConfig
 from supervisor.schemas import (
     ChangedFileContext,
     ChangedFileDiff,
@@ -132,13 +133,25 @@ async def test_completion_review_uses_disposable_workspace_write_snapshot(
             return {}
 
     client = FakeClient()
+    completion_multi_agent = MultiAgentConfig(enabled=True, max_concurrent=3)
+    cleanup_calls: list[tuple[str, Path]] = []
+
+    async def cleanup_descendants(thread_id: str, workspace_root: Path) -> None:
+        assert workspace_root.exists()
+        cleanup_calls.append((thread_id, workspace_root))
+
     agent = StatelessSupervisorAgent(
         client,  # type: ignore[arg-type]
         store,
         task,
         completion_workspace_write=True,
+        completion_multi_agent=completion_multi_agent,
+        before_completion_thread_cleanup=cleanup_descendants,
     )
-    assert agent._thread_params()["sandbox"] == "read-only"
+    runtime_params = agent._thread_params()
+    assert runtime_params["sandbox"] == "read-only"
+    assert runtime_params["config"] == {"agents": {"enabled": False}}
+    assert "developerInstructions" not in runtime_params
     packet = agent.build_packet(wake_sequence=7, current_summary="completion review")
 
     decision = await agent.decide_completion(packet)
@@ -148,6 +161,15 @@ async def test_completion_review_uses_disposable_workspace_write_snapshot(
     review_root = Path(client.thread_params["cwd"])
     assert client.thread_params["sandbox"] == "workspace-write"
     assert client.thread_params["runtimeWorkspaceRoots"] == [str(review_root)]
+    assert client.thread_params["config"]["agents"] == {
+        "enabled": True,
+        "max_concurrent_threads_per_session": 3,
+        "default_subagent_model": completion_multi_agent.default.model,
+        "default_subagent_reasoning_effort": completion_multi_agent.default.intelligence,
+    }
+    developer_instructions = client.thread_params["developerInstructions"]
+    assert "distinct requirements, modules, or validation questions" in developer_instructions
+    assert "do not delegate the final judgment or final output" in developer_instructions
     assert client.turn_params is not None
     assert client.turn_params["sandboxPolicy"] == {
         "type": "workspaceWrite",
@@ -155,6 +177,8 @@ async def test_completion_review_uses_disposable_workspace_write_snapshot(
         "networkAccess": False,
     }
     assert client.turn_params["approvalPolicy"] == "never"
+    assert "config" not in client.turn_params
+    assert "developerInstructions" not in client.turn_params
     assert source.read_text(encoding="utf-8") == "candidate\n"
     assert not (tmp_path / ".pytest_cache").exists()
     assert review_root.exists()
@@ -162,6 +186,7 @@ async def test_completion_review_uses_disposable_workspace_write_snapshot(
     await agent.close_completion_review()
 
     assert client.archived == ["completion-thread"]
+    assert cleanup_calls == [("completion-thread", review_root)]
     assert not review_root.exists()
     assert agent.completion_workspace_snapshot is None
 
@@ -305,10 +330,16 @@ async def test_stateless_supervisor_persists_wake_packet_and_decision(tmp_path: 
     store.initialize_bello(BelloConfig(project_root=str(tmp_path), task_path=str(task)), overwrite=True)
 
     class FakeClient:
+        def __init__(self) -> None:
+            self.thread_params: dict | None = None
+            self.turn_params: dict | None = None
+
         async def thread_start(self, params, *, timeout):
+            self.thread_params = params
             return {"thread": {"id": "supervisor-thread"}}
 
         async def turn_start(self, params, *, timeout):
+            self.turn_params = params
             return {
                 "turn": {
                     "id": "supervisor-turn",
@@ -332,7 +363,14 @@ async def test_stateless_supervisor_persists_wake_packet_and_decision(tmp_path: 
         async def thread_archive(self, thread_id, *, timeout):
             return {}
 
-    agent = StatelessSupervisorAgent(FakeClient(), store, task)  # type: ignore[arg-type]
+    reviewer_threads: list[str] = []
+    client = FakeClient()
+    agent = StatelessSupervisorAgent(
+        client,  # type: ignore[arg-type]
+        store,
+        task,
+        on_thread_start=reviewer_threads.append,
+    )
     packet = agent.build_packet(wake_sequence=7, current_summary="audit this wake")
 
     decision = await agent.decide(packet)
@@ -347,6 +385,16 @@ async def test_stateless_supervisor_persists_wake_packet_and_decision(tmp_path: 
     assert audit["packet"]["current_summary"] == "audit this wake"
     assert audit["decision"]["decision"] == "noop"
     assert audit["decision"]["reason"] == "state is consistent"
+    assert reviewer_threads == ["supervisor-thread"]
+    expected_roots = [str(tmp_path.resolve())]
+    assert client.thread_params is not None
+    assert client.thread_params["runtimeWorkspaceRoots"] == expected_roots
+    assert client.turn_params is not None
+    assert client.turn_params["runtimeWorkspaceRoots"] == expected_roots
+    assert client.turn_params["sandboxPolicy"] == {
+        "type": "readOnly",
+        "networkAccess": False,
+    }
 
 
 def test_supervisor_packet_uses_canonical_task_contents_override(tmp_path: Path) -> None:

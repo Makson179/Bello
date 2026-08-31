@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from supervisor.adversary_agent import AdversaryAgent, AdversaryAgentError, _report_has_candidate_finding
+from supervisor.project_config import MultiAgentConfig
 from supervisor.schemas import SupervisorWakePacket, ValidationRun
 
 
@@ -34,6 +36,15 @@ def _packet(tmp_path: Path) -> SupervisorWakePacket:
             )
         ],
     )
+
+
+def test_adversary_agent_disables_native_subagents_by_default(tmp_path: Path) -> None:
+    agent = AdversaryAgent(object(), tmp_path)  # type: ignore[arg-type]
+
+    params = agent._thread_params()
+
+    assert params["config"] == {"agents": {"enabled": False}}
+    assert "developerInstructions" not in params
 
 
 async def test_adversary_agent_uses_fresh_workspace_write_threads(tmp_path: Path) -> None:
@@ -73,6 +84,13 @@ async def test_adversary_agent_uses_fresh_workspace_write_threads(tmp_path: Path
     client = FakeClient()
     started: list[str] = []
     done: list[str] = []
+    cleanup_calls: list[tuple[str, Path]] = []
+    multi_agent = MultiAgentConfig(enabled=True, max_concurrent=5)
+
+    async def cleanup_descendants(thread_id: str, workspace_root: Path) -> None:
+        assert thread_id not in client.archived
+        cleanup_calls.append((thread_id, workspace_root))
+
     agent = AdversaryAgent(
         client,  # type: ignore[arg-type]
         tmp_path,
@@ -81,6 +99,8 @@ async def test_adversary_agent_uses_fresh_workspace_write_threads(tmp_path: Path
         timeout_seconds=1,
         on_thread_start=started.append,
         on_thread_done=done.append,
+        multi_agent=multi_agent,
+        before_thread_cleanup=cleanup_descendants,
     )
 
     first = await agent.run(_packet(tmp_path))
@@ -90,12 +110,25 @@ async def test_adversary_agent_uses_fresh_workspace_write_threads(tmp_path: Path
     assert second.thread_id == "adv-thread-2"
     assert started == ["adv-thread-1", "adv-thread-2"]
     assert done == ["adv-thread-1", "adv-thread-2"]
+    assert cleanup_calls == [
+        ("adv-thread-1", tmp_path.resolve()),
+        ("adv-thread-2", tmp_path.resolve()),
+    ]
     assert client.archived == ["adv-thread-1", "adv-thread-2"]
     assert client.thread_params[0]["ephemeral"] is False
     assert client.thread_params[0]["persistExtendedHistory"] is False
     assert client.thread_params[0]["sandbox"] == "workspace-write"
     assert client.thread_params[0]["model"] == "gpt-adversary"
     assert "effort" not in client.thread_params[0]
+    assert client.thread_params[0]["config"]["agents"] == {
+        "enabled": True,
+        "max_concurrent_threads_per_session": 5,
+        "default_subagent_model": multi_agent.default.model,
+        "default_subagent_reasoning_effort": multi_agent.default.intelligence,
+    }
+    developer_instructions = client.thread_params[0]["developerInstructions"]
+    assert "distinct attack surfaces, edge-case classes, or failure hypotheses" in developer_instructions
+    assert "do not delegate the final judgment or final output" in developer_instructions
     assert client.turn_params[0]["model"] == "gpt-adversary"
     assert client.turn_params[0]["effort"] == "ultra"
     assert client.turn_params[0]["sandboxPolicy"] == {
@@ -103,6 +136,8 @@ async def test_adversary_agent_uses_fresh_workspace_write_threads(tmp_path: Path
         "writableRoots": [str(tmp_path.resolve())],
         "networkAccess": False,
     }
+    assert "config" not in client.turn_params[0]
+    assert "developerInstructions" not in client.turn_params[0]
     prompt_payload = json.loads(client.turn_params[0]["input"][0]["text"])
     assert prompt_payload["task_contents"].startswith("# Task")
     assert "judged against the task" in prompt_payload["instructions"][1]
@@ -316,6 +351,202 @@ async def test_adversary_agent_retries_failed_turn_instead_of_accepting_progress
     assert result.candidate_finding is False
     assert client.thread_ids == ["adv-thread-1", "adv-thread-2"]
     assert client.archived == ["adv-thread-1", "adv-thread-2"]
+
+
+async def test_adversary_agent_retries_once_after_turn_completion_timeout(tmp_path: Path) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.thread_ids: list[str] = []
+            self.archived: list[str] = []
+
+        async def thread_start(self, params, *, timeout):
+            thread_id = f"adv-thread-{len(self.thread_ids) + 1}"
+            self.thread_ids.append(thread_id)
+            return {"thread": {"id": thread_id}}
+
+        async def turn_start(self, params, *, timeout):
+            if params["threadId"] == "adv-thread-1":
+                return {"turn": {"id": "adv-turn-1", "status": "inProgress", "items": []}}
+            return {
+                "turn": {
+                    "id": "adv-turn-2",
+                    "status": "completed",
+                    "items": [
+                        {
+                            "type": "agentMessage",
+                            "text": "candidate_finding: false\nattacked: retry\nfindings: none\noverall: held",
+                        }
+                    ],
+                }
+            }
+
+        async def wait_for_notification(self, predicate, *, timeout):
+            raise asyncio.TimeoutError
+
+        async def thread_archive(self, thread_id, *, timeout):
+            self.archived.append(thread_id)
+            return {}
+
+    client = FakeClient()
+    result = await AdversaryAgent(client, tmp_path, timeout_seconds=1).run(_packet(tmp_path))  # type: ignore[arg-type]
+
+    assert result.thread_id == "adv-thread-2"
+    assert client.thread_ids == ["adv-thread-1", "adv-thread-2"]
+    assert client.archived == ["adv-thread-1", "adv-thread-2"]
+
+
+async def test_adversary_agent_retries_terminal_error_notification(tmp_path: Path) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.thread_ids: list[str] = []
+            self.archived: list[str] = []
+
+        async def thread_start(self, params, *, timeout):
+            thread_id = f"adv-thread-{len(self.thread_ids) + 1}"
+            self.thread_ids.append(thread_id)
+            return {"thread": {"id": thread_id}}
+
+        async def turn_start(self, params, *, timeout):
+            if params["threadId"] == "adv-thread-1":
+                return {"turn": {"id": "adv-turn-1", "status": "inProgress", "items": []}}
+            return {
+                "turn": {
+                    "id": "adv-turn-2",
+                    "status": "completed",
+                    "items": [
+                        {
+                            "type": "agentMessage",
+                            "text": "candidate_finding: false\nattacked: retry\nfindings: none\noverall: held",
+                        }
+                    ],
+                }
+            }
+
+        async def wait_for_notification(self, predicate, *, timeout):
+            notification = SimpleNamespace(
+                method="error",
+                params={
+                    "threadId": "adv-thread-1",
+                    "turnId": "adv-turn-1",
+                    "willRetry": False,
+                    "error": {
+                        "message": "provider stream stalled",
+                        "codexErrorInfo": "internalServerError",
+                    },
+                },
+            )
+            assert predicate(notification)
+            return notification
+
+        async def thread_archive(self, thread_id, *, timeout):
+            self.archived.append(thread_id)
+            return {}
+
+    client = FakeClient()
+    result = await AdversaryAgent(client, tmp_path, timeout_seconds=1).run(_packet(tmp_path))  # type: ignore[arg-type]
+
+    assert result.thread_id == "adv-thread-2"
+    assert client.thread_ids == ["adv-thread-1", "adv-thread-2"]
+    assert client.archived == ["adv-thread-1", "adv-thread-2"]
+
+
+async def test_adversary_agent_leaves_transient_error_to_codex_retry(tmp_path: Path) -> None:
+    class FakeClient:
+        async def thread_start(self, params, *, timeout):
+            return {"thread": {"id": "adv-thread"}}
+
+        async def turn_start(self, params, *, timeout):
+            return {"turn": {"id": "adv-turn", "status": "inProgress", "items": []}}
+
+        async def wait_for_notification(self, predicate, *, timeout):
+            transient = SimpleNamespace(
+                method="error",
+                params={
+                    "threadId": "adv-thread",
+                    "turnId": "adv-turn",
+                    "willRetry": True,
+                    "error": {"message": "retrying upstream response"},
+                },
+            )
+            assert not predicate(transient)
+            completed = SimpleNamespace(
+                method="turn/completed",
+                params={
+                    "threadId": "adv-thread",
+                    "turn": {
+                        "id": "adv-turn",
+                        "status": "completed",
+                        "items": [
+                            {
+                                "type": "agentMessage",
+                                "text": (
+                                    "candidate_finding: false\n"
+                                    "attacked: built-in retry\nfindings: none\noverall: held"
+                                ),
+                            }
+                        ],
+                    },
+                },
+            )
+            assert predicate(completed)
+            return completed
+
+        async def thread_archive(self, thread_id, *, timeout):
+            return {}
+
+    result = await AdversaryAgent(FakeClient(), tmp_path, timeout_seconds=1).run(  # type: ignore[arg-type]
+        _packet(tmp_path)
+    )
+
+    assert result.thread_id == "adv-thread"
+    assert result.candidate_finding is False
+
+
+async def test_adversary_agent_surfaces_terminal_error_after_bounded_retry(tmp_path: Path) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.thread_count = 0
+
+        async def thread_start(self, params, *, timeout):
+            self.thread_count += 1
+            return {"thread": {"id": f"adv-thread-{self.thread_count}"}}
+
+        async def turn_start(self, params, *, timeout):
+            return {
+                "turn": {
+                    "id": f"adv-turn-{self.thread_count}",
+                    "status": "inProgress",
+                    "items": [],
+                }
+            }
+
+        async def wait_for_notification(self, predicate, *, timeout):
+            notification = SimpleNamespace(
+                method="error",
+                params={
+                    "threadId": f"adv-thread-{self.thread_count}",
+                    "turnId": f"adv-turn-{self.thread_count}",
+                    "willRetry": False,
+                    "error": {
+                        "message": "provider stream stalled",
+                        "codexErrorInfo": "internalServerError",
+                    },
+                },
+            )
+            assert predicate(notification)
+            return notification
+
+        async def thread_archive(self, thread_id, *, timeout):
+            return {}
+
+    client = FakeClient()
+    with pytest.raises(
+        AdversaryAgentError,
+        match="provider stream stalled.*codexErrorInfo='internalServerError'",
+    ):
+        await AdversaryAgent(client, tmp_path, timeout_seconds=1).run(_packet(tmp_path))  # type: ignore[arg-type]
+
+    assert client.thread_count == 2
 
 
 async def test_adversary_agent_retries_incomplete_completed_report(tmp_path: Path) -> None:

@@ -12,14 +12,55 @@ from supervisor.schemas import SupervisorWakePacket
 
 PROMPTS_ENV_VAR = "BELLO_PROMPTS_FILE"
 PROMPTS_RESOURCE = "prompts.toml"
+_PLAN_GUIDANCE_TEMPLATE = (
+    "Read the advisory plan at `{plan_path}` before working. Treat it as a working hypothesis, "
+    "not a binding specification: verify its assumptions against the workspace, and deviate when "
+    "implementation reveals new facts or nuances. Do not copy or summarize the plan into workspace "
+    "files, Bello runtime state, or your final message."
+)
 
 
-def build_coder_prompt(task_path: Path) -> str:
-    return _template("coder_initial").replace("{task_path}", str(task_path.resolve()))
+def build_coder_prompt(task_path: Path, *, plan_path: Path | None = None) -> str:
+    return _build_coder_prompt("coder_initial", task_path=task_path, plan_path=plan_path)
 
 
-def build_restart_prompt(task_path: Path) -> str:
-    return _template("coder_restart").replace("{task_path}", str(task_path.resolve()))
+def build_restart_prompt(task_path: Path, *, plan_path: Path | None = None) -> str:
+    return _build_coder_prompt("coder_restart", task_path=task_path, plan_path=plan_path)
+
+
+def build_revision_prompt(task_path: Path, reviewer_feedback: str) -> str:
+    return (
+        _template("coder_revision")
+        .replace("{task_path}", str(task_path.resolve()))
+        .replace("{reviewer_feedback}", reviewer_feedback)
+    )
+
+
+def _build_coder_prompt(
+    template_name: str,
+    *,
+    task_path: Path,
+    plan_path: Path | None,
+) -> str:
+    template = _template(template_name)
+    plan_guidance = _plan_guidance(plan_path)
+    if "{plan_guidance}" in template:
+        template = template.replace("{plan_guidance}", plan_guidance)
+    elif plan_guidance:
+        # Preserve support for older BELLO_PROMPTS_FILE overrides without
+        # silently dropping the plan. Prepending keeps their completion marker
+        # and any other terminal instruction at the end of the custom prompt.
+        template = f"{plan_guidance.lstrip()}\n\n{template}"
+    return template.replace("{task_path}", str(task_path.resolve()))
+
+
+def _plan_guidance(plan_path: Path | None) -> str:
+    if plan_path is None:
+        return ""
+    # The plan is exposed as a guarded copy inside Bello's disposable coder
+    # workspace. Keep that local path instead of resolving the private source.
+    guidance = _PLAN_GUIDANCE_TEMPLATE.replace("{plan_path}", str(plan_path.absolute()))
+    return f"\n\n{guidance}"
 
 
 def build_stateless_supervisor_prompt(packet: SupervisorWakePacket) -> str:

@@ -1,17 +1,27 @@
 # prompts.toml — system prompts for the coder, cheap triage, runtime supervisor, completion review, and adversary.
-# NOTE: coder prompts are intentionally minimal; the restart variant only adds the persisted handoff context.
+# NOTE: coder prompts are intentionally minimal; restart and revision variants only add persisted context and feedback.
 # Integrity note: the coder prompts deliberately never mention hidden or grading material or integrity rules —
 # enforcement lives in the approval policy (grading-path denials) and post-hoc audits. Do not add such a
 # clause to the coder prompts: naming that material primes gaming.
 
 [coder_initial]
-template = '''Complete the task described by the workspace instructions. Work autonomously.
+template = '''Complete the task described by the workspace instructions. Work autonomously.{plan_guidance}
 
 When complete, output BELLO_READY_FOR_REVIEW on its own line.'''
 
 [coder_restart]
 template = '''Continue the existing task. First read `.supervisor/HANDOFF.md`, `.supervisor/DECISIONS.md`, and `.supervisor/PROGRESS.md`,
-then work from the current workspace. Work autonomously.
+then work from the current workspace. Work autonomously.{plan_guidance}
+
+When complete, output BELLO_READY_FOR_REVIEW on its own line.'''
+
+[coder_revision]
+template = '''Continue the task described by the workspace instructions. First read `.supervisor/HANDOFF.md`, `.supervisor/DECISIONS.md`, and `.supervisor/PROGRESS.md`,
+then address the reviewer feedback below in the current workspace. Work autonomously.
+
+<reviewer_feedback>
+{reviewer_feedback}
+</reviewer_feedback>
 
 When complete, output BELLO_READY_FOR_REVIEW on its own line.'''
 
