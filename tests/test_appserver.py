@@ -360,7 +360,7 @@ def test_isolated_codex_home_handles_native_codex_junctions_and_locked_files(
         ),
     )
     for junction, target in junctions:
-        junction.parent.mkdir(parents=True)
+        junction.parent.mkdir(parents=True, exist_ok=True)
         result = subprocess.run(
             [
                 "cmd.exe",
