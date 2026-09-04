@@ -104,6 +104,19 @@ _WINDOWS_CREATE_SUSPENDED = getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
 _WINDOWS_CTRL_BREAK_EVENT = getattr(signal, "CTRL_BREAK_EVENT", 1)
 _WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_CLOSE = 0x00002000
 
+# Codex owns these directories as reconstructible runtime state.  Copying them
+# into the isolated home is both unnecessary and unsafe on native Windows:
+# packages contain installer-managed junctions, while lock/temp directories can
+# contain files opened with exclusive sharing.  Versioned plugin payloads are
+# preserved; only replaceable ``latest`` reparse aliases are omitted.
+# Persistent user state remains subject to the normal fail-closed validation.
+_WINDOWS_CODEX_HOME_SKIPPED_TOP_LEVEL = frozenset(
+    {".tmp", "packages", "thread-writer-locks", "tmp"}
+)
+_WINDOWS_CODEX_HOME_PLUGIN_CACHE_PREFIX = ("plugins", "cache")
+_WINDOWS_CODEX_HOME_PLUGIN_ALIAS = "latest"
+_WINDOWS_CODEX_HOME_PLUGIN_ALIAS_DEPTH = 5
+
 
 def _app_server_process_kwargs() -> dict[str, Any]:
     if _IS_WINDOWS:
@@ -893,9 +906,15 @@ def _create_isolated_codex_home(source: Path) -> Path:
         for child in children:
             if child.name == "rules" or (_IS_WINDOWS and child.name.casefold() == "rules"):
                 continue
+            if _IS_WINDOWS and _is_skipped_windows_codex_home_entry(source, child):
+                continue
             destination = isolated / child.name
             if _IS_WINDOWS:
-                _copy_windows_codex_home_entry(child, destination)
+                _copy_windows_codex_home_entry(
+                    child,
+                    destination,
+                    codex_home_root=source,
+                )
             else:
                 os.symlink(str(child), destination, target_is_directory=child.is_dir())
         (isolated / "rules").mkdir(mode=0o700)
@@ -922,14 +941,58 @@ def _validate_windows_codex_home_names(directory: Path, names: list[str]) -> Non
         seen[key] = name
 
 
-def _copy_windows_codex_home_entry(source: Path, destination: Path) -> None:
-    _validate_windows_codex_home_entry(source)
+def _is_skipped_windows_codex_home_entry(codex_home_root: Path, path: Path) -> bool:
+    try:
+        relative_parts = path.relative_to(codex_home_root).parts
+    except ValueError:
+        return False
+    folded_parts = tuple(part.casefold() for part in relative_parts)
+    if len(folded_parts) == 1:
+        return folded_parts[0] in _WINDOWS_CODEX_HOME_SKIPPED_TOP_LEVEL
+    is_plugin_latest = (
+        len(folded_parts) == _WINDOWS_CODEX_HOME_PLUGIN_ALIAS_DEPTH
+        and folded_parts[:2] == _WINDOWS_CODEX_HOME_PLUGIN_CACHE_PREFIX
+        and folded_parts[-1] == _WINDOWS_CODEX_HOME_PLUGIN_ALIAS
+    )
+    if not is_plugin_latest:
+        return False
+    metadata = path.lstat()
+    return is_link_or_reparse(path, stat_result=metadata)
+
+
+def _copy_windows_codex_home_entry(
+    source: Path,
+    destination: Path,
+    *,
+    codex_home_root: Path | None = None,
+) -> None:
+    _validate_windows_codex_home_entry(source, codex_home_root=codex_home_root)
     metadata = source.lstat()
     metadata = _assert_stable_codex_entry(
         source, metadata, require_directory=stat.S_ISDIR(metadata.st_mode)
     )
     if stat.S_ISDIR(metadata.st_mode):
-        shutil.copytree(source, destination, symlinks=False, copy_function=shutil.copy2)
+
+        def ignore_reconstructible_runtime_state(
+            directory: str,
+            names: list[str],
+        ) -> list[str]:
+            if codex_home_root is None:
+                return []
+            parent = Path(directory)
+            return [
+                name
+                for name in names
+                if _is_skipped_windows_codex_home_entry(codex_home_root, parent / name)
+            ]
+
+        shutil.copytree(
+            source,
+            destination,
+            symlinks=False,
+            copy_function=shutil.copy2,
+            ignore=ignore_reconstructible_runtime_state,
+        )
         _assert_stable_codex_entry(source, metadata, require_directory=True)
         _validate_windows_codex_home_entry(destination)
         _make_codex_home_copy_writable(destination)
@@ -943,7 +1006,11 @@ def _copy_windows_codex_home_entry(source: Path, destination: Path) -> None:
     raise AppServerError(f"unsupported Windows CODEX_HOME entry: {source}")
 
 
-def _validate_windows_codex_home_entry(source: Path) -> None:
+def _validate_windows_codex_home_entry(
+    source: Path,
+    *,
+    codex_home_root: Path | None = None,
+) -> None:
     metadata = source.lstat()
     if is_link_or_reparse(source, stat_result=metadata):
         raise AppServerError(
@@ -961,7 +1028,12 @@ def _validate_windows_codex_home_entry(source: Path) -> None:
     _validate_windows_codex_home_names(source, [child.name for child in children])
     for child in children:
         _assert_stable_codex_entry(source, metadata, require_directory=True)
-        _validate_windows_codex_home_entry(child)
+        if codex_home_root is not None and _is_skipped_windows_codex_home_entry(
+            codex_home_root,
+            child,
+        ):
+            continue
+        _validate_windows_codex_home_entry(child, codex_home_root=codex_home_root)
     _assert_stable_codex_entry(source, metadata, require_directory=True)
 
 
