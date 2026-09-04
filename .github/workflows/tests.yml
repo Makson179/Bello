@@ -66,4 +66,67 @@ jobs:
           New-Item -ItemType Directory -Force -Path $fixtureBin | Out-Null
           Copy-Item "tests/windows_fixtures/*" $fixtureBin
           $env:PATH = "$fixtureBin;$env:PATH"
-          bello doctor
+
+          # Reproduce the normal native-Windows CODEX_HOME shape that caused
+          # issue #22: installer/plugin junctions plus files held with
+          # FILE_SHARE_NONE by a running Codex process.
+          $codexHome = Join-Path $env:RUNNER_TEMP "bello-doctor-codex-home"
+          New-Item -ItemType Directory -Force -Path $codexHome | Out-Null
+          Set-Content -Path (Join-Path $codexHome "auth.json") -Value '{"token":"fixture"}'
+          Set-Content -Path (Join-Path $codexHome "config.toml") -Value 'model = "gpt-test"'
+
+          $packageTarget = Join-Path $codexHome "packages/standalone/1.2.3"
+          $packageJunction = Join-Path $codexHome "packages/standalone/current"
+          New-Item -ItemType Directory -Force -Path (Split-Path $packageJunction) | Out-Null
+          New-Item -ItemType Directory -Force -Path $packageTarget | Out-Null
+          New-Item -ItemType Junction -Path $packageJunction -Target $packageTarget | Out-Null
+
+          $pluginTarget = Join-Path $codexHome "plugins/cache/openai-bundled/chrome/1.2.3"
+          $pluginJunction = Join-Path $codexHome "plugins/cache/openai-bundled/chrome/latest"
+          New-Item -ItemType Directory -Force -Path (Split-Path $pluginJunction) | Out-Null
+          New-Item -ItemType Directory -Force -Path $pluginTarget | Out-Null
+          Set-Content -Path (Join-Path $pluginTarget "SKILL.md") -Value '# fixture plugin'
+          New-Item -ItemType Junction -Path $pluginJunction -Target $pluginTarget | Out-Null
+          $pluginState = Join-Path $codexHome "plugins/data/bello.json"
+          New-Item -ItemType Directory -Force -Path (Split-Path $pluginState) | Out-Null
+          Set-Content -Path $pluginState -Value '{"enabled":true}'
+
+          $writerLock = Join-Path $codexHome "thread-writer-locks/active.lock"
+          $tempLock = Join-Path $codexHome "tmp/arg0/active.lock"
+          $dotTempLock = Join-Path $codexHome ".tmp/plugins.sync.lock"
+          New-Item -ItemType Directory -Force -Path (Split-Path $writerLock) | Out-Null
+          New-Item -ItemType Directory -Force -Path (Split-Path $tempLock) | Out-Null
+          New-Item -ItemType Directory -Force -Path (Split-Path $dotTempLock) | Out-Null
+          $env:CODEX_HOME = $codexHome
+          $writerStream = $null
+          $tempStream = $null
+          $dotTempStream = $null
+          try {
+            $writerStream = [System.IO.File]::Open(
+              $writerLock,
+              [System.IO.FileMode]::OpenOrCreate,
+              [System.IO.FileAccess]::ReadWrite,
+              [System.IO.FileShare]::None
+            )
+            $tempStream = [System.IO.File]::Open(
+              $tempLock,
+              [System.IO.FileMode]::OpenOrCreate,
+              [System.IO.FileAccess]::ReadWrite,
+              [System.IO.FileShare]::None
+            )
+            $dotTempStream = [System.IO.File]::Open(
+              $dotTempLock,
+              [System.IO.FileMode]::OpenOrCreate,
+              [System.IO.FileAccess]::ReadWrite,
+              [System.IO.FileShare]::None
+            )
+            bello doctor
+            if ($LASTEXITCODE -ne 0) {
+              throw "bello doctor failed with exit code $LASTEXITCODE"
+            }
+          }
+          finally {
+            if ($dotTempStream) { $dotTempStream.Dispose() }
+            if ($tempStream) { $tempStream.Dispose() }
+            if ($writerStream) { $writerStream.Dispose() }
+          }
