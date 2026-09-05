@@ -452,10 +452,68 @@ Open the interactive editor from your project folder:
 bello config
 ```
 
+To use a source checkout instead of a separately installed `bello`, activate
+the checkout's virtual environment with its dependencies installed, then run
+from the checkout directory:
+
+```bash
+python -m supervisor.main config
+```
+
+This edits the configuration for the current directory. Updating a checkout
+does not automatically update a separate pipx installation.
+
 The editor saves `.supervisor/config.json` for the project and shows only the
 settings relevant to the active pipeline. Choose the model and reasoning level
 for each role, enable completion review or adversarial testing, set review
 budgets, and optionally configure a revision coder, subagents, or the Fast tier.
+
+### Models and reasoning effort
+
+Each role can select **GPT-6 Astra** (`gpt-6-astra`), **GPT-5.6** with a
+Sol, Terra, or Luna variant, or **GPT-5.5**. Astra appears when the Codex
+model list or local model cache reports it, or when it is already saved in
+the project configuration. GPT-5.6 Sol at `xhigh` remains the default.
+
+These are Bello's built-in, model-specific effort choices. Model discovery
+controls which model names appear; it does not dynamically replace this table.
+
+| Model | Reasoning effort |
+| --- | --- |
+| GPT-6 Astra | `low`, `medium`, `high`, `xhigh`, `max`, `ultra` |
+| GPT-5.6 Sol / Terra | `low`, `medium`, `high`, `xhigh`, `max`, `ultra` |
+| GPT-5.6 Luna | `low`, `medium`, `high`, `xhigh`, `max` |
+| GPT-5.5 | `low`, `medium`, `high`, `xhigh` |
+
+Astra is a standalone selection, so it has no variant row. Switching to a
+model with fewer reasoning levels lowers an incompatible saved effort to
+that model's highest supported level. Astra's list above, including `ultra`,
+was verified against Codex CLI 0.153.4's app-server catalog and in live Bello
+runs. Codex reports supported levels through
+[`model/list` → `supportedReasoningEfforts`](https://learn.chatgpt.com/docs/app-server#list-models-modellist).
+
+### Why the desktop app may show fewer effort levels
+
+The desktop app's visible controls are not the full model capability list.
+The app can filter supported efforts through its own preferences, and its
+slider uses presets of model/effort combinations. Bello does not copy those
+desktop UI preferences. `Extra High` in the app is the same value as `xhigh`
+in Bello.
+
+In the inspected desktop build **26.901.41600**, `max` is not enabled in the
+visible-effort preferences by default, and showing `ultra` on the slider has
+a separate switch that defaults to off. When available, these controls are
+under **Settings → Configuration → Model features**:
+
+- **Available reasoning efforts** controls which supported levels appear.
+- **Ultra in model picker slider** controls whether the slider includes Ultra.
+
+The Model features section is itself gated by feature availability, so it may
+not appear in every installation. `agent` is the internal route name, not the
+visible menu label in that build. A missing option in the desktop UI alone
+does not establish that the Codex app-server rejects it.
+
+### Project settings
 
 CLI flags override matching values for one run without rewriting the saved
 configuration. The full setting list is below.
@@ -465,7 +523,7 @@ configuration. The full setting list is below.
 | `task` | absent | Default task file for this folder. When set, plain `bello` runs it, and `--task` always overrides. |
 | `coder-mod` | GPT-5.6 | Model family for the coder thread. |
 | `coder-5.6-variant` | Sol | GPT-5.6 variant for the coder: Sol, Terra, or Luna. |
-| `coder-intelligence` | `xhigh` | Coder reasoning effort, limited by the selected variant. |
+| `coder-intelligence` | `xhigh` | Coder reasoning effort, limited by the selected model. |
 | `revision-coder` | `off` | Start one fresh coder thread on the first returned completion-review or adversary finding. Later findings reuse that thread. |
 | `revision-coder-mod` / `revision-coder-5.6-variant` | GPT-5.6 Sol | Model for the revision thread. Hidden while `revision-coder` is off. |
 | `revision-coder-intelligence` | `xhigh` | Revision-coder reasoning effort. Hidden while `revision-coder` is off. |

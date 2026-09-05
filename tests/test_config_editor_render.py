@@ -560,7 +560,7 @@ def test_config_editor_renders_role_specific_reviewer_subagent_labels() -> None:
             expanded_index=completion_allowed_index,
         ),
         width=160,
-        height=40,
+        height=48,
     )
     adversary_output = _render(
         config,
@@ -569,7 +569,7 @@ def test_config_editor_renders_role_specific_reviewer_subagent_labels() -> None:
             expanded_index=adversary_allowed_index,
         ),
         width=160,
-        height=40,
+        height=48,
     )
 
     assert "completion-multi-agent" in completion_output

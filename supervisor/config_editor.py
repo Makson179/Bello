@@ -23,6 +23,7 @@ from supervisor.project_config import (
     MODEL_GPT_5_6_LUNA,
     MODEL_GPT_5_6_SOL,
     MODEL_GPT_5_6_TERRA,
+    MODEL_GPT_6_ASTRA,
     SPEED_CHOICES,
     SUPPORTED_MODEL_CHOICES,
     ProjectConfig,
@@ -114,6 +115,7 @@ ULTRA_WAVE_FOREGROUNDS = (
 )
 ULTRA_EDGE_LEFT = "#9d58ed bg:#210b4c"
 ULTRA_EDGE_RIGHT = "#c06cff bg:#321067"
+MODEL_FAMILY_ASTRA_LABEL = "GPT-6 Astra"
 MODEL_FAMILY_5_6_LABEL = "GPT-5.6"
 MODEL_FAMILY_5_5_LABEL = "GPT-5.5"
 MODEL_VARIANT_LABELS = {
@@ -807,6 +809,8 @@ def _model_parameters(
     available = set(available_models)
     available_56 = [model for model in GPT_5_6_MODELS if model in available or model == selected_model]
     family_options: list[EditorOption] = []
+    if MODEL_GPT_6_ASTRA in available or selected_model == MODEL_GPT_6_ASTRA:
+        family_options.append(EditorOption(MODEL_FAMILY_ASTRA_LABEL, field, MODEL_GPT_6_ASTRA))
     if available_56:
         selected_56 = selected_model if selected_model in GPT_5_6_MODELS else available_56[0]
         family_options.append(EditorOption(MODEL_FAMILY_5_6_LABEL, field, selected_56))
@@ -840,6 +844,8 @@ def _model_parameters(
 
 
 def _model_family_label(model: str) -> str:
+    if model == MODEL_GPT_6_ASTRA:
+        return MODEL_FAMILY_ASTRA_LABEL
     if model in GPT_5_6_MODELS:
         return MODEL_FAMILY_5_6_LABEL
     if model == MODEL_GPT_5_5:
