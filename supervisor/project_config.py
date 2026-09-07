@@ -14,6 +14,7 @@ from supervisor.review_limits import (
 )
 
 
+MODEL_GPT_6_ASTRA = "gpt-6-astra"
 MODEL_GPT_5_6_SOL = "gpt-5.6-sol"
 MODEL_GPT_5_6_TERRA = "gpt-5.6-terra"
 MODEL_GPT_5_6_LUNA = "gpt-5.6-luna"
@@ -23,7 +24,7 @@ GPT_5_6_MODELS = (
     MODEL_GPT_5_6_TERRA,
     MODEL_GPT_5_6_LUNA,
 )
-SUPPORTED_MODEL_CHOICES = (*GPT_5_6_MODELS, MODEL_GPT_5_5)
+SUPPORTED_MODEL_CHOICES = (MODEL_GPT_6_ASTRA, *GPT_5_6_MODELS, MODEL_GPT_5_5)
 DEFAULT_MODEL = MODEL_GPT_5_6_SOL
 DEFAULT_INTELLIGENCE = "xhigh"
 BASE_INTELLIGENCE_CHOICES = ("low", "medium", "high", "xhigh")
@@ -170,6 +171,9 @@ def default_project_config() -> ProjectConfig:
 
 
 def intelligence_choices_for_model(model: str) -> tuple[str, ...]:
+    if model == MODEL_GPT_6_ASTRA:
+        # Bello uses Codex app-server, whose Astra catalog includes ultra.
+        return INTELLIGENCE_CHOICES
     if model in {MODEL_GPT_5_6_SOL, MODEL_GPT_5_6_TERRA}:
         return INTELLIGENCE_CHOICES
     if model == MODEL_GPT_5_6_LUNA:
