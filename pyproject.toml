@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "Bello"
-version = "0.5.2"
-description = "Terminal supervisor for autonomous Codex app-server runs"
+version = "0.6.0.dev0"
+description = "Multi-provider supervisor for autonomous coding agents"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -28,6 +28,7 @@ dependencies = [
   "pydantic>=2.0",
   "prompt-toolkit>=3.0",
   "wcwidth>=0.2",
+  "jsonschema>=4.23,<5",
 ]
 
 [project.urls]
@@ -36,9 +37,15 @@ Repository = "https://github.com/Makson179/Bello"
 Issues = "https://github.com/Makson179/Bello/issues"
 
 [project.optional-dependencies]
+claude = [
+  "claude-agent-sdk==0.2.152",
+]
 test = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
+  "setuptools>=77",
+  "wheel>=0.45,<1",
+  "claude-agent-sdk==0.2.152",
 ]
 
 [project.scripts]
@@ -46,9 +53,12 @@ bello = "supervisor.main:cli"
 
 [tool.setuptools.packages.find]
 include = ["supervisor*"]
+namespaces = false
 
 [tool.setuptools.package-data]
 "supervisor.prompts" = ["*.toml"]
+"supervisor.runtime" = ["tools.json", "bin/*.exe", "bin/THIRD_PARTY_NOTICES.txt"]
+"supervisor" = ["pi_worker/*.mjs", "pi_worker/*.json", "pi_worker/src/*.mjs", "pi_worker/LICENSE*", "pi_worker/NOTICE*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

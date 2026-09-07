@@ -1,0 +1,35 @@
+{
+  "name": "bello",
+  "version": "0.6.0-dev.0",
+  "description": "Launch and monitor an existing Bello coding workflow from Codex.",
+  "author": {
+    "name": "Maxim Bocharov",
+    "url": "https://github.com/Makson179"
+  },
+  "homepage": "https://github.com/Makson179/Bello",
+  "repository": "https://github.com/Makson179/Bello",
+  "license": "MIT",
+  "keywords": [
+    "bello",
+    "coding-agent",
+    "supervisor",
+    "multi-provider"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Bello",
+    "shortDescription": "Launch and monitor Bello coding runs.",
+    "longDescription": "Delegate a repository task to the installed Bello supervisor using the project's saved configuration, then monitor its durable progress and final report.",
+    "developerName": "Maxim Bocharov",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/Makson179/Bello",
+    "defaultPrompt": [
+      "Delegate this repository task to Bello.",
+      "Show me the status of the current Bello run."
+    ]
+  }
+}

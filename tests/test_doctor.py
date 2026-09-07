@@ -15,6 +15,13 @@ def _doctor_update_check_enabled_by_default(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.delenv(update_check.SKIP_UPDATE_CHECK_ENV, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_runtime_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(doctor, "_runtime_dependency_results", lambda: [
+        DoctorResult("ok", "Pinned Pi runtime installed"),
+    ])
+
+
 def test_doctor_result_format_is_readable() -> None:
     assert format_result(DoctorResult("ok", "Python 3.11.8")) == "[OK] Python 3.11.8"
     assert format_result(DoctorResult("warn", "Update available: 0.1.1")) == "[WARN] Update available: 0.1.1"
@@ -54,11 +61,8 @@ def test_doctor_collects_required_checks_with_update_warning(monkeypatch: pytest
 
     assert any(message.startswith("Python ") for message in messages)
     assert "Git found: /usr/bin/git" in messages
-    assert "Codex found: /usr/bin/codex" in messages
-    assert "Codex version OK" in messages
-    assert "Codex app-server supported" in messages
-    assert "app-server schema generation OK" in messages
-    assert "Codex auth OK" in messages
+    assert "Pinned Pi runtime installed" in messages
+    assert not any("app-server" in message for message in messages)
     assert "Bello package: bello 0.1.0" in messages
     assert "Bello executable: /usr/bin/bello" in messages
     assert "Bello install mode: pipx" in messages
@@ -79,7 +83,7 @@ def test_probe_result_fails_on_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> 
     assert result.detail == "nope"
 
 
-def test_doctor_reports_dependent_codex_checks_when_codex_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_doctor_reports_runtime_failure_without_requiring_codex(monkeypatch: pytest.MonkeyPatch) -> None:
     info = update_check.InstallInfo(
         package_name="bello",
         version="0.1.0",
@@ -88,6 +92,9 @@ def test_doctor_reports_dependent_codex_checks_when_codex_missing(monkeypatch: p
         warning="package metadata missing",
     )
     monkeypatch.setattr(doctor, "_doctor_executable", lambda name: None)
+    monkeypatch.setattr(doctor, "_runtime_dependency_results", lambda: [
+        DoctorResult("fail", "Pi runtime dependency check failed", "Run bello runtime install"),
+    ])
     monkeypatch.setattr(update_check, "read_install_info", lambda: info)
     monkeypatch.setattr(
         update_check,
@@ -102,11 +109,8 @@ def test_doctor_reports_dependent_codex_checks_when_codex_missing(monkeypatch: p
     results = doctor.collect_doctor_results()
     by_message = {result.message: result for result in results}
 
-    assert by_message["Codex not found on PATH"].level == "fail"
-    assert by_message["codex --version failed"].level == "fail"
-    assert by_message["Codex app-server support not checked"].level == "fail"
-    assert by_message["app-server schema generation not checked"].level == "fail"
-    assert by_message["Codex auth check failed"].level == "fail"
+    assert by_message["Pi runtime dependency check failed"].level == "fail"
+    assert not any("Codex" in message for message in by_message)
     assert by_message["Bello package metadata could not be read"].level == "fail"
 
 
@@ -255,7 +259,7 @@ def test_doctor_skip_update_env_avoids_network_probe(monkeypatch: pytest.MonkeyP
     assert skipped.detail == "BELLO_SKIP_UPDATE_CHECK=1"
 
 
-def test_doctor_uses_resolved_codex_executable_for_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_doctor_does_not_start_the_removed_codex_executor(monkeypatch: pytest.MonkeyPatch) -> None:
     info = update_check.InstallInfo(package_name="bello", version="0.1.0", install_mode="pipx")
     captured: list[list[str]] = []
     schema_executables: list[str] = []
@@ -290,6 +294,6 @@ def test_doctor_uses_resolved_codex_executable_for_probes(monkeypatch: pytest.Mo
 
     doctor.collect_doctor_results()
 
-    assert captured == [[codex, "--version"], [codex, "app-server", "--help"]]
-    assert schema_executables == [codex]
-    assert auth_executables == [codex]
+    assert captured == []
+    assert schema_executables == []
+    assert auth_executables == []

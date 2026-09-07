@@ -1,0 +1,122 @@
+name: Windows restricted sandbox
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, codex/0.6.0-multi-provider]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  native-windows:
+    name: ${{ matrix.name }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows Server 2022
+            os: windows-2022
+            python-version: "3.11"
+          - name: Windows Server 2025
+            os: windows-2025
+            python-version: "3.14"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: supervisor/pi_worker/package-lock.json
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc
+      - name: Audit native formatting, types, lints, and unit tests
+        shell: pwsh
+        run: |
+          cargo fmt --manifest-path native/windows-sandbox/Cargo.toml --all -- --check
+          cargo check --locked --manifest-path native/windows-sandbox/Cargo.toml --target x86_64-pc-windows-msvc
+          cargo clippy --locked --manifest-path native/windows-sandbox/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path native/windows-sandbox/Cargo.toml
+      - name: Install pinned Pi runtime
+        working-directory: supervisor/pi_worker
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Build and install package with mandatory helper
+        run: python -m pip install ".[test,claude]" wheel
+      - name: Stage helper beside the source package used by pytest
+        shell: pwsh
+        run: |
+          $sourceBin = Join-Path $PWD "supervisor/runtime/bin"
+          New-Item -ItemType Directory -Force -Path $sourceBin | Out-Null
+          Copy-Item `
+            "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe" `
+            (Join-Path $sourceBin "bello-windows-sandbox.exe")
+          Copy-Item `
+            "native/windows-sandbox/THIRD_PARTY_NOTICES.txt" `
+            (Join-Path $sourceBin "THIRD_PARTY_NOTICES.txt")
+      - name: Run fail-closed Windows integration tests
+        env:
+          BELLO_REQUIRE_NATIVE_SANDBOX: "1"
+          BELLO_WINDOWS_SANDBOX_TIMING_REPORT: ${{ runner.temp }}\bello-windows-sandbox-timing-pytest.json
+        run: python -m pytest -q tests/test_runtime_sandbox.py tests/test_runtime_windows_sandbox.py
+      - name: Build and inspect release wheel and sdist
+        shell: pwsh
+        run: |
+          $artifactDir = Join-Path $env:RUNNER_TEMP "bello-packages"
+          New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
+          python setup.py sdist --dist-dir $artifactDir
+          python setup.py bdist_wheel --dist-dir $artifactDir
+          $wheels = @(Get-ChildItem $artifactDir -Filter "*-py3-none-win_amd64.whl")
+          if ($wheels.Count -ne 1) { throw "expected exactly one py3-none-win_amd64 wheel" }
+          $sdists = @(Get-ChildItem $artifactDir -Filter "*.tar.gz")
+          if ($sdists.Count -ne 1) { throw "expected exactly one source distribution" }
+          @'
+          import sys, tarfile, zipfile
+          wheel, sdist = sys.argv[1:]
+          with zipfile.ZipFile(wheel) as archive:
+              wheel_names = set(archive.namelist())
+          wheel_required = {
+              "supervisor/runtime/bin/bello-windows-sandbox.exe",
+              "supervisor/runtime/bin/THIRD_PARTY_NOTICES.txt",
+          }
+          if missing := wheel_required - wheel_names:
+              raise SystemExit(f"Windows wheel missing: {sorted(missing)}")
+          with tarfile.open(sdist, "r:gz") as archive:
+              names = {name.split("/", 1)[-1] for name in archive.getnames()}
+          source_required = {
+              "setup.py", "MANIFEST.in", "native/windows-sandbox/Cargo.toml",
+              "native/windows-sandbox/Cargo.lock", "native/windows-sandbox/README.md",
+              "native/windows-sandbox/THIRD_PARTY_NOTICES.txt",
+              "native/windows-sandbox/src/main.rs",
+          }
+          if missing := source_required - names:
+              raise SystemExit(f"sdist missing: {sorted(missing)}")
+          '@ | python - $wheels[0].FullName $sdists[0].FullName
+      - name: Run native enforcement as a non-admin standard user
+        shell: pwsh
+        run: |
+          $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe"
+          $report = Join-Path $env:RUNNER_TEMP "bello-standard-user-output/bello-windows-sandbox-timing-standard-user.json"
+          ./native/windows-sandbox/ci/run_standard_user.ps1 `
+            -Python (Get-Command python).Source `
+            -Helper $helper `
+            -NodeSource (Get-Command node).Source `
+            -Report $report
+      - name: Upload native packages and timing reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-sandbox-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: |
+            ${{ runner.temp }}\bello-packages\*
+            ${{ runner.temp }}\bello-windows-sandbox-timing-*.json
+            ${{ runner.temp }}\bello-standard-user-output\*.json
+          if-no-files-found: error

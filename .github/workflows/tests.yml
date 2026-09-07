@@ -1,8 +1,9 @@
 name: Tests
 
 on:
+  workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, codex/0.6.0-multi-provider]
   pull_request:
 
 jobs:
@@ -16,13 +17,35 @@ jobs:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: supervisor/pi_worker/package-lock.json
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install
-        run: python -m pip install -e ".[test]"
-      - name: Run tests
-        run: python -m pytest -q
+      - name: Install Linux sandbox
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+      - name: Install pinned Pi runtime
+        working-directory: supervisor/pi_worker
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Install Python package and optional SDK
+        run: python -m pip install -e ".[test,claude]" wheel
+      - name: Run Pi worker tests
+        working-directory: supervisor/pi_worker
+        run: npm test
+      - name: Run Python tests except the separately gated Pi integration
+        env:
+          BELLO_REQUIRE_NATIVE_SANDBOX: "1"
+        run: python -m pytest -q --ignore=tests/test_runtime_pi_integration.py
+      - name: Run real offline Pi SDK and native sandbox integration
+        env:
+          BELLO_REQUIRE_NATIVE_SANDBOX: "1"
+          BELLO_REQUIRE_PI_INTEGRATION: "1"
+        run: python -m pytest -q tests/test_runtime_pi_integration.py
 
   native-platforms:
     name: ${{ matrix.name }} / Python ${{ matrix.python-version }}
@@ -43,90 +66,41 @@ jobs:
             python-version: "3.14"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: supervisor/pi_worker/package-lock.json
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install
-        run: python -m pip install ".[test]"
-      - name: Run full applicable test suite
-        run: python -m pytest -q
+      - name: Install pinned Windows helper toolchain
+        if: runner.os == 'Windows'
+        uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install pinned Pi runtime
+        working-directory: supervisor/pi_worker
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Install Python package and optional SDK
+        run: python -m pip install ".[test,claude]" wheel
+      - name: Run Pi worker tests
+        working-directory: supervisor/pi_worker
+        run: npm test
+      - name: Run full applicable Python suite except the separately gated Pi integration
+        run: python -m pytest -q --ignore=tests/test_runtime_pi_integration.py
+      - name: Run real offline Pi SDK and native sandbox integration
+        if: runner.os != 'Windows'
+        env:
+          BELLO_REQUIRE_NATIVE_SANDBOX: "1"
+          BELLO_REQUIRE_PI_INTEGRATION: "1"
+        run: python -m pytest -q tests/test_runtime_pi_integration.py
       - name: Exercise installed CLI help
         run: bello --help
       - name: Report Windows runner image
         if: runner.os == 'Windows'
         shell: pwsh
         run: Write-Output "$env:ImageOS $env:ImageVersion"
-      - name: Exercise doctor with deterministic Codex app-server
+      - name: Verify doctor has no legacy executor dependency
         if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          BELLO_SKIP_UPDATE_CHECK: "1"
-        run: |
-          $fixtureBin = Join-Path $env:RUNNER_TEMP "bello-fixture-bin"
-          New-Item -ItemType Directory -Force -Path $fixtureBin | Out-Null
-          Copy-Item "tests/windows_fixtures/*" $fixtureBin
-          $env:PATH = "$fixtureBin;$env:PATH"
-
-          # Reproduce the normal native-Windows CODEX_HOME shape that caused
-          # issue #22: installer/plugin junctions plus files held with
-          # FILE_SHARE_NONE by a running Codex process.
-          $codexHome = Join-Path $env:RUNNER_TEMP "bello-doctor-codex-home"
-          New-Item -ItemType Directory -Force -Path $codexHome | Out-Null
-          Set-Content -Path (Join-Path $codexHome "auth.json") -Value '{"token":"fixture"}'
-          Set-Content -Path (Join-Path $codexHome "config.toml") -Value 'model = "gpt-test"'
-
-          $packageTarget = Join-Path $codexHome "packages/standalone/1.2.3"
-          $packageJunction = Join-Path $codexHome "packages/standalone/current"
-          New-Item -ItemType Directory -Force -Path (Split-Path $packageJunction) | Out-Null
-          New-Item -ItemType Directory -Force -Path $packageTarget | Out-Null
-          New-Item -ItemType Junction -Path $packageJunction -Target $packageTarget | Out-Null
-
-          $pluginTarget = Join-Path $codexHome "plugins/cache/openai-bundled/chrome/1.2.3"
-          $pluginJunction = Join-Path $codexHome "plugins/cache/openai-bundled/chrome/latest"
-          New-Item -ItemType Directory -Force -Path (Split-Path $pluginJunction) | Out-Null
-          New-Item -ItemType Directory -Force -Path $pluginTarget | Out-Null
-          Set-Content -Path (Join-Path $pluginTarget "SKILL.md") -Value '# fixture plugin'
-          New-Item -ItemType Junction -Path $pluginJunction -Target $pluginTarget | Out-Null
-          $pluginState = Join-Path $codexHome "plugins/data/bello.json"
-          New-Item -ItemType Directory -Force -Path (Split-Path $pluginState) | Out-Null
-          Set-Content -Path $pluginState -Value '{"enabled":true}'
-
-          $writerLock = Join-Path $codexHome "thread-writer-locks/active.lock"
-          $tempLock = Join-Path $codexHome "tmp/arg0/active.lock"
-          $dotTempLock = Join-Path $codexHome ".tmp/plugins.sync.lock"
-          New-Item -ItemType Directory -Force -Path (Split-Path $writerLock) | Out-Null
-          New-Item -ItemType Directory -Force -Path (Split-Path $tempLock) | Out-Null
-          New-Item -ItemType Directory -Force -Path (Split-Path $dotTempLock) | Out-Null
-          $env:CODEX_HOME = $codexHome
-          $writerStream = $null
-          $tempStream = $null
-          $dotTempStream = $null
-          try {
-            $writerStream = [System.IO.File]::Open(
-              $writerLock,
-              [System.IO.FileMode]::OpenOrCreate,
-              [System.IO.FileAccess]::ReadWrite,
-              [System.IO.FileShare]::None
-            )
-            $tempStream = [System.IO.File]::Open(
-              $tempLock,
-              [System.IO.FileMode]::OpenOrCreate,
-              [System.IO.FileAccess]::ReadWrite,
-              [System.IO.FileShare]::None
-            )
-            $dotTempStream = [System.IO.File]::Open(
-              $dotTempLock,
-              [System.IO.FileMode]::OpenOrCreate,
-              [System.IO.FileAccess]::ReadWrite,
-              [System.IO.FileShare]::None
-            )
-            bello doctor
-            if ($LASTEXITCODE -ne 0) {
-              throw "bello doctor failed with exit code $LASTEXITCODE"
-            }
-          }
-          finally {
-            if ($dotTempStream) { $dotTempStream.Dispose() }
-            if ($tempStream) { $tempStream.Dispose() }
-            if ($writerStream) { $writerStream.Dispose() }
-          }
+        run: python -m pytest -q tests/test_doctor.py::test_doctor_does_not_start_the_removed_codex_executor

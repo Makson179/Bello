@@ -1,0 +1,255 @@
+[
+  {
+    "name": "exec_command",
+    "description": "Execute a shell command in the assigned isolated workspace. Long commands return a sessionId for poll_command or stop_command. timeout is the total execution deadline in seconds (default 120); yield_time_ms controls only the initial wait (default 10000). No interactive stdin or PTY. Use require_escalated only when this exact command needs access outside the sandbox; Bello must approve it before execution.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "timeout": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 3600
+        },
+        "yield_time_ms": {"type": "integer", "minimum": 0, "maximum": 30000},
+        "sandbox_permissions": {
+          "type": "string",
+          "enum": ["use_default", "require_escalated"]
+        },
+        "justification": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "poll_command",
+    "description": "Read new output and status from this turn's managed command session without starting another command.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "session_id": {"type": "string"},
+        "yield_time_ms": {"type": "integer", "minimum": 0, "maximum": 30000}
+      },
+      "required": ["session_id"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "stop_command",
+    "description": "Stop this turn's managed command session and wait for its sandbox cleanup.",
+    "parameters": {
+      "type": "object",
+      "properties": {"session_id": {"type": "string"}},
+      "required": ["session_id"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "view_image",
+    "description": "Read a PNG, JPEG, GIF, or WebP image from the assigned workspace for visual inspection.",
+    "parameters": {
+      "type": "object",
+      "properties": {"path": {"type": "string"}},
+      "required": ["path"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "read_file",
+    "description": "Read a UTF-8 file; line numbers are one-based. Use offset and limit for longer files.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "write_file",
+    "description": "Create or replace a UTF-8 file in the assigned workspace.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "content"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "edit_file",
+    "description": "Replace an exact text occurrence. Fails if the old text is absent or ambiguous.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "old_text": {
+          "type": "string"
+        },
+        "new_text": {
+          "type": "string"
+        },
+        "replace_all": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "old_text",
+        "new_text"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "list_directory",
+    "description": "List entries in one directory.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "search",
+    "description": "Search text files under a path for a regular expression.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern",
+        "path"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "spawn_agent",
+    "description": "Delegate an independent subtask to a Bello-managed child using an allowed model and effort.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "effort": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "message",
+        "model",
+        "effort"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "send_message",
+    "description": "Send instructions to an existing child agent.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent_id",
+        "message"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "wait_agent",
+    "description": "Wait for a child to finish and return its result.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "timeout": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 3600
+        }
+      },
+      "required": [
+        "agent_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "close_agent",
+    "description": "Stop and close a child agent.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent_id"
+      ],
+      "additionalProperties": false
+    }
+  }
+]

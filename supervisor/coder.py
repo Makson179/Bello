@@ -128,6 +128,8 @@ def apply_multi_agent_thread_start_params(
                 "max_concurrent_threads_per_session": config.max_concurrent,
                 "default_subagent_model": config.default.model,
                 "default_subagent_reasoning_effort": config.default.intelligence,
+                "allowed_profiles": {model: list(efforts) for model, efforts in config.allowed.items()},
+                "role": role,
             }
         )
         params["developerInstructions"] = build_multi_agent_developer_instructions(
@@ -146,6 +148,7 @@ def coder_thread_params(
     *,
     model: str | None = None,
     fast: bool = False,
+    intelligence: str | None = None,
     multi_agent: MultiAgentConfig | None = None,
 ) -> dict[str, Any]:
     multi_agent = multi_agent or MultiAgentConfig()
@@ -164,7 +167,7 @@ def coder_thread_params(
     apply_multi_agent_thread_start_params(params, multi_agent, role="coder")
     if model:
         params["model"] = model
-    return params
+    return apply_intelligence(params, intelligence)
 
 
 def coder_thread_resume_params(
@@ -173,6 +176,7 @@ def coder_thread_resume_params(
     *,
     model: str | None = None,
     fast: bool = False,
+    intelligence: str | None = None,
     multi_agent: MultiAgentConfig | None = None,
 ) -> dict[str, Any]:
     """Build the supported ``thread/resume`` overrides for a coder thread."""
@@ -190,7 +194,7 @@ def coder_thread_resume_params(
     apply_multi_agent_thread_start_params(params, multi_agent, role="coder")
     if model:
         params["model"] = model
-    return params
+    return apply_intelligence(params, intelligence)
 
 
 def coder_turn_params(
@@ -238,6 +242,7 @@ class CoderSession:
                 self.project_root,
                 model=self.model,
                 fast=self.fast,
+                intelligence=self.intelligence,
                 multi_agent=self.multi_agent,
             ),
             timeout=APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
@@ -260,6 +265,7 @@ class CoderSession:
                 self.project_root,
                 model=self.model,
                 fast=self.fast,
+                intelligence=self.intelligence,
                 multi_agent=self.multi_agent,
             ),
             timeout=APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
@@ -302,9 +308,9 @@ class CoderSession:
         turn_id = turn.get("id")
         if not isinstance(turn_id, str):
             raise RuntimeError("app-server turn/start did not return a turn id")
-        self.active_turn_id = turn_id
+        self.active_turn_id = None if turn.get("status") in {"completed", "failed", "interrupted"} else turn_id
         if persist_state:
-            self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"active_coder_turn_id": turn_id}))
+            self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"active_coder_turn_id": self.active_turn_id}))
         return turn_id
 
     async def steer_or_start(self, message: str) -> str | None:

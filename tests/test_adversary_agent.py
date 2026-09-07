@@ -119,12 +119,14 @@ async def test_adversary_agent_uses_fresh_workspace_write_threads(tmp_path: Path
     assert client.thread_params[0]["persistExtendedHistory"] is False
     assert client.thread_params[0]["sandbox"] == "workspace-write"
     assert client.thread_params[0]["model"] == "gpt-adversary"
-    assert "effort" not in client.thread_params[0]
+    assert client.thread_params[0]["effort"] == "ultra"
     assert client.thread_params[0]["config"]["agents"] == {
         "enabled": True,
         "max_concurrent_threads_per_session": 5,
         "default_subagent_model": multi_agent.default.model,
         "default_subagent_reasoning_effort": multi_agent.default.intelligence,
+        "allowed_profiles": {model: list(efforts) for model, efforts in multi_agent.allowed.items()},
+        "role": "adversary",
     }
     developer_instructions = client.thread_params[0]["developerInstructions"]
     assert "distinct attack surfaces, edge-case classes, or failure hypotheses" in developer_instructions

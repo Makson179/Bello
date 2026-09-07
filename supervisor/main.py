@@ -66,26 +66,26 @@ class BelloClickGroup(click.Group):
 @click.option(
     "--coder-intelligence",
     default=None,
-    type=click.Choice(INTELLIGENCE_CHOICES),
+    type=click.Choice(("off", "minimal", *INTELLIGENCE_CHOICES)),
     help="Reasoning effort for coder turns.",
 )
 @click.option(
     "--runtime-intelligence",
     "runtime_intelligence",
     default=None,
-    type=click.Choice(INTELLIGENCE_CHOICES),
+    type=click.Choice(("off", "minimal", *INTELLIGENCE_CHOICES)),
     help="Reasoning effort for runtime supervisor turns.",
 )
 @click.option(
     "--completion-intelligence",
     default=None,
-    type=click.Choice(INTELLIGENCE_CHOICES),
+    type=click.Choice(("off", "minimal", *INTELLIGENCE_CHOICES)),
     help="Reasoning effort for completion review turns.",
 )
 @click.option(
     "--adversary-intelligence",
     default=None,
-    type=click.Choice(INTELLIGENCE_CHOICES),
+    type=click.Choice(("off", "minimal", *INTELLIGENCE_CHOICES)),
     help="Reasoning effort for adversarial tester turns.",
 )
 @click.option(
@@ -93,7 +93,7 @@ class BelloClickGroup(click.Group):
     "legacy_supervisor_intelligence",
     default=None,
     hidden=True,
-    type=click.Choice(INTELLIGENCE_CHOICES),
+    type=click.Choice(("off", "minimal", *INTELLIGENCE_CHOICES)),
     help="Legacy alias that sets both runtime and completion reasoning effort.",
 )
 @click.option(
@@ -279,6 +279,69 @@ def _format_update_check_report(status: update_check.UpdateStatus) -> str:
 @cli.command("doctor")
 def doctor_command() -> None:
     raise click.exceptions.Exit(doctor.run_doctor())
+
+
+@cli.group("runtime")
+def runtime_group() -> None:
+    """Install execution dependencies, authenticate, or inspect available models."""
+
+
+@runtime_group.command("install")
+def runtime_install_command() -> None:
+    """Install the exact Pi dependencies pinned by this Bello version."""
+    from supervisor.runtime.install import install_worker
+    try:
+        destination = install_worker()
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Pi runtime installed: {destination}")
+
+
+@runtime_group.command("models")
+@click.option("--engine", type=click.Choice(["all", "pi", "claude-code"]), default="all", show_default=True)
+def runtime_models_command(engine: str) -> None:
+    """List the configured provider/model catalog without making a model request."""
+    import tempfile
+    from supervisor.runtime.client import RuntimeClient
+    async def read_models(directory: Path) -> dict[str, Any]:
+        client = RuntimeClient(cwd=directory)
+        try:
+            await client.start()
+            return await client.request("model/list", {
+                "engines": ["pi", "claude-code"] if engine == "all" else [engine],
+                "optionalEngines": engine == "all",
+            })
+        finally:
+            await client.stop()
+    try:
+        with tempfile.TemporaryDirectory(prefix="bello-models-") as temporary:
+            result = asyncio.run(read_models(Path(temporary)))
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+@runtime_group.command("login")
+@click.argument("provider")
+def runtime_login_command(provider: str) -> None:
+    """Authenticate with a provider's normal login flow; does not run an agent."""
+    import subprocess
+    from supervisor.runtime.install import worker_command
+    try:
+        if provider == "claude-code":
+            from supervisor.runtime.claude import ClaudeBackend
+            command = [str(ClaudeBackend._bundled_cli_path()), "auth", "login"]
+        else:
+            command = worker_command()
+            auth = Path(command[1]).with_name("auth.mjs")
+            if not auth.is_file():
+                raise RuntimeError("the Pi authentication entrypoint is missing from this installation")
+            command = [command[0], str(auth), provider]
+        completed = subprocess.run(command, check=False)
+        if completed.returncode:
+            raise RuntimeError(f"provider login exited with code {completed.returncode}")
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @cli.command("config")

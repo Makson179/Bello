@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "bello",
+  "displayName": "Bello",
+  "version": "0.6.0-dev.0",
+  "description": "Launch and monitor an existing Bello coding workflow from Claude Code.",
+  "author": {
+    "name": "Maxim Bocharov",
+    "url": "https://github.com/Makson179"
+  },
+  "homepage": "https://github.com/Makson179/Bello",
+  "repository": "https://github.com/Makson179/Bello",
+  "license": "MIT",
+  "keywords": [
+    "bello",
+    "coding-agent",
+    "supervisor",
+    "multi-provider"
+  ],
+  "skills": "./skills/"
+}

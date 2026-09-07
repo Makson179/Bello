@@ -147,6 +147,8 @@ class BelloConfig(BaseModel):
     task_hash: str | None = None
     codex_version: str | None = None
     appserver_schema_hash: str | None = None
+    runtime_name: str | None = None
+    runtime_protocol_version: int | None = None
     coder_thread_id: str | None = None
     active_coder_turn_id: str | None = None
     generation: int = 0

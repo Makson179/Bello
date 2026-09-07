@@ -10,3 +10,6 @@ dist/
 .bench-tmp/
 .codex/
 .DS_Store
+node_modules/
+native/windows-sandbox/target/
+supervisor/runtime/bin/*.exe

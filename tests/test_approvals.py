@@ -916,6 +916,14 @@ def test_runtime_triage_config_uses_project_enabled_value(monkeypatch) -> None:
     assert runtime_triage_config_from_env(enabled=False).enabled is False
 
 
+def test_runtime_triage_leaves_effort_unset_without_a_configured_effort(tmp_path: Path) -> None:
+    from supervisor.approval_triage import CheapRuntimeReviewer
+
+    reviewer = CheapRuntimeReviewer(object(), tmp_path, model="triage-model")  # type: ignore[arg-type]
+
+    assert "effort" not in reviewer._thread_params()
+
+
 def test_cheap_runtime_decision_validator() -> None:
     from supervisor.schemas import CheapRuntimeDecision
 

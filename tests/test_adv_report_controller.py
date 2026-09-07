@@ -239,6 +239,7 @@ async def test_dedicated_agent_uses_completion_settings_and_does_not_log_raw_pac
     review_root = str(client.review_root.resolve())
     active_root = str(coder_snapshot.snapshot_root.resolve())
     assert client.thread_params["cwd"] == review_root
+    assert client.thread_params["effort"] == "high"
     assert client.turn_params["cwd"] == review_root
     assert client.thread_params["runtimeWorkspaceRoots"] == [review_root, input_root]
     assert client.turn_params["runtimeWorkspaceRoots"] == [review_root, input_root]

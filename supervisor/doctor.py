@@ -58,32 +58,7 @@ def collect_doctor_results() -> list[DoctorResult]:
         else DoctorResult("fail", "Git not found on PATH", _missing_git_detail())
     )
 
-    codex_path = _doctor_executable("codex")
-    results.append(
-        DoctorResult("ok", f"Codex found: {codex_path}")
-        if codex_path
-        else DoctorResult("fail", "Codex not found on PATH", _missing_codex_detail())
-    )
-    if codex_path:
-        results.append(_probe_result([codex_path, "--version"], "Codex version OK", "codex --version failed"))
-        results.append(
-            _probe_result(
-                [codex_path, "app-server", "--help"],
-                "Codex app-server supported",
-                "codex app-server --help failed",
-            )
-        )
-        results.append(_schema_generation_result(codex_path))
-        results.append(_codex_auth_result(codex_path))
-    else:
-        results.extend(
-            [
-                DoctorResult("fail", "codex --version failed", "Codex executable not found on PATH"),
-                DoctorResult("fail", "Codex app-server support not checked", "Codex executable not found on PATH"),
-                DoctorResult("fail", "app-server schema generation not checked", "Codex executable not found on PATH"),
-                DoctorResult("fail", "Codex auth check failed", "Codex executable not found on PATH"),
-            ]
-        )
+    results.extend(_runtime_dependency_results())
 
     info = update_check.read_install_info()
     if not info.metadata_available:
@@ -122,6 +97,33 @@ def collect_doctor_results() -> list[DoctorResult]:
         else:
             results.append(DoctorResult("warn", "Could not check for Bello updates", status.warning))
 
+    return results
+
+
+def _runtime_dependency_results() -> list[DoctorResult]:
+    from supervisor.runtime.install import node_executable, worker_command
+    results: list[DoctorResult] = []
+    try:
+        node = node_executable()
+        results.append(DoctorResult("ok", f"Node.js supported: {node}"))
+        worker_command()
+        results.append(DoctorResult("ok", "Pinned Pi runtime installed"))
+    except Exception as exc:
+        results.append(DoctorResult("fail", "Pi runtime dependency check failed", str(exc)))
+    system = platform.system()
+    backend = "/usr/bin/sandbox-exec" if system == "Darwin" else _doctor_executable("bwrap") if system == "Linux" else None
+    if backend and Path(backend).is_file():
+        results.append(DoctorResult("ok", f"OS sandbox executable found: {backend}",
+                                    "The run preflight also checks whether the sandbox can actually start."))
+    else:
+        results.append(DoctorResult("fail", "No supported OS sandbox is available",
+                                    "Bello will not silently run outside its configured sandbox."))
+    claude = _doctor_executable("claude")
+    if claude:
+        results.append(DoctorResult("ok", f"Official Claude Code found: {claude}",
+                                    "Optional subscription backend; authenticate with `bello runtime login claude-code`."))
+    else:
+        results.append(DoctorResult("warn", "Claude Code subscription backend is not installed", "Not required for Pi/API providers."))
     return results
 
 

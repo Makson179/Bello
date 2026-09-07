@@ -811,7 +811,7 @@ class StatelessSupervisorAgent:
         )
         if self.model:
             params["model"] = self.model
-        return params
+        return apply_intelligence(params, self.intelligence)
 
     def _append_wake_audit(
         self,

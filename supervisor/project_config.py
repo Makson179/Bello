@@ -67,7 +67,15 @@ class MultiAgentConfig:
         }
 
     def is_allowed(self, model: str, intelligence: str) -> bool:
-        return intelligence in self.allowed.get(model, ())
+        if intelligence in self.allowed.get(model, ()):
+            return True
+        from supervisor.runtime.models import ModelSelectionError, parse_model_selection
+        try:
+            selected = parse_model_selection(model)
+            return any(parse_model_selection(candidate).qualified == selected.qualified and intelligence in efforts
+                       for candidate, efforts in self.allowed.items())
+        except ModelSelectionError:
+            return False
 
 
 RUNTIME_SYNC_FIELDS = (
@@ -171,8 +179,16 @@ def default_project_config() -> ProjectConfig:
 
 
 def intelligence_choices_for_model(model: str) -> tuple[str, ...]:
+    if "/" in model:
+        from supervisor.runtime.models import parse_model_selection
+        parse_model_selection(model)
+        # Exact model/provider support is checked against the runtime catalog
+        # before execution. API catalogs also contain non-reasoning models;
+        # applying the old Codex-only list would reject their valid `off` setting.
+        # The editor must not silently clamp the saved effort.
+        return ("off", "minimal", *INTELLIGENCE_CHOICES)
     if model == MODEL_GPT_6_ASTRA:
-        # Bello uses Codex app-server, whose Astra catalog includes ultra.
+        # Preserve existing unqualified Codex profile validation.
         return INTELLIGENCE_CHOICES
     if model in {MODEL_GPT_5_6_SOL, MODEL_GPT_5_6_TERRA}:
         return INTELLIGENCE_CHOICES
@@ -492,6 +508,20 @@ def _non_negative_int(value: Any, field: str, *, path: Path) -> int:
     raise ProjectConfigError(f"invalid Bello config at {path}: {field} must be a non-negative integer")
 
 
+def _configured_model(value: Any, field: str, *, path: Path) -> str:
+    value = _required_string(value, field, path=path)
+    if value in SUPPORTED_MODEL_CHOICES:
+        return value
+    if "/" in value:
+        from supervisor.runtime.models import ModelSelectionError, parse_model_selection
+        try:
+            parse_model_selection(value)
+            return value
+        except ModelSelectionError as exc:
+            raise ProjectConfigError(f"invalid Bello config at {path}: {field}: {exc}") from exc
+    raise ProjectConfigError(f"invalid Bello config at {path}: {field} must use a supported model or explicit provider/model id")
+
+
 def _positive_int(value: Any, field: str, *, path: Path) -> int:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
         return value
@@ -544,10 +574,9 @@ def _multi_agent_config(
         raise ProjectConfigError(
             f"invalid Bello config at {path}: {field_name}.default must be an object"
         )
-    default_model = _choice(
+    default_model = _configured_model(
         raw_default.get("model", defaults.default.model),
         f"{field_name}.default.model",
-        SUPPORTED_MODEL_CHOICES,
         path=path,
     )
     default_intelligence = _choice(
@@ -564,10 +593,9 @@ def _multi_agent_config(
         )
     allowed: dict[str, tuple[str, ...]] = {}
     for raw_model, raw_efforts in raw_allowed.items():
-        model = _choice(
+        model = _configured_model(
             raw_model,
             f"{field_name}.allowed model",
-            SUPPORTED_MODEL_CHOICES,
             path=path,
         )
         if not isinstance(raw_efforts, list | tuple) or not raw_efforts:

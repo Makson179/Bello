@@ -144,6 +144,7 @@ async def test_completion_review_uses_disposable_workspace_write_snapshot(
         client,  # type: ignore[arg-type]
         store,
         task,
+        intelligence="high",
         completion_workspace_write=True,
         completion_multi_agent=completion_multi_agent,
         before_completion_thread_cleanup=cleanup_descendants,
@@ -159,6 +160,7 @@ async def test_completion_review_uses_disposable_workspace_write_snapshot(
     assert decision.decision == "accept"
     assert client.thread_params is not None
     review_root = Path(client.thread_params["cwd"])
+    assert client.thread_params["effort"] == "high"
     assert client.thread_params["sandbox"] == "workspace-write"
     assert client.thread_params["runtimeWorkspaceRoots"] == [str(review_root)]
     assert client.thread_params["config"]["agents"] == {
@@ -166,11 +168,14 @@ async def test_completion_review_uses_disposable_workspace_write_snapshot(
         "max_concurrent_threads_per_session": 3,
         "default_subagent_model": completion_multi_agent.default.model,
         "default_subagent_reasoning_effort": completion_multi_agent.default.intelligence,
+        "allowed_profiles": {model: list(efforts) for model, efforts in completion_multi_agent.allowed.items()},
+        "role": "completion_review",
     }
     developer_instructions = client.thread_params["developerInstructions"]
     assert "distinct requirements, modules, or validation questions" in developer_instructions
     assert "do not delegate the final judgment or final output" in developer_instructions
     assert client.turn_params is not None
+    assert client.turn_params["effort"] == "high"
     assert client.turn_params["sandboxPolicy"] == {
         "type": "workspaceWrite",
         "writableRoots": [str(review_root)],

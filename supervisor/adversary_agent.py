@@ -238,7 +238,7 @@ class AdversaryAgent:
         )
         if self.model:
             params["model"] = self.model
-        return params
+        return apply_intelligence(params, self.intelligence)
 
     def _turn_params(self, thread_id: str, prompt: str) -> dict[str, Any]:
         params: dict[str, Any] = {

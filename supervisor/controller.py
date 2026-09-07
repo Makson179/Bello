@@ -30,6 +30,7 @@ from supervisor.appserver import (
     AppServerMessage,
     last_agent_message_text,
 )
+from supervisor.runtime.client import RuntimeClient
 from supervisor.approvals import ApprovalManager, normalize_approval_request
 from supervisor.coder import (
     CODER_SANDBOX_DANGER_FULL_ACCESS,
@@ -411,7 +412,7 @@ class BelloController:
         self.completion_review = completion_review
         self.project_config = project_config
         self.event_queue: asyncio.Queue[ControllerEvent] = asyncio.Queue()
-        self.client = client or AppServerClient(
+        self.client = client or RuntimeClient(
             cwd=self.project_root,
             notification_handler=self._on_notification,
             server_request_handler=self._on_server_request,
@@ -1408,6 +1409,9 @@ class BelloController:
         return getattr(self, "adv_report_controller", None)
 
     async def preflight(self) -> None:
+        if isinstance(self.client, RuntimeClient):
+            await self._runtime_preflight()
+            return
         self.tui.status("checking Codex version")
         codex = _controller_executable("codex", self.project_root)
         if codex is None:
@@ -1453,6 +1457,7 @@ class BelloController:
             coder_thread_params(
                 self._active_workspace_root(),
                 model=self._coder_model(),
+                intelligence=self._coder_intelligence(),
                 fast=self._fast_mode(),
                 multi_agent=self._multi_agent_config(),
             )
@@ -1471,6 +1476,58 @@ class BelloController:
             raise RuntimeError(f"app-server did not accept {expected_sandbox} coder sandbox")
         if isinstance(thread_id, str):
             await self._cleanup_preflight_probe_thread(thread_id)
+
+    async def _runtime_preflight(self) -> None:
+        from supervisor.runtime.sandbox import SandboxPolicy, SandboxRunner
+        self.tui.status("checking Bello execution engines and configured models")
+        selected = [self._coder_model(), self._runtime_model()]
+        if self._effective_completion_review():
+            selected.append(self._completion_model())
+            if self._revision_coder_enabled():
+                selected.append(self._revision_coder_model())
+        if self._adversary_model_required_for_preflight():
+            selected.append(self._adversary_model())
+        selected.extend(self._enabled_subagent_models_for_preflight())
+        self.client.required_models = tuple(dict.fromkeys(selected))
+        models = await self.client.model_list()
+        self.store.update_bello_config(lambda cfg: cfg.model_copy(update={
+            "runtime_name": "bello-pi/claude-code", "runtime_protocol_version": 1,
+        }))
+        self._persist_model_config()
+        await self._ensure_selected_models_available(models)
+        if self.store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE:
+            return
+        profiles = [(self._coder_model(), self._coder_intelligence()),
+                    (self._runtime_model(), self._runtime_intelligence())]
+        policies = [self._multi_agent_config()]
+        if self._effective_completion_review():
+            profiles.append((self._completion_model(), self._completion_intelligence()))
+            policies.append(self._completion_multi_agent_config())
+            if self._revision_coder_enabled():
+                profiles.append((self._revision_coder_model(), self._revision_coder_intelligence()))
+        if self._adversary_model_required_for_preflight():
+            profiles.append((self._adversary_model(), self._adversary_intelligence()))
+            policies.append(self._adversary_multi_agent_config())
+        for policy in policies:
+            if policy.enabled:
+                profiles.extend((model, effort) for model, efforts in policy.allowed.items() for effort in efforts)
+        for model, effort in dict.fromkeys(profiles):
+            validation = await self.client.request("model/validate", {
+                "model": model, "effort": effort,
+                "serviceTier": "priority" if self._fast_mode() else None,
+            })
+            if validation.get("valid") is not True:
+                raise RuntimeError(f"execution engine could not validate the exact model profile: {model} / {effort}")
+        self.tui.status("checking the operating-system sandbox")
+        root = self._active_workspace_root()
+        probe = await SandboxRunner(SandboxPolicy(root=root, mode=coder_sandbox_mode())).run(
+            "echo bello-sandbox-probe", root, 10
+        )
+        if probe.exit_code != 0 or "bello-sandbox-probe" not in probe.output:
+            raise RuntimeError("Bello could not start its required OS sandbox; no model run was started")
+        self.tui.status("checking supervisor structured output")
+        await self._structured_output_self_test()
+        await self._configure_runtime_triage()
 
     async def _ensure_selected_models_available(self, models_response: dict[str, Any]) -> None:
         result = _selected_model_availability(
@@ -1492,7 +1549,7 @@ class BelloController:
         missing = ", ".join(result.missing_roles)
         message = (
             "model availability preflight failed before coder start: "
-            f"selected model(s) are not available from Codex app-server model/list: {missing}. "
+            f"selected model(s) are not available from the execution engine: {missing}. "
             f"Available models: {available}. "
             "The interruption is recorded in .supervisor/FINAL_REPORT.md."
         )
@@ -2197,6 +2254,10 @@ class BelloController:
             )
             return
         if method == "turn/completed" and thread_id == cfg.coder_thread_id:
+            turn = params.get("turn", {})
+            if isinstance(turn, dict) and turn.get("status") == "failed":
+                await self.fail_provider(f"coder execution failed: {turn.get('error') or 'provider returned a failed turn'}")
+                return
             if self.coder and isinstance(turn_id, str):
                 self.coder.mark_turn_completed(turn_id)
             self._write_run_checkpoint("coder_turn_complete", state="stable")
@@ -2571,6 +2632,10 @@ class BelloController:
             state.active_turn_id = None
         state.nickname = _optional_bounded_text(thread.get("agentNickname"), 120) or state.nickname
         state.role = _optional_bounded_text(thread.get("agentRole"), 120) or state.role
+        if isinstance(thread.get("model"), str):
+            state.model = thread["model"]
+        if isinstance(thread.get("reasoningEffort"), str):
+            state.reasoning_effort = thread["reasoningEffort"]
         state.last_sequence = max(state.last_sequence, self._sequence)
         return state
 
@@ -6415,7 +6480,7 @@ class BelloController:
         return list(files.values())[:200]
 
     def _record_changed_files(self, action: TriggeringAction) -> None:
-        if not action.paths:
+        if not action.paths or action.kind == "fileRead":
             return
         observed = getattr(self, "observed_changed_files", None)
         if observed is None:
@@ -7821,6 +7886,23 @@ def _inspection_from_action(
     sequence: int,
     item: Any = None,
 ) -> InspectionRun | None:
+    if action.kind == "fileRead" and isinstance(item, dict) and item.get("tool") in {
+        "read_file", "search", "list_directory", "view_image"
+    }:
+        # Native managed reads are evidence too. Keep their actual tool identity
+        # instead of inventing a shell command that was never executed.
+        operation = "tool:" + item["tool"] + " " + json.dumps(item.get("arguments", {}), sort_keys=True, ensure_ascii=False)
+        output = _command_output_from_item(item)
+        passed = action.exit_code == 0 and action.status == "completed"
+        return InspectionRun(
+            inspection_id=_stable_inspection_id(normalized_command=operation, cwd=action.cwd, inspected_paths=action.paths),
+            command=operation, raw_command=operation, normalized_command=operation,
+            cwd=action.cwd, exit_code=action.exit_code, shell_exit_code=None,
+            outcome="pass" if passed else "fail", passed=passed,
+            summary=_validation_summary(action.summary, output), captured_output=output,
+            captured_output_truncated=output.endswith("...<truncated>"), sequence=sequence,
+            inspected_paths=action.paths,
+        )
     if action.kind != "commandExecution" or not action.command:
         return None
     if not _is_read_only_inspection_command(action.command):
@@ -8602,6 +8684,8 @@ def _is_recoverable_app_server_transport_error(message: str) -> bool:
         marker in normalized
         for marker in (
             "app-server stream closed",
+            "pi worker stream closed",
+            "claude code stream closed",
             "broken pipe",
             "connection reset",
             "connection closed",
@@ -10232,6 +10316,8 @@ def _item_summary(item: Any) -> str:
         return f"command completed: {item.get('command', '')} exit={item.get('exitCode')}"
     if item_type == "fileChange":
         return f"file change completed: {len(item.get('changes') or [])} changes"
+    if item_type == "fileRead":
+        return f"file inspection completed: {item.get('tool')} {', '.join(item.get('paths') or [])}"
     if item_type == "mcpToolCall":
         return f"mcp tool completed: {item.get('server')}/{item.get('tool')}"
     if item_type == "dynamicToolCall":
@@ -10242,7 +10328,7 @@ def _item_summary(item: Any) -> str:
 
 
 def _is_completed_action(item: Any) -> bool:
-    return isinstance(item, dict) and item.get("type") in {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"}
+    return isinstance(item, dict) and item.get("type") in {"commandExecution", "fileChange", "fileRead", "mcpToolCall", "dynamicToolCall", "webSearch"}
 
 
 def _adversary_enabled_from_env() -> bool | None:

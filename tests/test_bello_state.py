@@ -161,6 +161,7 @@ def test_coder_thread_resume_params_restore_policy_and_multi_agent(tmp_path: Pat
         "thread-1",
         tmp_path,
         model=MODEL_GPT_5_6_TERRA,
+        intelligence="high",
         multi_agent=config,
     )
 
@@ -169,6 +170,7 @@ def test_coder_thread_resume_params_restore_policy_and_multi_agent(tmp_path: Pat
     assert params["approvalPolicy"] == "on-request"
     assert params["approvalsReviewer"] == "user"
     assert params["model"] == MODEL_GPT_5_6_TERRA
+    assert params["effort"] == "high"
     assert params["config"]["agents"]["enabled"] is True
     assert params["config"]["agents"]["max_concurrent_threads_per_session"] == 3
 
@@ -419,7 +421,8 @@ def test_coder_fast_mode_sets_codex_service_tier(tmp_path: Path) -> None:
     assert coder_turn_params("thread", "work", tmp_path, fast=True)["serviceTier"] == CODEX_FAST_SERVICE_TIER
 
 
-def test_coder_turn_params_include_intelligence_effort(tmp_path: Path) -> None:
+def test_coder_thread_and_turn_params_include_intelligence_effort(tmp_path: Path) -> None:
+    assert coder_thread_params(tmp_path, intelligence="xhigh")["effort"] == "xhigh"
     assert coder_turn_params("thread", "work", tmp_path, intelligence="xhigh")["effort"] == "xhigh"
 
 
@@ -449,6 +452,8 @@ def test_coder_thread_applies_structured_multi_agent_config_and_separate_instruc
             "max_concurrent_threads_per_session": 6,
             "default_subagent_model": MODEL_GPT_5_6_LUNA,
             "default_subagent_reasoning_effort": "xhigh",
+            "allowed_profiles": {model: list(efforts) for model, efforts in multi_agent.allowed.items()},
+            "role": "coder",
         }
     }
     instructions = params["developerInstructions"]
@@ -518,6 +523,7 @@ async def test_coder_session_passes_multi_agent_config_only_at_thread_start(tmp_
 
     assert client.thread_params["config"]["agents"]["enabled"] is True
     assert client.thread_params["runtimeWorkspaceRoots"] == [str(tmp_path.resolve())]
+    assert client.thread_params["effort"] == "xhigh"
     assert "developerInstructions" in client.thread_params
     assert client.turn_params["input"] == [
         {"type": "text", "text": "unchanged user prompt", "text_elements": []}
@@ -5273,9 +5279,11 @@ async def test_supervisor_agent_sets_intelligence_effort(tmp_path: Path) -> None
 
     class FakeClient:
         def __init__(self) -> None:
+            self.thread_params = None
             self.turn_params = None
 
         async def thread_start(self, params, *, timeout):
+            self.thread_params = params
             return {"thread": {"id": "supervisor-thread"}}
 
         async def turn_start(self, params, *, timeout):
@@ -5303,6 +5311,7 @@ async def test_supervisor_agent_sets_intelligence_effort(tmp_path: Path) -> None
     decision = await agent.decide(packet)
 
     assert decision.decision == SupervisorDecisionKind.NOOP
+    assert client.thread_params["effort"] == "high"
     assert client.turn_params["effort"] == "high"
 
 

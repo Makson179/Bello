@@ -15,7 +15,7 @@ from typing import Any, Literal, cast
 
 from wcwidth import wcwidth
 
-from supervisor.appserver import AppServerClient
+from supervisor.runtime.client import RuntimeClient
 from supervisor.project_config import (
     DEFAULT_MODEL,
     GPT_5_6_MODELS,
@@ -29,7 +29,7 @@ from supervisor.project_config import (
     ProjectConfig,
     SubagentDefaultConfig,
     changed_project_config_fields,
-    intelligence_choices_for_model,
+    intelligence_choices_for_model as _fallback_intelligence_choices,
     load_project_config,
     project_config_path,
     sync_runtime_config_fields,
@@ -42,6 +42,14 @@ InlineEditKind = Literal["optional_text", "non_negative_int", "positive_int", "p
 StyledFragment = tuple[str, str]
 FragmentLine = list[StyledFragment]
 FormattedRender = list[StyledFragment]
+
+# Refreshed from the authenticated engines when opening the editor. This only
+# describes selectable values; execution still validates the exact profile.
+_model_effort_catalog: dict[str, tuple[str, ...]] = {}
+
+
+def intelligence_choices_for_model(model: str) -> tuple[str, ...]:
+    return _model_effort_catalog.get(model, _fallback_intelligence_choices(model))
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 ELLIPSIS = "..."
@@ -712,7 +720,7 @@ def _multi_agent_parameters(
             EditorOption("off", f"{field_prefix}_enabled", False),
         ),
         help_text=(
-            f"on lets the {owner} delegate bounded independent investigations to Codex subagents using only the "
+            f"on lets the {owner} delegate bounded independent investigations to subagents using only the "
             f"configured models and reasoning efforts. off removes subagent tools from the {owner} thread."
         ),
     )
@@ -766,7 +774,7 @@ def _multi_agent_parameters(
             str(settings.max_concurrent),
             (),
             edit_kind="positive_int",
-            help_text=f"Maximum number of Codex agent threads that may run concurrently in this {owner} session.",
+            help_text=f"Maximum number of agent threads that may run concurrently in this {owner} session.",
         ),
         *default_model_parameters,
         default_intelligence,
@@ -816,6 +824,8 @@ def _model_parameters(
         family_options.append(EditorOption(MODEL_FAMILY_5_6_LABEL, field, selected_56))
     if MODEL_GPT_5_5 in available or selected_model == MODEL_GPT_5_5:
         family_options.append(EditorOption(MODEL_FAMILY_5_5_LABEL, field, MODEL_GPT_5_5))
+    for model in sorted((available | {selected_model}) - set(SUPPORTED_MODEL_CHOICES)):
+        family_options.append(EditorOption(model, field, model))
 
     parameters = [
         EditorParameter(
@@ -2369,6 +2379,7 @@ def _save_config_change(project_root: Path, previous_config: ProjectConfig, conf
 
 
 def available_model_choices(project_root: Path) -> tuple[str, ...]:
+    _model_effort_catalog.clear()
     models = _available_models_from_app_server(project_root)
     if not models:
         models = _available_models_from_cache()
@@ -2396,13 +2407,25 @@ def _normalize_model_choices(models: Any) -> tuple[str, ...]:
         candidates = [models]
     else:
         candidates = list(models) if isinstance(models, list | tuple | set) else []
-    available = {
-        candidate.strip()
-        for candidate in candidates
-        if isinstance(candidate, str) and candidate.strip() in SUPPORTED_MODEL_CHOICES
-    }
+    from supervisor.runtime.models import ModelSelectionError, parse_model_selection
+    available: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        candidate = candidate.strip()
+        if candidate not in SUPPORTED_MODEL_CHOICES and "/" not in candidate:
+            # Legacy unqualified names remain the existing Codex aliases. New
+            # models carry an explicit provider so choosing one cannot change
+            # the user's billing route accidentally.
+            continue
+        try:
+            parse_model_selection(candidate)
+        except ModelSelectionError:
+            continue
+        available.add(candidate)
     available.update({DEFAULT_MODEL, MODEL_GPT_5_5})
-    return tuple(model for model in SUPPORTED_MODEL_CHOICES if model in available)
+    return (*tuple(model for model in SUPPORTED_MODEL_CHOICES if model in available),
+            *sorted(available - set(SUPPORTED_MODEL_CHOICES)))
 
 
 def _available_models_from_cache() -> tuple[str, ...]:
@@ -2428,11 +2451,20 @@ def _available_models_from_cache() -> tuple[str, ...]:
 
 def _available_models_from_app_server(project_root: Path) -> tuple[str, ...]:
     async def read_models() -> tuple[str, ...]:
-        client = AppServerClient(cwd=project_root)
+        client = RuntimeClient(cwd=project_root)
         await client.start()
         try:
             await client.initialize()
-            response = await client.model_list()
+            response = await client.request("model/list", {
+                "engines": ["pi", "claude-code"], "optionalEngines": True,
+            })
+            for descriptor in response.get("data", []):
+                if not isinstance(descriptor, dict):
+                    continue
+                efforts = descriptor.get("supportedEfforts")
+                if isinstance(efforts, list) and efforts and all(isinstance(item, str) for item in efforts):
+                    for model in _extract_model_ids(descriptor):
+                        _model_effort_catalog[model] = tuple(dict.fromkeys(efforts))
             return tuple(_extract_model_ids(response))
         finally:
             await client.stop()
@@ -2448,10 +2480,16 @@ def _extract_model_ids(value: Any) -> set[str]:
     if isinstance(value, dict):
         if value.get("hidden") is True:
             return ids
-        for key in ("id", "model", "slug", "name"):
+        qualified = value.get("qualifiedId")
+        keys = ("qualifiedId",) if isinstance(qualified, str) and qualified else ("id", "model", "slug")
+        for key in keys:
             candidate = value.get(key)
             if isinstance(candidate, str) and candidate.strip():
                 ids.add(candidate.strip())
+        if value.get("provider") == "openai-codex" and isinstance(qualified, str):
+            # Existing saved Codex profiles remain aliases for this route only,
+            # never for an API model with the same provider-local name.
+            ids.add(qualified.removeprefix("openai-codex/"))
         for key in ("data", "models", "items"):
             nested = value.get(key)
             if nested is not None:

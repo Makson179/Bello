@@ -1,0 +1,474 @@
+use crate::protocol::SandboxMode;
+use crate::winutil::{
+    contains, open_path, path_eq, validate_final_path, validate_plain_file_object, Handle,
+};
+use anyhow::{anyhow, Result};
+use std::collections::VecDeque;
+use std::ffi::c_void;
+use std::mem;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use windows_sys::Win32::Foundation::{LocalFree, PSID};
+use windows_sys::Win32::Security::Authorization::{
+    GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo, EXPLICIT_ACCESS_W, SET_ACCESS,
+    SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+};
+use windows_sys::Win32::Security::{
+    AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetTokenInformation, TokenUser,
+    ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
+    CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE, OBJECT_INHERIT_ACE,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
+    WRITE_DAC, WRITE_OWNER,
+};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+const GRANT_ACCESS: i32 = 1;
+const DENY_ACCESS: i32 = 3;
+const REVOKE_ACCESS: i32 = 4;
+
+struct SecurityDescriptor(*mut c_void);
+
+impl Drop for SecurityDescriptor {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                LocalFree(self.0);
+            }
+        }
+    }
+}
+
+struct LocalAcl(*mut ACL);
+
+impl Drop for LocalAcl {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                LocalFree(self.0 as *mut c_void);
+            }
+        }
+    }
+}
+
+fn trustee(sid: PSID) -> TRUSTEE_W {
+    TRUSTEE_W {
+        pMultipleTrustee: std::ptr::null_mut(),
+        MultipleTrusteeOperation: 0,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_UNKNOWN,
+        ptstrName: sid as *mut u16,
+    }
+}
+
+fn current_dacl(handle: &Handle) -> Result<(*mut ACL, SecurityDescriptor)> {
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: *mut c_void = std::ptr::null_mut();
+    let code = unsafe {
+        GetSecurityInfo(
+            handle.raw(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if code != 0 {
+        return Err(anyhow!("GetSecurityInfo failed with Win32 error {code}"));
+    }
+    let owned = SecurityDescriptor(descriptor);
+    if dacl.is_null() {
+        return Err(anyhow!(
+            "null DACLs cannot be mutated without changing their security semantics"
+        ));
+    }
+    Ok((dacl, owned))
+}
+
+pub fn require_non_null_dacl(handle: &Handle) -> Result<()> {
+    let _ = current_dacl(handle)?;
+    Ok(())
+}
+
+pub fn protect_state_directory(handle: &Handle) -> Result<()> {
+    let mut token = 0;
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(crate::winutil::last_error("OpenProcessToken"));
+    }
+    let token = Handle::new(token, "OpenProcessToken")?;
+    let mut required = 0_u32;
+    unsafe {
+        GetTokenInformation(
+            token.raw(),
+            TokenUser,
+            std::ptr::null_mut(),
+            0,
+            &mut required,
+        );
+    }
+    if required < mem::size_of::<TOKEN_USER>() as u32 {
+        return Err(anyhow!(
+            "GetTokenInformation returned an invalid user SID size"
+        ));
+    }
+    let words = (required as usize).div_ceil(mem::size_of::<usize>());
+    let mut buffer = vec![0_usize; words];
+    if unsafe {
+        GetTokenInformation(
+            token.raw(),
+            TokenUser,
+            buffer.as_mut_ptr() as *mut c_void,
+            required,
+            &mut required,
+        )
+    } == 0
+    {
+        return Err(crate::winutil::last_error("GetTokenInformation(TokenUser)"));
+    }
+    let user_sid = unsafe { (*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid };
+    if user_sid.is_null() {
+        return Err(anyhow!("the current process token has no user SID"));
+    }
+
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut descriptor: *mut c_void = std::ptr::null_mut();
+    let code = unsafe {
+        GetSecurityInfo(
+            handle.raw(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if code != 0 {
+        return Err(anyhow!(
+            "GetSecurityInfo(owner) failed with Win32 error {code}"
+        ));
+    }
+    let _descriptor = SecurityDescriptor(descriptor);
+    if owner.is_null() || unsafe { EqualSid(owner, user_sid) } == 0 {
+        return Err(anyhow!(
+            "the Windows sandbox state directory is not owned by the current account"
+        ));
+    }
+
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: FILE_ALL_ACCESS,
+        grfAccessMode: SET_ACCESS,
+        grfInheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+        Trustee: trustee(user_sid),
+    };
+    let mut exact_dacl: *mut ACL = std::ptr::null_mut();
+    let code = unsafe { SetEntriesInAclW(1, &entry, std::ptr::null(), &mut exact_dacl) };
+    if code != 0 {
+        return Err(anyhow!(
+            "SetEntriesInAclW(state directory) failed with Win32 error {code}"
+        ));
+    }
+    let exact_dacl = LocalAcl(exact_dacl);
+    let code = unsafe {
+        SetSecurityInfo(
+            handle.raw(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            exact_dacl.0,
+            std::ptr::null_mut(),
+        )
+    };
+    if code != 0 {
+        return Err(anyhow!(
+            "SetSecurityInfo(state directory) failed with Win32 error {code}"
+        ));
+    }
+
+    let (dacl, _descriptor) = current_dacl(handle)?;
+    let mut info: ACL_SIZE_INFORMATION = unsafe { mem::zeroed() };
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            &mut info as *mut _ as *mut c_void,
+            mem::size_of_val(&info) as u32,
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(crate::winutil::last_error(
+            "GetAclInformation(state directory)",
+        ));
+    }
+    if info.AceCount != 1 {
+        return Err(anyhow!(
+            "the Windows sandbox state DACL is not restricted to one account"
+        ));
+    }
+    let mut raw: *mut c_void = std::ptr::null_mut();
+    if unsafe { GetAce(dacl, 0, &mut raw) } == 0 {
+        return Err(crate::winutil::last_error("GetAce(state directory)"));
+    }
+    let header = unsafe { &*(raw as *const ACE_HEADER) };
+    let ace = unsafe { &*(raw as *const ACCESS_ALLOWED_ACE) };
+    let ace_sid =
+        (raw as usize + mem::size_of::<ACE_HEADER>() + mem::size_of::<u32>()) as *mut c_void;
+    if header.AceType != ACCESS_ALLOWED_ACE_TYPE
+        || ace.Mask != FILE_ALL_ACCESS
+        || unsafe { EqualSid(ace_sid, user_sid) } == 0
+    {
+        return Err(anyhow!(
+            "the Windows sandbox state DACL does not grant exactly its owner"
+        ));
+    }
+    Ok(())
+}
+
+fn set_entries(handle: &Handle, entries: &[EXPLICIT_ACCESS_W]) -> Result<()> {
+    let (old_dacl, _descriptor) = current_dacl(handle)?;
+    let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    let code = unsafe {
+        SetEntriesInAclW(
+            entries.len() as u32,
+            entries.as_ptr(),
+            old_dacl,
+            &mut new_dacl,
+        )
+    };
+    if code != 0 {
+        return Err(anyhow!("SetEntriesInAclW failed with Win32 error {code}"));
+    }
+    let new_dacl = LocalAcl(new_dacl);
+    let code = unsafe {
+        SetSecurityInfo(
+            handle.raw(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            new_dacl.0,
+            std::ptr::null_mut(),
+        )
+    };
+    if code != 0 {
+        return Err(anyhow!("SetSecurityInfo failed with Win32 error {code}"));
+    }
+    Ok(())
+}
+
+pub fn grant(handle: &Handle, sid: PSID, mode: SandboxMode) -> Result<()> {
+    let inheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
+    let base_mask = FILE_GENERIC_READ
+        | FILE_GENERIC_EXECUTE
+        | if mode == SandboxMode::WorkspaceWrite {
+            FILE_GENERIC_WRITE
+        } else {
+            0
+        };
+    let mut entries = vec![EXPLICIT_ACCESS_W {
+        grfAccessPermissions: base_mask,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: inheritance,
+        Trustee: trustee(sid),
+    }];
+    if mode == SandboxMode::WorkspaceWrite {
+        // DELETE applies to descendants, not the authority root. FILE_DELETE_CHILD
+        // is intentionally absent so direct private-path denies cannot be bypassed.
+        entries.push(EXPLICIT_ACCESS_W {
+            grfAccessPermissions: DELETE,
+            grfAccessMode: GRANT_ACCESS,
+            grfInheritance: inheritance | INHERIT_ONLY_ACE,
+            Trustee: trustee(sid),
+        });
+    }
+    set_entries(handle, &entries)
+}
+
+pub fn deny_all(handle: &Handle, sid: PSID) -> Result<()> {
+    set_entries(
+        handle,
+        &[EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FILE_ALL_ACCESS,
+            grfAccessMode: DENY_ACCESS,
+            grfInheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+            Trustee: trustee(sid),
+        }],
+    )
+}
+
+pub fn revoke(handle: &Handle, sid: PSID) -> Result<()> {
+    set_entries(
+        handle,
+        &[EXPLICIT_ACCESS_W {
+            grfAccessPermissions: 0,
+            grfAccessMode: REVOKE_ACCESS,
+            grfInheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+            Trustee: trustee(sid),
+        }],
+    )
+}
+
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+
+fn masks_for_sid(dacl: *mut ACL, sid: PSID, include_inherit_only: bool) -> Result<(u32, u32)> {
+    let mut info: ACL_SIZE_INFORMATION = unsafe { mem::zeroed() };
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            &mut info as *mut _ as *mut c_void,
+            mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(crate::winutil::last_error("GetAclInformation"));
+    }
+    let mut allowed = 0_u32;
+    let mut denied = 0_u32;
+    for index in 0..info.AceCount {
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        if unsafe { GetAce(dacl, index, &mut raw) } == 0 {
+            return Err(crate::winutil::last_error("GetAce"));
+        }
+        let header = unsafe { &*(raw as *const ACE_HEADER) };
+        if !include_inherit_only && header.AceFlags & INHERIT_ONLY_ACE as u8 != 0 {
+            continue;
+        }
+        if header.AceType != ACCESS_ALLOWED_ACE_TYPE && header.AceType != ACCESS_DENIED_ACE_TYPE {
+            continue;
+        }
+        let ace_sid =
+            (raw as usize + mem::size_of::<ACE_HEADER>() + mem::size_of::<u32>()) as *mut c_void;
+        if unsafe { EqualSid(ace_sid, sid) } == 0 {
+            continue;
+        }
+        if header.AceType == ACCESS_ALLOWED_ACE_TYPE {
+            allowed |= unsafe { (*(raw as *const ACCESS_ALLOWED_ACE)).Mask };
+        } else {
+            denied |= unsafe { (*(raw as *const ACCESS_DENIED_ACE)).Mask };
+        }
+    }
+    Ok((allowed, denied))
+}
+
+pub fn verify_tree(
+    root: &Path,
+    private_paths: &[std::path::PathBuf],
+    sid: PSID,
+    mode: SandboxMode,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<()> {
+    let mut pending = VecDeque::from([root.to_owned()]);
+    while let Some(path) = pending.pop_front() {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(anyhow!(
+                "controller closed stdin while verifying ACL propagation"
+            ));
+        }
+        let handle = open_path(&path, false)?;
+        validate_final_path(&handle, &std::fs::canonicalize(&path)?)?;
+        let (dacl, _descriptor) = current_dacl(&handle)?;
+        let (allowed, denied) = masks_for_sid(dacl, sid, false)?;
+        let private = private_paths.iter().any(|entry| contains(entry, &path));
+        if private {
+            let expected = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE;
+            if denied & expected != expected {
+                return Err(anyhow!(
+                    "private-path deny ACE did not propagate to {}",
+                    path.display()
+                ));
+            }
+            if allowed & (WRITE_DAC | WRITE_OWNER | FILE_DELETE_CHILD) != 0 {
+                return Err(anyhow!(
+                    "private-path inherited allow ACE grants administrative rights to {}",
+                    path.display()
+                ));
+            }
+        } else {
+            let mut expected = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+            if mode == SandboxMode::WorkspaceWrite {
+                expected |= FILE_GENERIC_WRITE;
+                if !path_eq(root, &path) {
+                    expected |= DELETE;
+                }
+            }
+            if allowed != expected || denied != 0 {
+                return Err(anyhow!(
+                    "AppContainer allow ACE did not propagate exactly to {}",
+                    path.display()
+                ));
+            }
+            let acl_admin = WRITE_DAC | WRITE_OWNER | FILE_DELETE_CHILD;
+            if allowed & acl_admin != 0 {
+                return Err(anyhow!(
+                    "AppContainer allow ACE grants ACL or child-deletion authority to {}",
+                    path.display()
+                ));
+            }
+            if path_eq(root, &path) && allowed & DELETE != 0 {
+                return Err(anyhow!(
+                    "AppContainer allow ACE grants deletion of authority root {}",
+                    path.display()
+                ));
+            }
+            if mode == SandboxMode::ReadOnly {
+                let mutation = FILE_WRITE_DATA
+                    | FILE_APPEND_DATA
+                    | FILE_WRITE_EA
+                    | FILE_WRITE_ATTRIBUTES
+                    | FILE_DELETE_CHILD
+                    | DELETE
+                    | WRITE_DAC
+                    | WRITE_OWNER;
+                if allowed & mutation != 0 {
+                    return Err(anyhow!(
+                        "read-only AppContainer ACE grants mutation rights to {}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        if path.is_dir() {
+            for entry in std::fs::read_dir(&path)? {
+                pending.push_back(entry?.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn verify_absent_tree(root: &Path, sid: PSID) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    let mut pending = VecDeque::from([root.to_owned()]);
+    while let Some(path) = pending.pop_front() {
+        let handle = open_path(&path, false)?;
+        validate_final_path(&handle, &std::fs::canonicalize(&path)?)?;
+        validate_plain_file_object(&handle, &path)?;
+        let (dacl, _descriptor) = current_dacl(&handle)?;
+        let (allowed, denied) = masks_for_sid(dacl, sid, true)?;
+        if allowed != 0 || denied != 0 {
+            return Err(anyhow!(
+                "AppContainer SID ACE remains after cleanup on {}",
+                path.display()
+            ));
+        }
+        if path.is_dir() {
+            for entry in std::fs::read_dir(&path)? {
+                pending.push_back(entry?.path());
+            }
+        }
+    }
+    Ok(())
+}
