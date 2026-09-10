@@ -410,6 +410,23 @@ mod tests {
     }
 
     #[test]
+    fn private_authority_comparison_ignores_case_but_does_not_expand_short_names() {
+        let root = Path::new(r"\\?\C:\Users\runneradmin\AppData\Local\Temp\workspace");
+        let casing = verbatim_local_absolute(Path::new(
+            r"C:\USERS\RUNNERADMIN\APPDATA\LOCAL\TEMP\workspace\.supervisor",
+        ))
+        .unwrap();
+        assert!(contains(root, &casing));
+        let short_name = verbatim_local_absolute(Path::new(
+            r"C:\Users\RUNNER~1\AppData\Local\Temp\workspace\.supervisor",
+        ))
+        .unwrap();
+        // Lexical authority comparison must not guess that an 8.3 alias names
+        // the same directory; callers first resolve existing path ancestors.
+        assert!(!contains(root, &short_name));
+    }
+
+    #[test]
     fn private_drive_spelling_does_not_accept_other_namespaces_or_ambiguity() {
         for supplied in [
             r"C:\workspace\..\outside",

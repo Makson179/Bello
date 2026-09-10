@@ -485,11 +485,15 @@ mod tests {
                 .as_nanos(),
         ));
         let supplied_root = base.join("workspace");
+        fs::create_dir_all(supplied_root.join(".supervisor")).unwrap();
+        let root = fs::canonicalize(&supplied_root).unwrap();
+        // Mirror the Python bridge's Path.resolve contract: expand existing
+        // temp-directory aliases (RUNNER~1) first, then send plain-drive paths
+        // without Rust's extended prefix, including a still-missing leaf.
+        let supplied_root = PathBuf::from(root.to_str().unwrap().strip_prefix(r"\\?\").unwrap());
         let existing = supplied_root.join(".supervisor");
         let missing = supplied_root.join(".codex").join("bello-run");
-        fs::create_dir_all(&existing).unwrap();
         assert!(!missing.exists());
-        let root = fs::canonicalize(&supplied_root).unwrap();
         let profile_name = random_profile_name().unwrap();
         let mut journal = Journal::create(
             &base.join("state"),
@@ -513,7 +517,9 @@ mod tests {
         assert!(paths.contains(&fs::canonicalize(&existing).unwrap()));
         assert!(paths.contains(&fs::canonicalize(&missing).unwrap()));
 
-        let sibling = base.join("workspace-other").join(".supervisor");
+        let sibling = supplied_root
+            .with_file_name("workspace-other")
+            .join(".supervisor");
         let error = prepare_private_paths(
             &root,
             &[],
