@@ -25,10 +25,48 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install Linux sandbox
+      - name: Install and verify Linux sandbox
+        shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install --yes bubblewrap
+          sudo apt-get install --yes bubblewrap apparmor-profiles
+          if [ "$(id -u)" -eq 0 ]; then
+            echo "::error::Native sandbox checks must run as the unprivileged runner."
+            exit 1
+          fi
+          sandbox_diagnostics() {
+            /usr/bin/bwrap --version
+            sysctl kernel.unprivileged_userns_clone user.max_user_namespaces \
+              kernel.apparmor_restrict_unprivileged_userns || true
+            sudo grep -E 'bwrap|unprivileged_userns' \
+              /sys/kernel/security/apparmor/profiles || true
+            sudo journalctl --kernel --boot --no-pager --since '-2 minutes' \
+              | grep -E 'apparmor=.*(bwrap|unprivileged_userns)' | tail -30 || true
+          }
+          sandbox_probe() {
+            /usr/bin/bwrap --die-with-parent --new-session \
+              --unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-net \
+              --cap-drop ALL --clearenv --ro-bind / / --proc /proc --dev /dev \
+              -- /usr/bin/true
+          }
+          sandbox_diagnostics
+          if ! sandbox_probe; then
+            sandbox_diagnostics
+            # Noble ships this targeted profile in apparmor-profiles, but does
+            # not load it by default. Keep AppArmor and network isolation on.
+            if [ ! -f /etc/apparmor.d/bwrap-userns-restrict ]; then
+              sudo install -m 0644 \
+                /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
+                /etc/apparmor.d/bwrap-userns-restrict
+            fi
+            sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+            sandbox_diagnostics
+            if ! sandbox_probe; then
+              sandbox_diagnostics
+              echo "::error::Bubblewrap cannot establish the required native sandbox."
+              exit 1
+            fi
+          fi
       - name: Install pinned Pi runtime
         working-directory: supervisor/pi_worker
         run: npm ci --ignore-scripts --no-audit --no-fund

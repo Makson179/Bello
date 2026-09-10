@@ -581,7 +581,47 @@ mod tests {
     fn windows_argument_quoting_preserves_quotes_and_trailing_slashes() {
         assert_eq!(quote_windows_argument("plain"), "plain");
         assert_eq!(quote_windows_argument("two words"), "\"two words\"");
-        assert_eq!(quote_windows_argument(r#"a\"b\\"#), r#"\"a\\\"b\\\\\""#);
+        assert_eq!(quote_windows_argument(r#"a\"b\\"#), r#""a\\\"b\\\\""#);
+    }
+
+    #[test]
+    fn windows_argument_quoting_round_trips_through_native_parser() {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
+
+        let arguments = [
+            "program.exe",
+            "",
+            "plain",
+            "two words",
+            "tab\tseparated",
+            r#"a\"b\\"#,
+            r"C:\Program Files\Tool\",
+            r#""quoted""#,
+            "α β",
+        ];
+        let command_line = arguments
+            .iter()
+            .map(|argument| quote_windows_argument(argument))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let command_line: Vec<_> = command_line.encode_utf16().chain(Some(0)).collect();
+        let mut count = 0;
+        let parsed = unsafe { CommandLineToArgvW(command_line.as_ptr(), &mut count) };
+        assert!(!parsed.is_null(), "CommandLineToArgvW failed");
+        // CommandLineToArgvW owns one allocation containing count terminated strings.
+        let actual: Vec<_> = unsafe { std::slice::from_raw_parts(parsed, count as usize) }
+            .iter()
+            .map(|argument| {
+                let mut length = 0;
+                while unsafe { *argument.add(length) } != 0 {
+                    length += 1;
+                }
+                String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(*argument, length) })
+            })
+            .collect();
+        unsafe { LocalFree(parsed as *mut c_void) };
+        assert_eq!(actual, arguments);
     }
 
     #[test]
