@@ -15,7 +15,7 @@ use windows_sys::Win32::Security::Authorization::{
     SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
-    AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetTokenInformation,
+    AclSizeInformation, DeleteAce, EqualSid, GetAce, GetAclInformation, GetTokenInformation,
     InitializeSecurityDescriptor, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
     SetSecurityDescriptorOwner, TokenUser, ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL,
     ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE,
@@ -31,7 +31,6 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 
 const GRANT_ACCESS: i32 = 1;
 const DENY_ACCESS: i32 = 3;
-const REVOKE_ACCESS: i32 = 4;
 
 struct SecurityDescriptor(*mut c_void);
 
@@ -351,19 +350,74 @@ pub fn deny_all(handle: &Handle, sid: PSID) -> Result<()> {
 }
 
 pub fn revoke(handle: &Handle, sid: PSID) -> Result<()> {
-    set_entries(
-        handle,
-        &[EXPLICIT_ACCESS_W {
-            grfAccessPermissions: 0,
-            grfAccessMode: REVOKE_ACCESS,
-            grfInheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
-            Trustee: trustee(sid),
-        }],
-    )
+    let (old_dacl, _descriptor) = current_dacl(handle)?;
+    let mut buffer = dacl_without_access_sid(old_dacl, sid)?;
+    let code = unsafe {
+        SetSecurityInfo(
+            handle.raw(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr() as *mut ACL,
+            std::ptr::null_mut(),
+        )
+    };
+    if code != 0 {
+        return Err(anyhow!(
+            "SetSecurityInfo(revoke) failed with Win32 error {code}"
+        ));
+    }
+    Ok(())
 }
 
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+
+fn dacl_without_access_sid(dacl: *mut ACL, sid: PSID) -> Result<Vec<usize>> {
+    let mut info: ACL_SIZE_INFORMATION = unsafe { mem::zeroed() };
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            &mut info as *mut _ as *mut c_void,
+            mem::size_of_val(&info) as u32,
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(crate::winutil::last_error("GetAclInformation(revoke)"));
+    }
+    let size = unsafe { (*dacl).AclSize } as usize;
+    if size < mem::size_of::<ACL>() || info.AclBytesInUse as usize > size {
+        return Err(anyhow!("invalid DACL size during revoke"));
+    }
+    let mut buffer = vec![0_usize; size.div_ceil(mem::size_of::<usize>())];
+    unsafe {
+        std::ptr::copy_nonoverlapping(dacl as *const u8, buffer.as_mut_ptr() as *mut u8, size);
+    }
+    let copied = buffer.as_mut_ptr() as *mut ACL;
+    // REVOKE_ACCESS removes allow ACEs, not deny ACEs. Delete exactly this
+    // run's basic allow/deny entries while preserving all unrelated ACE bytes,
+    // ordering and inheritance flags. Work on a copy of the non-null DACL.
+    for index in (0..info.AceCount).rev() {
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        if unsafe { GetAce(copied, index, &mut raw) } == 0 {
+            return Err(crate::winutil::last_error("GetAce(revoke)"));
+        }
+        let header = unsafe { &*(raw as *const ACE_HEADER) };
+        if !matches!(
+            header.AceType,
+            ACCESS_ALLOWED_ACE_TYPE | ACCESS_DENIED_ACE_TYPE
+        ) {
+            continue;
+        }
+        let ace_sid = (raw as usize + mem::size_of::<ACE_HEADER>() + mem::size_of::<u32>()) as PSID;
+        if unsafe { EqualSid(ace_sid, sid) } != 0 && unsafe { DeleteAce(copied, index) } == 0 {
+            return Err(crate::winutil::last_error("DeleteAce(revoke)"));
+        }
+    }
+    Ok(buffer)
+}
 
 fn masks_for_sid(dacl: *mut ACL, sid: PSID, include_inherit_only: bool) -> Result<(u32, u32)> {
     let mut info: ACL_SIZE_INFORMATION = unsafe { mem::zeroed() };
@@ -522,7 +576,97 @@ pub fn verify_absent_tree(root: &Path, sid: PSID) -> Result<()> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use windows_sys::Win32::Security::GetSecurityDescriptorControl;
+    use windows_sys::Win32::Security::{
+        AddAccessAllowedAceEx, AddAccessDeniedAceEx, GetSecurityDescriptorControl, InitializeAcl,
+        IsValidAcl, ACL_REVISION, INHERITED_ACE,
+    };
+
+    fn ace_bytes(dacl: *mut ACL) -> Vec<Vec<u8>> {
+        let count = unsafe { (*dacl).AceCount };
+        (0..u32::from(count))
+            .map(|index| {
+                let mut raw: *mut c_void = std::ptr::null_mut();
+                assert_ne!(unsafe { GetAce(dacl, index, &mut raw) }, 0);
+                let size = unsafe { (*(raw as *const ACE_HEADER)).AceSize } as usize;
+                unsafe { std::slice::from_raw_parts(raw as *const u8, size) }.to_vec()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn revoke_filters_only_run_allow_and_deny_aces_without_changing_other_entries() {
+        let ours =
+            crate::identity::derive_profile_sid(&crate::identity::random_profile_name().unwrap())
+                .unwrap();
+        let other =
+            crate::identity::derive_profile_sid(&crate::identity::random_profile_name().unwrap())
+                .unwrap();
+        let mut buffer = vec![0_usize; 128];
+        let dacl = buffer.as_mut_ptr() as *mut ACL;
+        assert_ne!(
+            unsafe {
+                InitializeAcl(
+                    dacl,
+                    (buffer.len() * mem::size_of::<usize>()) as u32,
+                    ACL_REVISION,
+                )
+            },
+            0
+        );
+        for (allow, sid, mask, flags) in [
+            (
+                false,
+                ours.0,
+                FILE_ALL_ACCESS,
+                CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+            ),
+            (
+                false,
+                other.0,
+                FILE_APPEND_DATA,
+                OBJECT_INHERIT_ACE | INHERITED_ACE,
+            ),
+            (true, ours.0, FILE_GENERIC_READ, 0),
+            (
+                true,
+                ours.0,
+                FILE_GENERIC_WRITE,
+                CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE,
+            ),
+            (true, other.0, FILE_GENERIC_READ, CONTAINER_INHERIT_ACE),
+            (false, other.0, DELETE, 0),
+        ] {
+            let result = unsafe {
+                if allow {
+                    AddAccessAllowedAceEx(dacl, ACL_REVISION, flags, mask, sid)
+                } else {
+                    AddAccessDeniedAceEx(dacl, ACL_REVISION, flags, mask, sid)
+                }
+            };
+            assert_ne!(result, 0);
+        }
+        let before = ace_bytes(dacl);
+        let expected = vec![before[1].clone(), before[4].clone(), before[5].clone()];
+        let mut filtered = dacl_without_access_sid(dacl, ours.0).unwrap();
+        let filtered_dacl = filtered.as_mut_ptr() as *mut ACL;
+        assert_eq!(ace_bytes(dacl), before, "source DACL was mutated");
+        assert_eq!(ace_bytes(filtered_dacl), expected);
+        assert_eq!(masks_for_sid(filtered_dacl, ours.0, true).unwrap(), (0, 0));
+        assert_eq!(
+            masks_for_sid(filtered_dacl, other.0, true).unwrap(),
+            masks_for_sid(dacl, other.0, true).unwrap(),
+        );
+        let mut repeated = dacl_without_access_sid(filtered_dacl, ours.0).unwrap();
+        assert_eq!(ace_bytes(repeated.as_mut_ptr() as *mut ACL), expected);
+        let mut empty = dacl_without_access_sid(filtered_dacl, other.0).unwrap();
+        assert!(
+            !empty.is_empty(),
+            "empty ACL must retain its allocated header"
+        );
+        let empty_dacl = empty.as_mut_ptr() as *mut ACL;
+        assert_ne!(unsafe { IsValidAcl(empty_dacl) }, 0);
+        assert!(ace_bytes(empty_dacl).is_empty());
+    }
 
     #[test]
     fn recovery_directory_is_created_with_account_owner_and_protected_dacl() {

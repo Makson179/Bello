@@ -492,6 +492,8 @@ mod tests {
         // without Rust's extended prefix, including a still-missing leaf.
         let supplied_root = PathBuf::from(root.to_str().unwrap().strip_prefix(r"\\?\").unwrap());
         let existing = supplied_root.join(".supervisor");
+        let existing_file = existing.join("preserved.txt");
+        fs::write(&existing_file, "preserved private file").unwrap();
         let missing = supplied_root.join(".codex").join("bello-run");
         assert!(!missing.exists());
         let profile_name = random_profile_name().unwrap();
@@ -548,6 +550,10 @@ mod tests {
         assert!(
             existing.is_dir(),
             "pre-existing private directory was removed"
+        );
+        assert_eq!(
+            fs::read_to_string(existing_file).unwrap(),
+            "preserved private file"
         );
         assert!(
             !missing.exists(),
