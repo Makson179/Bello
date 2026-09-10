@@ -358,7 +358,10 @@ fn prepare_private_paths(
         let authority = std::iter::once(root)
             .chain(readable_roots.iter().map(PathBuf::as_path))
             .find(|authority| contains(authority, &path))
-            .ok_or_else(|| anyhow!("privatePaths[{index}] is outside every authority"))?;
+            .ok_or_else(|| anyhow!(
+                "privatePaths[{index}] is outside every authority: supplied {value:?}, normalized {}, root {}, readable roots {readable_roots:?}",
+                path.display(), root.display(),
+            ))?;
         if path.exists() {
             let canonical = std::fs::canonicalize(&path)?;
             if !contains(authority, &canonical) {
