@@ -40,7 +40,7 @@ jobs:
               kernel.apparmor_restrict_unprivileged_userns || true
             sudo grep -E 'bwrap|unprivileged_userns' \
               /sys/kernel/security/apparmor/profiles || true
-            sudo journalctl --kernel --boot --no-pager --since '-2 minutes' \
+            sudo journalctl -k --boot --no-pager --since '-2 minutes' \
               | grep -E 'apparmor=.*(bwrap|unprivileged_userns)' | tail -30 || true
           }
           sandbox_probe() {
@@ -126,7 +126,7 @@ jobs:
         working-directory: supervisor/pi_worker
         run: npm test
       - name: Run full applicable Python suite except the separately gated Pi integration
-        run: python -m pytest -q --ignore=tests/test_runtime_pi_integration.py
+        run: python -m pytest -v -o faulthandler_timeout=120 --ignore=tests/test_runtime_pi_integration.py
       - name: Run real offline Pi SDK and native sandbox integration
         if: runner.os != 'Windows'
         env:

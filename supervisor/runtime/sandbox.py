@@ -737,6 +737,15 @@ def _linux_launcher() -> Path:
 
 def _linux_masks(policy: SandboxPolicy) -> tuple[tuple[str, Path], ...]:
     authorities = (policy.root, *policy.readable_roots)
+    if policy.mode == "workspace-write":
+        # A bind mount follows symlinks; it cannot pin the link's directory
+        # entry. Renaming such a private namespace link would leave its old
+        # target unmasked on the next command. Refuse that ambiguous layout.
+        for entry in _private_rename_anchors((policy.root,)):
+            if entry.is_symlink():
+                raise SandboxPolicyError(
+                    f"writable private sandbox namespaces cannot be symbolic links: {entry}"
+                )
     masks: list[tuple[str, Path]] = []
     for candidate in _private_candidates(authorities):
         try:
@@ -752,12 +761,28 @@ def _linux_masks(policy: SandboxPolicy) -> tuple[tuple[str, Path], ...]:
     return tuple(masks)
 
 
+def _linux_mask_anchors(
+    policy: SandboxPolicy, masks: Iterable[tuple[str, Path]]
+) -> tuple[Path, ...]:
+    """Pin private-path parents as mountpoints, without making siblings RO."""
+
+    if policy.mode != "workspace-write":
+        return ()
+    anchors: set[Path] = set()
+    for _, target in masks:
+        parent = target.parent
+        while parent != policy.root and _contains(policy.root, parent):
+            anchors.add(parent)
+            parent = parent.parent
+    return tuple(sorted(anchors, key=lambda path: (len(path.parts), os.fspath(path))))
+
+
 def _bwrap_parent_directories(destinations: Iterable[Path]) -> tuple[Path, ...]:
     existing = {Path("/home"), Path("/home/bello"), Path("/tmp")}
     parents: set[Path] = set()
     for destination in destinations:
         current = destination.parent
-        while current != Path("/"):
+        while current != current.parent:
             if current not in existing:
                 parents.add(current)
             current = current.parent
@@ -844,7 +869,13 @@ def _linux_invocation(
         argv.extend(("--ro-bind", str(dependency), str(dependency)))
     bind = "--ro-bind" if policy.mode == "read-only" else "--bind"
     argv.extend((bind, str(policy.root), str(policy.root)))
-    for kind, target in _linux_masks(policy):
+    masks = _linux_masks(policy)
+    # A masked leaf is already a mountpoint, but Linux still permits renaming
+    # an ordinary ancestor such as .codex. Bind the parents first so rename
+    # fails with EBUSY, then hide private leaves on top of those anchors.
+    for anchor in _linux_mask_anchors(policy, masks):
+        argv.extend(("--bind", str(anchor), str(anchor)))
+    for kind, target in masks:
         if kind == "dir":
             argv.extend(("--tmpfs", str(target), "--remount-ro", str(target)))
         else:

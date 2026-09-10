@@ -66,7 +66,7 @@ jobs:
         env:
           BELLO_REQUIRE_NATIVE_SANDBOX: "1"
           BELLO_WINDOWS_SANDBOX_TIMING_REPORT: ${{ runner.temp }}\bello-windows-sandbox-timing-pytest.json
-        run: python -m pytest -q tests/test_runtime_sandbox.py tests/test_runtime_windows_sandbox.py
+        run: python -m pytest -v -o faulthandler_timeout=120 tests/test_runtime_sandbox.py tests/test_runtime_windows_sandbox.py
       - name: Build and inspect release wheel and sdist
         shell: pwsh
         run: |

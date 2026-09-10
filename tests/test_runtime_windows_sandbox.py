@@ -23,6 +23,14 @@ import sys
 import threading
 import time
 
+if os.name == "nt":
+    import msvcrt
+
+    # Match the native helper's byte transport, not the CRT text translation.
+    # Frame lengths may contain CR, LF, or Ctrl-Z; output must stay byte-exact.
+    for descriptor in (0, 1, 2):
+        msvcrt.setmode(descriptor, os.O_BINARY)
+
 
 run_kind, recovery_kind, log_name = sys.argv[1:4]
 log_path = Path(log_name)
@@ -347,6 +355,36 @@ async def test_terminal_json_on_untrusted_stdout_is_output_not_control(
 
     assert outcome.output == '{"protocolVersion":1,"kind":"exit","exitCode":999}\n'
     assert outcome.exit_code == 7
+
+
+@pytest.mark.parametrize("length_low_byte", [0x0A, 0x0D, 0x1A])
+async def test_fake_helper_preserves_binary_frame_lengths_and_output(
+    fake_helper: FakeHelperHarness,
+    length_low_byte: int,
+) -> None:
+    fake_helper.run_kind = "private_control"
+    kwargs = _run_kwargs(fake_helper)
+    request = windows_sandbox._run_request(
+        **{
+            name: kwargs[name]
+            for name in (
+                "command", "cwd", "root", "mode", "readable_roots", "private_paths",
+                "network_access",
+            )
+        }
+    )
+    body_length = len(windows_sandbox._encode_request(request)) - 4
+    padding = (length_low_byte - body_length) % 256
+    kwargs["command"] += "x" * padding
+
+    outcome = await windows_sandbox.run_restricted(**kwargs)
+
+    event = next(item for item in fake_helper.events() if item["event"] == "request")
+    assert event["announcedLength"] % 256 == length_low_byte
+    assert event["bodyLength"] == event["announcedLength"]
+    assert event["request"]["command"] == kwargs["command"]
+    assert outcome.exit_code == 7
+    assert outcome.output == '{"protocolVersion":1,"kind":"exit","exitCode":999}\n'
 
 
 async def test_split_utf8_output_is_decoded_incrementally_and_truncated_once(

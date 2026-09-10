@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import shlex
 import subprocess
 import sys
@@ -250,6 +250,30 @@ def _argument_pairs(argv: tuple[str, ...], option: str) -> list[tuple[str, str]]
     return pairs
 
 
+@pytest.mark.parametrize(
+    "destination, expected",
+    [
+        (
+            r"D:\workspace\nested\output.txt",
+            (r"D:\workspace", r"D:\workspace\nested"),
+        ),
+        (
+            r"\\server\share\workspace\nested\output.txt",
+            (r"\\server\share\workspace", r"\\server\share\workspace\nested"),
+        ),
+    ],
+)
+def test_bwrap_parent_directories_stop_at_windows_drive_and_unc_anchors(
+    destination: str,
+    expected: tuple[str, ...],
+) -> None:
+    # The Linux command-construction tests also execute on Windows. A drive
+    # or UNC anchor is its own parent but is not equal to the drive-less '/'.
+    actual = sandbox._bwrap_parent_directories((PureWindowsPath(destination),))
+
+    assert tuple(map(str, actual)) == expected
+
+
 def test_linux_invocation_has_fail_closed_namespace_and_mount_contract(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -305,6 +329,50 @@ def test_linux_readonly_and_network_enabled_are_reflected_in_argv(
     assert (str(tmp_path), str(tmp_path)) in _argument_pairs(invocation.argv, "--ro-bind")
     assert "--unshare-net" not in invocation.argv
     assert "--share-net" not in invocation.argv
+
+
+@pytest.mark.parametrize("mode", ["workspace-write", "read-only"])
+def test_linux_private_mask_anchors_preserve_authorized_sibling_writes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
+) -> None:
+    private = tmp_path / ".codex" / "bello-run"
+    private.mkdir(parents=True)
+    (tmp_path / ".supervisor").mkdir()
+    monkeypatch.setattr(sandbox, "_linux_launcher", lambda: Path("/usr/bin/bwrap"))
+    monkeypatch.setattr(sandbox, "_linux_system_mounts", lambda: ())
+    invocation = sandbox._linux_invocation(
+        SandboxPolicy(tmp_path, mode=mode),  # type: ignore[arg-type]
+        tmp_path,
+        ("/bin/sh", "-c", "true"),
+    )
+    parent = str(private.parent.resolve())
+    masks = sandbox._linux_masks(SandboxPolicy(tmp_path, mode=mode))  # type: ignore[arg-type]
+    assert ("dir", private.resolve()) in masks
+    assert ("dir", (tmp_path / ".supervisor").resolve()) in masks
+    if mode == "workspace-write":
+        assert sandbox._linux_mask_anchors(SandboxPolicy(tmp_path), masks) == (private.parent.resolve(),)
+        assert (parent, parent) in _argument_pairs(invocation.argv, "--bind")
+        assert (parent, parent) not in _argument_pairs(invocation.argv, "--ro-bind")
+        assert invocation.argv.index(parent) < invocation.argv.index(str(private.resolve()))
+    else:
+        assert not _argument_pairs(invocation.argv, "--bind")
+        assert not sandbox._linux_mask_anchors(SandboxPolicy(tmp_path, mode="read-only"), masks)
+
+
+@pytest.mark.parametrize("relative", [".supervisor", ".codex", ".codex/bello-run"])
+def test_linux_rejects_renameable_private_namespace_symlinks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, relative: str
+) -> None:
+    root = tmp_path / "workspace"
+    target = root / "aliased-state"
+    target.mkdir(parents=True)
+    entry = root / relative
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(sandbox, "_linux_launcher", lambda: Path("/usr/bin/bwrap"))
+    monkeypatch.setattr(sandbox, "_linux_system_mounts", lambda: ())
+    with pytest.raises(SandboxPolicyError, match="private sandbox namespaces cannot be symbolic links"):
+        sandbox._linux_invocation(SandboxPolicy(root), root, ("/usr/bin/true",))
 
 
 def test_linux_toolchain_mounts_only_exact_runtime_and_creates_empty_parents(
@@ -780,6 +848,8 @@ async def test_native_private_namespace_cannot_be_aliased_to_expose_state(tmp_pa
     private.mkdir(parents=True)
     secret = "BELLO_PRIVATE_RENAME_SENTINEL"
     (private / "state.json").write_text(secret, encoding="utf-8")
+    (private.parent / "settings.txt").write_text("before", encoding="utf-8")
+    (private.parent / "ordinary-child").mkdir()
     runner = SandboxRunner(SandboxPolicy(root, mode="workspace-write", network_access=False))
 
     try:
@@ -787,7 +857,10 @@ async def test_native_private_namespace_cannot_be_aliased_to_expose_state(tmp_pa
             "mv .codex renamed-codex 2>/dev/null || true; "
             "cat renamed-codex/bello-run/state.json 2>/dev/null || true; "
             "ln .codex/bello-run/state.json exposed-state 2>/dev/null || true; "
-            "cat exposed-state 2>/dev/null || true",
+            "cat exposed-state 2>/dev/null || true; "
+            "printf after > .codex/settings.txt; "
+            "mkdir .codex/new-child; "
+            "mv .codex/ordinary-child .codex/renamed-child",
             root,
             5,
         )
@@ -800,6 +873,10 @@ async def test_native_private_namespace_cannot_be_aliased_to_expose_state(tmp_pa
     assert (root / ".codex").is_dir(), "private-state parent was renamed inside the sandbox"
     assert not (root / "renamed-codex").exists()
     assert not (root / "exposed-state").exists(), "private-state file was hard-linked outside its deny"
+    assert result.exit_code == 0, result.output
+    assert (private.parent / "settings.txt").read_text(encoding="utf-8") == "after"
+    assert (private.parent / "new-child").is_dir()
+    assert (private.parent / "renamed-child").is_dir()
 
 
 @pytest.mark.skipif(not _native_backend_expected(), reason="no supported native sandbox backend installed")
