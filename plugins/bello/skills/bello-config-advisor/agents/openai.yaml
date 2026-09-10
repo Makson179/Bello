@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bello Config Advisor"
+  short_description: "Choose one task-appropriate Bello setup"
+  default_prompt: "Use $bello-config-advisor to recommend one Bello configuration for this task and decide whether a separate planning profile should precede execution."

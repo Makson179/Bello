@@ -220,6 +220,7 @@ def cli(
 @click.option("--check", "check_only", is_flag=True, help="Check for updates without installing them.")
 @click.option("--json", "json_output", is_flag=True, help="Emit update status as JSON. Implies --check.")
 def update_command(check_only: bool, json_output: bool) -> None:
+    """Update Bello and prepare its compatible execution dependencies."""
     status = update_check.check_for_update()
     info = status.install_info
     if check_only or json_output:
@@ -232,19 +233,27 @@ def update_command(check_only: bool, json_output: bool) -> None:
     if status.state == update_check.UpdateState.UNKNOWN:
         raise click.ClickException(status.warning or "Could not check for Bello updates")
     if status.state == update_check.UpdateState.CURRENT:
+        click.echo("Checking Bello's execution dependencies...")
+        try:
+            prepared = update_check.prepare_runtime()
+        except update_check.UpdateCheckError as exc:
+            raise click.ClickException(str(exc)) from exc
         click.echo("Bello is up to date.")
-        click.echo(f"Installed: {info.version}")
+        click.echo(f"Installed: {prepared.version}")
+        click.echo("Compatible runtime ready.")
         return
 
     assert status.latest_version is not None
     old_version = info.version
+    click.echo("Updating Bello and preparing its execution dependencies...")
     try:
-        update_check.run_update(info)
+        prepared = update_check.run_update(info)
     except update_check.UpdateCheckError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo("Bello updated.")
     click.echo(f"Previous: {old_version}")
-    click.echo(f"Current:  {status.latest_version}")
+    click.echo(f"Current:  {prepared.version}")
+    click.echo("Compatible runtime ready.")
 
 
 def _update_status_payload(status: update_check.UpdateStatus) -> dict[str, Any]:
@@ -441,6 +450,7 @@ def _format_update_available_message(status: update_check.UpdateStatus) -> str:
 
 
 def _update_and_reexec(status: update_check.UpdateStatus) -> None:
+    click.echo("Updating Bello and preparing its execution dependencies...")
     try:
         update_check.run_update(status.install_info)
     except update_check.UpdateCheckError as exc:

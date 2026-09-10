@@ -319,7 +319,7 @@ test("assistant usage keeps per-response provider provenance and exact aggregate
   assert.deepEqual(read.thread.turns[0].usage, turnUsage);
 });
 
-test("structured turns activate submit_result with the exact schema and render JSON as the last agent message", async (t) => {
+test("structured turns can optionally use submit_result with the exact schema", async (t) => {
   const schema = {
     type: "object",
     properties: { verdict: { $ref: "#/$defs/Verdict" } },
@@ -331,8 +331,12 @@ test("structured turns activate submit_result with the exact schema and render J
     assert.deepEqual(session.state.tools.map((tool) => tool.name), ["exec_command", "submit_result"]);
     const submit = session.state.tools[1];
     assert.deepEqual(submit.parameters, schema);
+    assert.match(submit.description, /Optional/);
+    assert.match(submit.description, /final assistant message/);
+    await assert.rejects(submit.execute("invalid-structured-call", { verdict: "unsupported" }), /schema validation/);
     const result = await submit.execute("structured-call", { verdict: "accept" });
     assert.equal(result.terminate, true);
+    assert.equal(result.content[0].text, "Structured result received; Bello will validate the decision.");
     session.emitAssistant(undefined, { stopReason: "toolUse" });
   };
   const { runtime, workspace, events } = await setup(t, { behavior });
@@ -350,20 +354,62 @@ test("structured turns activate submit_result with the exact schema and render J
   assert.equal(completed.params.turn.items.at(-1).text, '{"verdict":"accept"}');
 });
 
-test("structured turns fail closed when submit_result is missing", async (t) => {
-  const { runtime, workspace, events } = await setup(t, {
-    behavior: async (session) => session.emitAssistant('{"verdict":"accept"}'),
-  });
-  await startThread(runtime, workspace);
-  await runtime.dispatch("turn/start", {
-    threadId: "thread-1",
-    turnId: "missing-submit",
-    input: "review",
-    outputSchema: { type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] },
-  });
-  const completed = await waitFor(() => events.find((event) => event.method === "turn/completed"));
-  assert.equal(completed.params.turn.status, "failed");
-  assert.match(completed.params.turn.error.message, /without calling submit_result/);
+test("structured turns deliver plain final text unchanged for Bello validation and repair", async (t) => {
+  for (const text of [
+    '{"verdict":"accept"}',
+    '```json\n{"verdict":"accept"}\n```',
+    '{"verdict":',
+    '{"forward_to_coder":true,"reason":"keep finding","report_to_coder":null}',
+  ]) {
+    await t.test(text, async (t) => {
+      const { runtime, workspace, events } = await setup(t, {
+        behavior: async (session) => session.emitAssistant(text),
+      });
+      await startThread(runtime, workspace);
+      await runtime.dispatch("turn/start", {
+        threadId: "thread-1",
+        turnId: "plain-json",
+        input: "review",
+        outputSchema: { type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] },
+      });
+      const completed = await waitFor(() => events.find((event) => event.method === "turn/completed"));
+      // Delivery success is not an accepted decision. Python still validates
+      // malformed JSON and cross-field invariants, and performs its own repair.
+      assert.equal(completed.params.turn.status, "completed");
+      assert.equal(completed.params.turn.error, undefined);
+      assert.equal(completed.params.turn.structuredResult, undefined);
+      assert.deepEqual(completed.params.turn.items.filter((item) => item.type === "agentMessage").map((item) => item.text), [text]);
+      const read = await runtime.dispatch("thread/read", { threadId: "thread-1", includeTurns: true });
+      assert.deepEqual(read.thread.turns[0], completed.params.turn);
+    });
+  }
+});
+
+test("plain JSON never hides a provider error or interruption on a structured turn", async (t) => {
+  for (const [stopReason, status, expectedError] of [
+    ["error", "failed", "test provider failure"],
+    ["aborted", "interrupted", "Turn was interrupted."],
+  ]) {
+    await t.test(stopReason, async (t) => {
+      const { runtime, workspace, events } = await setup(t, {
+        behavior: async (session) => session.emitAssistant('{"verdict":"accept"}', {
+          stopReason,
+          errorMessage: "test provider failure",
+        }),
+      });
+      await startThread(runtime, workspace);
+      await runtime.dispatch("turn/start", {
+        threadId: "thread-1",
+        turnId: "unsuccessful-json",
+        input: "review",
+        outputSchema: { type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] },
+      });
+      const completed = await waitFor(() => events.find((event) => event.method === "turn/completed"));
+      assert.equal(completed.params.turn.status, status);
+      assert.equal(completed.params.turn.error.message, expectedError);
+      assert.equal(completed.params.turn.structuredResult, undefined);
+    });
+  }
 });
 
 test("unsupported effort and service tier fail before any model request", async (t) => {

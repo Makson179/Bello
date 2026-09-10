@@ -5,18 +5,18 @@
 # clause to the coder prompts: naming that material primes gaming.
 
 [coder_initial]
-template = '''Complete the task described by the workspace instructions. Work autonomously.{plan_guidance}
+template = '''Read the task at `{task_path}` and complete it. Work autonomously.{plan_guidance}
 
 When complete, output BELLO_READY_FOR_REVIEW on its own line.'''
 
 [coder_restart]
-template = '''Continue the existing task. First read `.supervisor/HANDOFF.md`, `.supervisor/DECISIONS.md`, and `.supervisor/PROGRESS.md`,
+template = '''Continue the task at `{task_path}`. First read `.supervisor/HANDOFF.md`, `.supervisor/DECISIONS.md`, and `.supervisor/PROGRESS.md`,
 then work from the current workspace. Work autonomously.{plan_guidance}
 
 When complete, output BELLO_READY_FOR_REVIEW on its own line.'''
 
 [coder_revision]
-template = '''Continue the task described by the workspace instructions. First read `.supervisor/HANDOFF.md`, `.supervisor/DECISIONS.md`, and `.supervisor/PROGRESS.md`,
+template = '''Read the task at `{task_path}`. First read `.supervisor/HANDOFF.md`, `.supervisor/DECISIONS.md`, and `.supervisor/PROGRESS.md`,
 then address the reviewer feedback below in the current workspace. Work autonomously.
 
 <reviewer_feedback>

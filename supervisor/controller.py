@@ -1927,7 +1927,7 @@ class BelloController:
             self.client,
             self.store,
             self._active_workspace_root(),
-            self._active_task_path(),
+            previous.task_read_path,
             model=self._active_coder_model(),
             fast=self._fast_mode(),
             intelligence=self._active_coder_intelligence(),

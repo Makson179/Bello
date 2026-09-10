@@ -15,6 +15,7 @@ from supervisor.coder import (
     apply_intelligence,
     apply_multi_agent_thread_start_params,
     codex_service_tier,
+    task_runtime_workspace_roots,
 )
 from supervisor.project_config import MultiAgentConfig
 from supervisor.prompts import (
@@ -305,7 +306,9 @@ class StatelessSupervisorAgent:
                         await self._create_completion_workspace_snapshot()
                     )
                 decision_workspace_root = self.completion_workspace_snapshot.snapshot_root
-            runtime_workspace_roots: list[Path] = [decision_workspace_root]
+            runtime_workspace_roots = task_runtime_workspace_roots(
+                decision_workspace_root, self.task_path
+            )
             for root in additional_runtime_roots or []:
                 resolved = root.resolve()
                 if resolved not in runtime_workspace_roots:

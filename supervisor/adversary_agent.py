@@ -188,7 +188,6 @@ class AdversaryAgent:
             if text is None or not text.strip():
                 raise AdversaryAttemptError("adversary did not produce an agent message")
             report_text = text.strip()
-            _validate_adversary_report(report_text)
             return AdversaryRunResult(
                 report_text=report_text,
                 thread_id=thread_id,
@@ -344,27 +343,8 @@ def _turn_failure_message(turn: Any, *, thread_id: str, turn_id: str) -> str:
     )
 
 
-def _validate_adversary_report(report_text: str) -> None:
-    lines = [line.strip() for line in report_text.splitlines() if line.strip()]
-    if not lines or lines[0].lower() not in {"candidate_finding: true", "candidate_finding: false"}:
-        raise AdversaryAttemptError(
-            "adversary did not produce a complete report: missing the initial candidate_finding routing line"
-        )
-
-    sections: set[str] = set()
-    for line in lines[1:]:
-        normalized = line.lower().lstrip("#*- ")
-        for section in ("attacked", "findings", "overall"):
-            if normalized.startswith(f"{section}:"):
-                sections.add(section)
-    missing = sorted({"attacked", "findings", "overall"} - sections)
-    if missing:
-        raise AdversaryAttemptError(
-            "adversary did not produce a complete report: missing sections " + ", ".join(missing)
-        )
-
-
 def _report_has_candidate_finding(report_text: str) -> bool:
+    """Extract informational metadata; every nonempty report goes to the report controller."""
     lowered_lines = [line.strip().lower() for line in report_text.splitlines() if line.strip()]
     for index, line in enumerate(lowered_lines):
         if line.startswith("candidate_finding:"):

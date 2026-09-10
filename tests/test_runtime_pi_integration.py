@@ -70,6 +70,21 @@ def _completion_decision(flow: str) -> dict[str, Any]:
 
 
 def _tool_chunk(flow: str, step: int, name: str, arguments: dict[str, Any]) -> bytes:
+    return _response_chunks(flow, step, {
+        "role": "assistant",
+        "tool_calls": [{
+            "index": 0,
+            "id": f"call-{flow.lower()}-{name}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
+            },
+        }],
+    }, "tool_calls")
+
+
+def _response_chunks(flow: str, step: int, delta: dict[str, Any], finish_reason: str) -> bytes:
     payload = {
         "id": f"chatcmpl-{flow}-{step}",
         "object": "chat.completion.chunk",
@@ -77,19 +92,8 @@ def _tool_chunk(flow: str, step: int, name: str, arguments: dict[str, Any]) -> b
         "model": "bello-integration-model",
         "choices": [{
             "index": 0,
-            "delta": {
-                "role": "assistant",
-                "tool_calls": [{
-                    "index": 0,
-                    "id": f"call-{flow.lower()}-{name}",
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
-                    },
-                }],
-            },
-            "finish_reason": "tool_calls",
+            "delta": delta,
+            "finish_reason": finish_reason,
         }],
     }
     usage = {
@@ -114,8 +118,9 @@ def _tool_chunk(flow: str, step: int, name: str, arguments: dict[str, Any]) -> b
 
 
 class _LocalProviderState:
-    def __init__(self, output_schema: dict[str, Any]):
+    def __init__(self, output_schema: dict[str, Any], final_mode: str):
         self.output_schema = output_schema
+        self.final_mode = final_mode
         self.condition = threading.Condition()
         self.first_requests: set[str] = set()
         self.steps: dict[str, int] = {}
@@ -169,13 +174,20 @@ class _LocalProviderState:
         if step == 3:
             if f"call-{flow.lower()}-exec_command" not in serialized or f"exec-{flow}-ok" not in serialized:
                 raise AssertionError("the command result did not return through the Pi conversation")
+            if self.final_mode == "text":
+                return _response_chunks(flow, step, {
+                    "role": "assistant",
+                    "content": json.dumps(_completion_decision(flow), ensure_ascii=False),
+                }, "stop")
             return _tool_chunk(flow, step, "submit_result", _completion_decision(flow))
         raise AssertionError(f"unexpected extra model request for flow {flow}: step {step}")
 
 
 @contextmanager
-def _local_openai_provider(output_schema: dict[str, Any]) -> Iterator[tuple[str, _LocalProviderState]]:
-    state = _LocalProviderState(output_schema)
+def _local_openai_provider(
+    output_schema: dict[str, Any], final_mode: str,
+) -> Iterator[tuple[str, _LocalProviderState]]:
+    state = _LocalProviderState(output_schema, final_mode)
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -242,7 +254,10 @@ def _worker_environment(node: Path, home: Path, scratch: Path) -> dict[str, str]
 
 @pytest.mark.skipif(os.name == "nt", reason="restricted Windows tool execution intentionally fails closed")
 @pytest.mark.asyncio
-async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(tmp_path: Path) -> None:
+@pytest.mark.parametrize("final_mode", ["submit_result", "text"])
+async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(
+    tmp_path: Path, final_mode: str,
+) -> None:
     node = _supported_node()
     worker_dir = Path(__file__).resolve().parents[1] / "supervisor" / "pi_worker"
     worker = worker_dir / "worker.mjs"
@@ -278,7 +293,7 @@ async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(tmp_pat
     await client.start()
     transport: WorkerTransport | None = None
     try:
-        with _local_openai_provider(output_schema) as (base_url, provider):
+        with _local_openai_provider(output_schema, final_mode) as (base_url, provider):
             (agent_dir / "models.json").write_text(json.dumps({
                 "providers": {
                     "bello-local": {
@@ -308,27 +323,36 @@ async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(tmp_pat
             async def emit(message: dict[str, Any]) -> None:
                 await client._emit(message, engine="pi")
 
-            transport = WorkerTransport(
-                [str(node), str(worker)],
-                worker_dir,
-                emit=emit,
-                tool=client._call_tool,
-                on_error=client._notify_transport_error,
-                env=_worker_environment(node, tmp_path / "worker-home", tmp_path / "worker-tmp"),
-            )
-            await transport.start()
-            initialized = await transport.request("initialize", {
-                "stateDir": str(state_dir / "pi"),
-                "agentDir": str(agent_dir),
-                "allowModelNetwork": False,
-            })
-            assert initialized["serverInfo"]["piSdkVersion"] == "0.85.1"
-            client._engines["pi"] = transport
+            worker_environment = _worker_environment(node, tmp_path / "worker-home", tmp_path / "worker-tmp")
+
+            async def start_worker() -> WorkerTransport:
+                backend = WorkerTransport(
+                    [str(node), str(worker)],
+                    worker_dir,
+                    emit=emit,
+                    tool=client._call_tool,
+                    on_error=client._notify_transport_error,
+                    env=worker_environment,
+                )
+                # RuntimeClient must own cleanup even if initialization fails.
+                client._engines["pi"] = backend
+                await backend.start()
+                initialized = await backend.request("initialize", {
+                    "stateDir": str(state_dir / "pi"),
+                    "agentDir": str(agent_dir),
+                    "allowModelNetwork": False,
+                })
+                assert initialized["serverInfo"]["piSdkVersion"] == "0.85.1"
+                return backend
+
+            transport = await start_worker()
 
             listed = await client.request("model/list", {})
             local = next(item for item in listed["data"] if item.get("qualifiedId") == "bello-local/integration-model")
             assert local["configured"] is True
             assert local["supportedEfforts"] == ["off"]
+
+            thread_ids: dict[str, str] = {}
 
             async def run_flow(flow: str) -> tuple[dict[str, Any], CompletionReviewDecision]:
                 workspace = workspaces[flow]
@@ -341,6 +365,7 @@ async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(tmp_pat
                     "approvalPolicy": "never",
                 })
                 thread_id = started["thread"]["id"]
+                thread_ids[flow] = thread_id
                 response = await client.turn_start({
                     "threadId": thread_id,
                     "input": [{"type": "text", "text": f"Run controlled integration FLOW-{flow}."}],
@@ -380,6 +405,11 @@ async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(tmp_pat
             for flow, (turn, decision) in zip(("A", "B"), results, strict=True):
                 assert decision.decision is CompletionReviewDecisionKind.ACCEPT
                 assert decision.reason == f"local Pi integration {flow} completed"
+                if final_mode == "submit_result":
+                    assert turn["structuredResult"] == _completion_decision(flow)
+                else:
+                    assert "structuredResult" not in turn
+                    assert last_agent_message_text(turn) == json.dumps(_completion_decision(flow), ensure_ascii=False)
                 assert turn["usage"]["input"] == 40
                 assert turn["usage"]["output"] == 20
                 assert turn["usage"]["cacheRead"] == 0
@@ -436,6 +466,22 @@ async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(tmp_pat
                 in {"fileChange", "fileRead", "dynamicToolCall", "commandExecution"}
             }
             assert completed_host_items == started_host_items
+
+            # Both final forms must survive a real worker restart without a
+            # replayed model request, fabricated structured data or lost usage.
+            await transport.stop()
+            transport = await start_worker()
+            for flow, (turn, _) in zip(("A", "B"), results, strict=True):
+                await client.request("thread/resume", {"threadId": thread_ids[flow]})
+                restored = await client.request("thread/read", {
+                    "threadId": thread_ids[flow], "includeTurns": True,
+                })
+                restored_turns = restored["thread"]["turns"]
+                assert len(restored_turns) == 1
+                assert restored_turns[0] == turn
+            assert len(provider.requests) == 8
+            assert not provider.errors
+            assert not transport_errors
     finally:
         # RuntimeClient owns any backend inserted into _engines.
         await client.stop()

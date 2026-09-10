@@ -197,7 +197,8 @@ async def test_adversary_agent_reads_completed_report_from_turns_list(tmp_path: 
     assert client.thread_params[0]["ephemeral"] is False
 
 
-async def test_adversary_agent_retries_once_after_no_message(tmp_path: Path) -> None:
+@pytest.mark.parametrize("empty_text", [None, "", " \n\t"])
+async def test_adversary_agent_retries_once_after_no_message(tmp_path: Path, empty_text: str | None) -> None:
     class FakeClient:
         def __init__(self) -> None:
             self.thread_ids: list[str] = []
@@ -210,7 +211,8 @@ async def test_adversary_agent_retries_once_after_no_message(tmp_path: Path) -> 
 
         async def turn_start(self, params, *, timeout):
             if params["threadId"] == "adv-thread-1":
-                return {"turn": {"id": "adv-turn-1", "status": "completed", "items": []}}
+                items = [] if empty_text is None else [{"type": "agentMessage", "text": empty_text}]
+                return {"turn": {"id": "adv-turn-1", "status": "completed", "items": items}}
             return {
                 "turn": {
                     "id": "adv-turn-2",
@@ -551,10 +553,37 @@ async def test_adversary_agent_surfaces_terminal_error_after_bounded_retry(tmp_p
     assert client.thread_count == 2
 
 
-async def test_adversary_agent_retries_incomplete_completed_report(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("report_text", "candidate_finding"),
+    [
+        pytest.param(
+            "candidate_finding: true\n\n## attacked\nParser\n\n## findings\nInvalid input accepted\n\n## overall\nDefects remain",
+            True,
+            id="markdown-headings-without-colons",
+        ),
+        pytest.param(
+            "## attacked\nParser\n\n## findings\nInvalid input accepted\n\n## overall\nDefects remain",
+            True,
+            id="no-routing-line",
+        ),
+        pytest.param(
+            "I am replaying the previous findings before probing new behavior.",
+            True,
+            id="unstructured-prose",
+        ),
+        pytest.param("candidate_finding: false\nNo defects found.", False, id="declared-no-findings"),
+    ],
+)
+async def test_adversary_agent_returns_nonempty_report_without_format_retry(
+    tmp_path: Path,
+    report_text: str,
+    candidate_finding: bool,
+) -> None:
     class FakeClient:
         def __init__(self) -> None:
             self.thread_ids: list[str] = []
+            self.archived: list[str] = []
+            self.turn_count = 0
 
         async def thread_start(self, params, *, timeout):
             thread_id = f"adv-thread-{len(self.thread_ids) + 1}"
@@ -562,44 +591,42 @@ async def test_adversary_agent_retries_incomplete_completed_report(tmp_path: Pat
             return {"thread": {"id": thread_id}}
 
         async def turn_start(self, params, *, timeout):
-            if params["threadId"] == "adv-thread-1":
-                return {
-                    "turn": {
-                        "id": "adv-turn-1",
-                        "status": "completed",
-                        "items": [
-                            {
-                                "type": "agentMessage",
-                                "text": "I am replaying the previous findings before probing new behavior.",
-                            }
-                        ],
-                    }
-                }
+            self.turn_count += 1
             return {
                 "turn": {
-                    "id": "adv-turn-2",
+                    "id": "adv-turn-1",
                     "status": "completed",
                     "items": [
                         {
                             "type": "agentMessage",
-                            "text": "candidate_finding: true\nattacked: parser\nfindings: malformed input accepted\noverall: defects remain",
+                            "text": report_text,
                         }
                     ],
                 }
             }
 
         async def thread_archive(self, thread_id, *, timeout):
+            self.archived.append(thread_id)
             return {}
 
-    result = await AdversaryAgent(FakeClient(), tmp_path, timeout_seconds=1).run(  # type: ignore[arg-type]
+    client = FakeClient()
+    result = await AdversaryAgent(client, tmp_path, timeout_seconds=1).run(  # type: ignore[arg-type]
         _packet(tmp_path)
     )
 
-    assert result.thread_id == "adv-thread-2"
-    assert result.candidate_finding is True
+    assert result.report_text == report_text
+    assert result.thread_id == "adv-thread-1"
+    assert result.candidate_finding is candidate_finding
+    assert client.thread_ids == ["adv-thread-1"]
+    assert client.turn_count == 1
+    assert client.archived == ["adv-thread-1"]
 
 
-async def test_adversary_agent_surfaces_failed_turn_after_bounded_retry(tmp_path: Path) -> None:
+@pytest.mark.parametrize("terminal_status", ["failed", "interrupted"])
+async def test_adversary_agent_surfaces_unsuccessful_turn_after_bounded_retry(
+    tmp_path: Path,
+    terminal_status: str,
+) -> None:
     class FakeClient:
         def __init__(self) -> None:
             self.thread_count = 0
@@ -612,7 +639,7 @@ async def test_adversary_agent_surfaces_failed_turn_after_bounded_retry(tmp_path
             return {
                 "turn": {
                     "id": f"adv-turn-{self.thread_count}",
-                    "status": "failed",
+                    "status": terminal_status,
                     "error": {"message": "provider overloaded", "codexErrorInfo": "serverOverloaded"},
                     "items": [{"type": "agentMessage", "text": "Starting the audit now."}],
                 }
@@ -622,10 +649,35 @@ async def test_adversary_agent_surfaces_failed_turn_after_bounded_retry(tmp_path
             return {}
 
     client = FakeClient()
-    with pytest.raises(AdversaryAgentError, match="status='failed'.*provider overloaded"):
+    with pytest.raises(AdversaryAgentError, match=f"status='{terminal_status}'.*provider overloaded"):
         await AdversaryAgent(client, tmp_path, timeout_seconds=1).run(_packet(tmp_path))  # type: ignore[arg-type]
 
     assert client.thread_count == 2
+
+
+async def test_adversary_agent_does_not_retry_cancellation(tmp_path: Path) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.thread_count = 0
+            self.archived: list[str] = []
+
+        async def thread_start(self, params, *, timeout):
+            self.thread_count += 1
+            return {"thread": {"id": "adv-thread"}}
+
+        async def turn_start(self, params, *, timeout):
+            raise asyncio.CancelledError
+
+        async def thread_archive(self, thread_id, *, timeout):
+            self.archived.append(thread_id)
+            return {}
+
+    client = FakeClient()
+    with pytest.raises(asyncio.CancelledError):
+        await AdversaryAgent(client, tmp_path, timeout_seconds=1).run(_packet(tmp_path))  # type: ignore[arg-type]
+
+    assert client.thread_count == 1
+    assert client.archived == ["adv-thread"]
 
 
 def test_adversary_candidate_finding_parser_handles_multiline_findings() -> None:

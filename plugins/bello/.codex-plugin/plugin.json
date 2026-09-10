@@ -1,7 +1,7 @@
 {
   "name": "bello",
   "version": "0.6.0-dev.0",
-  "description": "Launch and monitor an existing Bello coding workflow from Codex.",
+  "description": "Choose a Bello configuration, then launch and monitor a supervised coding task from Codex.",
   "author": {
     "name": "Maxim Bocharov",
     "url": "https://github.com/Makson179"
@@ -18,8 +18,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Bello",
-    "shortDescription": "Launch and monitor Bello coding runs.",
-    "longDescription": "Delegate a repository task to the installed Bello supervisor using the project's saved configuration, then monitor its durable progress and final report.",
+    "shortDescription": "Choose configs and delegate tasks to Bello.",
+    "longDescription": "Read the task, repository and user preferences to recommend one configuration across available providers, optionally prepare an approved plan, then launch and monitor the installed Bello workflow.",
     "developerName": "Maxim Bocharov",
     "category": "Productivity",
     "capabilities": [
@@ -28,6 +28,7 @@
     ],
     "websiteURL": "https://github.com/Makson179/Bello",
     "defaultPrompt": [
+      "Recommend one Bello configuration for TASK.md.",
       "Delegate this repository task to Bello.",
       "Show me the status of the current Bello run."
     ]

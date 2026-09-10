@@ -162,7 +162,7 @@ async def test_completion_review_uses_disposable_workspace_write_snapshot(
     review_root = Path(client.thread_params["cwd"])
     assert client.thread_params["effort"] == "high"
     assert client.thread_params["sandbox"] == "workspace-write"
-    assert client.thread_params["runtimeWorkspaceRoots"] == [str(review_root)]
+    assert client.thread_params["runtimeWorkspaceRoots"] == [str(review_root), str(task)]
     assert client.thread_params["config"]["agents"] == {
         "enabled": True,
         "max_concurrent_threads_per_session": 3,

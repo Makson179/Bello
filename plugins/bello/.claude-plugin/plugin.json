@@ -3,7 +3,7 @@
   "name": "bello",
   "displayName": "Bello",
   "version": "0.6.0-dev.0",
-  "description": "Launch and monitor an existing Bello coding workflow from Claude Code.",
+  "description": "Choose a Bello configuration, then launch and monitor a supervised coding task from Claude Code.",
   "author": {
     "name": "Maxim Bocharov",
     "url": "https://github.com/Makson179"

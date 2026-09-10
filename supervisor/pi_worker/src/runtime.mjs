@@ -711,7 +711,7 @@ export class PiWorkerRuntime {
     hostTools.push({
       name: RESERVED_TOOL_NAME,
       label: "Submit result",
-      description: "Submit the final structured result for this turn and stop.",
+      description: "Optional: submit the final JSON matching this schema and stop. You may instead return the same JSON as your final assistant message. Bello validates the decision in either case.",
       parameters: { type: "object", additionalProperties: true },
       executionMode: "sequential",
       execute: async (_callId, args) => {
@@ -724,7 +724,7 @@ export class PiWorkerRuntime {
         }
         active.structuredResult = cloneJson(args, "structured result");
         return {
-          content: [{ type: "text", text: "Structured result accepted." }],
+          content: [{ type: "text", text: "Structured result received; Bello will validate the decision." }],
           details: { accepted: true },
           terminate: true,
         };
@@ -977,11 +977,12 @@ export class PiWorkerRuntime {
       await session.prompt(active.input, { expandPromptTemplates: false });
       if (active.interrupted || active.lastAssistant?.stopReason === "aborted") {
         this.finishTurn(record, active, "interrupted", "Turn was interrupted.");
-      } else if (active.outputSchema && active.structuredResult === undefined) {
-        this.finishTurn(record, active, "failed", "Model finished without calling submit_result.");
       } else if (active.lastAssistant?.stopReason === "error") {
         this.finishTurn(record, active, "failed", active.lastAssistant.errorMessage || "Provider returned an error.");
       } else {
+        // A normal final JSON message is also a valid delivery path, as in
+        // Bello 0.5.2. Leave its text intact for the existing Python decision
+        // parsers, validation and repair loop; completed is not decision accept.
         if (active.structuredResult !== undefined) {
           const text = JSON.stringify(active.structuredResult);
           const item = {

@@ -181,12 +181,16 @@ def test_startup_gate_skip_env_bypasses_check(monkeypatch: pytest.MonkeyPatch) -
 
 def test_update_command_reports_current(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.CURRENT, VERSION_A))
+    calls = []
+    monkeypatch.setattr(update_check, "prepare_runtime", lambda: calls.append("prepare") or update_check.PreparedRuntime(VERSION_A, "/runtime"))
 
     result = CliRunner().invoke(cli, ["update"])
 
     assert result.exit_code == 0
     assert "Bello is up to date." in result.output
     assert "Installed: 0.1.0" in result.output
+    assert "Compatible runtime ready." in result.output
+    assert calls == ["prepare"]
 
 
 def test_update_check_reports_outdated_without_installing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -240,7 +244,7 @@ def test_update_command_runs_update_when_outdated(monkeypatch: pytest.MonkeyPatc
         "check_for_update",
         lambda: update_check.UpdateStatus(update_check.UpdateState.OUTDATED, _info(VERSION_A), latest_version=VERSION_B),
     )
-    monkeypatch.setattr(update_check, "run_update", lambda info: calls.append(info))
+    monkeypatch.setattr(update_check, "run_update", lambda info: calls.append(info) or update_check.PreparedRuntime(VERSION_B, "/runtime"))
 
     result = CliRunner().invoke(cli, ["update"])
 
@@ -248,6 +252,46 @@ def test_update_command_runs_update_when_outdated(monkeypatch: pytest.MonkeyPatc
     assert calls == [_info(VERSION_A)]
     assert "Previous: 0.1.0" in result.output
     assert "Current:  0.1.1" in result.output
+    assert "Compatible runtime ready." in result.output
+
+
+@pytest.mark.parametrize("args", [["update", "--check"], ["update", "--json"]])
+@pytest.mark.parametrize("state", list(update_check.UpdateState))
+def test_update_check_never_prepares_dependencies(monkeypatch, args, state) -> None:
+    monkeypatch.setattr(update_check, "check_for_update", lambda: _status(state))
+    monkeypatch.setattr(update_check, "prepare_runtime", lambda: pytest.fail("must not install runtime"))
+    monkeypatch.setattr(update_check, "run_update", lambda info: pytest.fail("must not install package"))
+    assert CliRunner().invoke(cli, args).exit_code == 0
+
+
+def test_current_update_does_not_claim_success_when_preparation_fails(monkeypatch) -> None:
+    monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.CURRENT))
+    def fail():
+        raise update_check.UpdateCheckError("Node.js is too old")
+    monkeypatch.setattr(update_check, "prepare_runtime", fail)
+    result = CliRunner().invoke(cli, ["update"])
+    assert result.exit_code == 1
+    assert "Node.js is too old" in result.output
+    assert "Bello is up to date." not in result.output
+    assert "Compatible runtime ready." not in result.output
+
+
+def test_update_reports_actual_installed_version_not_pypi_target(monkeypatch) -> None:
+    monkeypatch.setattr(update_check, "check_for_update", lambda: _status(update_check.UpdateState.OUTDATED, "0.7.0"))
+    monkeypatch.setattr(update_check, "run_update", lambda info: update_check.PreparedRuntime("0.6.1", "/runtime"))
+    result = CliRunner().invoke(cli, ["update"])
+    assert result.exit_code == 0
+    assert "Current:  0.6.1" in result.output
+    assert "Current:  0.7.0" not in result.output
+
+
+def test_startup_update_does_not_launch_task_after_failed_preparation(monkeypatch) -> None:
+    def fail(info):
+        raise update_check.UpdateCheckError("runtime installation failed")
+    monkeypatch.setattr(update_check, "run_update", fail)
+    monkeypatch.setattr("supervisor.main.os.execvp", lambda *args: pytest.fail("must not launch task"))
+    with pytest.raises(click.ClickException, match="runtime installation failed"):
+        _update_and_reexec(_status(update_check.UpdateState.OUTDATED, VERSION_B))
 
 
 def test_version_option_bypasses_startup_gate(monkeypatch: pytest.MonkeyPatch) -> None:

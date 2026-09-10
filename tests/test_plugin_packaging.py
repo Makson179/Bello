@@ -32,7 +32,10 @@ def test_codex_and_claude_manifests_share_one_versioned_skill() -> None:
     assert codex["skills"] == claude["skills"] == "./skills/"
     assert (PLUGIN / "skills" / "bello-delegate" / "SKILL.md").is_file()
     assert SCRIPT.is_file()
-    assert not (PLUGIN / "skills" / "bello-config-advisor").exists()
+    advisor = PLUGIN / "skills" / "bello-config-advisor"
+    assert (advisor / "SKILL.md").is_file()
+    for script in ("inspect_models.py", "inspect_config.py", "validate_config.py"):
+        assert (advisor / "scripts" / script).is_file()
     assert not list(PLUGIN.rglob("marketplace.json"))
 
 

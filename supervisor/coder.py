@@ -64,6 +64,23 @@ def codex_service_tier(*, fast: bool) -> str | None:
     return CODEX_FAST_SERVICE_TIER if fast else None
 
 
+def task_runtime_workspace_roots(
+    workspace_root: Path, task_path: Path | None = None,
+) -> list[Path]:
+    """Keep snapshot task links readable without granting their source directory."""
+
+    root = workspace_root.resolve()
+    roots = [root]
+    if task_path is not None:
+        task = task_path if task_path.is_absolute() else root / task_path
+        task = task.resolve()
+        if not task.is_relative_to(root):
+            if not task.is_file():
+                raise ValueError("task read authority must be an existing file")
+            roots.append(task)
+    return roots
+
+
 def apply_intelligence(params: dict[str, Any], intelligence: str | None) -> dict[str, Any]:
     if intelligence:
         params["effort"] = intelligence
@@ -146,6 +163,7 @@ def apply_multi_agent_thread_start_params(
 def coder_thread_params(
     project_root: Path,
     *,
+    task_path: Path | None = None,
     model: str | None = None,
     fast: bool = False,
     intelligence: str | None = None,
@@ -154,7 +172,7 @@ def coder_thread_params(
     multi_agent = multi_agent or MultiAgentConfig()
     params: dict[str, Any] = {
         "cwd": str(project_root),
-        "runtimeWorkspaceRoots": [str(project_root.resolve())],
+        "runtimeWorkspaceRoots": [str(root) for root in task_runtime_workspace_roots(project_root, task_path)],
         "approvalPolicy": "on-request",
         "approvalsReviewer": "user",
         "sandbox": coder_sandbox_mode(),
@@ -174,6 +192,7 @@ def coder_thread_resume_params(
     thread_id: str,
     project_root: Path,
     *,
+    task_path: Path | None = None,
     model: str | None = None,
     fast: bool = False,
     intelligence: str | None = None,
@@ -185,6 +204,7 @@ def coder_thread_resume_params(
     params: dict[str, Any] = {
         "threadId": thread_id,
         "cwd": str(project_root.resolve()),
+        "runtimeWorkspaceRoots": [str(root) for root in task_runtime_workspace_roots(project_root, task_path)],
         "approvalPolicy": "on-request",
         "approvalsReviewer": "user",
         "sandbox": coder_sandbox_mode(),
@@ -202,6 +222,7 @@ def coder_turn_params(
     text: str,
     project_root: Path,
     *,
+    task_path: Path | None = None,
     model: str | None = None,
     fast: bool = False,
     intelligence: str | None = None,
@@ -210,7 +231,7 @@ def coder_turn_params(
         "threadId": thread_id,
         "input": [text_input(text)],
         "cwd": str(project_root),
-        "runtimeWorkspaceRoots": [str(project_root.resolve())],
+        "runtimeWorkspaceRoots": [str(root) for root in task_runtime_workspace_roots(project_root, task_path)],
         "approvalPolicy": "on-request",
         "approvalsReviewer": "user",
         "sandboxPolicy": coder_turn_sandbox_policy(project_root),
@@ -235,11 +256,24 @@ class CoderSession:
     coder_rpc_timeout_seconds: float = APP_SERVER_CODER_RPC_TIMEOUT_SECONDS
     multi_agent: MultiAgentConfig = field(default_factory=MultiAgentConfig)
     plan_path: Path | None = None
+    _task_read_path: Path = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # The model can replace a snapshot symlink. Its later target must never
+        # become new read authority when a turn starts or a session resumes.
+        task = self.task_path if self.task_path.is_absolute() else self.project_root / self.task_path
+        self._task_read_path = task.resolve()
+
+    @property
+    def task_read_path(self) -> Path:
+        """The canonical task authority fixed before the model starts."""
+        return self._task_read_path
 
     async def start_thread(self, *, persist_state: bool = True) -> str:
         response = await self.client.thread_start(
             coder_thread_params(
                 self.project_root,
+                task_path=self._task_read_path,
                 model=self.model,
                 fast=self.fast,
                 intelligence=self.intelligence,
@@ -263,6 +297,7 @@ class CoderSession:
             coder_thread_resume_params(
                 self.thread_id,
                 self.project_root,
+                task_path=self._task_read_path,
                 model=self.model,
                 fast=self.fast,
                 intelligence=self.intelligence,
@@ -277,17 +312,17 @@ class CoderSession:
 
     async def start_initial_turn(self) -> str:
         return await self.start_turn(
-            build_coder_prompt(self.task_path, plan_path=self.plan_path)
+            build_coder_prompt(self._task_read_path, plan_path=self.plan_path)
         )
 
     async def start_restart_turn(self) -> str:
         return await self.start_turn(
-            build_restart_prompt(self.task_path, plan_path=self.plan_path)
+            build_restart_prompt(self._task_read_path, plan_path=self.plan_path)
         )
 
     async def start_revision_turn(self, reviewer_feedback: str, *, persist_state: bool = True) -> str:
         return await self.start_turn(
-            build_revision_prompt(self.task_path, reviewer_feedback),
+            build_revision_prompt(self._task_read_path, reviewer_feedback),
             persist_state=persist_state,
         )
 
@@ -298,6 +333,7 @@ class CoderSession:
                 thread_id,
                 message,
                 self.project_root,
+                task_path=self._task_read_path,
                 model=self.model,
                 fast=self.fast,
                 intelligence=self.intelligence,

@@ -7237,9 +7237,33 @@ async def test_adversary_report_controller_routes_schema_valid_normalized_report
     assert "overall: broke" not in coder_readable_log
 
 
-async def test_adversary_observations_are_routed_when_candidate_finding_is_false(
+@pytest.mark.parametrize(
+    "raw_report",
+    [
+        pytest.param(
+            "candidate_finding: false\n"
+            "attacked: cache behavior\n"
+            "findings: none\n"
+            "observations:\n"
+            "- cache count changed without the expected header\n"
+            "held: ordinary cache path\n"
+            "overall: I believe no defects remain in the submitted solution",
+            id="declared-no-findings",
+        ),
+        pytest.param(
+            "candidate_finding: false\n\n## observations\n"
+            "Cache count changed without the expected header.",
+            id="markdown-without-required-sections",
+        ),
+        pytest.param(
+            "No defects found. Cache count changed without the expected header.",
+            id="heading-free-report-without-routing-line",
+        ),
+    ],
+)
+async def test_nonempty_adversary_reports_reach_report_controller_without_format_retry(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    raw_report: str,
 ) -> None:
     validations = [
         ValidationRun(
@@ -7257,9 +7281,8 @@ async def test_adversary_observations_are_routed_when_candidate_finding_is_false
         validations=validations,
     )
     controller.adversary_enabled = True
-    controller.client = object()
     controller.running = True
-    controller.adv_report_controller = _FakeAdvReportController(
+    normalized = _FakeAdvReportController(
         [
             AdvReportControllerDecision(
                 forward_to_coder=True,
@@ -7271,28 +7294,34 @@ async def test_adversary_observations_are_routed_when_candidate_finding_is_false
             )
         ]
     )
+    controller.adv_report_controller = normalized
 
-    class ObservingAdversary:
-        def __init__(self, *args, **kwargs) -> None:
-            pass
+    class FakeClient:
+        def __init__(self) -> None:
+            self.thread_count = 0
+            self.turn_count = 0
+            self.archived: list[str] = []
 
-        async def run(self, packet, *, previous_adversary_report=None):
-            return SimpleNamespace(
-                report_text=(
-                    "candidate_finding: false\n"
-                    "attacked: cache behavior\n"
-                    "findings: none\n"
-                    "observations:\n"
-                    "- cache count changed without the expected header\n"
-                    "held: ordinary cache path\n"
-                    "overall: I believe no defects remain in the submitted solution"
-                ),
-                thread_id="adv-thread",
-                turn_id="adv-turn",
-                candidate_finding=False,
-            )
+        async def thread_start(self, params, *, timeout):
+            self.thread_count += 1
+            return {"thread": {"id": f"adv-thread-{self.thread_count}"}}
 
-    monkeypatch.setattr("supervisor.controller.AdversaryAgent", ObservingAdversary)
+        async def turn_start(self, params, *, timeout):
+            self.turn_count += 1
+            return {
+                "turn": {
+                    "id": f"adv-turn-{self.turn_count}",
+                    "status": "completed",
+                    "items": [{"type": "agentMessage", "text": raw_report}],
+                }
+            }
+
+        async def thread_archive(self, thread_id, *, timeout):
+            self.archived.append(thread_id)
+            return {}
+
+    client = FakeClient()
+    controller.client = client
 
     await controller.apply_completion_decision(
         _covered_accept_decision(wake_sequence=1, validation_id="validation-3"),
@@ -7300,6 +7329,12 @@ async def test_adversary_observations_are_routed_when_candidate_finding_is_false
         packet=_gate_packet(task, validations=validations),
     )
 
+    assert client.thread_count == 1
+    assert client.turn_count == 1
+    assert client.archived == ["adv-thread-1"]
+    assert len(normalized.packets) == 1
+    assert normalized.packets[0].adversary_report is not None
+    assert normalized.packets[0].adversary_report.report_text == raw_report
     assert store.get_bello_config().status == BelloStatus.STARTING
     assert len(coder.messages) == 1
     assert "## Observations requiring investigation" in coder.messages[0]

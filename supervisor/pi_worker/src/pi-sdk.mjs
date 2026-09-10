@@ -113,7 +113,10 @@ export const realPiSdk = {
       noThemes: true,
       noContextFiles: true,
       extensionFactories: [providerPayloadExtension(requestOptions)],
-      ...(typeof systemPrompt === "string" && systemPrompt.trim() ? { systemPrompt } : {}),
+      // Pi 0.85.1 discovers project/agent SYSTEM.md only when this option is
+      // nullish. An explicit empty source prevents those reads while retaining
+      // Pi's generic base prompt when Bello supplies no custom system prompt.
+      systemPrompt: typeof systemPrompt === "string" && systemPrompt.trim() ? systemPrompt : "",
       appendSystemPrompt,
     });
     await resourceLoader.reload();

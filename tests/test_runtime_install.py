@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from pathlib import PurePosixPath
 import subprocess
 import sys
 import tarfile
+from threading import Event
 import zipfile
 
 import pytest
@@ -224,3 +226,203 @@ def test_install_worker_rejects_an_installed_pi_version_mismatch(
     assert calls == [
         ([str(npm), "ci", "--ignore-scripts", "--no-audit", "--no-fund"], destination),
     ]
+
+
+def _ensure_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path, str, str]:
+    source = tmp_path / "source"
+    destination = tmp_path / "runtime" / "current-fingerprint"
+    source.mkdir()
+    (source / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    (source / "package.json").write_text("{}\n", encoding="utf-8")
+    (source / "worker.mjs").write_text("// fixture\n", encoding="utf-8")
+    node = str(tmp_path / "trusted" / "node")
+    npm = str(tmp_path / "trusted" / "npm")
+    monkeypatch.setattr(runtime_install, "node_executable", lambda: node)
+    monkeypatch.setattr(runtime_install, "source_worker_directory", lambda: source)
+    monkeypatch.setattr(runtime_install, "worker_directory", lambda: destination)
+    monkeypatch.setattr(runtime_install, "require_trusted_executable", lambda *_args, **_kwargs: npm)
+    return source, destination, node, npm
+
+
+def _ready_fixture(destination: Path, *, version: str = runtime_install.PINNED_PI_VERSION) -> None:
+    manifest = destination / _PINNED_PI_PACKAGE
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps({"version": version}), encoding="utf-8")
+    (destination / "worker.mjs").write_text("// installed fixture\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("development_install", [False, True])
+def test_ensure_worker_reuses_ready_runtime_without_writing_files_or_running_npm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, development_install: bool,
+) -> None:
+    source, destination, node, _ = _ensure_fixture(tmp_path, monkeypatch)
+    if development_install:
+        destination = source
+        monkeypatch.setattr(runtime_install, "worker_directory", lambda: source)
+    _ready_fixture(destination)
+    before = {path.relative_to(destination): (path.read_bytes(), path.stat().st_mtime_ns)
+              for path in destination.rglob("*") if path.is_file()}
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(runtime_install.subprocess, "run", fake_run)
+    assert runtime_install.ensure_worker() == destination
+    assert runtime_install.ensure_worker() == destination
+    assert len(calls) == 2
+    assert all(args == [node, str(destination / "worker.mjs")] for args, _ in calls)
+    assert all(kwargs["input"] == "" and kwargs["check"] is False for _, kwargs in calls)
+    after = {path.relative_to(destination): (path.read_bytes(), path.stat().st_mtime_ns)
+             for path in destination.rglob("*") if path.is_file()}
+    assert after == before
+
+
+@pytest.mark.parametrize("incomplete", ["absent", "missing-entry", "wrong-version", "broken-import"])
+def test_ensure_worker_prepares_missing_or_incomplete_pinned_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, incomplete: str,
+) -> None:
+    source, destination, node, npm = _ensure_fixture(tmp_path, monkeypatch)
+    if incomplete != "absent":
+        _ready_fixture(destination, version="0.85.0" if incomplete == "wrong-version" else runtime_install.PINNED_PI_VERSION)
+    if incomplete == "missing-entry":
+        (destination / "worker.mjs").unlink()
+    old = destination.parent / "old-fingerprint" / "node_modules" / "active-module.js"
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_text("// used by an active old release\n", encoding="utf-8")
+    old_stat = old.stat().st_mtime_ns
+    installed = False
+    calls = []
+
+    def fake_run(args, **kwargs):
+        nonlocal installed
+        calls.append(args)
+        if args[0] == npm:
+            assert args == [npm, "ci", "--ignore-scripts", "--no-audit", "--no-fund"]
+            assert kwargs["cwd"] == destination
+            assert kwargs["check"] is True
+            assert kwargs["env"]["PATH"].split(runtime_install.os.pathsep)[0] == str(Path(node).parent)
+            assert (destination / "package-lock.json").read_bytes() == (source / "package-lock.json").read_bytes()
+            _ready_fixture(destination)
+            installed = True
+        elif incomplete == "broken-import" and not installed:
+            return subprocess.CompletedProcess(args, 1, "", "module missing")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(runtime_install.subprocess, "run", fake_run)
+    assert runtime_install.ensure_worker() == destination
+    assert installed
+    assert sum(args[0] == npm for args in calls) == 1
+    assert calls[-1] == [node, str(destination / "worker.mjs")]
+    assert old.read_text(encoding="utf-8") == "// used by an active old release\n"
+    assert old.stat().st_mtime_ns == old_stat
+
+
+def test_ensure_worker_does_not_reinstall_on_readiness_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, destination, node, _ = _ensure_fixture(tmp_path, monkeypatch)
+    _ready_fixture(destination)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+
+    monkeypatch.setattr(runtime_install.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="readiness check timed out; its files were left unchanged"):
+        runtime_install.ensure_worker()
+    assert calls == [[node, str(destination / "worker.mjs")]]
+
+
+def test_ensure_worker_reports_failed_dependency_install_and_can_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, destination, _, npm = _ensure_fixture(tmp_path, monkeypatch)
+
+    def failing_run(args, **_kwargs):
+        assert args[0] == npm
+        raise subprocess.CalledProcessError(1, args)
+
+    monkeypatch.setattr(runtime_install.subprocess, "run", failing_run)
+    with pytest.raises(subprocess.CalledProcessError):
+        runtime_install.ensure_worker()
+
+    def working_run(args, **_kwargs):
+        if args[0] == npm:
+            _ready_fixture(destination)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(runtime_install.subprocess, "run", working_run)
+    assert runtime_install.ensure_worker() == destination
+
+
+def test_ensure_worker_rejects_runtime_that_still_cannot_start_after_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, destination, _, npm = _ensure_fixture(tmp_path, monkeypatch)
+
+    def fake_run(args, **_kwargs):
+        if args[0] == npm:
+            _ready_fixture(destination)
+            return subprocess.CompletedProcess(args, 0)
+        return subprocess.CompletedProcess(args, 1, "", "module missing")
+
+    monkeypatch.setattr(runtime_install.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="Pi runtime is not ready after installation"):
+        runtime_install.ensure_worker()
+
+
+def test_ensure_worker_serializes_concurrent_updates_and_installs_only_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, destination, _, npm = _ensure_fixture(tmp_path, monkeypatch)
+    installing = Event()
+    second_started = Event()
+    release = Event()
+    installs = []
+
+    def fake_run(args, **_kwargs):
+        if args[0] == npm:
+            installs.append(args)
+            installing.set()
+            assert release.wait(5)
+            _ready_fixture(destination)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    def second_update():
+        second_started.set()
+        return runtime_install.ensure_worker()
+
+    monkeypatch.setattr(runtime_install.subprocess, "run", fake_run)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(runtime_install.ensure_worker)
+        assert installing.wait(5)
+        second = executor.submit(second_update)
+        assert second_started.wait(5)
+        release.set()
+        assert first.result(timeout=5) == destination
+        assert second.result(timeout=5) == destination
+    assert len(installs) == 1
+
+
+@pytest.mark.parametrize("target", ["directory", "lock"])
+def test_ensure_worker_rejects_symlink_install_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str,
+) -> None:
+    _, destination, _, _ = _ensure_fixture(tmp_path, monkeypatch)
+    destination.parent.mkdir(parents=True)
+    link = destination if target == "directory" else destination.parent / f".{destination.name}.install.lock"
+    link_target = tmp_path / "unrelated"
+    if target == "directory":
+        link_target.mkdir()
+    else:
+        link_target.touch()
+    try:
+        link.symlink_to(link_target, target_is_directory=target == "directory")
+    except OSError:
+        pytest.skip("symlink creation is unavailable for this Windows user")
+    monkeypatch.setattr(runtime_install.subprocess, "run", lambda *_args, **_kwargs: pytest.fail("must not run npm or Node"))
+    with pytest.raises(RuntimeError, match="must not be a symbolic link"):
+        runtime_install.ensure_worker()
