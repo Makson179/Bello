@@ -437,6 +437,10 @@ fn cleanup_data(data: &JournalData) -> Result<()> {
     if let Err(error) = delete_profile(&data.profile_name) {
         return Err(anyhow!("delete profile: {error:#}"));
     }
+    // These handles intentionally disallow delete sharing during revocation
+    // and verification. Release them before removing our empty directories;
+    // the authority handles remain pinned for the rest of cleanup.
+    drop(touched_handles);
     for created in data.created_paths.iter().rev() {
         match open_path(&created.path, false).and_then(|handle| file_identity(&handle)) {
             Ok(identity)

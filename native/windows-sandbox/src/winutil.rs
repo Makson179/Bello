@@ -256,6 +256,44 @@ pub fn is_normalized_local_absolute(path: &Path) -> bool {
     })
 }
 
+pub fn verbatim_local_absolute(path: &Path) -> Result<PathBuf> {
+    if !is_normalized_local_absolute(path) {
+        return Err(anyhow!(
+            "path must be a normalized absolute local-drive path"
+        ));
+    }
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        unreachable!("a normalized local path has a drive prefix");
+    };
+    let (drive, verbatim) = match prefix.kind() {
+        Prefix::Disk(drive) => (drive, false),
+        Prefix::VerbatimDisk(drive) => (drive, true),
+        _ => unreachable!("a normalized local path has a drive prefix"),
+    };
+    // Authorities returned by canonicalize use extended-length drive paths.
+    // Convert only strictly validated local paths to that spelling, without
+    // resolving links or changing the supplied directory components.
+    let mut value: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .map(|unit| {
+            if unit == b'/' as u16 {
+                b'\\' as u16
+            } else {
+                unit
+            }
+        })
+        .collect();
+    if !verbatim {
+        value.splice(
+            0..0,
+            [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16],
+        );
+    }
+    value[4] = drive.to_ascii_uppercase() as u16;
+    Ok(PathBuf::from(OsString::from_wide(&value)))
+}
+
 pub fn contains(parent: &Path, child: &Path) -> bool {
     let parent = normalized_path_wide(parent);
     let child = normalized_path_wide(child);
@@ -343,6 +381,53 @@ pub fn as_void<T>(value: &T) -> *const c_void {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_drive_spellings_match_canonical_authorities() {
+        let root = Path::new(r"\\?\C:\workspace");
+        for supplied in [
+            r"C:\workspace\.codex\bello-run",
+            r"c:\workspace\.codex\bello-run",
+            r"C:/workspace/.codex/bello-run",
+            r"\\?\C:\workspace\.codex\bello-run",
+            r"\\?\c:\workspace\.codex\bello-run",
+        ] {
+            let path = verbatim_local_absolute(Path::new(supplied)).unwrap();
+            assert_eq!(path, root.join(r".codex\bello-run"));
+            assert!(contains(root, &path));
+            assert_eq!(
+                path.strip_prefix(root).unwrap(),
+                Path::new(r".codex\bello-run")
+            );
+        }
+        for supplied in [
+            r"C:\workspace-other\.supervisor",
+            r"D:\workspace\.supervisor",
+        ] {
+            let path = verbatim_local_absolute(Path::new(supplied)).unwrap();
+            assert!(!contains(root, &path));
+        }
+    }
+
+    #[test]
+    fn private_drive_spelling_does_not_accept_other_namespaces_or_ambiguity() {
+        for supplied in [
+            r"C:\workspace\..\outside",
+            r"C:\workspace\.\private",
+            r"C:\workspace\private.",
+            r"C:\workspace\private ",
+            r"C:\workspace\private:stream",
+            r"C:workspace\private",
+            r"\\server\share\private",
+            r"\\?\UNC\server\share\private",
+            r"\\.\C:\workspace\private",
+        ] {
+            assert!(
+                verbatim_local_absolute(Path::new(supplied)).is_err(),
+                "{supplied}"
+            );
+        }
+    }
 
     #[test]
     fn private_lexical_paths_cannot_escape_with_parent_components() {

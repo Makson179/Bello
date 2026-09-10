@@ -15,7 +15,7 @@ use windows_sys::Win32::UI::Shell::{FOLDERID_Profile, SHGetKnownFolderPath};
 use winutil::{
     canonical_existing, contains, file_identity, is_normalized_local_absolute, is_volume_root,
     open_path, path_eq, require_persistent_acls, validate_final_path, validate_plain_file_object,
-    Handle,
+    verbatim_local_absolute, Handle,
 };
 
 const MAX_AUTHORITY_OBJECTS: usize = 500_000;
@@ -354,6 +354,7 @@ fn prepare_private_paths(
                 "privatePaths[{index}] must be a normalized absolute local-drive path"
             ));
         }
+        let path = verbatim_local_absolute(&path)?;
         let authority = std::iter::once(root)
             .chain(readable_roots.iter().map(PathBuf::as_path))
             .find(|authority| contains(authority, &path))
@@ -463,4 +464,87 @@ fn verify_effective_tree(
         acl::verify_tree(authority, private_paths, sid, authority_mode, cancelled)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn private_paths_accept_existing_and_missing_plain_drive_paths() {
+        let base = std::env::temp_dir().join(format!(
+            "bello-private-paths-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let supplied_root = base.join("workspace");
+        let existing = supplied_root.join(".supervisor");
+        let missing = supplied_root.join(".codex").join("bello-run");
+        fs::create_dir_all(&existing).unwrap();
+        assert!(!missing.exists());
+        let root = fs::canonicalize(&supplied_root).unwrap();
+        let profile_name = random_profile_name().unwrap();
+        let mut journal = Journal::create(
+            &base.join("state"),
+            &profile_name,
+            &mutex_name(&profile_name),
+            std::slice::from_ref(&root),
+        )
+        .unwrap();
+        let paths = prepare_private_paths(
+            &root,
+            &[],
+            SandboxMode::WorkspaceWrite,
+            vec![
+                existing.to_string_lossy().into_owned(),
+                missing.to_string_lossy().into_owned(),
+            ],
+            &mut journal,
+        )
+        .unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&fs::canonicalize(&existing).unwrap()));
+        assert!(paths.contains(&fs::canonicalize(&missing).unwrap()));
+
+        let sibling = base.join("workspace-other").join(".supervisor");
+        let error = prepare_private_paths(
+            &root,
+            &[],
+            SandboxMode::WorkspaceWrite,
+            vec![sibling.to_string_lossy().into_owned()],
+            &mut journal,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("outside every authority"));
+        assert!(!sibling.exists());
+
+        // Follow the actual mutation/recovery path: a created private leaf is
+        // both journaled for deletion and held open while its deny is revoked.
+        let sid = identity::derive_profile_sid(&profile_name).unwrap();
+        for path in std::iter::once(&root).chain(paths.iter()) {
+            let handle = open_path(path, true).unwrap();
+            journal.before_acl_mutation(path, &handle).unwrap();
+            if path == &root {
+                acl::grant(&handle, sid.0, SandboxMode::WorkspaceWrite).unwrap();
+            } else {
+                acl::deny_all(&handle, sid.0).unwrap();
+            }
+        }
+        journal.cleanup().unwrap();
+        acl::verify_absent_tree(&root, sid.0).unwrap();
+        assert!(
+            existing.is_dir(),
+            "pre-existing private directory was removed"
+        );
+        assert!(
+            !missing.exists(),
+            "created private directory remained after cleanup"
+        );
+        assert!(!missing.parent().unwrap().exists());
+        fs::remove_dir_all(base).unwrap();
+    }
 }
