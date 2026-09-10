@@ -82,13 +82,26 @@ jobs:
           import sys, tarfile, zipfile
           wheel, sdist = sys.argv[1:]
           with zipfile.ZipFile(wheel) as archive:
-              wheel_names = set(archive.namelist())
+              wheel_names = [name for name in archive.namelist() if not name.endswith("/")]
+              metadata = [name for name in wheel_names if name.endswith(".dist-info/WHEEL")]
+              if len(metadata) != 1:
+                  raise SystemExit("expected exactly one wheel metadata file")
+              data_root = metadata[0].removesuffix(".dist-info/WHEEL") + ".data/"
+              library_roots = (data_root + "purelib/", data_root + "platlib/")
+              installed = {}
+              for name in wheel_names:
+                  relative = next((name[len(root):] for root in library_roots if name.startswith(root)), name)
+                  if relative in installed:
+                      raise SystemExit(f"duplicate installed wheel path: {relative}")
+                  installed[relative] = archive.read(name)
           wheel_required = {
               "supervisor/runtime/bin/bello-windows-sandbox.exe",
               "supervisor/runtime/bin/THIRD_PARTY_NOTICES.txt",
           }
-          if missing := wheel_required - wheel_names:
+          if missing := wheel_required - installed.keys():
               raise SystemExit(f"Windows wheel missing: {sorted(missing)}")
+          if empty := {name for name in wheel_required if not installed[name]}:
+              raise SystemExit(f"Windows wheel has empty assets: {sorted(empty)}")
           with tarfile.open(sdist, "r:gz") as archive:
               names = {name.split("/", 1)[-1] for name in archive.getnames()}
           source_required = {

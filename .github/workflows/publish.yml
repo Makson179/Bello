@@ -91,14 +91,25 @@ jobs:
           if len(wheels) != 1:
               raise SystemExit("expected exactly one Windows-specific wheel")
           with ZipFile(wheels[0]) as wheel:
-              names = set(wheel.namelist())
+              names = [name for name in wheel.namelist() if not name.endswith("/")]
+              metadata = [name for name in names if name.endswith(".dist-info/WHEEL")]
+              if len(metadata) != 1:
+                  raise SystemExit("expected exactly one wheel metadata file")
+              data_root = metadata[0].removesuffix(".dist-info/WHEEL") + ".data/"
+              library_roots = (data_root + "purelib/", data_root + "platlib/")
+              installed = {}
+              for name in names:
+                  relative = next((name[len(root):] for root in library_roots if name.startswith(root)), name)
+                  if relative in installed:
+                      raise SystemExit(f"duplicate installed wheel path: {relative}")
+                  installed[relative] = name
               for required in (
                   "supervisor/runtime/bin/bello-windows-sandbox.exe",
                   "supervisor/runtime/bin/THIRD_PARTY_NOTICES.txt",
                   "supervisor/pi_worker/package-lock.json",
                   "supervisor/prompts/prompts.toml",
               ):
-                  if required not in names or not wheel.read(required):
+                  if required not in installed or not wheel.read(installed[required]):
                       raise SystemExit(f"missing or empty Windows wheel asset: {required}")
           '@ | python -
       - uses: actions/upload-artifact@v4

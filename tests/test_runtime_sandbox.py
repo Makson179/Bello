@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import shlex
 import subprocess
 import sys
@@ -83,15 +83,25 @@ async def test_run_rejects_invalid_command_or_timeout(tmp_path: Path, command: s
 
 
 def test_macos_profile_uses_parameters_not_interpolated_paths(tmp_path: Path) -> None:
-    injected = tmp_path / 'workspace )\n(allow network*)\n("quoted"'
+    class ProfilePath(PurePosixPath):
+        def resolve(self, strict: bool = False):
+            return self
+
+        def is_dir(self) -> bool:
+            return True
+
+    # Exercise the exact hostile macOS path without creating a name that
+    # Windows rejects before the profile generator can be tested.
+    injected = ProfilePath('/workspace )\n(allow network*)\n("quoted"')
     scratch = tmp_path / "scratch"
-    injected.mkdir()
     scratch.mkdir()
     (scratch / "home").mkdir()
     (scratch / "tmp").mkdir()
-    policy = SandboxPolicy(injected, mode="workspace-write", network_access=False)
+    policy = SandboxPolicy(tmp_path, mode="workspace-write", network_access=False)
 
-    profile, parameters = sandbox._mac_profile(policy, scratch)
+    profile, parameters = sandbox._mac_profile(
+        policy, scratch, sandbox._Toolchain(readable_roots=(injected,))
+    )
 
     assert str(injected.resolve()) not in profile
     assert any(value.endswith(f"={injected.resolve()}") for value in parameters)
@@ -130,7 +140,7 @@ def test_macos_invocation_scrubs_host_environment(monkeypatch: pytest.MonkeyPatc
         SandboxPolicy(tmp_path, mode="read-only"), tmp_path, ("/bin/sh", "-c", "true"), scratch
     )
 
-    assert invocation.argv[0] == "/usr/bin/sandbox-exec"
+    assert invocation.argv[0] == str(Path("/usr/bin/sandbox-exec"))
     assert invocation.argv[-4:] == ("--", "/bin/sh", "-c", "true")
     assert invocation.env is not None
     assert invocation.env["HOME"] == str(scratch / "home")
@@ -375,6 +385,39 @@ def test_linux_rejects_renameable_private_namespace_symlinks(
         sandbox._linux_invocation(SandboxPolicy(root), root, ("/usr/bin/true",))
 
 
+@pytest.mark.parametrize("exposure", ["unmounted", "readable", "readable-file", "toolchain", "system"])
+def test_linux_external_private_symlink_is_allowed_only_when_target_is_unmounted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, exposure: str
+) -> None:
+    root = tmp_path / "workspace"
+    target = tmp_path / "original-project" / ".supervisor"
+    root.mkdir()
+    target.mkdir(parents=True)
+    (target / "state.json").write_text("private", encoding="utf-8")
+    (root / ".supervisor").symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(sandbox, "_linux_launcher", lambda: Path("/usr/bin/bwrap"))
+    monkeypatch.setattr(
+        sandbox, "_linux_system_mounts",
+        lambda: ((target.parent.resolve(), target.parent.resolve()),) if exposure == "system" else (),
+    )
+    readable_roots = {
+        "readable": (target.parent,),
+        "readable-file": (target / "state.json",),
+    }.get(exposure, ())
+    policy = SandboxPolicy(root, readable_roots=readable_roots)
+    toolchain = sandbox._Toolchain(
+        readable_roots=(target.parent.resolve(),) if exposure == "toolchain" else (),
+    )
+    if exposure == "unmounted":
+        invocation = sandbox._linux_invocation(policy, root, ("/usr/bin/true",), toolchain=toolchain)
+        for option in ("--bind", "--ro-bind"):
+            assert not any(str(target) in pair for pair in _argument_pairs(invocation.argv, option))
+            assert not any(str(target.parent) in pair for pair in _argument_pairs(invocation.argv, option))
+    else:
+        with pytest.raises(SandboxPolicyError, match="private sandbox namespaces cannot be symbolic links"):
+            sandbox._linux_invocation(policy, root, ("/usr/bin/true",), toolchain=toolchain)
+
+
 def test_linux_toolchain_mounts_only_exact_runtime_and_creates_empty_parents(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -402,7 +445,7 @@ def test_linux_toolchain_mounts_only_exact_runtime_and_creates_empty_parents(
     )
     assert str(runtime.parent) in invocation.argv
     assert invocation.env is not None
-    assert invocation.env["PATH"].split(os.pathsep)[0] == "/opt/bello-tools/bin"
+    assert invocation.env["PATH"].split(os.pathsep)[0] == str(Path("/opt/bello-tools/bin"))
     assert str(runtime.parent.parent.parent.parent) not in {
         source for source, _ in _argument_pairs(invocation.argv, "--ro-bind")
     }
@@ -419,7 +462,11 @@ async def test_restricted_windows_without_native_helper_refuses_before_spawn(
         called = True
         raise AssertionError("restricted command escaped to raw subprocess")
 
+    def missing_helper(_root: Path, _mode: str) -> Path:
+        raise windows_sandbox.WindowsSandboxUnavailableError("test helper is absent")
+
     monkeypatch.setattr(sandbox.sys, "platform", "win32")
+    monkeypatch.setattr(windows_sandbox, "_helper_path", missing_helper)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden_spawn)
 
     with pytest.raises(SandboxUnavailableError, match="failed closed"):
@@ -877,6 +924,57 @@ async def test_native_private_namespace_cannot_be_aliased_to_expose_state(tmp_pa
     assert (private.parent / "settings.txt").read_text(encoding="utf-8") == "after"
     assert (private.parent / "new-child").is_dir()
     assert (private.parent / "renamed-child").is_dir()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux") or not _native_backend_expected(),
+    reason="native Linux coder snapshot sandbox integration",
+)
+@pytest.mark.asyncio
+async def test_native_linux_coder_snapshot_keeps_external_supervisor_state_inaccessible(
+    tmp_path: Path,
+) -> None:
+    from supervisor.workspace_snapshot import create_workspace_snapshot
+
+    project = tmp_path / "original-project"
+    state = project / ".supervisor"
+    state.mkdir(parents=True)
+    task = project / "TASK.md"
+    task.write_text("CODER_TASK_READABLE", encoding="utf-8")
+    secret = "EXTERNAL_SUPERVISOR_STATE_MUST_STAY_PRIVATE"
+    (state / "state.json").write_text(secret, encoding="utf-8")
+    snapshot = create_workspace_snapshot(project, task)
+    try:
+        root = snapshot.snapshot_root
+        assert (root / ".supervisor").is_symlink()
+        assert (root / ".supervisor").resolve() == state.resolve()
+        runner = SandboxRunner(SandboxPolicy(root, readable_roots=(task,)))
+        try:
+            result = await runner.run(
+                "cat TASK.md; printf allowed > solution.txt; "
+                "cat .supervisor/state.json 2>/dev/null || true; "
+                "mv .supervisor renamed-state; "
+                "cat renamed-state/state.json 2>/dev/null || true",
+                root, 5,
+            )
+        except SandboxUnavailableError as exc:
+            if os.environ.get("BELLO_REQUIRE_NATIVE_SANDBOX") == "1":
+                raise
+            pytest.skip(str(exc))
+        assert result.exit_code == 0, result.output
+        assert "CODER_TASK_READABLE" in result.output
+        assert secret not in result.output
+        assert (root / "solution.txt").read_text(encoding="utf-8") == "allowed"
+        # It must remain inaccessible in a later command after its private
+        # namespace link has been renamed, not only under the initial mask.
+        later = await runner.run(
+            "cat renamed-state/state.json 2>/dev/null || true", root, 5,
+        )
+        assert later.exit_code == 0, later.output
+        assert secret not in later.output
+        assert (state / "state.json").read_text(encoding="utf-8") == secret
+    finally:
+        snapshot.cleanup()
 
 
 @pytest.mark.skipif(not _native_backend_expected(), reason="no supported native sandbox backend installed")

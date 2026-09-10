@@ -1,6 +1,6 @@
 use crate::protocol::SandboxMode;
 use crate::winutil::{
-    contains, open_path, path_eq, validate_final_path, validate_plain_file_object, Handle,
+    contains, open_path, path_eq, validate_final_path, validate_plain_file_object, wide, Handle,
 };
 use anyhow::{anyhow, Result};
 use std::collections::VecDeque;
@@ -15,15 +15,17 @@ use windows_sys::Win32::Security::Authorization::{
     SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
-    AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetTokenInformation, TokenUser,
-    ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
-    CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE, OBJECT_INHERIT_ACE,
-    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
+    AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetTokenInformation,
+    InitializeSecurityDescriptor, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+    SetSecurityDescriptorOwner, TokenUser, ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL,
+    ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE,
+    OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
-    WRITE_DAC, WRITE_OWNER,
+    CreateDirectoryW, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_DELETE_CHILD,
+    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_WRITE_ATTRIBUTES,
+    FILE_WRITE_DATA, FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -97,7 +99,7 @@ pub fn require_non_null_dacl(handle: &Handle) -> Result<()> {
     Ok(())
 }
 
-pub fn protect_state_directory(handle: &Handle) -> Result<()> {
+fn current_user_sid_buffer() -> Result<Vec<usize>> {
     let mut token = 0;
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(crate::winutil::last_error("OpenProcessToken"));
@@ -136,6 +138,62 @@ pub fn protect_state_directory(handle: &Handle) -> Result<()> {
     if user_sid.is_null() {
         return Err(anyhow!("the current process token has no user SID"));
     }
+    Ok(buffer)
+}
+
+fn state_directory_dacl(user_sid: PSID) -> Result<LocalAcl> {
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: FILE_ALL_ACCESS,
+        grfAccessMode: SET_ACCESS,
+        grfInheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+        Trustee: trustee(user_sid),
+    };
+    let mut exact_dacl: *mut ACL = std::ptr::null_mut();
+    let code = unsafe { SetEntriesInAclW(1, &entry, std::ptr::null(), &mut exact_dacl) };
+    if code != 0 {
+        return Err(anyhow!(
+            "SetEntriesInAclW(state directory) failed with Win32 error {code}"
+        ));
+    }
+    Ok(LocalAcl(exact_dacl))
+}
+
+pub fn create_state_directory(path: &Path) -> Result<()> {
+    // Elevated accounts may default new objects to an Administrators owner.
+    // Set the intended account owner and protected DACL atomically at creation;
+    // never take ownership of or relax validation for an existing directory.
+    let buffer = current_user_sid_buffer()?;
+    let user_sid = unsafe { (*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid };
+    let exact_dacl = state_directory_dacl(user_sid)?;
+    let mut descriptor: SECURITY_DESCRIPTOR = unsafe { mem::zeroed() };
+    let descriptor_ptr = &mut descriptor as *mut _ as *mut c_void;
+    if unsafe { InitializeSecurityDescriptor(descriptor_ptr, 1) } == 0
+        || unsafe { SetSecurityDescriptorOwner(descriptor_ptr, user_sid, 0) } == 0
+        || unsafe { SetSecurityDescriptorDacl(descriptor_ptr, 1, exact_dacl.0, 0) } == 0
+        || unsafe {
+            SetSecurityDescriptorControl(descriptor_ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED)
+        } == 0
+    {
+        return Err(crate::winutil::last_error(
+            "initialize state directory security",
+        ));
+    }
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor_ptr,
+        bInheritHandle: 0,
+    };
+    if unsafe { CreateDirectoryW(wide(path).as_ptr(), &attributes) } == 0 {
+        return Err(crate::winutil::last_error(
+            "CreateDirectoryW(state directory)",
+        ));
+    }
+    Ok(())
+}
+
+pub fn protect_state_directory(handle: &Handle) -> Result<()> {
+    let buffer = current_user_sid_buffer()?;
+    let user_sid = unsafe { (*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid };
 
     let mut owner: PSID = std::ptr::null_mut();
     let mut descriptor: *mut c_void = std::ptr::null_mut();
@@ -163,20 +221,7 @@ pub fn protect_state_directory(handle: &Handle) -> Result<()> {
         ));
     }
 
-    let entry = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: FILE_ALL_ACCESS,
-        grfAccessMode: SET_ACCESS,
-        grfInheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
-        Trustee: trustee(user_sid),
-    };
-    let mut exact_dacl: *mut ACL = std::ptr::null_mut();
-    let code = unsafe { SetEntriesInAclW(1, &entry, std::ptr::null(), &mut exact_dacl) };
-    if code != 0 {
-        return Err(anyhow!(
-            "SetEntriesInAclW(state directory) failed with Win32 error {code}"
-        ));
-    }
-    let exact_dacl = LocalAcl(exact_dacl);
+    let exact_dacl = state_directory_dacl(user_sid)?;
     let code = unsafe {
         SetSecurityInfo(
             handle.raw(),
@@ -471,4 +516,58 @@ pub fn verify_absent_tree(root: &Path, sid: PSID) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use windows_sys::Win32::Security::GetSecurityDescriptorControl;
+
+    #[test]
+    fn recovery_directory_is_created_with_account_owner_and_protected_dacl() {
+        let path = std::env::temp_dir().join(format!(
+            "bello-state-owner-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        create_state_directory(&path).unwrap();
+        let handle = open_path(&path, true).unwrap();
+        let buffer = current_user_sid_buffer().unwrap();
+        let user_sid = unsafe { (*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid };
+        let (dacl, descriptor) = current_dacl(&handle).unwrap();
+        let mut control = 0;
+        let mut revision = 0;
+        assert_ne!(
+            unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) },
+            0
+        );
+        assert_ne!(control & SE_DACL_PROTECTED, 0);
+        assert_eq!(
+            masks_for_sid(dacl, user_sid, true).unwrap(),
+            (FILE_ALL_ACCESS, 0)
+        );
+        let mut info: ACL_SIZE_INFORMATION = unsafe { mem::zeroed() };
+        assert_ne!(
+            unsafe {
+                GetAclInformation(
+                    dacl,
+                    &mut info as *mut _ as *mut c_void,
+                    mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            },
+            0
+        );
+        assert_eq!(info.AceCount, 1);
+        // The unchanged strict owner check must accept a fresh directory even
+        // when the process token's default owner is the Administrators group.
+        protect_state_directory(&handle).unwrap();
+        assert!(create_state_directory(&path).is_err());
+        drop(handle);
+        std::fs::remove_dir(path).unwrap();
+    }
 }

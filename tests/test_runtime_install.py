@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -17,6 +18,88 @@ from supervisor.runtime import install as runtime_install
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _PINNED_PI_PACKAGE = Path("node_modules/@earendil-works/pi-coding-agent/package.json")
+
+
+def _installed_wheel_files(archive: zipfile.ZipFile) -> dict[str, bytes]:
+    """Resolve wheel library relocation paths, not arbitrary archive prefixes."""
+
+    names = [name for name in archive.namelist() if not name.endswith("/")]
+    metadata = [name for name in names if name.endswith(".dist-info/WHEEL")]
+    assert len(metadata) == 1
+    data_root = metadata[0].removesuffix(".dist-info/WHEEL") + ".data/"
+    library_roots = (data_root + "purelib/", data_root + "platlib/")
+    files: dict[str, bytes] = {}
+    for name in names:
+        installed = next((name[len(root):] for root in library_roots if name.startswith(root)), name)
+        assert installed not in files, f"duplicate installed wheel path: {installed}"
+        files[installed] = archive.read(name)
+    return files
+
+
+@pytest.mark.parametrize("library", ["", "purelib", "platlib"])
+def test_wheel_file_inspection_resolves_only_library_relocation(library: str) -> None:
+    buffer = io.BytesIO()
+    package = "bello-0.6.0.dev0"
+    relative = "supervisor/runtime/tools.json"
+    prefix = f"{package}.data/{library}/" if library else ""
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(f"{package}.dist-info/WHEEL", "Wheel-Version: 1.0\n")
+        archive.writestr(prefix + relative, b'{"tool": "original bytes"}\n')
+        archive.writestr(f"{package}.data/data/{relative}", b"not a library location")
+        archive.writestr(f"unrelated.data/purelib/{relative}", b"not this distribution")
+    with zipfile.ZipFile(buffer) as archive:
+        files = _installed_wheel_files(archive)
+    assert files[relative] == b'{"tool": "original bytes"}\n'
+    assert files[f"{package}.data/data/{relative}"] == b"not a library location"
+    assert files[f"unrelated.data/purelib/{relative}"] == b"not this distribution"
+
+
+def test_wheel_file_inspection_rejects_conflicting_installed_paths() -> None:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("bello-0.6.0.dev0.dist-info/WHEEL", "Wheel-Version: 1.0\n")
+        archive.writestr("supervisor/runtime/tools.json", b"root")
+        archive.writestr("bello-0.6.0.dev0.data/purelib/supervisor/runtime/tools.json", b"relocated")
+    with zipfile.ZipFile(buffer) as archive:
+        with pytest.raises(AssertionError, match="duplicate installed wheel path"):
+            _installed_wheel_files(archive)
+
+
+def test_setuptools_platform_wheel_preserves_relocated_package_bytes(tmp_path: Path) -> None:
+    # Match Bello's platform-tagged wheel without compiling a Windows binary:
+    # root_is_pure=False does not itself change Distribution.has_ext_modules().
+    package = tmp_path / "supervisor" / "runtime"
+    package.mkdir(parents=True)
+    (package.parent / "__init__.py").write_text("", encoding="utf-8")
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    expected = b'{"fixture": "exact package data"}\n'
+    (package / "tools.json").write_bytes(expected)
+    (tmp_path / "setup.py").write_text(
+        "from setuptools import setup\n"
+        "from setuptools.command.bdist_wheel import bdist_wheel\n"
+        "class PlatformWheel(bdist_wheel):\n"
+        "    def finalize_options(self):\n"
+        "        super().finalize_options()\n"
+        "        self.root_is_pure = False\n"
+        "    def get_tag(self):\n"
+        "        return ('py3', 'none', 'win_amd64')\n"
+        "setup(name='bello-wheel-fixture', version='1.0',\n"
+        "      packages=['supervisor', 'supervisor.runtime'],\n"
+        "      package_data={'supervisor.runtime': ['tools.json']},\n"
+        "      cmdclass={'bdist_wheel': PlatformWheel})\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [sys.executable, "setup.py", "bdist_wheel"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    wheels = list((tmp_path / "dist").glob("*-py3-none-win_amd64.whl"))
+    assert len(wheels) == 1
+    with zipfile.ZipFile(wheels[0]) as archive:
+        assert "bello_wheel_fixture-1.0.data/purelib/supervisor/runtime/tools.json" in archive.namelist()
+        files = _installed_wheel_files(archive)
+    assert files["supervisor/runtime/tools.json"] == expected
 
 
 def test_built_wheel_contains_runtime_sources_but_not_node_modules(tmp_path: Path) -> None:
@@ -44,6 +127,7 @@ def test_built_wheel_contains_runtime_sources_but_not_node_modules(tmp_path: Pat
 
     with zipfile.ZipFile(wheels[0]) as archive:
         names = set(archive.namelist())
+        files = _installed_wheel_files(archive)
 
     required = {
         "supervisor/pi_worker/LICENSE-Pi",
@@ -59,8 +143,10 @@ def test_built_wheel_contains_runtime_sources_but_not_node_modules(tmp_path: Pat
         "supervisor/runtime/file_worker.py",
         "supervisor/runtime/tools.json",
     }
-    assert required <= names
-    assert not any("node_modules" in Path(name).parts for name in names)
+    assert required <= files.keys()
+    for relative in required:
+        assert files[relative] == (_PROJECT_ROOT / relative).read_bytes()
+    assert not any("node_modules" in PurePosixPath(name).parts for name in names)
 
 
 def test_built_sdist_contains_native_sources_and_exact_notices_only(tmp_path: Path) -> None:

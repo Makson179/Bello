@@ -735,16 +735,28 @@ def _linux_launcher() -> Path:
     )
 
 
-def _linux_masks(policy: SandboxPolicy) -> tuple[tuple[str, Path], ...]:
+def _linux_masks(
+    policy: SandboxPolicy, *, exposed_roots: Iterable[Path] = ()
+) -> tuple[tuple[str, Path], ...]:
     authorities = (policy.root, *policy.readable_roots)
     if policy.mode == "workspace-write":
         # A bind mount follows symlinks; it cannot pin the link's directory
-        # entry. Renaming such a private namespace link would leave its old
-        # target unmasked on the next command. Refuse that ambiguous layout.
+        # entry. Reject aliases into exposed trees, since renaming the link
+        # would leave its old target unmasked on the next command. Bello's
+        # coder snapshot normally links .supervisor OUTSIDE all mounted trees;
+        # that target remains inaccessible regardless of the link's name.
+        visible_roots = (*authorities, *exposed_roots)
         for entry in _private_rename_anchors((policy.root,)):
-            if entry.is_symlink():
+            if not entry.is_symlink():
+                continue
+            target = entry.resolve(strict=False)
+            if any(
+                _contains(authority, target) or _contains(target, authority)
+                for authority in visible_roots
+            ):
                 raise SandboxPolicyError(
-                    f"writable private sandbox namespaces cannot be symbolic links: {entry}"
+                    "writable private sandbox namespaces cannot be symbolic links "
+                    f"into exposed trees: {entry}"
                 )
     masks: list[tuple[str, Path]] = []
     for candidate in _private_candidates(authorities):
@@ -869,7 +881,7 @@ def _linux_invocation(
         argv.extend(("--ro-bind", str(dependency), str(dependency)))
     bind = "--ro-bind" if policy.mode == "read-only" else "--bind"
     argv.extend((bind, str(policy.root), str(policy.root)))
-    masks = _linux_masks(policy)
+    masks = _linux_masks(policy, exposed_roots=destinations)
     # A masked leaf is already a mountpoint, but Linux still permits renaming
     # an ordinary ancestor such as .codex. Bind the parents first so rename
     # fails with EBUSY, then hide private leaves on top of those anchors.

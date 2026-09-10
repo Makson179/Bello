@@ -52,7 +52,7 @@ def test_trusted_linux_bubblewrap_does_not_require_path(monkeypatch: pytest.Monk
     monkeypatch.setenv("PATH", "")
     result = sandbox_result()
     assert result.level == "ok"
-    assert "/usr/bin/bwrap" in result.message
+    assert str(Path("/usr/bin/bwrap")) in result.message
     assert "preflight" in result.detail
 
 

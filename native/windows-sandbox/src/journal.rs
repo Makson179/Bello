@@ -237,7 +237,7 @@ pub fn state_directory() -> Result<StateDirectory> {
 
     let state = bello.join("SandboxState-v1");
     if !state.exists() {
-        fs::create_dir(&state)
+        acl::create_state_directory(&state)
             .with_context(|| format!("could not create recovery directory {}", state.display()))?;
     }
     // Open the lexical leaf with OPEN_REPARSE_POINT before canonicalizing it.
