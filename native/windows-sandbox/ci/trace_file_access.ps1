@@ -278,7 +278,7 @@ try {
             $sessionMayExist = $true
             $null = Invoke-TraceUtility $logman @("create", "trace", $session, "-ets",
                 "-o", $etl, "-f", "bincirc", "-max", "32", "-bs", "64", "-nb", "16", "64",
-                "-rf", "00:01:30", "-p", $fileProvider, "0xffffffffffffffff", "5")
+                "-p", $fileProvider, "0xffffffffffffffff", "5")
             $null = Invoke-TraceUtility $logman @("update", "trace", $session, "-ets", "-p", $processProvider, "0x10", "5")
             $sessionConfiguration = Invoke-TraceUtility $logman @("query", $session, "-ets")
             foreach ($provider in @($fileProvider, $processProvider)) {
