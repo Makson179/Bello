@@ -169,7 +169,11 @@ class _LocalProviderState:
         if step == 2:
             if f"call-{flow.lower()}-read_file" not in serialized or f"payload-{flow}" not in serialized:
                 raise AssertionError("the read result did not return through the Pi conversation")
-            command = f'test "$(cat {filename})" = "payload-{flow}" && printf "exec-{flow}-ok"'
+            command = (
+                f'findstr /x /c:"payload-{flow}" {filename} && echo exec-{flow}-ok'
+                if os.name == "nt"
+                else f'test "$(cat {filename})" = "payload-{flow}" && printf "exec-{flow}-ok"'
+            )
             return _tool_chunk(flow, step, "exec_command", {"command": command, "timeout": 10})
         if step == 3:
             if f"call-{flow.lower()}-exec_command" not in serialized or f"exec-{flow}-ok" not in serialized:
@@ -241,7 +245,7 @@ def _local_openai_provider(
 def _worker_environment(node: Path, home: Path, scratch: Path) -> dict[str, str]:
     home.mkdir()
     scratch.mkdir()
-    return {
+    environment = {
         "HOME": str(home),
         "TMPDIR": str(scratch),
         "PATH": os.pathsep.join((str(node.parent), "/usr/bin", "/bin")),
@@ -250,14 +254,35 @@ def _worker_environment(node: Path, home: Path, scratch: Path) -> dict[str, str]
         "NO_PROXY": "127.0.0.1,localhost",
         "no_proxy": "127.0.0.1,localhost",
     }
+    if os.name == "nt":
+        for name in ("SystemRoot", "WINDIR", "ComSpec", "PATHEXT"):
+            if value := os.environ.get(name):
+                environment[name] = value
+        environment.update({
+            "USERPROFILE": str(home),
+            "LOCALAPPDATA": str(home / "AppData" / "Local"),
+            "APPDATA": str(home / "AppData" / "Roaming"),
+            "TEMP": str(scratch),
+            "TMP": str(scratch),
+            "PATH": os.pathsep.join((str(node.parent), str(Path(os.environ["SystemRoot"]) / "System32"))),
+        })
+    return environment
 
 
-@pytest.mark.skipif(os.name == "nt", reason="restricted Windows tool execution intentionally fails closed")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("final_mode", ["submit_result", "text"])
 async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(
-    tmp_path: Path, final_mode: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, final_mode: str,
 ) -> None:
+    if os.name == "nt":
+        if os.environ.get("BELLO_REQUIRE_PI_INTEGRATION") != "1":
+            pytest.skip("Windows Pi integration requires the native CI host-setup fixture")
+        from supervisor.runtime import sandbox
+
+        # This command uses only system CMD/findstr and the assigned workspace.
+        # Do not grant or mutate unrelated machine-wide developer installations.
+        # ToolHost and the real native sandbox runner remain unchanged.
+        monkeypatch.setattr(sandbox, "_discover_toolchain", lambda _policy: sandbox._Toolchain())
     node = _supported_node()
     worker_dir = Path(__file__).resolve().parents[1] / "supervisor" / "pi_worker"
     worker = worker_dir / "worker.mjs"
@@ -377,7 +402,7 @@ async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(
                     lambda message: message.method == "turn/completed"
                     and message.params.get("threadId") == thread_id
                     and message.params.get("turn", {}).get("id") == turn_id,
-                    timeout=30,
+                    timeout=90 if os.name == "nt" else 30,
                 )
                 turn = completed.params["turn"]
                 assert turn["status"] == "completed", turn.get("error")

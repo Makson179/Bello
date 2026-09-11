@@ -122,13 +122,27 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Install Python package and optional SDK
         run: python -m pip install ".[test,claude]" wheel
+      - name: Stage and prepare the Windows native helper
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe"
+          $sourceBin = Join-Path $PWD "supervisor/runtime/bin"
+          New-Item -ItemType Directory -Force -Path $sourceBin | Out-Null
+          Copy-Item $helper (Join-Path $sourceBin "bello-windows-sandbox.exe")
+          Copy-Item "native/windows-sandbox/THIRD_PARTY_NOTICES.txt" (Join-Path $sourceBin "THIRD_PARTY_NOTICES.txt")
+          ./native/windows-sandbox/ci/verify_host_setup.ps1 `
+            -Helper $helper -Phase Prepare `
+            -SnapshotPath (Join-Path $env:RUNNER_TEMP "bello-host-setup-baseline.json") `
+            -Report (Join-Path $env:RUNNER_TEMP "bello-host-setup-prepare.json")
       - name: Run Pi worker tests
         working-directory: supervisor/pi_worker
         run: npm test
       - name: Run full applicable Python suite except the separately gated Pi integration
+        env:
+          BELLO_REQUIRE_PI_INTEGRATION: "1"
         run: python -m pytest -v -o faulthandler_timeout=120 --ignore=tests/test_runtime_pi_integration.py
       - name: Run real offline Pi SDK and native sandbox integration
-        if: runner.os != 'Windows'
         env:
           BELLO_REQUIRE_NATIVE_SANDBOX: "1"
           BELLO_REQUIRE_PI_INTEGRATION: "1"
@@ -142,3 +156,23 @@ jobs:
       - name: Verify doctor has no legacy executor dependency
         if: runner.os == 'Windows'
         run: python -m pytest -q tests/test_doctor.py::test_doctor_does_not_start_the_removed_codex_executor
+      - name: Restore the Windows host setup ACL
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $snapshot = Join-Path $env:RUNNER_TEMP "bello-host-setup-baseline.json"
+          if (Test-Path -LiteralPath $snapshot) {
+            $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe"
+            ./native/windows-sandbox/ci/verify_host_setup.ps1 `
+              -Helper $helper -Phase Restore -SnapshotPath $snapshot `
+              -Report (Join-Path $env:RUNNER_TEMP "bello-host-setup-restore.json")
+          }
+      - name: Upload Windows host setup verification
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-host-setup-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/bello-host-setup-prepare.json
+            ${{ runner.temp }}/bello-host-setup-restore.json
+          if-no-files-found: ignore

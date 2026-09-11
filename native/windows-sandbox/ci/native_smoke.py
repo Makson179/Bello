@@ -138,6 +138,26 @@ def main() -> int:
     arguments = parser.parse_args()
     helper = arguments.helper.resolve(strict=True)
     node_source = arguments.node_source.resolve(strict=True)
+    status_process = subprocess.run(
+        [str(helper), "host-status"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    if status_process.returncode != 0:
+        raise AssertionError(f"non-admin host status failed: {status_process.stderr!r}")
+    host_status = json.loads(status_process.stdout)
+    if host_status.get("kind") != "hostPreparation" or host_status.get("prepared") is not True:
+        raise AssertionError(f"host is not prepared for the non-admin smoke: {host_status!r}")
+    system_root = str(host_status["systemRoot"])
+    unauthorized_prepare = subprocess.run(
+        [str(helper), "host-prepare"],
+        capture_output=True,
+        timeout=30,
+    )
+    if unauthorized_prepare.returncode == 0:
+        raise AssertionError("host preparation unexpectedly accepted a non-admin caller")
     base = Path(tempfile.mkdtemp(prefix="bello-native-standard-user-")).resolve()
     root = base / "workspace"
     root.mkdir()
@@ -213,6 +233,29 @@ def main() -> int:
     )
     if code != 0 or node_marker.read_text(encoding="utf-8") != "STAGED_NODE_OK":
         raise AssertionError(f"staged per-user Node toolchain failed: {output!r}")
+
+    metadata_script = root / "root-metadata-only.js"
+    metadata_script.write_text(
+        "const fs=require('fs');\n"
+        f"const root={json.dumps(system_root)};\n"
+        "if(!fs.lstatSync(root).isDirectory())process.exit(91);\n"
+        "try { fs.readdirSync(root); process.exit(92); }\n"
+        "catch(e) { if(e.code==='EACCES'||e.code==='EPERM')process.exit(23); throw e; }\n",
+        encoding="utf-8",
+    )
+    output, code = invoke(
+        helper,
+        request(
+            root,
+            f'"{staged_node}" "{metadata_script}"',
+            readable_roots=(toolchain,),
+        ),
+    )
+    if code != 23:
+        raise AssertionError(
+            "system-root metadata setup must allow lstat but not directory listing: "
+            f"exit={code}, output={output!r}"
+        )
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))
@@ -294,6 +337,8 @@ def main() -> int:
                 "schemaVersion": 1,
                 "runner": platform.platform(),
                 "standardUser": True,
+                "hostPrepared": True,
+                "systemRootListingDenied": True,
                 "mode": "workspace-write",
                 "fileCount": object_count,
                 "directoryCount": 21,

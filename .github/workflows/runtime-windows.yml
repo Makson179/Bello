@@ -45,6 +45,17 @@ jobs:
           cargo fmt --manifest-path native/windows-sandbox/Cargo.toml --all -- --check
           cargo check --locked --manifest-path native/windows-sandbox/Cargo.toml --target x86_64-pc-windows-msvc
           cargo clippy --locked --manifest-path native/windows-sandbox/Cargo.toml --all-targets -- -D warnings
+      - name: Prepare and verify metadata-only Windows host setup
+        id: host_setup
+        shell: pwsh
+        run: |
+          cargo build --locked --manifest-path native/windows-sandbox/Cargo.toml --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "host setup helper build failed" }
+          $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/debug/bello-windows-sandbox.exe"
+          ./native/windows-sandbox/ci/verify_host_setup.ps1 `
+            -Helper $helper -Phase Prepare `
+            -SnapshotPath (Join-Path $env:RUNNER_TEMP "bello-host-setup-baseline.json") `
+            -Report (Join-Path $env:RUNNER_TEMP "bello-host-setup-prepare.json")
       - name: Run native Rust unit tests
         id: native_unit_tests
         continue-on-error: true
@@ -74,6 +85,24 @@ jobs:
           BELLO_REQUIRE_NATIVE_SANDBOX: "1"
           BELLO_WINDOWS_SANDBOX_TIMING_REPORT: ${{ runner.temp }}\bello-windows-sandbox-timing-pytest.json
         run: python -m pytest -v -o faulthandler_timeout=120 tests/test_runtime_sandbox.py tests/test_runtime_windows_sandbox.py
+      - name: Run real Bello and Pi integration with the local test provider
+        id: pi_integration_tests
+        continue-on-error: true
+        shell: pwsh
+        env:
+          BELLO_REQUIRE_NATIVE_SANDBOX: "1"
+          BELLO_REQUIRE_PI_INTEGRATION: "1"
+        run: |
+          $report = Join-Path $env:RUNNER_TEMP "bello-windows-pi-integration.xml"
+          python -m pytest -v -o faulthandler_timeout=120 `
+            --junitxml $report `
+            tests/test_runtime_pi_integration.py tests/test_runtime_pipeline_integration.py
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) { throw "Bello/Pi integration tests failed with exit $testExit" }
+          [xml]$results = Get-Content -LiteralPath $report -Raw
+          if ($results.SelectNodes("//testcase").Count -eq 0 -or $results.SelectNodes("//testcase/skipped").Count -ne 0) {
+            throw "Bello/Pi integration must actually run; zero tests or skipped cases are not accepted"
+          }
       - name: Trace failing native file operations
         if: always() && (steps.native_unit_tests.outcome == 'failure' || steps.native_integration_tests.outcome == 'failure')
         continue-on-error: true
@@ -143,6 +172,7 @@ jobs:
               raise SystemExit(f"sdist missing: {sorted(missing)}")
           '@ | python - $wheels[0].FullName $sdists[0].FullName
       - name: Run native enforcement as a non-admin standard user
+        id: standard_user_tests
         shell: pwsh
         run: |
           $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe"
@@ -152,6 +182,18 @@ jobs:
             -Helper $helper `
             -NodeSource (Get-Command node).Source `
             -Report $report
+      - name: Restore and verify the original host setup ACL
+        id: host_restore
+        if: always()
+        shell: pwsh
+        run: |
+          $snapshot = Join-Path $env:RUNNER_TEMP "bello-host-setup-baseline.json"
+          if (Test-Path -LiteralPath $snapshot) {
+            $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/debug/bello-windows-sandbox.exe"
+            ./native/windows-sandbox/ci/verify_host_setup.ps1 `
+              -Helper $helper -Phase Restore -SnapshotPath $snapshot `
+              -Report (Join-Path $env:RUNNER_TEMP "bello-host-setup-restore.json")
+          }
       - name: Upload native packages and timing reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -163,10 +205,14 @@ jobs:
             ${{ runner.temp }}\bello-standard-user-output\*.json
             ${{ runner.temp }}/bello-standard-user-output/standard-user-stdout.txt
             ${{ runner.temp }}/bello-standard-user-output/standard-user-stderr.txt
+            ${{ runner.temp }}/bello-host-setup-prepare.json
+            ${{ runner.temp }}/bello-host-setup-restore.json
+            ${{ runner.temp }}/bello-windows-pi-integration.xml
           if-no-files-found: error
       # Collect independent evidence after a failure, but never report this
-      # job as successful without both required test groups passing.
-      - name: Require native unit and integration tests to pass
-        if: always() && (steps.native_unit_tests.outcome != 'success' || steps.native_integration_tests.outcome != 'success')
+      # job as successful without setup, both test groups, non-admin enforcement,
+      # and restoration all passing. Diagnostic continuation never masks failure.
+      - name: Require all native sandbox checks to pass
+        if: always() && (steps.host_setup.outcome != 'success' || steps.native_unit_tests.outcome != 'success' || steps.native_integration_tests.outcome != 'success' || steps.pi_integration_tests.outcome != 'success' || steps.standard_user_tests.outcome != 'success' || steps.host_restore.outcome != 'success')
         shell: pwsh
-        run: throw "Native unit or integration tests failed or did not run. See the required test steps."
+        run: throw "A required native setup, enforcement, or cleanup check failed or did not run."

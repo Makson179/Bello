@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Iterator
@@ -66,7 +67,12 @@ def _supported_node() -> Path:
     pytest.skip(message)
 
 
-def _pytest_command() -> str:
+def _pytest_command(windows_python: Path | None = None) -> str:
+    if windows_python is not None:
+        return subprocess.list2cmdline([
+            str(windows_python), "-I", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+            "test_solution.py",
+        ])
     executable = shutil.which("pytest")
     if executable is None:
         pytest.skip("the offline pipeline fixture requires pytest on the host")
@@ -77,6 +83,65 @@ def _pytest_command() -> str:
         f"{shlex_quote(str(Path(executable).resolve()))} "
         "-q -p no:cacheprovider test_solution.py"
     )
+
+
+def _stage_windows_pytest_runtime(destination: Path) -> Path:
+    """Copy the trusted interpreter and pytest into an isolated test toolchain.
+
+    Never grant ACLs on the machine-wide Python installation. Copy its stdlib,
+    DLLs, and the installed pytest distributions with their declared runtime
+    dependencies; do not include unrelated plugins, SDKs, or host settings.
+    """
+    from importlib import metadata
+
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+
+    base = Path(sys.base_prefix).resolve(strict=True)
+    destination.mkdir()
+    for source in base.iterdir():
+        if source.is_file() and source.suffix.lower() in {".exe", ".dll", ".zip"}:
+            shutil.copy2(source, destination / source.name)
+    shutil.copytree(
+        base / "Lib", destination / "Lib",
+        ignore=shutil.ignore_patterns("site-packages", "__pycache__", "test", "tests"),
+    )
+    if (base / "DLLs").is_dir():
+        shutil.copytree(base / "DLLs", destination / "DLLs")
+
+    site = destination / "Lib" / "site-packages"
+    pending = ["pytest"]
+    copied: set[str] = set()
+    while pending:
+        name = canonicalize_name(pending.pop())
+        if name in copied:
+            continue
+        copied.add(name)
+        distribution = metadata.distribution(name)
+        assert distribution.files, f"installed test dependency has no file manifest: {name}"
+        for relative in distribution.files:
+            # Wheel entry-point scripts can live above site-packages. We invoke
+            # `python -m pytest` and copy only files inside the library root.
+            if relative.is_absolute() or ".." in relative.parts or relative.suffix == ".pyc":
+                continue
+            source = Path(distribution.locate_file(relative))
+            if source.is_file():
+                target = site / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+        for specification in distribution.requires or ():
+            requirement = Requirement(specification)
+            if requirement.marker is None or requirement.marker.evaluate({"extra": ""}):
+                pending.append(requirement.name)
+
+    python = destination / "python.exe"
+    assert python.is_file(), "Windows integration requires a conventional CPython runtime"
+    probe = subprocess.run(
+        [str(python), "-I", "-m", "pytest", "--version"],
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    assert probe.stdout.startswith("pytest "), probe.stdout
+    return python
 
 
 def shlex_quote(value: str) -> str:
@@ -375,7 +440,7 @@ class _PipelineProviderState:
                 "chatcmpl-coder-3",
                 "call-coder-pytest",
                 "exec_command",
-                {"command": self.pytest_command, "cwd": "app", "timeout": 30},
+                {"command": self.pytest_command, "cwd": "app", "timeout": 60 if os.name == "nt" else 30},
             )
         if "1 passed" not in serialized:
             raise AssertionError("coder did not receive a passing pytest result")
@@ -430,7 +495,7 @@ class _PipelineProviderState:
                 "chatcmpl-adversary-2",
                 "call-adversary-pytest",
                 "exec_command",
-                {"command": self.pytest_command, "cwd": "app", "timeout": 30},
+                {"command": self.pytest_command, "cwd": "app", "timeout": 60 if os.name == "nt" else 30},
             )
         if "1 passed" not in serialized:
             raise AssertionError("adversary did not receive its passing probe result")
@@ -535,7 +600,7 @@ def _local_provider(
 def _worker_environment(node: Path, home: Path, scratch: Path) -> dict[str, str]:
     home.mkdir()
     scratch.mkdir()
-    return {
+    environment = {
         "HOME": str(home),
         "TMPDIR": str(scratch),
         "PATH": os.pathsep.join((str(node.parent), "/usr/bin", "/bin")),
@@ -544,6 +609,19 @@ def _worker_environment(node: Path, home: Path, scratch: Path) -> dict[str, str]
         "NO_PROXY": "127.0.0.1,localhost",
         "no_proxy": "127.0.0.1,localhost",
     }
+    if os.name == "nt":
+        for name in ("SystemRoot", "WINDIR", "ComSpec", "PATHEXT"):
+            if value := os.environ.get(name):
+                environment[name] = value
+        environment.update({
+            "USERPROFILE": str(home),
+            "LOCALAPPDATA": str(home / "AppData" / "Local"),
+            "APPDATA": str(home / "AppData" / "Roaming"),
+            "TEMP": str(scratch),
+            "TMP": str(scratch),
+            "PATH": os.pathsep.join((str(node.parent), str(Path(os.environ["SystemRoot"]) / "System32"))),
+        })
+    return environment
 
 
 def _git(project: Path, *args: str) -> str:
@@ -576,7 +654,6 @@ class _QuietTUI:
         self.messages.append(("STATUS", message))
 
 
-@pytest.mark.skipif(os.name == "nt", reason="restricted Windows execution intentionally fails closed")
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("reasoning", "intelligence"),
@@ -591,6 +668,19 @@ async def test_real_pi_offline_coder_completion_adversary_pipeline(
     reasoning: bool,
     intelligence: str,
 ) -> None:
+    windows_python: Path | None = None
+    if os.name == "nt":
+        if os.environ.get("BELLO_REQUIRE_PI_INTEGRATION") != "1":
+            pytest.skip("Windows Pi integration requires the native CI host-setup fixture")
+        from supervisor.runtime import sandbox
+
+        windows_python = _stage_windows_pytest_runtime(tmp_path / "staged-python")
+        # Declare only the copied test runtime as a host-selected dependency.
+        # The actual ToolHost, OS enforcement, and all controller gates run.
+        monkeypatch.setattr(
+            sandbox, "_discover_toolchain",
+            lambda _policy: sandbox._Toolchain(readable_roots=(windows_python.parent,)),
+        )
     node = _supported_node()
     worker_dir = Path(__file__).resolve().parents[1] / "supervisor" / "pi_worker"
     worker = worker_dir / "worker.mjs"
@@ -667,7 +757,7 @@ async def test_real_pi_offline_coder_completion_adversary_pipeline(
     inserted = False
     try:
         with _local_provider(
-            _pytest_command(),
+            _pytest_command(windows_python),
             expected_reasoning_effort="high" if reasoning else None,
         ) as (base_url, provider):
             (agent_dir / "models.json").write_text(
@@ -741,7 +831,7 @@ async def test_real_pi_offline_coder_completion_adversary_pipeline(
             client._engines["pi"] = transport
             inserted = True
 
-            await asyncio.wait_for(controller.run(), timeout=90)
+            await asyncio.wait_for(controller.run(), timeout=240 if os.name == "nt" else 90)
 
             assert not provider.errors
             assert provider.finished_roles == {
