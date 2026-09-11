@@ -619,6 +619,14 @@ mod tests {
         let mut descriptor: SECURITY_DESCRIPTOR = unsafe { mem::zeroed() };
         let pointer = &mut descriptor as *mut _ as *mut c_void;
         let preserved = SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED | SE_DACL_AUTO_INHERIT_REQ;
+        // The native setter needs the request bit to retain an existing
+        // AUTO_INHERITED state. This set-only bit is absent from queried SDs.
+        let requested = (control & preserved)
+            | if control & SE_DACL_AUTO_INHERITED != 0 {
+                SE_DACL_AUTO_INHERIT_REQ
+            } else {
+                0
+            };
         if unsafe { InitializeSecurityDescriptor(pointer, 1) } == 0
             || unsafe {
                 SetSecurityDescriptorDacl(
@@ -628,7 +636,7 @@ mod tests {
                     i32::from(control & SE_DACL_DEFAULTED != 0),
                 )
             } == 0
-            || unsafe { SetSecurityDescriptorControl(pointer, preserved, control & preserved) } == 0
+            || unsafe { SetSecurityDescriptorControl(pointer, preserved, requested) } == 0
         {
             return Err(crate::winutil::last_error(
                 "initialize object-only DACL probe",
@@ -844,9 +852,11 @@ mod tests {
                 "object-only update changed root DACL control flags"
             );
             for (path, before) in private_paths.iter().zip(&private_before) {
+                let after = object_dacl_snapshot(&open_path(path, false)?)?;
                 ensure!(
-                    &object_dacl_snapshot(&open_path(path, false)?)? == before,
-                    "root grant changed private DACL bytes or control flags"
+                    &after == before,
+                    "root grant changed {} DACL: before={before:?}, after={after:?}",
+                    path.display()
                 );
             }
             for relative in ["ordinary", "ordinary\\existing.txt"] {
@@ -903,6 +913,26 @@ mod tests {
                 "echo ROOT>root.txt",
             ] {
                 ensure!(command(step)? == 0, "sparse child operation failed: {step}");
+            }
+            for relative in [".", "renamed"] {
+                ensure!(
+                    command(&format!("icacls {relative}"))? == 0,
+                    "icacls could not read the allowed object DACL"
+                );
+                let path = if relative == "." {
+                    root.clone()
+                } else {
+                    root.join(relative)
+                };
+                let before = object_dacl_snapshot(&open_path(&path, false)?)?;
+                ensure!(
+                    command(&format!("icacls {relative} /inheritance:e"))? != 0,
+                    "child unexpectedly gained WRITE_DAC on {relative}"
+                );
+                ensure!(
+                    object_dacl_snapshot(&open_path(&path, false)?)? == before,
+                    "child modified {relative} DACL or inheritance flags"
+                );
             }
             ensure!(
                 fs::read_to_string(root.join("renamed").join("second.txt"))?.trim() == "CHILD",
