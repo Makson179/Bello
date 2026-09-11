@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import stat
 import sys
 import time
 
@@ -112,6 +113,76 @@ def test_status_is_read_only_without_a_launch_and_marks_dead_process_stale(tmp_p
     stale = launcher.status(project)
     assert stale["launcher"]["status"] == "stale"
     assert stale["launcher"]["belloProcessAliveUnverified"] is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the race fixture unlinks an open POSIX inode")
+def test_launcher_json_read_rechecks_atomically_replaced_unlinked_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = _load_launcher()
+    path = tmp_path / "state.json"
+    replacement = tmp_path / "replacement.json"
+    path.write_text('{"status": "running"}', encoding="utf-8")
+    replacement.write_text('{"status": "exited"}', encoding="utf-8")
+    original_lstat = Path.lstat
+    calls = 0
+
+    with path.open("rb") as old_inode:
+        def racing_lstat(candidate: Path):
+            nonlocal calls
+            if candidate == path:
+                calls += 1
+                if calls == 1:
+                    os.replace(replacement, path)
+                    old_info = os.fstat(old_inode.fileno())
+                    assert old_info.st_nlink == 0
+                    assert old_info.st_ino != original_lstat(path).st_ino
+                    return old_info
+            return original_lstat(candidate)
+
+        monkeypatch.setattr(Path, "lstat", racing_lstat)
+        assert launcher._read_json(path) == {"status": "exited"}
+    assert calls == 2
+
+
+@pytest.mark.parametrize(
+    ("next_mode", "next_links", "next_inode", "expected_calls", "message"),
+    [
+        (stat.S_IFREG | 0o600, 0, 10, 3, "ordinary, unshared"),
+        (stat.S_IFREG | 0o600, 1, 10, 2, "ordinary, unshared"),
+        (stat.S_IFREG | 0o600, 2, 11, 2, "ordinary, unshared"),
+        (stat.S_IFDIR | 0o700, 1, 11, 2, "ordinary, unshared"),
+        (stat.S_IFLNK | 0o700, 1, 11, 2, "symbolic link"),
+    ],
+)
+def test_launcher_unlinked_inode_retry_stays_bounded_and_rejects_unsafe_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    next_mode: int,
+    next_links: int,
+    next_inode: int,
+    expected_calls: int,
+    message: str,
+) -> None:
+    launcher = _load_launcher()
+    path = tmp_path / "state.json"
+    unlinked = os.stat_result((stat.S_IFREG | 0o600, 10, 1, 0, 0, 0, 0, 0, 0, 0))
+    replacement = os.stat_result((next_mode, next_inode, 1, next_links, 0, 0, 0, 0, 0, 0))
+    calls = 0
+    original_lstat = Path.lstat
+
+    def racing_lstat(candidate: Path):
+        nonlocal calls
+        if candidate != path:
+            return original_lstat(candidate)
+        calls += 1
+        return unlinked if calls == 1 else replacement
+
+    monkeypatch.setattr(Path, "lstat", racing_lstat)
+    with pytest.raises(launcher.LauncherError, match=message):
+        launcher._safe_regular_file(path, path.name)
+    assert calls == expected_calls
 
 
 @pytest.mark.skipif(os.name == "nt", reason="the test fixture uses a POSIX shebang")

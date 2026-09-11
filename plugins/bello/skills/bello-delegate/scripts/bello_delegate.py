@@ -82,14 +82,26 @@ def _run_directory(project: Path, *, create: bool) -> Path:
 
 
 def _safe_regular_file(path: Path, label: str) -> None:
-    if path.is_symlink():
-        raise LauncherError(f"{label} cannot be a symbolic link: {path}")
-    try:
-        info = path.stat()
-    except FileNotFoundError:
-        return
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-        raise LauncherError(f"{label} must be an ordinary, unshared file: {path}")
+    unlinked_identities: set[tuple[int, int]] = set()
+    for _ in range(3):
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(info.st_mode):
+            raise LauncherError(f"{label} cannot be a symbolic link: {path}")
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink not in (0, 1):
+            break
+        identity = (info.st_dev, info.st_ino)
+        if info.st_nlink == 1:
+            if identity not in unlinked_identities:
+                return
+            break
+        # An atomic state update can unlink the inode after pathname lookup but
+        # before lstat reads its metadata. Recheck the replacement, never accept
+        # that unlinked inode itself or relax the hard-link/symlink checks.
+        unlinked_identities.add(identity)
+    raise LauncherError(f"{label} must be an ordinary, unshared file: {path}")
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
