@@ -68,6 +68,8 @@ jobs:
             "native/windows-sandbox/THIRD_PARTY_NOTICES.txt" `
             (Join-Path $sourceBin "THIRD_PARTY_NOTICES.txt")
       - name: Run fail-closed Windows integration tests
+        id: native_integration_tests
+        continue-on-error: true
         env:
           BELLO_REQUIRE_NATIVE_SANDBOX: "1"
           BELLO_WINDOWS_SANDBOX_TIMING_REPORT: ${{ runner.temp }}\bello-windows-sandbox-timing-pytest.json
@@ -128,6 +130,28 @@ jobs:
             -Helper $helper `
             -NodeSource (Get-Command node).Source `
             -Report $report
+      - name: Trace failing native file operations
+        if: always() && (steps.native_unit_tests.outcome == 'failure' || steps.native_integration_tests.outcome == 'failure')
+        continue-on-error: true
+        shell: pwsh
+        env:
+          BELLO_REQUIRE_NATIVE_SANDBOX: "1"
+        run: |
+          ./native/windows-sandbox/ci/trace_file_access.ps1 `
+            -Python (Get-Command python).Source `
+            -OutputDirectory (Join-Path $env:RUNNER_TEMP "bello-file-trace")
+      - name: Upload only filtered file-access diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-file-trace-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/bello-file-trace/summary.json
+            ${{ runner.temp }}/bello-file-trace/cmd-events.jsonl
+            ${{ runner.temp }}/bello-file-trace/node-events.jsonl
+            ${{ runner.temp }}/bello-file-trace/cmd-test.txt
+            ${{ runner.temp }}/bello-file-trace/node-test.txt
+          if-no-files-found: ignore
       - name: Upload native packages and timing reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -138,9 +162,9 @@ jobs:
             ${{ runner.temp }}\bello-windows-sandbox-timing-*.json
             ${{ runner.temp }}\bello-standard-user-output\*.json
           if-no-files-found: error
-      # Collect integration evidence even when a unit test fails, but never
-      # report this job as successful without all native unit tests passing.
-      - name: Require native Rust unit tests to pass
-        if: always() && steps.native_unit_tests.outcome != 'success'
+      # Collect independent evidence after a failure, but never report this
+      # job as successful without both required test groups passing.
+      - name: Require native unit and integration tests to pass
+        if: always() && (steps.native_unit_tests.outcome != 'success' || steps.native_integration_tests.outcome != 'success')
         shell: pwsh
-        run: throw "Native Rust unit tests failed or did not run. See the unit-test step."
+        run: throw "Native unit or integration tests failed or did not run. See the required test steps."
