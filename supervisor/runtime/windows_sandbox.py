@@ -118,19 +118,20 @@ def _helper_environment() -> dict[str, str]:
 
 def host_preparation(
     operation: Literal["status", "prepare", "remove"], *, drive: str | None = None,
-    null_device: bool = False,
+    null_device: bool = False, network: bool = False,
 ) -> dict[str, object]:
     """Run only a fixed host preparation command, never an agent.
 
     Elevation is deliberately external: the user opens an administrator terminal
-    for prepare/remove. Only a drive letter or the fixed NUL device can be selected,
+    for prepare/remove. Only a drive letter, fixed NUL device, or fixed network service can be selected,
     never a task, shell command, directory path, SID, or permission mask. The
     native helper checks elevation and resolves and pins actual Windows targets.
     """
     if operation not in {"status", "prepare", "remove"}:
         raise WindowsSandboxBackendError("unknown Windows sandbox preparation operation")
-    if type(null_device) is not bool or (null_device and drive is not None):
-        raise WindowsSandboxBackendError("select either --null-device or --drive, not both")
+    if (type(null_device) is not bool or type(network) is not bool
+            or sum((null_device, network, drive is not None)) > 1):
+        raise WindowsSandboxBackendError("select only one of --null-device, --network, or --drive")
     if drive is not None:
         if (
             not isinstance(drive, str) or len(drive) != 2
@@ -145,7 +146,7 @@ def host_preparation(
     try:
         completed = subprocess.run(
             [os.fspath(helper), f"host-{operation}",
-             *(["--null-device"] if null_device else ["--drive", drive] if drive else [])],
+             *(["--network"] if network else ["--null-device"] if null_device else ["--drive", drive] if drive else [])],
             cwd=helper.parent,
             env=_helper_environment(),
             stdin=subprocess.DEVNULL,
@@ -171,6 +172,8 @@ def host_preparation(
         value = json.loads(completed.stdout.decode("utf-8", "strict"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise WindowsSandboxBackendError("Windows sandbox preparation response is not JSON") from exc
+    if network:
+        return _validate_network_preparation(value, operation)
     if null_device:
         return _validate_null_preparation(value, operation)
     if (
@@ -258,6 +261,43 @@ def _validate_null_preparation(value: object, operation: str) -> dict[str, objec
         or (operation == "remove" and value["prepared"])
     ):
         raise WindowsSandboxBackendError("Windows sandbox NUL preparation response has invalid fields")
+    return value
+
+
+def _validate_network_preparation(value: object, operation: str) -> dict[str, object]:
+    expected = {"protocolVersion", "kind", "operation", "serviceName", "installPath",
+                "installed", "running", "prepared", "changed", "servicePid",
+                "activeLeases", "retainedLeases", "policyVersion", "binaryMatches"}
+    if not isinstance(value, dict) or set(value) != expected:
+        raise WindowsSandboxBackendError("Windows offline network response has invalid fields")
+    if (
+        any(type(value[key]) is not bool for key in
+            ("installed", "running", "prepared", "changed", "binaryMatches"))
+        or any(type(value[key]) is not int or value[key] < 0 for key in
+               ("protocolVersion", "policyVersion", "servicePid", "activeLeases", "retainedLeases"))
+        or value["protocolVersion"] != PROTOCOL_VERSION or value["policyVersion"] != 1
+        or value["kind"] != "networkPreparation" or value["operation"] != operation
+        or value["serviceName"] != "BelloOfflineNetwork"
+        or not isinstance(value["installPath"], str)
+    ):
+        raise WindowsSandboxBackendError("Windows offline network response has invalid values")
+    path = PureWindowsPath(value["installPath"])
+    if (not path.is_absolute() or len(path.drive) != 2
+            or path.drive[0] not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+            or path.drive[1] != ":" or ".." in path.parts or "\x00" in value["installPath"]
+            or path.parts[-2:] != ("BelloOfflineNetwork", "bello-windows-sandbox.exe")):
+        raise WindowsSandboxBackendError("Windows offline network response has an invalid install path")
+    if (
+        (not value["installed"] and any(value[k] for k in
+         ("running", "prepared", "binaryMatches", "servicePid", "activeLeases", "retainedLeases")))
+        or value["running"] != (value["servicePid"] > 0)
+        or value["prepared"] != (value["running"] and value["binaryMatches"])
+        or (not value["running"] and (value["activeLeases"] or value["retainedLeases"]))
+        or (operation == "status" and value["changed"])
+        or (operation == "prepare" and not value["prepared"])
+        or (operation == "remove" and value["installed"])
+    ):
+        raise WindowsSandboxBackendError("Windows offline network response has inconsistent state")
     return value
 
 

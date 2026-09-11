@@ -30,7 +30,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath};
 
-const JOURNAL_VERSION: u32 = 4;
+const JOURNAL_VERSION: u32 = 5;
 const MAX_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -53,6 +53,10 @@ struct JournalData {
     // but a v3 record with non-empty metadata_paths is explicitly rejected.
     #[serde(default)]
     metadata_paths: Vec<RecordedPath>,
+    // A broker-owned duplicate Job can survive helper death. v5 recovery must
+    // receive its explicit empty-job ACK before touching any filesystem ACL.
+    #[serde(default)]
+    broker_required: bool,
 }
 
 pub struct Journal {
@@ -114,6 +118,7 @@ impl Journal {
                 touched_paths: Vec::new(),
                 created_paths: Vec::new(),
                 metadata_paths: Vec::new(),
+                broker_required: false,
             },
         };
         validate_journal(&journal.data)?;
@@ -123,6 +128,11 @@ impl Journal {
 
     pub fn profile_name(&self) -> &str {
         &self.data.profile_name
+    }
+
+    pub fn require_network_broker(&mut self) -> Result<()> {
+        self.data.broker_required = true;
+        self.persist()
     }
 
     pub fn before_acl_mutation(&mut self, path: &Path, handle: &Handle) -> Result<()> {
@@ -437,6 +447,11 @@ fn mutex_is_live(name: &str) -> Result<bool> {
     }
 }
 
+pub(crate) fn profile_marker_is_live(profile: &str) -> Result<bool> {
+    validate_profile_name(profile)?;
+    mutex_is_live(&mutex_name(profile))
+}
+
 pub fn recover_stale(state_dir: &Path) -> Result<()> {
     if !state_dir.exists() {
         return Ok(());
@@ -479,6 +494,11 @@ pub fn recover_stale(state_dir: &Path) -> Result<()> {
         if mutex_is_live(&data.mutex_name)? {
             continue;
         }
+        if data.broker_required {
+            crate::network_broker::recover(&data.profile_name).context(
+                "offline broker could not prove the stale job empty; journal and ACLs retained",
+            )?;
+        }
         cleanup_data(&data)
             .with_context(|| format!("could not recover stale sandbox {}", data.profile_name))?;
         let _acl_lock = crate::global_acl_lock::GlobalAclLock::acquire()?;
@@ -493,8 +513,9 @@ fn validate_journal(data: &JournalData) -> Result<()> {
     if data.journal_version == 2 && data.mutex_name == format!("Local\\{}", data.profile_name) {
         return Err(anyhow!("legacy session-local recovery journal retained: another Windows session may still own this run; automatic recovery cannot establish its liveness"));
     }
-    if !matches!(data.journal_version, 3 | JOURNAL_VERSION)
+    if !matches!(data.journal_version, 3 | 4 | JOURNAL_VERSION)
         || (data.journal_version == 3 && !data.metadata_paths.is_empty())
+        || (data.journal_version < 5 && data.broker_required)
     {
         return Err(anyhow!("unsupported recovery journal version"));
     }
@@ -1065,6 +1086,33 @@ mod tests {
         old["journalVersion"] = 3.into();
         old.as_object_mut().unwrap().remove("metadataPaths");
         journal.data = serde_json::from_value(old).unwrap();
+        journal.persist().unwrap();
+        let path = journal.path.clone();
+        drop(journal);
+        recover_stale(&base.join("state")).unwrap();
+        assert!(!path.exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn broker_recovery_marker_requires_v5_and_legacy_v4_remains_compatible() {
+        let (base, mut journal) = liveness_fixture();
+        assert_eq!(journal.data.journal_version, 5);
+        journal.require_network_broker().unwrap();
+        assert!(journal.data.broker_required);
+        for old in [3, 4] {
+            journal.data.journal_version = old;
+            assert!(validate_journal(&journal.data).is_err());
+        }
+        journal.data.broker_required = false;
+        journal.data.journal_version = 6;
+        assert!(validate_journal(&journal.data).is_err());
+        journal.data.journal_version = 4;
+        let mut legacy = serde_json::to_value(&journal.data).unwrap();
+        legacy.as_object_mut().unwrap().remove("brokerRequired");
+        journal.data = serde_json::from_value(legacy).unwrap();
+        assert!(!journal.data.broker_required);
+        validate_journal(&journal.data).unwrap();
         journal.persist().unwrap();
         let path = journal.path.clone();
         drop(journal);

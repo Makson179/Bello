@@ -159,7 +159,9 @@ def _sandbox_dependency_result() -> DoctorResult:
             "normal tasks do not require elevation. Check NUL device access separately with "
             "`bello runtime windows-sandbox status --null-device`; if missing, explicitly run "
             "`bello runtime windows-sandbox prepare --null-device` as administrator. "
-            "Windows resets the NUL permission on reboot."
+            "Windows resets the NUL permission on reboot. Offline runs additionally require "
+            "`bello runtime windows-sandbox prepare --network` once as administrator; "
+            "inspect that fixed service with `bello runtime windows-sandbox status --network`."
         )
     return DoctorResult("ok", f"OS sandbox executable found: {backend}", detail)
 

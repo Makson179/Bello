@@ -5,7 +5,9 @@ use crate::{acl, identity, journal, process, winutil};
 use anyhow::{anyhow, Context, Result};
 use identity::{create_profile, profile_local_app_data, random_profile_name, CapabilitySids};
 use journal::{create_live_mutex, mutex_name, recover_stale, state_directory, Journal};
-use process::{clean_environment, run_child_verified, start_parent_monitor, Job};
+use process::{
+    clean_environment, run_child_offline, run_child_verified, start_parent_monitor, Job,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -136,7 +138,15 @@ fn run(
     let mutex_name = mutex_name(&profile_name);
     let _live_mutex = create_live_mutex(&mutex_name)?;
     let mut journal = Journal::create(state_dir, &profile_name, &mutex_name, &authority_paths)?;
-    let mut capabilities = CapabilitySids::for_network(network_access)?;
+    if !network_access {
+        // Write ahead of any registration/Job duplication; crash recovery must
+        // not mistake the helper's death for death of the broker-held job.
+        journal.require_network_broker()?;
+    }
+    // Both modes need Winsock initialization (including Python's _overlapped).
+    // Offline mode MUST use run_child_offline below: that path requires the
+    // broker's persistent per-package deny filters before ResumeThread.
+    let mut capabilities = CapabilitySids::for_network(true)?;
     let sid = create_profile(journal.profile_name(), &capabilities)?;
     let profile_local = profile_local_app_data(sid.0)?;
     let job = Job::create()?;
@@ -300,16 +310,30 @@ fn run(
             drop(mutation_lock.take());
             Ok(())
         };
-        run_child_verified(
-            &command,
-            &cwd,
-            sid.0,
-            &mut capabilities,
-            &mut environment,
-            &job,
-            &cancelled,
-            &mut verify_access,
-        )
+        if network_access {
+            run_child_verified(
+                &command,
+                &cwd,
+                sid.0,
+                &mut capabilities,
+                &mut environment,
+                &job,
+                &cancelled,
+                &mut verify_access,
+            )
+        } else {
+            run_child_offline(
+                &command,
+                &cwd,
+                sid.0,
+                &mut capabilities,
+                &mut environment,
+                &job,
+                &cancelled,
+                &mut verify_access,
+                &profile_name,
+            )
+        }
     })();
 
     let requested_exit = operation.as_ref().copied().unwrap_or(125) as u32;

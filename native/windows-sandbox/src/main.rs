@@ -19,7 +19,17 @@ mod identity;
 #[cfg(windows)]
 mod journal;
 #[cfg(windows)]
+mod network_broker;
+#[cfg(all(windows, test))]
+mod network_ci_tests;
+#[cfg(windows)]
+mod network_protocol;
+#[cfg(windows)]
+mod network_setup;
+#[cfg(windows)]
 mod null_device;
+#[cfg(windows)]
+mod offline_network;
 #[cfg(windows)]
 mod process;
 #[cfg(windows)]
@@ -83,7 +93,7 @@ fn normalize_drive(value: &str) -> Result<String> {
 
 fn parse_host_arguments(
     mut arguments: impl Iterator<Item = std::ffi::OsString>,
-) -> Result<(&'static str, Option<String>, bool)> {
+) -> Result<(&'static str, Option<String>, bool, bool)> {
     let argument = arguments
         .next()
         .ok_or_else(|| anyhow!("missing fixed host operation"))?;
@@ -97,9 +107,10 @@ fn parse_host_arguments(
             ))
         }
     };
-    let (drive, null_device) = match arguments.next() {
-        None => (None, false),
-        Some(option) if option == "--null-device" => (None, true),
+    let (drive, null_device, network) = match arguments.next() {
+        None => (None, false, false),
+        Some(option) if option == "--null-device" => (None, true, false),
+        Some(option) if option == "--network" => (None, false, true),
         Some(option) if option == "--drive" => {
             let value = arguments
                 .next()
@@ -111,20 +122,21 @@ fn parse_host_arguments(
                         .ok_or_else(|| anyhow!("--drive must be ASCII"))?,
                 )?),
                 false,
+                false,
             )
         }
         _ => {
             return Err(anyhow!(
-                "only --drive D: or --null-device is accepted; no paths or commands"
+                "only --drive D:, --null-device, or --network is accepted; no paths or commands"
             ))
         }
     };
     if arguments.next().is_some() {
         return Err(anyhow!(
-            "host preparation accepts only one selector: --drive D: or --null-device"
+            "host preparation accepts only one selector: --drive D:, --null-device, or --network"
         ));
     }
-    Ok((operation, drive, null_device))
+    Ok((operation, drive, null_device, network))
 }
 
 fn dispatch() -> Result<Option<i32>> {
@@ -132,14 +144,21 @@ fn dispatch() -> Result<Option<i32>> {
     if arguments.is_empty() {
         return read_request().and_then(execute).map(Some);
     }
-    let (operation, drive, null_device) = parse_host_arguments(arguments.into_iter())?;
+    #[cfg(windows)]
+    if arguments.len() == 1 && arguments[0] == "--network-service" {
+        crate::network_broker::service_main()?;
+        return Ok(None);
+    }
+    let (operation, drive, null_device, network) = parse_host_arguments(arguments.into_iter())?;
     #[cfg(windows)]
     {
         // This branch never reads framed stdin, configuration, run/recovery
         // requests, or invokes a user-controlled command with elevated rights.
         let stdout = io::stdout();
         let mut writer = stdout.lock();
-        if null_device {
+        if network {
+            serde_json::to_writer(&mut writer, &network_setup::execute(operation)?)?;
+        } else if null_device {
             serde_json::to_writer(&mut writer, &null_device::execute(operation)?)?;
         } else {
             let report = match drive.as_deref() {
@@ -154,7 +173,7 @@ fn dispatch() -> Result<Option<i32>> {
     }
     #[cfg(not(windows))]
     {
-        let _ = (operation, drive, null_device);
+        let _ = (operation, drive, null_device, network);
         Err(anyhow!("Windows host preparation can run only on Windows"))
     }
 }
@@ -206,14 +225,21 @@ mod host_argument_tests {
     #[test]
     fn only_a_single_literal_drive_selector_is_accepted() {
         let parse = |args: &[&str]| parse_host_arguments(args.iter().map(std::ffi::OsString::from));
-        assert_eq!(parse(&["host-status"]).unwrap(), ("status", None, false));
+        assert_eq!(
+            parse(&["host-status"]).unwrap(),
+            ("status", None, false, false)
+        );
         assert_eq!(
             parse(&["host-prepare", "--drive", "d:"]).unwrap(),
-            ("prepare", Some("D:".to_owned()), false)
+            ("prepare", Some("D:".to_owned()), false, false)
         );
         assert_eq!(
             parse(&["host-prepare", "--null-device"]).unwrap(),
-            ("prepare", None, true)
+            ("prepare", None, true, false)
+        );
+        assert_eq!(
+            parse(&["host-prepare", "--network"]).unwrap(),
+            ("prepare", None, false, true)
         );
         for drive in [
             "D",
@@ -243,6 +269,10 @@ mod host_argument_tests {
             vec!["host-prepare", "--drive", "D:", "--null-device"],
             vec!["host-status", "--null-device", "NUL"],
             vec!["host-remove", "--null-device=NUL"],
+            vec!["host-prepare", "--network", "--null-device"],
+            vec!["host-prepare", "--network", "--drive", "D:"],
+            vec!["host-prepare", "--network=anything"],
+            vec!["host-prepare", "--network-service"],
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
         }

@@ -340,7 +340,7 @@ pub fn metadata_mutation_lock(path: &Path, handle: &Handle) -> Result<MetadataMu
 }
 
 impl SetupLock {
-    fn acquire() -> Result<Self> {
+    pub(crate) fn acquire() -> Result<Self> {
         let admin = known_sid(WinBuiltinAdministratorsSid)?;
         let system = known_sid(WinLocalSystemSid)?;
         let mut storage = [0_usize; 32];

@@ -5,8 +5,8 @@
 Bello supports native 64-bit Windows 11 and Windows Server 2022/2025 with
 Python 3.11 or newer. CI runs the complete applicable suite on Windows Server
 2022 with Python 3.11 and Windows Server 2025 with Python 3.14. Both jobs run
-`bello --help`; native Windows also runs a deterministic `bello doctor` smoke
-through a real app-server subprocess and records the exact GitHub runner image.
+`bello --help`, native sandbox checks and the Pi integration with a local test
+provider, and record the exact GitHub runner image.
 Windows on ARM, Windows 10, older Windows Server releases, FAT/exFAT
 workspaces, and remote filesystem providers are not claimed as supported
 because they are not in that matrix.
@@ -22,8 +22,7 @@ it is visible in a new PowerShell or Command Prompt session:
 
 1. Python 3.11 or newer (`py -3 --version`).
 2. Git for Windows (`git --version`).
-3. The Codex CLI (`codex --version`) with `codex app-server` support.
-4. A completed Codex login (`codex login`).
+3. Node.js 24 or newer (`node --version`) for the Pi runtime.
 
 Then install Bello without elevation:
 
@@ -31,12 +30,31 @@ Then install Bello without elevation:
 py -m pip install --user pipx
 py -m pipx ensurepath
 pipx install bello
+bello runtime install
+bello runtime login openai-codex
 bello doctor
 ```
 
-Neither Administrator access nor Windows Developer Mode is required. Bello's
-Windows isolation paths use private copies and native process controls instead
-of depending on privileged symbolic-link creation.
+Task execution does not need Administrator access or Windows Developer Mode.
+Host sandbox preparation does require an explicit administrator terminal:
+
+```powershell
+bello runtime windows-sandbox prepare
+bello runtime windows-sandbox prepare --null-device
+bello runtime windows-sandbox prepare --network
+```
+
+The first command grants only metadata access on fixed system directories.
+The second permits access to NUL, which Python test capture needs; Windows may
+reset that device permission on reboot. The third installs the fixed
+`BelloOfflineNetwork` service in Program Files. It starts with Windows and runs
+as LocalSystem only to manage blocking rules for sandbox processes. Agent
+commands do not run as administrator. Nothing elevates silently.
+
+Use the corresponding `status` commands to inspect setup without changing it.
+For a project or toolchain on another local drive, prepare only that drive's
+root with `bello runtime windows-sandbox prepare --drive D:`. Offline commands
+refuse to start if their network blocking rules cannot be established.
 
 ## Native use
 
@@ -48,13 +66,13 @@ bello --task .\TASK.md
 ```
 
 The interactive configuration editor is available through `bello config`.
-Commands proposed by Codex may use PowerShell or `cmd.exe`; ambiguous shell
+Commands proposed by the coder may use PowerShell or `cmd.exe`; ambiguous shell
 syntax is reviewed or denied rather than auto-approved.
 
 ## Filesystem locations
 
 - Prefer a short path on a local NTFS volume, such as `C:\src\project`.
-- A project, temporary directory, and isolated Codex home may be on different
+- A project, temporary directory, and isolated runtime home may be on different
   local volumes. Bello copies across volumes and does not create cross-volume
   hardlinks.
 - Drive-letter and UNC syntax is recognized. UNC/network shares and cloud-sync
@@ -78,12 +96,14 @@ still treated as an integrity failure instead of becoming trusted validation.
 
 ## WSL2 alternative
 
-Inside WSL2, install the Linux builds of Python, Git, Codex, and Bello and keep
+Inside WSL2, install the Linux builds of Python, Git, Node.js, Bubblewrap, and Bello and keep
 the project under the distribution's Linux filesystem, for example:
 
 ```bash
 cd ~/src/project
 pipx install bello
+bello runtime install
+bello runtime login openai-codex
 bello doctor
 bello --task TASK.md
 ```
@@ -94,17 +114,25 @@ the WSL home filesystem is the recommended location.
 
 ## Troubleshooting
 
-### `python`, `git`, `codex`, or `bello` is not found
+### `python`, `git`, `node`, or `bello` is not found
 
 Close and reopen the terminal after installation. Run `py -m pipx ensurepath`
 again for a pipx install. `bello doctor` prints the exact executable path it
-found for Git, Codex, and Bello, so a stale or mixed WSL/native PATH is visible.
+found for the runtime and Git, so a stale or mixed WSL/native PATH is visible.
 
-### Codex app-server or authentication fails
+### Runtime installation or authentication fails
 
-Run `codex --version`, `codex app-server --help`, and `codex login` in the same
-terminal. Then rerun `bello doctor`. Its schema-generation and authentication
-checks distinguish a missing app-server feature from a missing login.
+Run `node --version`, `bello runtime install`, and the login command for the
+selected provider in the same terminal. Then rerun `bello doctor`.
+
+### Offline network service is missing or outdated
+
+Check `bello runtime windows-sandbox status --network`. Explicitly run
+`bello runtime windows-sandbox prepare --network` as administrator when setup
+or a service binary update is needed. Updates and removal refuse active runs
+and retained leases; finish runs first. A service crash leaves blocking rules
+in place. Uncertain leases survive until a verified Windows restart, rather
+than removing protection from a process that might still be running.
 
 ### Snapshot creation reports a reparse, hardlink, or path-safety failure
 

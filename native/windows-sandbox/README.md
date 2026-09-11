@@ -51,10 +51,34 @@ EOF and discards output; standard Python test capture requires it. Device setup
 does not grant access to files or other devices and preserves unrelated ACEs,
 owner, group and integrity label. Windows resets its descriptor on reboot:
 check `host-status --null-device` again afterwards and explicitly prepare it
-from an administrator terminal if needed. No automatic elevation, service or
-scheduled task is installed. `host-remove --null-device` removes only the exact
+from an administrator terminal if needed. This selector installs no service or
+scheduled task and does not elevate automatically. `host-remove --null-device` removes only the exact
 named permission. The capability's narrow rights, not secrecy of its name,
 define the access granted.
+
+## Offline networking
+
+The separate, mutually exclusive `--network` selector prepares one fixed
+`BelloOfflineNetwork` Windows service. It requires explicit administrator
+approval and installs this helper under the OS Program Files directory, with
+an administrative owner and protected permissions. The service runs as
+LocalSystem and starts with Windows; agent commands remain unprivileged LPAC
+processes. There is no general elevated command or firewall-rule interface.
+
+An offline command is created suspended. Before it resumes, the service checks
+the real local caller, the child's AppContainer identity and its Job Object,
+then installs four Windows Filtering Platform BLOCK rules for that exact
+package SID: IPv4/IPv6 connect and receive/accept. The token can create a socket
+(needed even by Python imports), but the rules block traffic. If service setup
+or rule verification fails, the command does not run. Online commands do not
+use these blocking leases.
+
+Rules persist if the service crashes. Normal release requires the process Job
+to be empty; uncertain same-boot leases remain blocked. A verified new boot
+allows stale lease cleanup. Service removal or replacement refuses active or
+retained leases, and never removes unrelated firewall objects. Inspect with
+`bello runtime windows-sandbox status --network`; explicitly prepare/remove
+with the matching command in an administrator terminal.
 
 For other strict ancestors of allowed roots, the helper checks the actual child
 token and temporarily adds only missing metadata access for the unique per-run
@@ -73,10 +97,11 @@ Another local process can cause a bounded timeout by holding it; the helper then
 fails closed. This cooperative lock cannot serialize unrelated ACL-management
 tools that do not participate in the protocol.
 
-Journal v4 stores these ancestor grants separately from recursive authorities.
+Journal v5 stores these ancestor grants separately from recursive authorities
+and records whether crash recovery needs the network broker's empty-Job proof.
 Recovery validates their identities and revokes the exact per-run entry without
-walking or deleting the ancestor tree. Existing v3 journals remain readable
-without ancestor records.
+walking or deleting the ancestor tree. Existing v3/v4 journals remain readable;
+they do not require a broker that did not participate in those older runs.
 
 ## Command protocol and cleanup
 

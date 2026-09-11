@@ -54,6 +54,25 @@ const PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT: u32 = 1;
 // Hold this only while marking handles and creating the suspended process.
 static HANDLE_INHERIT_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(test)]
+thread_local! {
+    static TEST_BROKER_UNAVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn register_offline(
+    profile: &str,
+    pid: u32,
+    job: &Arc<Job>,
+) -> Result<crate::network_broker::OfflineLease> {
+    #[cfg(test)]
+    if TEST_BROKER_UNAVAILABLE.with(std::cell::Cell::get) {
+        return Err(anyhow!(
+            "test-only simulated missing offline-network service"
+        ));
+    }
+    crate::network_broker::register(profile, pid, job)
+}
+
 pub struct Job {
     handle: Handle,
     termination_failures: Mutex<Vec<String>>,
@@ -599,6 +618,58 @@ pub fn run_child_verified(
     cancelled: &Arc<AtomicBool>,
     verify_access: &mut dyn FnMut(&Handle) -> Result<()>,
 ) -> Result<i32> {
+    run_child_inner(
+        command,
+        cwd,
+        appcontainer_sid,
+        capabilities,
+        environment,
+        job,
+        cancelled,
+        verify_access,
+        None,
+    )
+}
+
+/// Socket creation is allowed, but the broker installs persistent per-package
+/// traffic denies before the suspended child is resumed.
+#[allow(clippy::too_many_arguments)]
+pub fn run_child_offline(
+    command: &str,
+    cwd: &Path,
+    appcontainer_sid: *mut c_void,
+    capabilities: &mut CapabilitySids,
+    environment: &mut [u16],
+    job: &Arc<Job>,
+    cancelled: &Arc<AtomicBool>,
+    verify_access: &mut dyn FnMut(&Handle) -> Result<()>,
+    profile_name: &str,
+) -> Result<i32> {
+    run_child_inner(
+        command,
+        cwd,
+        appcontainer_sid,
+        capabilities,
+        environment,
+        job,
+        cancelled,
+        verify_access,
+        Some(profile_name),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_child_inner(
+    command: &str,
+    cwd: &Path,
+    appcontainer_sid: *mut c_void,
+    capabilities: &mut CapabilitySids,
+    environment: &mut [u16],
+    job: &Arc<Job>,
+    cancelled: &Arc<AtomicBool>,
+    verify_access: &mut dyn FnMut(&Handle) -> Result<()>,
+    offline_profile: Option<&str>,
+) -> Result<i32> {
     if cancelled.load(Ordering::Acquire) {
         return Err(anyhow!(
             "sandbox launch cancelled because the controller closed stdin"
@@ -692,6 +763,18 @@ pub fn run_child_verified(
         let _ = job.terminate(125);
         return Err(error);
     }
+    let mut offline_lease = match offline_profile {
+        Some(profile) => match register_offline(profile, process.dwProcessId, job) {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                let _ = job.terminate(125);
+                return Err(
+                    error.context("offline-network protection unavailable; command not resumed")
+                );
+            }
+        },
+        None => None,
+    };
     if cancelled.load(Ordering::Acquire) {
         job.terminate(130)?;
     } else if unsafe { ResumeThread(thread_handle.raw()) } == u32::MAX {
@@ -718,12 +801,114 @@ pub fn run_child_verified(
     // A shell can return after starting a background descendant. Terminating
     // the job here guarantees no descendant survives past ACL revocation.
     job.terminate(exit_code)?;
+    if let Some(lease) = &mut offline_lease {
+        lease.release().context(
+            "command completed but offline-network lease cleanup failed; protection retained",
+        )?;
+    }
     Ok(exit_code as i32)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn simulate_missing_broker<T>(run: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_BROKER_UNAVAILABLE.with(|flag| flag.set(false));
+            }
+        }
+        TEST_BROKER_UNAVAILABLE.with(|flag| flag.set(true));
+        let _reset = Reset;
+        run()
+    }
+
+    pub(crate) struct SuspendedBrokerChild {
+        pub profile: String,
+        pub package: String,
+        pub pid: u32,
+        pub token: Handle,
+        pub job: Arc<Job>,
+        _process: Handle,
+        _thread: Handle,
+    }
+    impl Drop for SuspendedBrokerChild {
+        fn drop(&mut self) {
+            let _ = self.job.terminate(125);
+            let _ = crate::identity::delete_profile(&self.profile);
+        }
+    }
+    pub(crate) fn suspended_broker_child(lpac: bool) -> SuspendedBrokerChild {
+        let profile = crate::identity::random_profile_name().unwrap();
+        let mut capabilities = CapabilitySids::for_network(true).unwrap();
+        let sid = crate::identity::create_profile(&profile, &capabilities).unwrap();
+        let job = Job::create().unwrap();
+        let security = capabilities.security_capabilities(sid.0);
+        let policy = u32::from(lpac);
+        let jobs = [job.raw()];
+        let mut attributes = AttributeList::new(3).unwrap();
+        attributes
+            .set(PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &security)
+            .unwrap();
+        attributes
+            .set(
+                PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
+                &policy,
+            )
+            .unwrap();
+        attributes
+            .set_slice(PROC_THREAD_ATTRIBUTE_JOB_LIST, &jobs)
+            .unwrap();
+        let mut startup: STARTUPINFOEXW = unsafe { mem::zeroed() };
+        startup.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
+        startup.lpAttributeList = attributes.ptr();
+        let shell = system_directory().unwrap().join("cmd.exe");
+        let mut command = wide(command_processor_line(&shell, "exit /b 0"));
+        let mut info: PROCESS_INFORMATION = unsafe { mem::zeroed() };
+        assert_ne!(
+            unsafe {
+                CreateProcessW(
+                    wide(&shell).as_ptr(),
+                    command.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &startup.StartupInfo,
+                    &mut info,
+                )
+            },
+            0,
+            "{}",
+            last_error("test suspended child")
+        );
+        let child = Handle(info.hProcess);
+        let thread = Handle(info.hThread);
+        let token = verify_child_token(child.raw(), sid.0).unwrap();
+        SuspendedBrokerChild {
+            profile,
+            package: crate::identity::sid_string(sid.0).unwrap(),
+            pid: info.dwProcessId,
+            token,
+            job,
+            _process: child,
+            _thread: thread,
+        }
+    }
+
+    #[test]
+    fn broker_lpac_access_control_distinguishes_actual_ac_and_lpac_tokens() {
+        for lpac in [false, true] {
+            let child = suspended_broker_child(lpac);
+            let result =
+                crate::network_broker::validate_lpac_restriction(&child.token, &child.package);
+            assert_eq!(result.is_ok(), lpac, "LPAC={lpac}: {result:?}");
+        }
+    }
 
     #[test]
     fn inheritance_guard_restores_both_original_flag_states() {

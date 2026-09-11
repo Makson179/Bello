@@ -308,7 +308,7 @@ def test_null_device_selects_only_fixed_helper_operation(monkeypatch, host, oper
                                     {"null_device": "NUL"}, {"null_device": 1}])
 def test_null_selector_is_explicit_and_exclusive(monkeypatch, kwargs):
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: pytest.fail("unexpected process"))
-    with pytest.raises(backend.WindowsSandboxBackendError, match="either"):
+    with pytest.raises(backend.WindowsSandboxBackendError, match="select only one"):
         backend.host_preparation("prepare", **kwargs)
 
 

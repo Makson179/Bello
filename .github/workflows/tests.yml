@@ -153,6 +153,23 @@ jobs:
             -Helper $helper -Phase Prepare `
             -SnapshotPath (Join-Path $env:RUNNER_TEMP "bello-null-device-baseline.json") `
             -Report (Join-Path $env:RUNNER_TEMP "bello-null-device-prepare.json")
+      - name: Prepare and verify offline network isolation
+        id: network_setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe"
+          ./native/windows-sandbox/ci/verify_network_setup.ps1 `
+            -Helper $helper -Phase Prepare `
+            -SnapshotPath (Join-Path $env:RUNNER_TEMP "bello-network-baseline.json") `
+            -Report (Join-Path $env:RUNNER_TEMP "bello-network-prepare.json")
+      - name: Collect only offline broker startup errors
+        if: always() && runner.os == 'Windows' && steps.network_setup.outcome == 'failure'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          ./native/windows-sandbox/ci/collect_network_service_events.ps1 `
+            -Report (Join-Path $env:RUNNER_TEMP "bello-network-service-events.json")
       - name: Run Pi worker tests
         working-directory: supervisor/pi_worker
         run: npm test
@@ -174,6 +191,17 @@ jobs:
       - name: Verify doctor has no legacy executor dependency
         if: runner.os == 'Windows'
         run: python -m pytest -q tests/test_doctor.py::test_doctor_does_not_start_the_removed_codex_executor
+      - name: Restore and verify offline network setup
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $snapshot = Join-Path $env:RUNNER_TEMP "bello-network-baseline.json"
+          if (Test-Path -LiteralPath $snapshot) {
+            $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe"
+            ./native/windows-sandbox/ci/verify_network_setup.ps1 `
+              -Helper $helper -Phase Restore -SnapshotPath $snapshot `
+              -Report (Join-Path $env:RUNNER_TEMP "bello-network-restore.json")
+          }
       - name: Restore and verify the Windows null-device security
         if: always() && runner.os == 'Windows'
         shell: pwsh
@@ -220,4 +248,7 @@ jobs:
             ${{ runner.temp }}/bello-checkout-drive-restore.json
             ${{ runner.temp }}/bello-null-device-prepare.json
             ${{ runner.temp }}/bello-null-device-restore.json
+            ${{ runner.temp }}/bello-network-prepare.json
+            ${{ runner.temp }}/bello-network-restore.json
+            ${{ runner.temp }}/bello-network-service-events.json
           if-no-files-found: ignore

@@ -314,13 +314,21 @@ def runtime_windows_sandbox_group() -> None:
 @runtime_windows_sandbox_group.command("status")
 @click.option("--drive", help="Check only this fixed local drive root, for example D:.")
 @click.option("--null-device", is_flag=True, help="Check only access to the fixed NUL device.")
-def runtime_windows_sandbox_status(drive: str | None, null_device: bool) -> None:
+@click.option("--network", is_flag=True, help="Check the fixed offline-network isolation service.")
+def runtime_windows_sandbox_status(drive: str | None, null_device: bool, network: bool) -> None:
     """Check the host permission without changing it or requesting elevation."""
     from supervisor.runtime.windows_sandbox import WindowsSandboxError, host_preparation
     try:
-        result = host_preparation("status", drive=drive, null_device=null_device)
+        result = host_preparation("status", drive=drive, null_device=null_device, **({"network": True} if network else {}))
     except WindowsSandboxError as exc:
         raise click.ClickException(str(exc)) from exc
+    if network:
+        click.echo("Windows offline network isolation is prepared." if result["prepared"]
+                   else "Windows offline network isolation needs administrator setup.")
+        click.echo(f"Service: {result['serviceName']}; active runs: {result['activeLeases']}; retained leases: {result['retainedLeases']}.")
+        if not result["prepared"]:
+            click.echo("In an administrator terminal, run: bello runtime windows-sandbox prepare --network")
+        return
     if null_device:
         click.echo("Windows sandbox NUL access is prepared." if result["prepared"]
                    else "Windows sandbox NUL access needs administrator setup.")
@@ -340,8 +348,13 @@ def runtime_windows_sandbox_status(drive: str | None, null_device: bool) -> None
 
 
 def _windows_sandbox_change(operation: str, *, yes: bool, drive: str | None = None,
-                            null_device: bool = False) -> None:
+                            null_device: bool = False, network: bool = False) -> None:
     from supervisor.runtime.windows_sandbox import WindowsSandboxError, host_preparation
+    if network:
+        if drive is not None or null_device:
+            raise click.ClickException("Select only one of --network, --null-device, or --drive.")
+        _windows_network_change(operation, yes=yes)
+        return
     # Perform a read-only check first, including platform/helper validation.
     try:
         current = host_preparation("status", drive=drive, null_device=null_device)
@@ -390,22 +403,52 @@ def _windows_sandbox_change(operation: str, *, yes: bool, drive: str | None = No
     )
 
 
+def _windows_network_change(operation: str, *, yes: bool) -> None:
+    from supervisor.runtime.windows_sandbox import WindowsSandboxError, host_preparation
+    try:
+        current = host_preparation("status", network=True)
+    except WindowsSandboxError as exc:
+        raise click.ClickException(str(exc)) from exc
+    removing = operation == "remove"
+    if (removing and not current["installed"]) or (not removing and current["prepared"]):
+        click.echo("Offline network service already absent." if removing else "Offline network service already prepared.")
+        return
+    if current["activeLeases"] or current["retainedLeases"]:
+        raise click.ClickException("Finish active Bello runs and resolve retained sandbox leases before changing the network service.")
+    verb = "Remove" if removing else "Install or update"
+    click.echo(f"{verb} the fixed BelloOfflineNetwork service at {current['installPath']}.")
+    click.echo("This Windows service runs as LocalSystem and only manages fixed blocking rules for Bello sandboxes. Agent commands still run without administrator rights.")
+    click.echo("It starts with Windows. No API keys or model calls are involved. Other applications' firewall rules are preserved.")
+    click.echo("Run this command in an administrator terminal; run tasks normally afterwards.")
+    if not yes:
+        click.confirm(f"{verb} this service?", abort=True)
+    try:
+        result = host_preparation(operation, network=True)
+    except WindowsSandboxError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if result["installPath"] != current["installPath"] or result["serviceName"] != current["serviceName"]:
+        raise click.ClickException("The helper reported a different network service target; inspect setup before continuing.")
+    click.echo("Offline network service removed." if removing else "Offline network service prepared.")
+
+
 @runtime_windows_sandbox_group.command("prepare")
 @click.option("--yes", is_flag=True, help="Confirm the selected fixed permission change without prompting.")
 @click.option("--drive", help="Prepare only this fixed local drive root, for example D:.")
 @click.option("--null-device", is_flag=True, help="Prepare only read/write access to the fixed NUL device.")
-def runtime_windows_sandbox_prepare(yes: bool, drive: str | None, null_device: bool) -> None:
+@click.option("--network", is_flag=True, help="Install the fixed offline-network service (administrator only).")
+def runtime_windows_sandbox_prepare(yes: bool, drive: str | None, null_device: bool, network: bool) -> None:
     """Fixed permission setup. Requires an administrator terminal."""
-    _windows_sandbox_change("prepare", yes=yes, drive=drive, null_device=null_device)
+    _windows_sandbox_change("prepare", yes=yes, drive=drive, null_device=null_device, network=network)
 
 
 @runtime_windows_sandbox_group.command("remove")
 @click.option("--yes", is_flag=True, help="Confirm removal of the selected fixed permission without prompting.")
 @click.option("--drive", help="Remove preparation only from this fixed local drive root, for example D:.")
 @click.option("--null-device", is_flag=True, help="Remove only Bello's fixed NUL device permission.")
-def runtime_windows_sandbox_remove(yes: bool, drive: str | None, null_device: bool) -> None:
+@click.option("--network", is_flag=True, help="Remove the fixed offline-network service after all runs finish.")
+def runtime_windows_sandbox_remove(yes: bool, drive: str | None, null_device: bool, network: bool) -> None:
     """Remove the setup permission. Stop runs first; requires an administrator terminal."""
-    _windows_sandbox_change("remove", yes=yes, drive=drive, null_device=null_device)
+    _windows_sandbox_change("remove", yes=yes, drive=drive, null_device=null_device, network=network)
 
 
 @runtime_group.command("models")
