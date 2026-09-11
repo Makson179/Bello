@@ -578,7 +578,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use windows_sys::Win32::Security::{
         AddAccessAllowedAceEx, AddAccessDeniedAceEx, GetSecurityDescriptorControl, InitializeAcl,
-        IsValidAcl, ACL_REVISION, INHERITED_ACE,
+        IsValidAcl, ACL_REVISION, INHERITED_ACE, SE_DACL_AUTO_INHERITED, SE_DACL_AUTO_INHERIT_REQ,
+        SE_DACL_DEFAULTED,
     };
 
     fn ace_bytes(dacl: *mut ACL) -> Vec<Vec<u8>> {
@@ -593,8 +594,164 @@ mod tests {
             .collect()
     }
 
+    fn object_dacl_snapshot(handle: &Handle) -> Result<(Vec<Vec<u8>>, u16)> {
+        let (dacl, descriptor) = current_dacl(handle)?;
+        let mut control = 0;
+        let mut revision = 0;
+        if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
+            return Err(crate::winutil::last_error(
+                "GetSecurityDescriptorControl(probe)",
+            ));
+        }
+        Ok((ace_bytes(dacl), control))
+    }
+
+    fn set_object_dacl(handle: &Handle, dacl: *mut ACL) -> Result<()> {
+        // Test-only use of Microsoft's documented user-mode native service.
+        // Unlike SetSecurityInfo's tree propagation, this must change only the
+        // already pinned object. The probe verifies that claim before launch.
+        #[link(name = "ntdll")]
+        extern "system" {
+            fn NtSetSecurityObject(handle: isize, information: u32, descriptor: *mut c_void)
+                -> i32;
+        }
+        let (_, control) = object_dacl_snapshot(handle)?;
+        let mut descriptor: SECURITY_DESCRIPTOR = unsafe { mem::zeroed() };
+        let pointer = &mut descriptor as *mut _ as *mut c_void;
+        let preserved = SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED | SE_DACL_AUTO_INHERIT_REQ;
+        if unsafe { InitializeSecurityDescriptor(pointer, 1) } == 0
+            || unsafe {
+                SetSecurityDescriptorDacl(
+                    pointer,
+                    1,
+                    dacl,
+                    i32::from(control & SE_DACL_DEFAULTED != 0),
+                )
+            } == 0
+            || unsafe { SetSecurityDescriptorControl(pointer, preserved, control & preserved) } == 0
+        {
+            return Err(crate::winutil::last_error(
+                "initialize object-only DACL probe",
+            ));
+        }
+        let status =
+            unsafe { NtSetSecurityObject(handle.raw(), DACL_SECURITY_INFORMATION, pointer) };
+        if status < 0 {
+            return Err(anyhow!(
+                "NtSetSecurityObject(probe) failed with NTSTATUS {:#010x}",
+                status as u32
+            ));
+        }
+        Ok(())
+    }
+
+    fn set_object_entries(handle: &Handle, entries: &[EXPLICIT_ACCESS_W]) -> Result<()> {
+        let (old_dacl, _descriptor) = current_dacl(handle)?;
+        let mut dacl = std::ptr::null_mut();
+        let result = unsafe {
+            SetEntriesInAclW(entries.len() as u32, entries.as_ptr(), old_dacl, &mut dacl)
+        };
+        if result != 0 {
+            return Err(anyhow!("SetEntriesInAclW(object probe) failed: {result}"));
+        }
+        let dacl = LocalAcl(dacl);
+        set_object_dacl(handle, dacl.0)
+    }
+
+    fn revoke_object_sid(handle: &Handle, sid: PSID) -> Result<()> {
+        let (dacl, _descriptor) = current_dacl(handle)?;
+        let mut filtered = dacl_without_access_sid(dacl, sid)?;
+        set_object_dacl(handle, filtered.as_mut_ptr() as *mut ACL)
+    }
+
     #[test]
-    fn sparse_root_grant_supports_new_children_without_exposing_private_files() {
+    fn object_only_dacl_updates_preserve_peer_aces_control_and_existing_children() {
+        let ours =
+            crate::identity::derive_profile_sid(&crate::identity::random_profile_name().unwrap())
+                .unwrap();
+        let peer =
+            crate::identity::derive_profile_sid(&crate::identity::random_profile_name().unwrap())
+                .unwrap();
+        for protected in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "bello-object-dacl-{}-{}-{protected}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(root.join("child")).unwrap();
+            let parent = open_path(&root, true).unwrap();
+            if protected {
+                let (dacl, _descriptor) = current_dacl(&parent).unwrap();
+                assert_eq!(
+                    unsafe {
+                        SetSecurityInfo(
+                            parent.raw(),
+                            SE_FILE_OBJECT,
+                            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            dacl,
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    0
+                );
+            }
+            set_entries(
+                &parent,
+                &[EXPLICIT_ACCESS_W {
+                    grfAccessPermissions: FILE_GENERIC_READ,
+                    grfAccessMode: GRANT_ACCESS,
+                    grfInheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+                    Trustee: trustee(peer.0),
+                }],
+            )
+            .unwrap();
+            let before = object_dacl_snapshot(&parent).unwrap();
+            assert_eq!(before.1 & SE_DACL_PROTECTED != 0, protected);
+            let child = open_path(&root.join("child"), false).unwrap();
+            let child_before = object_dacl_snapshot(&child).unwrap();
+            set_object_entries(
+                &parent,
+                &[EXPLICIT_ACCESS_W {
+                    grfAccessPermissions: FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                    grfAccessMode: GRANT_ACCESS,
+                    grfInheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+                    Trustee: trustee(ours.0),
+                }],
+            )
+            .unwrap();
+            let (dacl, _descriptor) = current_dacl(&parent).unwrap();
+            let mut without_ours = dacl_without_access_sid(dacl, ours.0).unwrap();
+            assert_eq!(
+                ace_bytes(without_ours.as_mut_ptr() as *mut ACL),
+                before.0,
+                "foreign ACE bytes/order changed"
+            );
+            assert_eq!(
+                object_dacl_snapshot(&parent).unwrap().1,
+                before.1,
+                "DACL control/defaulted flags changed"
+            );
+            assert_eq!(
+                object_dacl_snapshot(&child).unwrap(),
+                child_before,
+                "object-only update propagated to existing child"
+            );
+            revoke_object_sid(&parent, ours.0).unwrap();
+            assert_eq!(object_dacl_snapshot(&parent).unwrap(), before);
+            assert_eq!(object_dacl_snapshot(&child).unwrap(), child_before);
+            drop(child);
+            drop(parent);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn object_only_grants_support_new_children_without_exposing_private_files() {
         use crate::identity::{
             create_profile, delete_profile, profile_local_app_data, random_profile_name,
             CapabilitySids,
@@ -625,19 +782,8 @@ mod tests {
 
         let operation = (|| -> Result<()> {
             let handle = open_path(&root, true)?;
-            // Test-only candidate: no inheritable package grant reaches the
-            // pre-existing private tree. Production grant remains unchanged.
-            set_entries(
-                &handle,
-                &[EXPLICIT_ACCESS_W {
-                    grfAccessPermissions: FILE_GENERIC_READ
-                        | FILE_GENERIC_WRITE
-                        | FILE_GENERIC_EXECUTE,
-                    grfAccessMode: GRANT_ACCESS,
-                    grfInheritance: 0,
-                    Trustee: trustee(sid.0),
-                }],
-            )?;
+            // Configure the AAP-only fixture before granting anything on its
+            // parent, so fixture setup cannot inherit the package grant.
             let mut aap_sid = [0_usize; 9];
             let mut aap_size = mem::size_of_val(&aap_sid) as u32;
             ensure!(
@@ -660,18 +806,63 @@ mod tests {
                     Trustee: trustee(aap_sid.as_mut_ptr() as PSID),
                 }],
             )?;
-            set_entries(
-                &open_path(&root.join("ordinary"), true)?,
-                &[EXPLICIT_ACCESS_W {
-                    grfAccessPermissions: FILE_GENERIC_READ
-                        | FILE_GENERIC_WRITE
-                        | FILE_GENERIC_EXECUTE
-                        | DELETE,
-                    grfAccessMode: GRANT_ACCESS,
-                    grfInheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
-                    Trustee: trustee(sid.0),
-                }],
+            let private_paths = [
+                root.join(".supervisor"),
+                root.join(".supervisor").join("sentinel.txt"),
+                root.join("aap-only.txt"),
+            ];
+            let private_before = private_paths
+                .iter()
+                .map(|path| object_dacl_snapshot(&open_path(path, false)?))
+                .collect::<Result<Vec<_>>>()?;
+            let root_control_before = object_dacl_snapshot(&handle)?.1;
+            // Inheritable for future children, but do not propagate to any
+            // pre-existing object. Production grant remains unchanged.
+            set_object_entries(
+                &handle,
+                &[
+                    EXPLICIT_ACCESS_W {
+                        grfAccessPermissions: FILE_GENERIC_READ
+                            | FILE_GENERIC_WRITE
+                            | FILE_GENERIC_EXECUTE,
+                        grfAccessMode: GRANT_ACCESS,
+                        grfInheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+                        Trustee: trustee(sid.0),
+                    },
+                    EXPLICIT_ACCESS_W {
+                        grfAccessPermissions: DELETE,
+                        grfAccessMode: GRANT_ACCESS,
+                        grfInheritance: CONTAINER_INHERIT_ACE
+                            | OBJECT_INHERIT_ACE
+                            | INHERIT_ONLY_ACE,
+                        Trustee: trustee(sid.0),
+                    },
+                ],
             )?;
+            ensure!(
+                object_dacl_snapshot(&handle)?.1 == root_control_before,
+                "object-only update changed root DACL control flags"
+            );
+            for (path, before) in private_paths.iter().zip(&private_before) {
+                ensure!(
+                    &object_dacl_snapshot(&open_path(path, false)?)? == before,
+                    "root grant changed private DACL bytes or control flags"
+                );
+            }
+            for relative in ["ordinary", "ordinary\\existing.txt"] {
+                set_object_entries(
+                    &open_path(&root.join(relative), true)?,
+                    &[EXPLICIT_ACCESS_W {
+                        grfAccessPermissions: FILE_GENERIC_READ
+                            | FILE_GENERIC_WRITE
+                            | FILE_GENERIC_EXECUTE
+                            | DELETE,
+                        grfAccessMode: GRANT_ACCESS,
+                        grfInheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+                        Trustee: trustee(sid.0),
+                    }],
+                )?;
+            }
             let mut environment = clean_environment(&profile_local_app_data(sid.0)?, &root, &[])?;
             let cancelled = Arc::new(AtomicBool::new(false));
             let mut command = |text: &str| -> Result<i32> {
@@ -742,7 +933,13 @@ mod tests {
                     ensure!(masks == (0, 0), "private file received a package ACE");
                 }
             }
-            revoke(&handle, sid.0)?;
+            for (path, before) in private_paths.iter().zip(&private_before) {
+                ensure!(
+                    &object_dacl_snapshot(&open_path(path, false)?)? == before,
+                    "commands changed private DACL bytes or control flags"
+                );
+            }
+            revoke_object_sid(&handle, sid.0)?;
             let root_only_cleanup = verify_absent_tree(&root, sid.0);
             writeln!(
                 std::io::stderr(),
@@ -776,7 +973,7 @@ mod tests {
                     masks.0,
                     masks.1
                 )?;
-                revoke(&handle, sid.0)?;
+                revoke_object_sid(&handle, sid.0)?;
             }
             verify_absent_tree(&root, sid.0)?;
             delete_profile(&profile)?;
