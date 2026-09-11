@@ -715,6 +715,9 @@ mod tests {
         let profile = crate::identity::random_profile_name().unwrap();
         let base = std::env::temp_dir().join(format!("bello-liveness-{profile}"));
         fs::create_dir(&base).unwrap();
+        // Windows TEMP may use an 8.3 account alias. Production state_directory
+        // supplies canonical paths; the fixture must obey the same contract.
+        let base = fs::canonicalize(&base).unwrap();
         fs::create_dir(base.join("workspace")).unwrap();
         let root = fs::canonicalize(base.join("workspace")).unwrap();
         fs::write(root.join("keep.txt"), "unchanged").unwrap();
@@ -795,7 +798,10 @@ mod tests {
         let before = fs::read(&journal.path).unwrap();
         assert!(!mutex_is_live(&journal.data.mutex_name).unwrap());
         let error = recover_stale(&base.join("state")).unwrap_err();
-        assert!(error.to_string().contains("legacy session-local"));
+        assert!(
+            error.to_string().contains("legacy session-local"),
+            "unexpected legacy recovery error: {error:#}"
+        );
         assert_eq!(fs::read(&journal.path).unwrap(), before);
         assert_eq!(
             fs::read_to_string(base.join("workspace/keep.txt")).unwrap(),
