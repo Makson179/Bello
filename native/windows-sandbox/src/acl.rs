@@ -687,10 +687,9 @@ mod tests {
                 );
                 job.terminate(125)?;
                 job.ensure_empty()?;
+                writeln!(std::io::stderr(), "sparse command {text:?}: {outcome:?}")?;
                 outcome
             };
-            ensure!(command("mkdir fresh && echo CHILD>fresh\\first.txt && type fresh\\first.txt && ren fresh\\first.txt second.txt && ren fresh renamed && type renamed\\second.txt && echo ROOT>root.txt")? == 0,
-                "sparse root failed create/read/rename of new files or directories");
             ensure!(
                 command("type .supervisor\\sentinel.txt")? != 0,
                 "sparse root exposed pre-existing private file"
@@ -703,6 +702,17 @@ mod tests {
                 command("ren ordinary moved-ordinary && type moved-ordinary\\existing.txt")? == 0,
                 "sparse grants prevented renaming an ordinary existing subtree"
             );
+            for step in [
+                "mkdir fresh",
+                "echo CHILD>fresh\\first.txt",
+                "type fresh\\first.txt",
+                "ren fresh\\first.txt second.txt",
+                "ren fresh renamed",
+                "type renamed\\second.txt",
+                "echo ROOT>root.txt",
+            ] {
+                ensure!(command(step)? == 0, "sparse child operation failed: {step}");
+            }
             ensure!(
                 fs::read_to_string(root.join("renamed").join("second.txt"))?.trim() == "CHILD",
                 "child payload changed"
@@ -756,7 +766,17 @@ mod tests {
                 paths.push(path);
             }
             for path in paths.iter().rev() {
-                revoke(&open_path(path, true)?, sid.0)?;
+                let handle = open_path(path, true)?;
+                let (dacl, _descriptor) = current_dacl(&handle)?;
+                let masks = masks_for_sid(dacl, sid.0, true)?;
+                writeln!(
+                    std::io::stderr(),
+                    "sparse cleanup {}: package allow={:#x}, deny={:#x}",
+                    path.strip_prefix(&root)?.display(),
+                    masks.0,
+                    masks.1
+                )?;
+                revoke(&handle, sid.0)?;
             }
             verify_absent_tree(&root, sid.0)?;
             delete_profile(&profile)?;
