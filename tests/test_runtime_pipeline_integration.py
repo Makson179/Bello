@@ -39,6 +39,22 @@ _MODEL = "bello-local/pipeline-model"
 _DUMMY_KEY = "bello-offline-pipeline-dummy-key"
 
 
+def _fixture_exchange_diagnostic(body: dict[str, Any]) -> list[dict[str, Any]]:
+    """Show bounded synthetic tool results/retry hints, never headers or system prompts."""
+    messages = [
+        message for message in body.get("messages", [])
+        if isinstance(message, dict) and message.get("role") in {"tool", "user"}
+    ]
+    return [
+        {
+            "role": message["role"],
+            "tool_call_id": message.get("tool_call_id"),
+            "content": json.dumps(message.get("content"), ensure_ascii=False)[:2400],
+        }
+        for message in messages[-6:]
+    ]
+
+
 def _supported_node() -> Path:
     bundled = Path.home() / ".cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node"
     candidates = [os.environ.get("BELLO_NODE"), str(bundled), shutil.which("node")]
@@ -833,7 +849,13 @@ async def test_real_pi_offline_coder_completion_adversary_pipeline(
 
             await asyncio.wait_for(controller.run(), timeout=240 if os.name == "nt" else 90)
 
-            assert not provider.errors
+            assert not provider.errors, {
+                "errors": provider.errors,
+                "recent_exchanges_by_role": {
+                    role: _fixture_exchange_diagnostic(body)
+                    for role, body in provider.requests
+                },
+            }
             assert provider.finished_roles == {
                 "coder",
                 "completion",

@@ -26,6 +26,22 @@ _MIN_NODE = Version("22.19.0")
 _DUMMY_KEY = "bello-local-integration-dummy-key"
 
 
+def _fixture_exchange_diagnostic(body: dict[str, Any]) -> list[dict[str, Any]]:
+    """Show bounded synthetic tool results/retry hints, never headers or system prompts."""
+    messages = [
+        message for message in body.get("messages", [])
+        if isinstance(message, dict) and message.get("role") in {"tool", "user"}
+    ]
+    return [
+        {
+            "role": message["role"],
+            "tool_call_id": message.get("tool_call_id"),
+            "content": json.dumps(message.get("content"), ensure_ascii=False)[:2400],
+        }
+        for message in messages[-6:]
+    ]
+
+
 def _supported_node() -> Path:
     bundled = Path.home() / ".cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node"
     candidates = [os.environ.get("BELLO_NODE"), str(bundled), shutil.which("node")]
@@ -405,7 +421,13 @@ async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(
                     timeout=90 if os.name == "nt" else 30,
                 )
                 turn = completed.params["turn"]
-                assert turn["status"] == "completed", turn.get("error")
+                assert turn["status"] == "completed", {
+                    "error": turn.get("error"),
+                    "recent_exchange": _fixture_exchange_diagnostic(next(
+                        (body for request_flow, _step, body in reversed(provider.requests) if request_flow == flow),
+                        {},
+                    )),
+                }
                 text = last_agent_message_text(turn)
                 assert text is not None
                 return turn, CompletionReviewDecision.model_validate_json(text)
