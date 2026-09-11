@@ -1,8 +1,10 @@
 use crate::identity::CapabilitySids;
-use crate::winutil::{as_void, checked_usize_to_u32, last_error, wide, Handle};
+use crate::winutil::{
+    as_void, checked_usize_to_u32, last_error, verbatim_local_absolute, wide, Handle,
+};
 use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeMap;
-use std::ffi::c_void;
+use std::ffi::{c_void, OsString};
 use std::mem;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf, Prefix};
@@ -457,6 +459,17 @@ pub fn clean_environment(
     environment_block(&environment)
 }
 
+fn command_processor_cwd(cwd: &Path) -> Result<PathBuf> {
+    // CMD treats an extended-length cwd as UNC and silently changes directory.
+    // Only strip the prefix after strict local-path validation, so names such
+    // as trailing-dot/space components cannot acquire different DOS meanings.
+    let extended = verbatim_local_absolute(cwd)?;
+    let units = wide(&extended);
+    Ok(PathBuf::from(OsString::from_wide(
+        &units[4..units.len() - 1],
+    )))
+}
+
 pub fn run_child(
     command: &str,
     cwd: &Path,
@@ -485,6 +498,7 @@ pub fn run_child(
             "Windows command line exceeds 32767 UTF-16 code units"
         ));
     }
+    let process_cwd = command_processor_cwd(cwd)?;
 
     let stdin = nul_handle()?;
     let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
@@ -530,7 +544,7 @@ pub fn run_child(
                 | CREATE_UNICODE_ENVIRONMENT
                 | EXTENDED_STARTUPINFO_PRESENT,
             environment.as_ptr() as *const c_void,
-            wide(cwd).as_ptr(),
+            wide(&process_cwd).as_ptr(),
             &startup.StartupInfo,
             &mut process,
         )
@@ -576,6 +590,54 @@ pub fn run_child(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_processor_cwd_preserves_local_path_and_utf16() {
+        assert_eq!(
+            command_processor_cwd(Path::new(r"\\?\C:\workspace\α β")).unwrap(),
+            Path::new(r"C:\workspace\α β"),
+        );
+        let units = [67, 58, 92, 120, 0xD800];
+        let path = PathBuf::from(OsString::from_wide(&units));
+        assert_eq!(command_processor_cwd(&path).unwrap(), path);
+        for path in [
+            r"\\?\C:\workspace\private.",
+            r"\\?\C:\workspace\private ",
+            r"\\server\share",
+        ] {
+            assert!(command_processor_cwd(Path::new(path)).is_err());
+        }
+    }
+
+    #[test]
+    fn command_processor_writes_in_canonical_workspace_cwd() {
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let root = std::env::temp_dir().join(format!(
+            "bello-cmd-cwd-{}-{} α β",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let canonical = std::fs::canonicalize(&root).unwrap();
+        let output = Command::new(system_directory().unwrap().join("cmd.exe"))
+            .args(["/d", "/s", "/c", "echo CWD_OK>allowed.txt"])
+            .current_dir(command_processor_cwd(&canonical).unwrap())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("allowed.txt"))
+                .unwrap()
+                .trim(),
+            "CWD_OK"
+        );
+        std::fs::remove_file(root.join("allowed.txt")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn windows_argument_quoting_preserves_quotes_and_trailing_slashes() {
