@@ -20,7 +20,7 @@ use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
 pub const PROFILE_PREFIX: &str = "Bello.Sandbox.";
 // A named capability is a permission recipient, not proof of Bello identity:
 // other host programs can derive/request it. Its only prepared permission is
-// non-inheriting metadata access on the OS system-drive root.
+// non-inheriting metadata access on the fixed OS host-preparation targets.
 pub const SYSTEM_ROOT_METADATA_CAPABILITY: &str = "Bello.Sandbox.SystemRootMetadata.v1";
 
 pub struct AppContainerSid(pub PSID);

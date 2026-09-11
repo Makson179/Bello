@@ -290,15 +290,24 @@ def _worker_environment(node: Path, home: Path, scratch: Path) -> dict[str, str]
 async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, final_mode: str,
 ) -> None:
+    file_tool_commands: list[tuple[str, ...]] = []
     if os.name == "nt":
         if os.environ.get("BELLO_REQUIRE_PI_INTEGRATION") != "1":
             pytest.skip("Windows Pi integration requires the native CI host-setup fixture")
         from supervisor.runtime import sandbox
+        from tests.test_runtime_pipeline_integration import (
+            _stage_windows_pytest_runtime,
+            _use_staged_windows_file_tools,
+        )
 
-        # This command uses only system CMD/findstr and the assigned workspace.
-        # Do not grant or mutate unrelated machine-wide developer installations.
-        # ToolHost and the real native sandbox runner remain unchanged.
-        monkeypatch.setattr(sandbox, "_discover_toolchain", lambda _policy: sandbox._Toolchain())
+        # Shell commands use system CMD/findstr, but read/write tools also need
+        # their real Python interpreter. Authorize only the copied runtime.
+        python = _stage_windows_pytest_runtime(tmp_path / "staged-python")
+        file_tool_commands = _use_staged_windows_file_tools(monkeypatch, python)
+        monkeypatch.setattr(
+            sandbox, "_discover_toolchain",
+            lambda _policy: sandbox._Toolchain(readable_roots=(python.parent,)),
+        )
     node = _supported_node()
     worker_dir = Path(__file__).resolve().parents[1] / "supervisor" / "pi_worker"
     worker = worker_dir / "worker.mjs"
@@ -421,13 +430,13 @@ async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(
                     timeout=90 if os.name == "nt" else 30,
                 )
                 turn = completed.params["turn"]
-                assert turn["status"] == "completed", {
+                assert turn["status"] == "completed", json.dumps({
                     "error": turn.get("error"),
                     "recent_exchange": _fixture_exchange_diagnostic(next(
                         (body for request_flow, _step, body in reversed(provider.requests) if request_flow == flow),
                         {},
                     )),
-                }
+                }, ensure_ascii=False, indent=2)
                 text = last_agent_message_text(turn)
                 assert text is not None
                 return turn, CompletionReviewDecision.model_validate_json(text)
@@ -528,6 +537,8 @@ async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(
                 assert restored_turns[0] == turn
             assert len(provider.requests) == 8
             assert not provider.errors
+            if os.name == "nt":
+                assert len(file_tool_commands) == 4  # A/B each perform a real write and read.
             assert not transport_errors
     finally:
         # RuntimeClient owns any backend inserted into _engines.

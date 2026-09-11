@@ -50,7 +50,8 @@ Native Windows verification is tracked separately; passing non-Windows tests
 does not certify the Windows boundary.
 
 Windows tools such as Node and CMD also need metadata access to the system-drive
-root. Check the one-time preparation without changing permissions:
+root and Windows' user-profiles directory (usually `C:\` and `C:\Users`).
+Check the one-time preparation without changing permissions:
 
 ```powershell
 bello runtime windows-sandbox status
@@ -63,7 +64,7 @@ without administrator rights. Installation and ordinary runs never silently
 elevate or perform this setup.
 
 This grants only attributes, extended attributes, permission-descriptor reads
-and synchronization on the system-drive root. It does not grant listing,
+and synchronization on those two directories. It does not grant listing,
 file-content reads, writes, or inherited access to descendants. The permission
 persists until explicitly removed with `bello runtime windows-sandbox remove`
 from an administrator terminal; stop runs before removal. Existing unrelated
@@ -74,6 +75,11 @@ this fixed metadata permission, rather than applying to all AppContainers.
 Preparation does not grant access to arbitrary drives or protected machine-wide
 toolchains. Exposed toolchain roots must still allow the invoking account to
 manage their exact permissions; use host-controlled per-user installations.
+Other required parent directories receive temporary metadata-only permissions
+for the individual command, when the invoking account owns them. These do not
+allow listing or access to sibling files and are removed during cleanup.
+Administrators-owned parents require an already elevated caller; unsupported
+locations are rejected rather than triggering automatic elevation.
 
 ## Sign in and choose models
 

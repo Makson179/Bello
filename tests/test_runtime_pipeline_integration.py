@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 from typing import Any, Iterator
 
 from packaging.version import InvalidVersion, Version
@@ -158,6 +159,34 @@ def _stage_windows_pytest_runtime(destination: Path) -> Path:
     )
     assert probe.stdout.startswith("pytest "), probe.stdout
     return python
+
+
+def _use_staged_windows_file_tools(
+    monkeypatch: pytest.MonkeyPatch, python: Path,
+) -> list[tuple[str, ...]]:
+    """Keep real ToolHost execution while selecting the fixture's interpreter.
+
+    Change only module-local bindings, never the shared sys/subprocess modules.
+    Capturing the real command serialization proves file tools use the runtime
+    that the sandbox fixture authorizes, not the machine-wide Python install.
+    """
+    from supervisor.runtime import tools
+
+    expected_python = python.resolve(strict=True)
+    expected_helper = Path(tools.__file__).with_name("file_worker.py").resolve(strict=True)
+    commands: list[tuple[str, ...]] = []
+
+    def serialize(argv: list[str]) -> str:
+        assert len(argv) == 4
+        assert Path(argv[0]) == expected_python
+        assert argv[1] == "-I"
+        assert Path(argv[2]) == expected_helper
+        commands.append(tuple(argv[:3]))
+        return subprocess.list2cmdline(argv)
+
+    monkeypatch.setattr(tools, "sys", SimpleNamespace(executable=str(expected_python)))
+    monkeypatch.setattr(tools, "subprocess", SimpleNamespace(list2cmdline=serialize))
+    return commands
 
 
 def shlex_quote(value: str) -> str:
@@ -685,12 +714,14 @@ async def test_real_pi_offline_coder_completion_adversary_pipeline(
     intelligence: str,
 ) -> None:
     windows_python: Path | None = None
+    file_tool_commands: list[tuple[str, ...]] = []
     if os.name == "nt":
         if os.environ.get("BELLO_REQUIRE_PI_INTEGRATION") != "1":
             pytest.skip("Windows Pi integration requires the native CI host-setup fixture")
         from supervisor.runtime import sandbox
 
         windows_python = _stage_windows_pytest_runtime(tmp_path / "staged-python")
+        file_tool_commands = _use_staged_windows_file_tools(monkeypatch, windows_python)
         # Declare only the copied test runtime as a host-selected dependency.
         # The actual ToolHost, OS enforcement, and all controller gates run.
         monkeypatch.setattr(
@@ -849,13 +880,13 @@ async def test_real_pi_offline_coder_completion_adversary_pipeline(
 
             await asyncio.wait_for(controller.run(), timeout=240 if os.name == "nt" else 90)
 
-            assert not provider.errors, {
+            assert not provider.errors, json.dumps({
                 "errors": provider.errors,
                 "recent_exchanges_by_role": {
                     role: _fixture_exchange_diagnostic(body)
                     for role, body in provider.requests
                 },
-            }
+            }, ensure_ascii=False, indent=2)
             assert provider.finished_roles == {
                 "coder",
                 "completion",
@@ -875,6 +906,8 @@ async def test_real_pi_offline_coder_completion_adversary_pipeline(
             await client.stop()
 
     assert controller.store.get_bello_config().status is BelloStatus.COMPLETE
+    if os.name == "nt":
+        assert file_tool_commands, "the actual file tools must launch the staged Python runtime"
     assert controller._snapshot_patch_applied is True
     assert controller._coder_snapshot is None
     assert (project / "app" / "solution.py").read_text(encoding="utf-8").endswith(

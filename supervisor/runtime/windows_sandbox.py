@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import platform
 import stat
 import struct
@@ -120,7 +120,7 @@ def host_preparation(operation: Literal["status", "prepare", "remove"]) -> dict[
     Elevation is deliberately external: the user opens an administrator terminal
     for prepare/remove. No task, shell command, path, SID, or permission mask is
     accepted by this interface. The native helper independently checks elevation
-    and obtains the system-drive root from Windows, not the caller's environment.
+    and obtains the two fixed system directories from Windows, not environment.
     """
     if operation not in {"status", "prepare", "remove"}:
         raise WindowsSandboxBackendError("unknown Windows sandbox preparation operation")
@@ -174,11 +174,43 @@ def host_preparation(operation: Literal["status", "prepare", "remove"]) -> dict[
         or value["systemRoot"][1:] != ":\\"
     ):
         raise WindowsSandboxBackendError("Windows sandbox preparation response has invalid fields")
+    targets = value.get("targets")
+    if not isinstance(targets, list) or len(targets) != 2:
+        raise WindowsSandboxBackendError("Windows sandbox preparation must report both fixed targets")
+    kinds: set[str] = set()
+    for target in targets:
+        if (
+            not isinstance(target, dict)
+            or not isinstance(target.get("kind"), str)
+            or target.get("kind") not in {"systemDriveRoot", "userProfiles"}
+            or target["kind"] in kinds
+            or not isinstance(target.get("path"), str)
+            or type(target.get("prepared")) is not bool
+            or type(target.get("changed")) is not bool
+        ):
+            raise WindowsSandboxBackendError("Windows sandbox preparation target is malformed")
+        path = PureWindowsPath(target["path"])
+        if (
+            not path.is_absolute()
+            or len(path.drive) != 2
+            or path.drive[0] not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+            or path.drive[1] != ":"
+            or ".." in path.parts
+            or "\x00" in target["path"]
+            or (target["kind"] == "systemDriveRoot" and target["path"] != value["systemRoot"])
+            or (target["kind"] == "userProfiles" and len(path.parts) < 2)
+        ):
+            raise WindowsSandboxBackendError("Windows sandbox preparation target is not an expected local directory")
+        kinds.add(target["kind"])
+    if value["prepared"] != all(target["prepared"] for target in targets) or value["changed"] != any(
+        target["changed"] for target in targets
+    ):
+        raise WindowsSandboxBackendError("Windows sandbox preparation target states are inconsistent")
     if operation == "status" and value["changed"]:
         raise WindowsSandboxBackendError("Windows sandbox status unexpectedly reported a change")
     if operation == "prepare" and not value["prepared"]:
         raise WindowsSandboxBackendError("Windows sandbox preparation did not establish the required permission")
-    if operation == "remove" and value["prepared"]:
+    if operation == "remove" and any(target["prepared"] for target in targets):
         raise WindowsSandboxBackendError("Windows sandbox preparation permission was not removed")
     return value
 

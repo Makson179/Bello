@@ -5,16 +5,17 @@ It launches the fixed system `cmd.exe` inside a unique less-privileged
 AppContainer (LPAC), atomically attaches it to a kill-on-close Job Object, and
 temporarily grants the AppContainer SID access only to the requested roots.
 
-## System-drive preparation
+## System-directory preparation
 
 The separate fixed-argument commands `host-status`, `host-prepare`, and
-`host-remove` operate only on a non-inherited root-metadata permission. They
+`host-remove` operate only on non-inherited metadata permissions for two fixed
+OS directories: the system-drive root and `FOLDERID_UserProfiles`. They
 never enter command execution or recovery and accept no paths, commands, SIDs,
 or permission masks. Status is read-only. Prepare and remove require an
 administrator terminal; the helper does not elevate itself. The user-facing
 commands are `bello runtime windows-sandbox status|prepare|remove`.
 
-The system root is obtained from Windows, not environment variables. The
+Both directories are obtained from Windows, not environment variables. The
 permission recipient is the capability `Bello.Sandbox.SystemRootMetadata.v1`,
 also present in Bello's command tokens. Its fixed mask `0x00120088` permits
 attributes, extended attributes, permission-descriptor reads and synchronization.
@@ -30,9 +31,23 @@ whole-drive ACL. Stop runs before removal. The setup lock serializes Bello's
 administrative changes; it cannot serialize unrelated administrators editing
 the same ACL. Do not run independent ACL-management tools concurrently.
 
-Preparing the system drive does not authorize metadata on other drive roots or
+Preparing these two directories does not authorize metadata on other drive roots or
 provide access to protected toolchain directories. Native tests must still prove
 real CMD/Node operation and private-file denial after preparation.
+
+For other strict ancestors of allowed roots, the helper checks the actual child
+token and temporarily adds only missing metadata access for the unique per-run
+SID. The directories and their ancestry are pinned before mutation. An ancestor
+must be owned by the invoking account, or by Administrators with an already
+elevated caller. The latter path uses the same cross-account setup lock during
+mutation and cleanup, never during command execution. SYSTEM-owned ancestors
+are not a fallback. Permissions never inherit or permit listing or sibling
+content access.
+
+Journal v4 stores these ancestor grants separately from recursive authorities.
+Recovery validates their identities and revokes the exact per-run entry without
+walking or deleting the ancestor tree. Existing v3 journals remain readable
+without ancestor records.
 
 ## Command protocol and cleanup
 

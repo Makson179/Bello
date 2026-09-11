@@ -139,6 +139,37 @@ pub fn file_identity(handle: &Handle) -> Result<FileIdentity> {
     })
 }
 
+/// Pin each lexical directory from the volume root downward, before a caller
+/// canonicalizes or mutates a descendant. No junction or rename is hidden by
+/// resolution, and no directory enumeration is needed outside an authority.
+pub fn pin_directory_chain(path: &Path, leaf_write_dac: bool) -> Result<Vec<(PathBuf, Handle)>> {
+    let path = verbatim_local_absolute(path)?;
+    let mut paths: Vec<&Path> = path.ancestors().collect();
+    paths.reverse();
+    let mut pins = Vec::new();
+    for candidate in paths {
+        if !candidate.is_absolute() {
+            continue;
+        }
+        let handle = open_path(candidate, leaf_write_dac && path_eq(candidate, &path))?;
+        validate_final_path(&handle, candidate)?;
+        let identity = validate_plain_file_object(&handle, candidate)?;
+        if file_info(&handle)?.dwFileAttributes
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY
+            == 0
+            || identity.file_index == 0
+        {
+            return Err(anyhow!(
+                "metadata ancestry is not a stable directory: {}",
+                candidate.display()
+            ));
+        }
+        require_persistent_acls(&handle, candidate)?;
+        pins.push((candidate.to_owned(), handle));
+    }
+    Ok(pins)
+}
+
 pub fn validate_plain_file_object(handle: &Handle, path: &Path) -> Result<FileIdentity> {
     let info = file_info(handle)?;
     if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {

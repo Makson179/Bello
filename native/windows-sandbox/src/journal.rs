@@ -2,8 +2,8 @@ use crate::acl;
 use crate::identity::{delete_profile, derive_profile_sid, validate_profile_name};
 use crate::winutil::{
     contains, file_identity, is_normalized_local_absolute, open_path, open_regular_file_read,
-    path_eq, require_persistent_acls, validate_final_path, validate_plain_file_object, wide,
-    wide_ptr_to_os_string, FileIdentity, Handle,
+    path_eq, pin_directory_chain, require_persistent_acls, validate_final_path,
+    validate_plain_file_object, wide, wide_ptr_to_os_string, FileIdentity, Handle,
 };
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath};
 
-const JOURNAL_VERSION: u32 = 3;
+const JOURNAL_VERSION: u32 = 4;
 const MAX_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -49,6 +49,10 @@ struct JournalData {
     authorities: Vec<RecordedPath>,
     touched_paths: Vec<RecordedPath>,
     created_paths: Vec<RecordedPath>,
+    // v3 never granted outside its authorities. Default permits safe v3 cleanup,
+    // but a v3 record with non-empty metadata_paths is explicitly rejected.
+    #[serde(default)]
+    metadata_paths: Vec<RecordedPath>,
 }
 
 pub struct Journal {
@@ -109,6 +113,7 @@ impl Journal {
                 authorities,
                 touched_paths: Vec::new(),
                 created_paths: Vec::new(),
+                metadata_paths: Vec::new(),
             },
         };
         validate_journal(&journal.data)?;
@@ -141,6 +146,23 @@ impl Journal {
             .created_paths
             .push(RecordedPath { path, identity });
         self.persist()
+    }
+
+    pub fn before_metadata_mutation(&mut self, path: &Path, handle: &Handle) -> Result<()> {
+        if !self
+            .data
+            .metadata_paths
+            .iter()
+            .any(|record| path_eq(&record.path, path))
+        {
+            self.data.metadata_paths.push(RecordedPath {
+                path: path.to_owned(),
+                identity: file_identity(handle)?,
+            });
+            validate_journal(&self.data)?;
+            self.persist()?;
+        }
+        Ok(())
     }
 
     pub fn cleanup(self) -> Result<()> {
@@ -461,7 +483,9 @@ fn validate_journal(data: &JournalData) -> Result<()> {
     if data.journal_version == 2 && data.mutex_name == format!("Local\\{}", data.profile_name) {
         return Err(anyhow!("legacy session-local recovery journal retained: another Windows session may still own this run; automatic recovery cannot establish its liveness"));
     }
-    if data.journal_version != JOURNAL_VERSION {
+    if !matches!(data.journal_version, 3 | JOURNAL_VERSION)
+        || (data.journal_version == 3 && !data.metadata_paths.is_empty())
+    {
         return Err(anyhow!("unsupported recovery journal version"));
     }
     if data.mutex_name != mutex_name(&data.profile_name) {
@@ -484,6 +508,30 @@ fn validate_journal(data: &JournalData) -> Result<()> {
                 "recovery journal path is outside every recorded authority: {}",
                 record.path.display()
             ));
+        }
+    }
+    let fixed = if data.metadata_paths.is_empty() {
+        Vec::new()
+    } else {
+        crate::host_prepare::fixed_targets()?
+    };
+    for record in &data.metadata_paths {
+        validate_recorded_path(record, "metadata ancestor")?;
+        if crate::winutil::is_volume_root(&record.path)
+            || fixed.iter().any(|target| {
+                crate::winutil::verbatim_local_absolute(&target.path)
+                    .is_ok_and(|path| path_eq(&path, &record.path))
+            })
+            || data
+                .authorities
+                .iter()
+                .any(|authority| contains(&authority.path, &record.path))
+            || !data
+                .authorities
+                .iter()
+                .any(|authority| contains(&record.path, &authority.path))
+        {
+            return Err(anyhow!("metadata journal path must be a proper ancestor outside all authorities and fixed host targets: {}", record.path.display()));
         }
     }
     Ok(())
@@ -524,6 +572,28 @@ fn reopen_recorded(record: &RecordedPath, write_dac: bool) -> Result<Handle> {
 }
 
 fn cleanup_data(data: &JournalData) -> Result<()> {
+    // These are exact outside objects, NOT recursive cleanup authorities. Pin
+    // their full lexical ancestry and match identity before opening WRITE_DAC.
+    let metadata_pins = data
+        .metadata_paths
+        .iter()
+        .map(|record| {
+            let pins = pin_directory_chain(&record.path, false)?;
+            let (_, handle) = pins
+                .last()
+                .ok_or_else(|| anyhow!("empty metadata ancestry"))?;
+            let identity = file_identity(handle)?;
+            if identity.volume_serial != record.identity.volume_serial
+                || identity.file_index != record.identity.file_index
+            {
+                return Err(anyhow!(
+                    "metadata recovery path identity changed: {}",
+                    record.path.display()
+                ));
+            }
+            Ok(pins)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let _authority_handles = data
         .authorities
         .iter()
@@ -546,6 +616,24 @@ fn cleanup_data(data: &JournalData) -> Result<()> {
         ) {
             failures.push(format!(
                 "revoke authority {}: {error:#}",
+                record.path.display()
+            ));
+        }
+    }
+    for (record, pins) in data.metadata_paths.iter().zip(&metadata_pins) {
+        let result = (|| -> Result<()> {
+            let pinned = &pins
+                .last()
+                .ok_or_else(|| anyhow!("empty metadata ancestry"))?
+                .1;
+            let _admin_lock = crate::host_prepare::metadata_mutation_lock(pinned)?;
+            let writable = reopen_recorded(record, true)?;
+            acl::revoke(&writable, sid.0)?;
+            acl::verify_absent_object(&writable, sid.0)
+        })();
+        if let Err(error) = result {
+            failures.push(format!(
+                "revoke exact metadata ancestor {}: {error:#}",
                 record.path.display()
             ));
         }
@@ -729,6 +817,111 @@ mod tests {
         )
         .unwrap();
         (base, journal)
+    }
+
+    #[test]
+    fn metadata_recovery_is_exact_nonrecursive_and_preserves_peer_grants() {
+        let profile = crate::identity::random_profile_name().unwrap();
+        let base = std::env::temp_dir().join(format!("bello-metadata-recovery-{profile}"));
+        acl::create_state_directory(&base).unwrap();
+        let base = fs::canonicalize(base).unwrap();
+        fs::create_dir(base.join("workspace")).unwrap();
+        fs::create_dir(base.join("outside")).unwrap();
+        fs::write(base.join("outside/keep.txt"), "outside survives").unwrap();
+        let root = base.join("workspace");
+        let mut journal = Journal::create(
+            &base.join("state"),
+            &profile,
+            &mutex_name(&profile),
+            &[root],
+        )
+        .unwrap();
+        let ours = derive_profile_sid(&profile).unwrap();
+        let peer = derive_profile_sid(&crate::identity::random_profile_name().unwrap()).unwrap();
+        let parent = open_path(&base, true).unwrap();
+        let outside = open_path(&base.join("outside"), true).unwrap();
+        acl::set_system_root_metadata(&parent, peer.0, true).unwrap();
+        let before = acl::tests::paired_dacl_snapshot(&parent).unwrap();
+        let outside_before = acl::tests::paired_dacl_snapshot(&outside).unwrap();
+        journal.before_metadata_mutation(&base, &parent).unwrap();
+        acl::set_system_root_metadata(&parent, ours.0, true).unwrap();
+        assert_eq!(
+            acl::tests::paired_dacl_snapshot(&outside).unwrap(),
+            outside_before
+        );
+        fs::create_dir(base.join("new-outside")).unwrap();
+        acl::verify_absent_object(
+            &open_path(&base.join("new-outside"), false).unwrap(),
+            ours.0,
+        )
+        .unwrap();
+        // A sentinel with the same SID outside all authorities must survive:
+        // recovery may touch the recorded parent, never recursively its tree.
+        acl::set_system_root_metadata(&outside, ours.0, true).unwrap();
+        let saved_path = journal.path.clone();
+        drop(journal);
+        recover_stale(&base.join("state")).unwrap();
+        assert!(!saved_path.exists());
+        assert_eq!(acl::tests::paired_dacl_snapshot(&parent).unwrap(), before);
+        assert!(acl::system_root_metadata_prepared(&outside, ours.0).unwrap());
+        assert_eq!(
+            fs::read_to_string(base.join("outside/keep.txt")).unwrap(),
+            "outside survives"
+        );
+        acl::revoke(&outside, ours.0).unwrap();
+        acl::revoke(&parent, peer.0).unwrap();
+        drop((parent, outside));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn metadata_recovery_refuses_replaced_ancestor_identity() {
+        let (base, mut journal) = liveness_fixture();
+        let ancestor = base.join("ancestor");
+        acl::create_state_directory(&ancestor).unwrap();
+        fs::rename(base.join("workspace"), ancestor.join("workspace")).unwrap();
+        journal.data.authorities = vec![record_existing_path(&ancestor.join("workspace")).unwrap()];
+        let ours = derive_profile_sid(journal.profile_name()).unwrap();
+        let handle = open_path(&ancestor, true).unwrap();
+        journal
+            .before_metadata_mutation(&ancestor, &handle)
+            .unwrap();
+        acl::set_system_root_metadata(&handle, ours.0, true).unwrap();
+        drop(handle);
+        let before = fs::read(&journal.path).unwrap();
+        let moved = base.join("original-ancestor");
+        fs::rename(&ancestor, &moved).unwrap();
+        fs::create_dir_all(ancestor.join("workspace")).unwrap();
+        let error = recover_stale(&base.join("state")).unwrap_err();
+        assert!(format!("{error:#}").contains("metadata recovery path identity changed"));
+        assert_eq!(fs::read(&journal.path).unwrap(), before);
+        acl::verify_absent_object(&open_path(&ancestor, false).unwrap(), ours.0).unwrap();
+        acl::revoke(&open_path(&moved, true).unwrap(), ours.0).unwrap();
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn metadata_journal_rejects_scope_expansion_and_recovers_v3_without_metadata() {
+        let (base, mut journal) = liveness_fixture();
+        let original = serde_json::to_vec(&journal.data).unwrap();
+        for invalid in [base.join("workspace"), base.join("state")] {
+            journal.data.metadata_paths = vec![record_existing_path(&invalid).unwrap()];
+            assert!(validate_journal(&journal.data).is_err());
+        }
+        journal.data.metadata_paths = vec![record_existing_path(&base).unwrap()];
+        assert!(validate_journal(&journal.data).is_ok());
+        journal.data.journal_version = 3;
+        assert!(validate_journal(&journal.data).is_err());
+        let mut old: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        old["journalVersion"] = 3.into();
+        old.as_object_mut().unwrap().remove("metadataPaths");
+        journal.data = serde_json::from_value(old).unwrap();
+        journal.persist().unwrap();
+        let path = journal.path.clone();
+        drop(journal);
+        recover_stale(&base.join("state")).unwrap();
+        assert!(!path.exists());
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

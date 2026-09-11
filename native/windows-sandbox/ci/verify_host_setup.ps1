@@ -37,6 +37,21 @@ function Invoke-HostOperation([string]$Operation) {
             $status.capabilitySid -notmatch '^S-1-15-3-') {
             throw "unexpected host setup response: $output"
         }
+        $targets = @($status.targets)
+        if ($targets.Count -ne 2) { throw "expected exactly the two fixed OS host targets" }
+        foreach ($kind in @("systemDriveRoot", "userProfiles")) {
+            $matching = @($targets | Where-Object { $_.kind -eq $kind })
+            if ($matching.Count -ne 1 -or $matching[0].path -notmatch '^[A-Za-z]:\\' -or
+                $matching[0].prepared -isnot [bool] -or $matching[0].changed -isnot [bool]) {
+                throw "invalid or duplicated fixed host target: $kind"
+            }
+        }
+        $drive = @($targets | Where-Object { $_.kind -eq "systemDriveRoot" })[0]
+        if ($drive.path -cne $status.systemRoot -or
+            $status.prepared -ne (@($targets | Where-Object { $_.prepared }).Count -eq 2) -or
+            $status.changed -ne (@($targets | Where-Object { $_.changed }).Count -gt 0)) {
+            throw "inconsistent host target aggregate status"
+        }
         return $status
     }
     finally {
@@ -88,8 +103,13 @@ New-Item -ItemType Directory -Force -Path (Split-Path -Parent $SnapshotPath) | O
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Report) | Out-Null
 if ($Phase -eq "Prepare") {
     $beforeStatus = Invoke-HostOperation "host-status"
-    $before = Read-AclSnapshot $beforeStatus.systemRoot
-    $snapshot = @{ status = $beforeStatus; acl = $before }
+    # The product supports mixed states. This disposable CI fixture refuses one
+    # before any mutation so all-target removal cannot erase pre-existing setup.
+    $preparedCount = @($beforeStatus.targets | Where-Object { $_.prepared }).Count
+    if ($preparedCount -eq 1) { throw "CI setup fixture requires both targets initially prepared or both absent" }
+    $before = @{}
+    foreach ($target in $beforeStatus.targets) { $before[$target.kind] = Read-AclSnapshot $target.path }
+    $snapshot = @{ status = $beforeStatus; acls = $before }
     # Save before the first mutation, so an assertion failure still permits rollback.
     $snapshot | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $SnapshotPath -Encoding utf8
     $prepared = Invoke-HostOperation "host-prepare"
@@ -103,29 +123,35 @@ if ($Phase -eq "Prepare") {
             $result.capabilitySid -cne $beforeStatus.capabilitySid) {
             throw "host setup changed its fixed target or capability identity"
         }
-    }
-    $after = Read-AclSnapshot $status.systemRoot
-    $capabilityAces = @($after.aces | Where-Object { $_.sid -eq $status.capabilitySid })
-    if ($capabilityAces.Count -ne 1 -or $capabilityAces[0].type -ne 0 -or
-        $capabilityAces[0].flags -ne 0 -or $capabilityAces[0].mask -ne $expectedMask) {
-        throw "setup did not produce exactly the non-inheriting metadata-only capability ACE"
-    }
-    if ($beforeStatus.prepared) {
-        if ($prepared.changed) { throw "prepare changed an already prepared host" }
-        Assert-AclEqual $before $after
-    }
-    else {
-        if (-not $prepared.changed -or @($before.aces | Where-Object { $_.sid -eq $status.capabilitySid }).Count) {
-            throw "unexpected capability ACL before first setup"
+        foreach ($target in $result.targets) {
+            $original = @($beforeStatus.targets | Where-Object { $_.kind -eq $target.kind })[0]
+            if ($target.path -cne $original.path) { throw "host setup changed an OS target path" }
         }
-        $after.aces = @($after.aces | Where-Object { $_.sid -ne $status.capabilitySid })
-        Assert-AclEqual $before $after
+    }
+    foreach ($target in $status.targets) {
+        $after = Read-AclSnapshot $target.path
+        $capabilityAces = @($after.aces | Where-Object { $_.sid -eq $status.capabilitySid })
+        if ($capabilityAces.Count -ne 1 -or $capabilityAces[0].type -ne 0 -or
+            $capabilityAces[0].flags -ne 0 -or $capabilityAces[0].mask -ne $expectedMask) {
+            throw "setup did not produce exactly the non-inheriting metadata-only capability ACE"
+        }
+        if ($beforeStatus.prepared) {
+            if ($prepared.changed) { throw "prepare changed an already prepared host" }
+        }
+        else {
+            if (-not $prepared.changed -or @($before[$target.kind].aces | Where-Object { $_.sid -eq $status.capabilitySid }).Count) {
+                throw "unexpected capability ACL before first setup"
+            }
+            $after.aces = @($after.aces | Where-Object { $_.sid -ne $status.capabilitySid })
+        }
+        Assert-AclEqual $before[$target.kind] $after
     }
     @{
         phase = $Phase; systemRoot = $status.systemRoot; capabilitySid = $status.capabilitySid
         metadataMask = $expectedMask; prepared = $status.prepared; changed = $prepared.changed
+        targets = $status.targets
         idempotent = $true; unrelatedAclUnchanged = $true; inherits = $false
-    } | ConvertTo-Json | Set-Content -LiteralPath $Report -Encoding utf8
+    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Report -Encoding utf8
 }
 else {
     $snapshot = Get-Content -LiteralPath $SnapshotPath -Raw | ConvertFrom-Json -AsHashtable
@@ -133,6 +159,10 @@ else {
     if ($status.systemRoot -cne $snapshot.status.systemRoot -or
         $status.capabilitySid -cne $snapshot.status.capabilitySid) {
         throw "host cleanup target does not match the saved setup target"
+    }
+    foreach ($target in $status.targets) {
+        $original = @($snapshot.status.targets | Where-Object { $_.kind -eq $target.kind })[0]
+        if ($target.path -cne $original.path) { throw "host cleanup OS target does not match the saved target" }
     }
     if (-not $snapshot.status.prepared) {
         # All foreground tests and their child Jobs have finished before this CI step.
@@ -145,7 +175,9 @@ else {
         }
     }
     elseif (-not $status.prepared) { throw "pre-existing host setup disappeared" }
-    Assert-AclEqual $snapshot.acl (Read-AclSnapshot $status.systemRoot)
+    foreach ($target in $status.targets) {
+        Assert-AclEqual $snapshot.acls[$target.kind] (Read-AclSnapshot $target.path)
+    }
     @{ phase = $Phase; originalAclRestored = $true; preservedExistingSetup = $snapshot.status.prepared } |
         ConvertTo-Json | Set-Content -LiteralPath $Report -Encoding utf8
 }

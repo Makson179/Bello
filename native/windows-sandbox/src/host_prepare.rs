@@ -1,7 +1,8 @@
 //! Explicit, fixed-scope administrative setup, never a privileged command runner.
 //!
 //! The named capability is not application authentication. Any host program can
-//! request it; consequently its sole host grant is non-inheriting root metadata.
+//! request it; consequently its only host grants are non-inheriting metadata on
+//! the two fixed OS targets, never their contents or descendants.
 //! Our lock coordinates Bello installers across accounts, not unrelated admin
 //! programs changing filesystem security outside this protocol.
 
@@ -26,11 +27,13 @@ use windows_sys::Win32::Security::{
     SECURITY_DESCRIPTOR, TOKEN_ELEVATION, TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
 };
 use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
+use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 use windows_sys::Win32::System::Threading::{
     CreateMutexExW, GetCurrentProcess, OpenProcessToken, ReleaseMutex, WaitForSingleObject,
     SYNCHRONIZATION_SYNCHRONIZE,
 };
+use windows_sys::Win32::UI::Shell::{FOLDERID_UserProfiles, SHGetKnownFolderPath};
 
 const SETUP_LOCK: &str = "Global\\Bello.Sandbox.SystemRootMetadata.Setup.v1";
 const SETUP_LOCK_ACCESS: u32 = SYNCHRONIZATION_SYNCHRONIZE | READ_CONTROL;
@@ -47,6 +50,21 @@ pub struct HostStatus {
     metadata_mask: u32,
     prepared: bool,
     changed: bool,
+    targets: Vec<HostTargetStatus>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HostTargetStatus {
+    kind: &'static str,
+    path: String,
+    prepared: bool,
+    changed: bool,
+}
+
+pub struct FixedTarget {
+    kind: &'static str,
+    pub path: PathBuf,
 }
 
 fn known_sid(kind: WELL_KNOWN_SID_TYPE) -> Result<Vec<usize>> {
@@ -130,6 +148,7 @@ fn system_root() -> Result<PathBuf> {
     root_from_windows_directory(&directory)
 }
 
+#[cfg(test)]
 fn open_system_root(root: &Path, write: bool) -> Result<Handle> {
     if !winutil::is_volume_root(root) {
         return Err(anyhow!(
@@ -147,7 +166,57 @@ fn open_system_root(root: &Path, write: bool) -> Result<Handle> {
     Ok(handle)
 }
 
-struct SetupLock(Handle);
+/// These are fixed OS locations, never caller-selected directories. A relocated
+/// UserProfiles folder remains a named target, not permission to grant its tree.
+pub fn fixed_targets() -> Result<Vec<FixedTarget>> {
+    let root = system_root()?;
+    let mut raw = std::ptr::null_mut();
+    let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_UserProfiles, 0, 0, &mut raw) };
+    if hr < 0 || raw.is_null() {
+        return Err(anyhow!(
+            "SHGetKnownFolderPath(UserProfiles) failed with HRESULT {:#010x}",
+            hr as u32
+        ));
+    }
+    let profiles = PathBuf::from(unsafe { winutil::wide_ptr_to_os_string(raw) });
+    unsafe { CoTaskMemFree(raw as *const c_void) };
+    // Keep the public confirmation path exact, ordinary drive-absolute Unicode,
+    // never a lossy rendering or a hidden device/UNC spelling.
+    root_from_windows_directory(profiles.to_str().ok_or_else(|| {
+        anyhow!("the OS UserProfiles folder cannot be represented in the setup report")
+    })?)?;
+    Ok(vec![
+        FixedTarget {
+            kind: "systemDriveRoot",
+            path: root,
+        },
+        FixedTarget {
+            kind: "userProfiles",
+            path: profiles,
+        },
+    ])
+}
+
+pub struct SetupLock(Handle);
+
+/// The normal helper may change exact metadata on its own directories under its
+/// existing account lock. Administrators-owned ancestors additionally require an
+/// already elevated caller and this same cross-account lock. Never elevate here.
+pub fn metadata_mutation_lock(handle: &Handle) -> Result<Option<SetupLock>> {
+    if acl::owned_by_current_account(handle)? {
+        return Ok(None);
+    }
+    let admin = known_sid(WinBuiltinAdministratorsSid)?;
+    if !acl::owner_matches(handle, admin.as_ptr() as PSID)? {
+        return Err(anyhow!("metadata ancestor is not owned by this account or Administrators; no permissions changed"));
+    }
+    require_elevated_admin()?;
+    let lock = SetupLock::acquire()?;
+    if !acl::owner_matches(handle, admin.as_ptr() as PSID)? {
+        return Err(anyhow!("metadata ancestor owner changed during setup"));
+    }
+    Ok(Some(lock))
+}
 
 impl SetupLock {
     fn acquire() -> Result<Self> {
@@ -308,26 +377,75 @@ pub fn execute(operation: &'static str) -> Result<HostStatus> {
     } else {
         None
     };
-    let root = system_root()?;
-    let handle = open_system_root(&root, write)?;
+    let fixed = fixed_targets()?;
+    // Pin and validate every target before making even the first change.
+    // This preserves a pre-existing grant if another target has a conflict.
+    let pins = fixed
+        .iter()
+        .map(|target| winutil::pin_directory_chain(&target.path, write))
+        .collect::<Result<Vec<_>>>()?;
     let capability = CapabilitySids::system_root_metadata()?;
     let sid = capability.single_sid()?;
-    let changed = if write {
-        acl::set_system_root_metadata(&handle, sid, operation == "prepare")?
-    } else {
-        false
-    };
-    let prepared = acl::system_root_metadata_prepared(&handle, sid)?;
+    let handles = pins
+        .iter()
+        .map(|chain| &chain.last().expect("fixed target has a directory pin").1)
+        .collect::<Vec<_>>();
+    let before = handles
+        .iter()
+        .map(|handle| acl::system_root_metadata_prepared(handle, sid))
+        .collect::<Result<Vec<_>>>()?;
+    let mut changed = vec![false; fixed.len()];
+    if write {
+        for (index, handle) in handles.iter().enumerate() {
+            match acl::set_system_root_metadata(handle, sid, operation == "prepare") {
+                Ok(value) => changed[index] = value,
+                Err(error) => {
+                    let mut failures = vec![format!("host preparation failed: {error:#}")];
+                    // The failing setter may have reached readback. Restore only
+                    // tuples this operation intended to change, never a full ACL.
+                    for rollback in (0..=index).rev() {
+                        if before[rollback] == (operation == "prepare") {
+                            continue;
+                        }
+                        if let Err(error) =
+                            acl::set_system_root_metadata(handles[rollback], sid, before[rollback])
+                        {
+                            failures.push(format!(
+                                "rollback {} failed: {error:#}",
+                                fixed[rollback].path.display()
+                            ));
+                        }
+                    }
+                    return Err(anyhow!(failures.join("; ")));
+                }
+            }
+        }
+    }
+    let targets = fixed
+        .iter()
+        .enumerate()
+        .map(|(index, target)| HostTargetStatus {
+            kind: target.kind,
+            path: target.path.to_string_lossy().into_owned(),
+            prepared: if write {
+                operation == "prepare"
+            } else {
+                before[index]
+            },
+            changed: changed[index],
+        })
+        .collect::<Vec<_>>();
     Ok(HostStatus {
         protocol_version: crate::protocol::PROTOCOL_VERSION,
         kind: "hostPreparation",
         operation,
-        system_root: root.to_string_lossy().into_owned(),
+        system_root: fixed[0].path.to_string_lossy().into_owned(),
         capability_name: SYSTEM_ROOT_METADATA_CAPABILITY,
         capability_sid: sid_string(sid)?,
         metadata_mask: SYSTEM_ROOT_METADATA_MASK,
-        prepared,
-        changed,
+        prepared: targets.iter().all(|target| target.prepared),
+        changed: targets.iter().any(|target| target.changed),
+        targets,
     })
 }
 
@@ -363,6 +481,14 @@ mod tests {
         assert!(winutil::is_volume_root(&root));
         assert_eq!(root.as_os_str().len(), 3);
         open_system_root(&root, false).unwrap();
+        let targets = fixed_targets().unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].kind, "systemDriveRoot");
+        assert_eq!(targets[1].kind, "userProfiles");
+        for target in targets {
+            assert!(!target.path.to_str().unwrap().starts_with(r"\\?\"));
+            winutil::pin_directory_chain(&target.path, false).unwrap();
+        }
     }
 
     #[test]

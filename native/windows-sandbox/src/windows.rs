@@ -19,8 +19,8 @@ use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::UI::Shell::{FOLDERID_Profile, SHGetKnownFolderPath};
 use winutil::{
     canonical_existing, contains, file_identity, is_normalized_local_absolute, is_volume_root,
-    open_path, path_eq, require_persistent_acls, validate_final_path, validate_plain_file_object,
-    verbatim_local_absolute, walk_pinned_tree, Handle,
+    open_path, path_eq, pin_directory_chain, require_persistent_acls, validate_final_path,
+    validate_plain_file_object, verbatim_local_absolute, walk_pinned_tree, Handle,
 };
 
 pub fn execute(request: Request) -> Result<i32> {
@@ -68,6 +68,28 @@ fn run(
     let cancelled = Arc::new(AtomicBool::new(false));
     if command.trim().is_empty() || command.contains('\0') {
         return Err(anyhow!("command must be non-empty and contain no NUL byte"));
+    }
+    // Preserve lexical ancestry before canonicalize can hide a junction. These
+    // no-delete-sharing pins remain alive until the sandbox Job is empty.
+    let mut ancestry_handles: Vec<(PathBuf, Handle)> = Vec::new();
+    let mut lexical_authority_handles: Vec<Handle> = Vec::new();
+    for supplied in std::iter::once(&root).chain(readable_roots.iter()) {
+        let lexical = verbatim_local_absolute(Path::new(supplied))?;
+        let parent = lexical
+            .parent()
+            .ok_or_else(|| anyhow!("authority has no directory parent"))?;
+        for (path, handle) in pin_directory_chain(parent, false)? {
+            if !ancestry_handles
+                .iter()
+                .any(|(held, _)| path_eq(held, &path))
+            {
+                ancestry_handles.push((path, handle));
+            }
+        }
+        let leaf = open_path(&lexical, false)?;
+        validate_final_path(&leaf, &lexical)?;
+        validate_plain_file_object(&leaf, &lexical)?;
+        lexical_authority_handles.push(leaf);
     }
     let root = canonical_existing(&root, "root")?;
     if !root.is_dir() || is_volume_root(&root) {
@@ -191,6 +213,54 @@ fn run(
         let mut environment = clean_environment(&profile_local, &root, &readable_roots)?;
         let mut verify_access = |token: &Handle| -> Result<()> {
             let verifier = AccessVerifier::from_token(token)?;
+            let fixed = crate::host_prepare::fixed_targets()?
+                .into_iter()
+                .map(|target| verbatim_local_absolute(&target.path))
+                .collect::<Result<Vec<_>>>()?;
+            for (path, handle) in &ancestry_handles {
+                // A parent of one readable root may itself be inside another
+                // authority. Its existing full policy takes precedence.
+                if authorities
+                    .iter()
+                    .any(|authority| contains(authority, path))
+                {
+                    continue;
+                }
+                if verifier.granted_file_access(handle)? & acl::SYSTEM_ROOT_METADATA_MASK
+                    == acl::SYSTEM_ROOT_METADATA_MASK
+                {
+                    continue;
+                }
+                if is_volume_root(path) || fixed.iter().any(|target| path_eq(target, path)) {
+                    return Err(anyhow!("sandbox requires fixed host metadata preparation for {}; run the explicit Administrator host-prepare command (no automatic elevation)", path.display()));
+                }
+                let _admin_lock = crate::host_prepare::metadata_mutation_lock(handle)
+                    .with_context(|| {
+                        format!("cannot prepare exact metadata ancestor {}", path.display())
+                    })?;
+                let writable = open_path(path, true)?;
+                validate_final_path(&writable, path)?;
+                let actual = file_identity(&writable)?;
+                let pinned = file_identity(handle)?;
+                if actual.volume_serial != pinned.volume_serial
+                    || actual.file_index != pinned.file_index
+                {
+                    return Err(anyhow!(
+                        "metadata ancestor identity changed: {}",
+                        path.display()
+                    ));
+                }
+                journal.before_metadata_mutation(path, &writable)?;
+                acl::set_system_root_metadata(&writable, sid.0, true)?;
+                if verifier.granted_file_access(&writable)? & acl::SYSTEM_ROOT_METADATA_MASK
+                    != acl::SYSTEM_ROOT_METADATA_MASK
+                {
+                    return Err(anyhow!(
+                        "actual sandbox token cannot read required metadata for {}",
+                        path.display()
+                    ));
+                }
+            }
             for authority in &authorities {
                 let authority_mode = if path_eq(authority, &root) {
                     mode

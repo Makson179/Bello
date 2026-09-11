@@ -140,6 +140,39 @@ fn current_user_sid_buffer() -> Result<Vec<usize>> {
     Ok(buffer)
 }
 
+pub fn owner_matches(handle: &Handle, expected: PSID) -> Result<bool> {
+    let mut owner = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    let code = unsafe {
+        GetSecurityInfo(
+            handle.raw(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if code != 0 {
+        return Err(anyhow!(
+            "GetSecurityInfo(metadata owner) failed with Win32 error {code}"
+        ));
+    }
+    let _descriptor = SecurityDescriptor(descriptor);
+    if owner.is_null() {
+        return Err(anyhow!("metadata directory has no owner"));
+    }
+    Ok(unsafe { EqualSid(owner, expected) } != 0)
+}
+
+pub fn owned_by_current_account(handle: &Handle) -> Result<bool> {
+    let buffer = current_user_sid_buffer()?;
+    let sid = unsafe { (*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid };
+    owner_matches(handle, sid)
+}
+
 fn state_directory_dacl(user_sid: PSID) -> Result<LocalAcl> {
     let entry = EXPLICIT_ACCESS_W {
         grfAccessPermissions: FILE_ALL_ACCESS,
@@ -816,8 +849,18 @@ pub fn verify_absent_tree(root: &Path, sid: PSID) -> Result<()> {
     })
 }
 
+pub fn verify_absent_object(handle: &Handle, sid: PSID) -> Result<()> {
+    let (dacl, _descriptor) = raw_object_dacl(handle)?;
+    if dacl_has_sid(dacl, sid)? {
+        return Err(anyhow!(
+            "AppContainer SID ACE remains after exact-object cleanup"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::winutil::open_path;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -872,7 +915,7 @@ mod tests {
         Ok((ace_bytes(dacl), control))
     }
 
-    fn paired_dacl_snapshot(handle: &Handle) -> Result<(DaclSnapshot, DaclSnapshot)> {
+    pub(crate) fn paired_dacl_snapshot(handle: &Handle) -> Result<(DaclSnapshot, DaclSnapshot)> {
         let raw = raw_dacl_snapshot(handle)?;
         let high_level = object_dacl_snapshot(handle)?;
         anyhow::ensure!(

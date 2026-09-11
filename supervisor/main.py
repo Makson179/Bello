@@ -308,7 +308,7 @@ def runtime_install_command() -> None:
 
 @runtime_group.group("windows-sandbox")
 def runtime_windows_sandbox_group() -> None:
-    """Inspect or explicitly prepare Windows sandbox system-root metadata access."""
+    """Inspect or explicitly prepare Windows sandbox system-directory metadata access."""
 
 
 @runtime_windows_sandbox_group.command("status")
@@ -319,8 +319,9 @@ def runtime_windows_sandbox_status() -> None:
         result = host_preparation("status")
     except WindowsSandboxError as exc:
         raise click.ClickException(str(exc)) from exc
+    targets = ", ".join(target["path"] for target in result["targets"])
     if result["prepared"]:
-        click.echo(f"Windows sandbox metadata access is prepared for {result['systemRoot']}")
+        click.echo(f"Windows sandbox metadata access is prepared for {targets}")
     else:
         click.echo("Windows sandbox metadata access needs one-time administrator setup.")
         click.echo("In an administrator terminal, run: bello runtime windows-sandbox prepare")
@@ -335,12 +336,14 @@ def _windows_sandbox_change(operation: str, *, yes: bool) -> None:
     except WindowsSandboxError as exc:
         raise click.ClickException(str(exc)) from exc
     removing = operation == "remove"
-    if current["prepared"] == (not removing):
+    present = any(target["prepared"] for target in current["targets"])
+    if (not removing and current["prepared"]) or (removing and not present):
         click.echo("Permission already prepared." if not removing else "Permission already absent.")
         return
     verb = "Remove" if removing else "Add"
+    targets = ", ".join(target["path"] for target in current["targets"])
     click.echo(
-        f"{verb} the persistent Bello-named metadata permission on {current['systemRoot']} only. "
+        f"{verb} the persistent Bello-named metadata permission on these fixed directories only: {targets}. "
         "It does not grant directory listing, file contents, writes, or inherited access."
     )
     if removing:
@@ -352,11 +355,16 @@ def _windows_sandbox_change(operation: str, *, yes: bool) -> None:
         result = host_preparation("remove" if removing else "prepare")
     except WindowsSandboxError as exc:
         raise click.ClickException(str(exc)) from exc
-    if result["systemRoot"] != current["systemRoot"] or result["capabilitySid"] != current["capabilitySid"]:
+    if (
+        result["systemRoot"] != current["systemRoot"]
+        or result["capabilitySid"] != current["capabilitySid"]
+        or {target["kind"]: target["path"] for target in result["targets"]}
+        != {target["kind"]: target["path"] for target in current["targets"]}
+    ):
         raise click.ClickException("The helper reported a different setup target; verify host preparation before continuing.")
     click.echo(
         f"Windows sandbox metadata permission {'removed' if removing else 'prepared'} "
-        f"for {result['systemRoot']}."
+        f"for {targets}."
     )
 
 
