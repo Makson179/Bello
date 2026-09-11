@@ -577,9 +577,9 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
     use windows_sys::Win32::Security::{
-        AddAccessAllowedAceEx, AddAccessDeniedAceEx, GetSecurityDescriptorControl, InitializeAcl,
-        IsValidAcl, ACL_REVISION, INHERITED_ACE, SE_DACL_AUTO_INHERITED, SE_DACL_AUTO_INHERIT_REQ,
-        SE_DACL_DEFAULTED,
+        AddAccessAllowedAceEx, AddAccessDeniedAceEx, GetSecurityDescriptorControl,
+        GetSecurityDescriptorDacl, InitializeAcl, IsValidAcl, ACL_REVISION, INHERITED_ACE,
+        SE_DACL_AUTO_INHERITED, SE_DACL_AUTO_INHERIT_REQ, SE_DACL_DEFAULTED,
     };
 
     fn ace_bytes(dacl: *mut ACL) -> Vec<Vec<u8>> {
@@ -594,7 +594,9 @@ mod tests {
             .collect()
     }
 
-    fn object_dacl_snapshot(handle: &Handle) -> Result<(Vec<Vec<u8>>, u16)> {
+    type DaclSnapshot = (Vec<Vec<u8>>, u16);
+
+    fn object_dacl_snapshot(handle: &Handle) -> Result<DaclSnapshot> {
         let (dacl, descriptor) = current_dacl(handle)?;
         let mut control = 0;
         let mut revision = 0;
@@ -606,6 +608,106 @@ mod tests {
         Ok((ace_bytes(dacl), control))
     }
 
+    fn raw_object_dacl(handle: &Handle) -> Result<(*mut ACL, Vec<usize>)> {
+        #[link(name = "ntdll")]
+        extern "system" {
+            fn NtQuerySecurityObject(
+                handle: isize,
+                information: u32,
+                descriptor: *mut c_void,
+                length: u32,
+                needed: *mut u32,
+            ) -> i32;
+        }
+        let mut required = 0;
+        let mut status = unsafe {
+            NtQuerySecurityObject(
+                handle.raw(),
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                0,
+                &mut required,
+            )
+        };
+        for _ in 0..3 {
+            if required == 0 || required > 128 * 1024 {
+                return Err(anyhow!(
+                    "NtQuerySecurityObject(probe) invalid size {required}, NTSTATUS {:#010x}",
+                    status as u32
+                ));
+            }
+            let mut buffer = vec![0_usize; (required as usize).div_ceil(mem::size_of::<usize>())];
+            status = unsafe {
+                NtQuerySecurityObject(
+                    handle.raw(),
+                    DACL_SECURITY_INFORMATION,
+                    buffer.as_mut_ptr() as *mut c_void,
+                    (buffer.len() * mem::size_of::<usize>()) as u32,
+                    &mut required,
+                )
+            };
+            if status == 0xC0000023_u32 as i32 {
+                continue;
+            }
+            if status < 0 {
+                return Err(anyhow!(
+                    "NtQuerySecurityObject(probe) failed with NTSTATUS {:#010x}",
+                    status as u32
+                ));
+            }
+            let mut dacl = std::ptr::null_mut();
+            let mut present = 0;
+            let mut defaulted = 0;
+            if unsafe {
+                GetSecurityDescriptorDacl(
+                    buffer.as_ptr() as *mut c_void,
+                    &mut present,
+                    &mut dacl,
+                    &mut defaulted,
+                )
+            } == 0
+            {
+                return Err(crate::winutil::last_error(
+                    "GetSecurityDescriptorDacl(raw probe)",
+                ));
+            }
+            if present == 0 || dacl.is_null() {
+                return Err(anyhow!("raw probe refuses an absent/null DACL"));
+            }
+            return Ok((dacl, buffer));
+        }
+        Err(anyhow!("raw DACL changed size repeatedly during probe"))
+    }
+
+    fn raw_dacl_snapshot(handle: &Handle) -> Result<DaclSnapshot> {
+        let (dacl, buffer) = raw_object_dacl(handle)?;
+        let mut control = 0;
+        let mut revision = 0;
+        if unsafe {
+            GetSecurityDescriptorControl(
+                buffer.as_ptr() as *mut c_void,
+                &mut control,
+                &mut revision,
+            )
+        } == 0
+        {
+            return Err(crate::winutil::last_error(
+                "GetSecurityDescriptorControl(raw probe)",
+            ));
+        }
+        Ok((ace_bytes(dacl), control))
+    }
+
+    fn paired_dacl_snapshot(handle: &Handle) -> Result<(DaclSnapshot, DaclSnapshot)> {
+        let raw = raw_dacl_snapshot(handle)?;
+        let high_level = object_dacl_snapshot(handle)?;
+        anyhow::ensure!(
+            raw_dacl_snapshot(handle)? == raw,
+            "GetSecurityInfo changed the actual object DACL"
+        );
+        Ok((raw, high_level))
+    }
+
     fn set_object_dacl(handle: &Handle, dacl: *mut ACL) -> Result<()> {
         // Test-only use of Microsoft's documented user-mode native service.
         // Unlike SetSecurityInfo's tree propagation, this must change only the
@@ -615,7 +717,7 @@ mod tests {
             fn NtSetSecurityObject(handle: isize, information: u32, descriptor: *mut c_void)
                 -> i32;
         }
-        let (_, control) = object_dacl_snapshot(handle)?;
+        let (_, control) = raw_dacl_snapshot(handle)?;
         let mut descriptor: SECURITY_DESCRIPTOR = unsafe { mem::zeroed() };
         let pointer = &mut descriptor as *mut _ as *mut c_void;
         let preserved = SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED | SE_DACL_AUTO_INHERIT_REQ;
@@ -654,7 +756,7 @@ mod tests {
     }
 
     fn set_object_entries(handle: &Handle, entries: &[EXPLICIT_ACCESS_W]) -> Result<()> {
-        let (old_dacl, _descriptor) = current_dacl(handle)?;
+        let (old_dacl, _descriptor) = raw_object_dacl(handle)?;
         let mut dacl = std::ptr::null_mut();
         let result = unsafe {
             SetEntriesInAclW(entries.len() as u32, entries.as_ptr(), old_dacl, &mut dacl)
@@ -667,8 +769,11 @@ mod tests {
     }
 
     fn revoke_object_sid(handle: &Handle, sid: PSID) -> Result<()> {
-        let (dacl, _descriptor) = current_dacl(handle)?;
+        let (dacl, _descriptor) = raw_object_dacl(handle)?;
         let mut filtered = dacl_without_access_sid(dacl, sid)?;
+        if ace_bytes(dacl) == ace_bytes(filtered.as_mut_ptr() as *mut ACL) {
+            return Ok(());
+        }
         set_object_dacl(handle, filtered.as_mut_ptr() as *mut ACL)
     }
 
@@ -719,9 +824,11 @@ mod tests {
             )
             .unwrap();
             let before = object_dacl_snapshot(&parent).unwrap();
+            let raw_before = raw_dacl_snapshot(&parent).unwrap();
             assert_eq!(before.1 & SE_DACL_PROTECTED != 0, protected);
             let child = open_path(&root.join("child"), false).unwrap();
             let child_before = object_dacl_snapshot(&child).unwrap();
+            let raw_child_before = raw_dacl_snapshot(&child).unwrap();
             set_object_entries(
                 &parent,
                 &[EXPLICIT_ACCESS_W {
@@ -749,9 +856,12 @@ mod tests {
                 child_before,
                 "object-only update propagated to existing child"
             );
+            assert_eq!(raw_dacl_snapshot(&child).unwrap(), raw_child_before);
             revoke_object_sid(&parent, ours.0).unwrap();
             assert_eq!(object_dacl_snapshot(&parent).unwrap(), before);
             assert_eq!(object_dacl_snapshot(&child).unwrap(), child_before);
+            assert_eq!(raw_dacl_snapshot(&parent).unwrap(), raw_before);
+            assert_eq!(raw_dacl_snapshot(&child).unwrap(), raw_child_before);
             drop(child);
             drop(parent);
             std::fs::remove_dir_all(root).unwrap();
@@ -787,6 +897,7 @@ mod tests {
         let profile = random_profile_name().unwrap();
         let mut capabilities = CapabilitySids::for_network(false).unwrap();
         let sid = create_profile(&profile, &capabilities).unwrap();
+        let mut original_objects = Vec::new();
 
         let operation = (|| -> Result<()> {
             let handle = open_path(&root, true)?;
@@ -821,9 +932,24 @@ mod tests {
             ];
             let private_before = private_paths
                 .iter()
-                .map(|path| object_dacl_snapshot(&open_path(path, false)?))
+                .map(|path| paired_dacl_snapshot(&open_path(path, false)?))
                 .collect::<Result<Vec<_>>>()?;
-            let root_control_before = object_dacl_snapshot(&handle)?.1;
+            let mut pending = vec![root.clone()];
+            while let Some(path) = pending.pop() {
+                if path.is_dir() {
+                    for entry in fs::read_dir(&path)? {
+                        pending.push(entry?.path());
+                    }
+                }
+                let object = open_path(&path, false)?;
+                let identity = crate::winutil::file_identity(&object)?;
+                original_objects.push((
+                    (identity.volume_serial, identity.file_index),
+                    path,
+                    paired_dacl_snapshot(&object)?,
+                ));
+            }
+            let root_control_before = raw_dacl_snapshot(&handle)?.1;
             // Inheritable for future children, but do not propagate to any
             // pre-existing object. Production grant remains unchanged.
             set_object_entries(
@@ -848,14 +974,19 @@ mod tests {
                 ],
             )?;
             ensure!(
-                object_dacl_snapshot(&handle)?.1 == root_control_before,
+                raw_dacl_snapshot(&handle)?.1 == root_control_before,
                 "object-only update changed root DACL control flags"
             );
             for (path, before) in private_paths.iter().zip(&private_before) {
-                let after = object_dacl_snapshot(&open_path(path, false)?)?;
+                let after = paired_dacl_snapshot(&open_path(path, false)?)?;
+                writeln!(
+                    std::io::stderr(),
+                    "sparse private {}: raw before={:?}, raw after={:?}, GetSecurityInfo before={:?}, after={:?}",
+                    path.display(), before.0, after.0, before.1, after.1
+                )?;
                 ensure!(
-                    &after == before,
-                    "root grant changed {} DACL: before={before:?}, after={after:?}",
+                    after.0 == before.0,
+                    "root grant changed {} actual DACL: before={before:?}, after={after:?}",
                     path.display()
                 );
             }
@@ -924,13 +1055,13 @@ mod tests {
                 } else {
                     root.join(relative)
                 };
-                let before = object_dacl_snapshot(&open_path(&path, false)?)?;
+                let before = paired_dacl_snapshot(&open_path(&path, false)?)?;
                 ensure!(
                     command(&format!("icacls {relative} /inheritance:e"))? != 0,
                     "child unexpectedly gained WRITE_DAC on {relative}"
                 );
                 ensure!(
-                    object_dacl_snapshot(&open_path(&path, false)?)? == before,
+                    paired_dacl_snapshot(&open_path(&path, false)?)? == before,
                     "child modified {relative} DACL or inheritance flags"
                 );
             }
@@ -950,7 +1081,7 @@ mod tests {
                 ".supervisor\\sentinel.txt",
             ] {
                 let child = open_path(&root.join(relative), false)?;
-                let (dacl, _descriptor) = current_dacl(&child)?;
+                let (dacl, _descriptor) = raw_object_dacl(&child)?;
                 let masks = masks_for_sid(dacl, sid.0, true)?;
                 // Write directly so successful CI probes retain this evidence.
                 writeln!(
@@ -965,8 +1096,8 @@ mod tests {
             }
             for (path, before) in private_paths.iter().zip(&private_before) {
                 ensure!(
-                    &object_dacl_snapshot(&open_path(path, false)?)? == before,
-                    "commands changed private DACL bytes or control flags"
+                    paired_dacl_snapshot(&open_path(path, false)?)?.0 == before.0,
+                    "commands changed actual private DACL bytes or control flags"
                 );
             }
             revoke_object_sid(&handle, sid.0)?;
@@ -994,7 +1125,7 @@ mod tests {
             }
             for path in paths.iter().rev() {
                 let handle = open_path(path, true)?;
-                let (dacl, _descriptor) = current_dacl(&handle)?;
+                let (dacl, _descriptor) = raw_object_dacl(&handle)?;
                 let masks = masks_for_sid(dacl, sid.0, true)?;
                 writeln!(
                     std::io::stderr(),
@@ -1006,6 +1137,28 @@ mod tests {
                 revoke_object_sid(&handle, sid.0)?;
             }
             verify_absent_tree(&root, sid.0)?;
+            let current_objects = paths
+                .iter()
+                .map(|path| {
+                    let handle = open_path(path, false)?;
+                    let identity = crate::winutil::file_identity(&handle)?;
+                    Ok(((identity.volume_serial, identity.file_index), path))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (identity, original_path, before) in &original_objects {
+                let (_, current_path) = current_objects
+                    .iter()
+                    .find(|(current, _)| current == identity)
+                    .ok_or_else(|| {
+                        anyhow!("original fixture disappeared: {}", original_path.display())
+                    })?;
+                let after = paired_dacl_snapshot(&open_path(current_path, false)?)?;
+                ensure!(
+                    &after == before,
+                    "cleanup did not restore raw/high-level DACL for {} (now {}): before={before:?}, after={after:?}",
+                    original_path.display(), current_path.display()
+                );
+            }
             delete_profile(&profile)?;
             fs::remove_dir_all(&root)?;
             Ok(())
