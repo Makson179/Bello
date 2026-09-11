@@ -158,7 +158,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe"
+          $helper = Resolve-Path "supervisor/runtime/bin/bello-windows-sandbox.exe"
           ./native/windows-sandbox/ci/verify_network_setup.ps1 `
             -Helper $helper -Phase Prepare `
             -SnapshotPath (Join-Path $env:RUNNER_TEMP "bello-network-baseline.json") `
@@ -197,7 +197,7 @@ jobs:
         run: |
           $snapshot = Join-Path $env:RUNNER_TEMP "bello-network-baseline.json"
           if (Test-Path -LiteralPath $snapshot) {
-            $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe"
+            $helper = Resolve-Path "supervisor/runtime/bin/bello-windows-sandbox.exe"
             ./native/windows-sandbox/ci/verify_network_setup.ps1 `
               -Helper $helper -Phase Restore -SnapshotPath $snapshot `
               -Report (Join-Path $env:RUNNER_TEMP "bello-network-restore.json")

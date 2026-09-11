@@ -20,6 +20,7 @@ version = "0.52.0"
 features = [
   "Win32_Foundation",
   "Win32_Globalization",
+  "Win32_NetworkManagement_Dns",
   "Win32_NetworkManagement_WindowsFilteringPlatform",
   "Win32_NetworkManagement_WindowsFirewall",
   "Win32_Networking_WinSock",

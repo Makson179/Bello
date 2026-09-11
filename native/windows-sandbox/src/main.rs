@@ -22,6 +22,8 @@ mod journal;
 mod network_broker;
 #[cfg(all(windows, test))]
 mod network_ci_tests;
+#[cfg(all(windows, test))]
+mod network_dns_tests;
 #[cfg(windows)]
 mod network_protocol;
 #[cfg(windows)]

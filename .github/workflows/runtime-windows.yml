@@ -76,11 +76,24 @@ jobs:
             -Report (Join-Path $env:RUNNER_TEMP "bello-null-device-prepare.json")
       - name: Build and install package with mandatory helper
         run: python -m pip install ".[test,claude]" wheel
+      - name: Stage helper beside the source package used by pytest
+        shell: pwsh
+        run: |
+          $sourceBin = Join-Path $PWD "supervisor/runtime/bin"
+          New-Item -ItemType Directory -Force -Path $sourceBin | Out-Null
+          # Cargo's top-level executable can be hard-linked to its deps artifact.
+          # Exercise an ordinary distributed copy, exactly as the wheel does.
+          Copy-Item `
+            "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe" `
+            (Join-Path $sourceBin "bello-windows-sandbox.exe")
+          Copy-Item `
+            "native/windows-sandbox/THIRD_PARTY_NOTICES.txt" `
+            (Join-Path $sourceBin "THIRD_PARTY_NOTICES.txt")
       - name: Prepare and verify offline network isolation
         id: network_setup
         shell: pwsh
         run: |
-          $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe"
+          $helper = Resolve-Path "supervisor/runtime/bin/bello-windows-sandbox.exe"
           ./native/windows-sandbox/ci/verify_network_setup.ps1 `
             -Helper $helper -Phase Prepare `
             -SnapshotPath (Join-Path $env:RUNNER_TEMP "bello-network-baseline.json") `
@@ -114,17 +127,6 @@ jobs:
       - name: Install pinned Pi runtime
         working-directory: supervisor/pi_worker
         run: npm ci --ignore-scripts --no-audit --no-fund
-      - name: Stage helper beside the source package used by pytest
-        shell: pwsh
-        run: |
-          $sourceBin = Join-Path $PWD "supervisor/runtime/bin"
-          New-Item -ItemType Directory -Force -Path $sourceBin | Out-Null
-          Copy-Item `
-            "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe" `
-            (Join-Path $sourceBin "bello-windows-sandbox.exe")
-          Copy-Item `
-            "native/windows-sandbox/THIRD_PARTY_NOTICES.txt" `
-            (Join-Path $sourceBin "THIRD_PARTY_NOTICES.txt")
       - name: Run fail-closed Windows integration tests
         id: native_integration_tests
         continue-on-error: true
@@ -239,7 +241,7 @@ jobs:
         run: |
           $snapshot = Join-Path $env:RUNNER_TEMP "bello-network-baseline.json"
           if (Test-Path -LiteralPath $snapshot) {
-            $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe"
+            $helper = Resolve-Path "supervisor/runtime/bin/bello-windows-sandbox.exe"
             ./native/windows-sandbox/ci/verify_network_setup.ps1 `
               -Helper $helper -Phase Restore -SnapshotPath $snapshot `
               -Report (Join-Path $env:RUNNER_TEMP "bello-network-restore.json")
