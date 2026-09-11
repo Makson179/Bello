@@ -6,6 +6,8 @@ use std::io::{self, Read, Write};
 
 #[cfg(windows)]
 mod acl;
+#[cfg(all(windows, test))]
+mod acl_lock;
 #[cfg(windows)]
 mod identity;
 #[cfg(windows)]

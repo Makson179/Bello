@@ -781,9 +781,15 @@ mod tests {
     fn native_delete_probe_child() {
         use std::io::Write;
         use windows_sys::Win32::Storage::FileSystem::{
-            CreateFileW, DeleteFileW, GetFileAttributesW, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+            CreateFileW, DeleteFileW, FindClose, FindFirstFileW, GetFileAttributesW,
+            GetFinalPathNameByHandleW, GetFullPathNameW, GetVolumeInformationW,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            OPEN_EXISTING, VOLUME_NAME_DOS, VOLUME_NAME_NT, WIN32_FIND_DATAW,
         };
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentDirectoryW(length: u32, buffer: *mut u16) -> u32;
+        }
         if std::env::var("BELLO_TEST_DELETE_PROBE").as_deref() != Ok("1")
             || std::env::current_exe()
                 .unwrap()
@@ -794,6 +800,81 @@ mod tests {
             return;
         }
         let name = wide("root.txt");
+        let mut directory = vec![0_u16; 32768];
+        let count = unsafe { GetCurrentDirectoryW(directory.len() as u32, directory.as_mut_ptr()) };
+        let error = (count == 0).then(std::io::Error::last_os_error);
+        writeln!(
+            std::io::stderr(),
+            "native cwd count={count}, path={:?}, error={:?}",
+            directory
+                .get(..count as usize)
+                .map(String::from_utf16_lossy),
+            error
+        )
+        .unwrap();
+        let mut absolute = vec![0_u16; 32768];
+        let count = unsafe {
+            GetFullPathNameW(
+                name.as_ptr(),
+                absolute.len() as u32,
+                absolute.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        let error = (count == 0).then(std::io::Error::last_os_error);
+        let absolute = absolute
+            .get(..count as usize)
+            .map(String::from_utf16_lossy)
+            .unwrap_or_default();
+        writeln!(
+            std::io::stderr(),
+            "native full path count={count}, path={absolute:?}, error={:?}",
+            error
+        )
+        .unwrap();
+        for candidate in [
+            "root.txt".to_owned(),
+            absolute.clone(),
+            format!("\\\\?\\{absolute}"),
+        ] {
+            let mut found: WIN32_FIND_DATAW = unsafe { mem::zeroed() };
+            let find = unsafe { FindFirstFileW(wide(&candidate).as_ptr(), &mut found) };
+            let error = if find == -1 {
+                Some(std::io::Error::last_os_error())
+            } else {
+                None
+            };
+            writeln!(
+                std::io::stderr(),
+                "native FindFirstFileW {candidate:?}: {error:?}"
+            )
+            .unwrap();
+            if find != -1 {
+                unsafe {
+                    FindClose(find);
+                }
+            }
+        }
+        if let Some(drive) = absolute.get(..3) {
+            let result = unsafe {
+                GetVolumeInformationW(
+                    wide(drive).as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            let error = (result == 0).then(std::io::Error::last_os_error);
+            writeln!(
+                std::io::stderr(),
+                "native volume query {drive:?}: result={result}, error={error:?}"
+            )
+            .unwrap();
+        }
         writeln!(
             std::io::stderr(),
             "native delete probe attributes: {:#x}",
@@ -820,6 +901,27 @@ mod tests {
             opened.as_ref().map(|_| ())
         )
         .unwrap();
+        if let Ok(handle) = &opened {
+            for (label, flags) in [("DOS", VOLUME_NAME_DOS), ("NT", VOLUME_NAME_NT)] {
+                let mut buffer = vec![0_u16; 32768];
+                let count = unsafe {
+                    GetFinalPathNameByHandleW(
+                        handle.raw(),
+                        buffer.as_mut_ptr(),
+                        buffer.len() as u32,
+                        flags,
+                    )
+                };
+                let error = (count == 0).then(std::io::Error::last_os_error);
+                writeln!(
+                    std::io::stderr(),
+                    "native final path {label}: count={count}, path={:?}, error={:?}",
+                    buffer.get(..count as usize).map(String::from_utf16_lossy),
+                    error
+                )
+                .unwrap();
+            }
+        }
         drop(opened);
         let deleted = if unsafe { DeleteFileW(name.as_ptr()) } == 0 {
             Err(std::io::Error::last_os_error())
@@ -1143,6 +1245,42 @@ mod tests {
                     std::io::stderr(),
                     "CMD enumeration diagnostic: {enumeration}"
                 )?;
+                for (name, verbatim) in
+                    [("absolute-probe.txt", false), ("verbatim-probe.txt", true)]
+                {
+                    ensure!(
+                        command(&format!("echo PROBE>{name}"))? == 0,
+                        "could not create CMD probe fixture"
+                    );
+                    let path = root.join(name);
+                    let path = path
+                        .to_str()
+                        .ok_or_else(|| anyhow!("non-Unicode probe fixture"))?;
+                    let spelling = if verbatim {
+                        path
+                    } else {
+                        path.strip_prefix("\\\\?\\").unwrap_or(path)
+                    };
+                    let _ = command(&format!("dir /b \"{spelling}\""))?;
+                    let _ = command(&format!("del \"{spelling}\""))?;
+                }
+                let mut windows_buffer = vec![0_u16; 32768];
+                let count = unsafe {
+                    windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW(
+                        windows_buffer.as_mut_ptr(),
+                        windows_buffer.len() as u32,
+                    )
+                };
+                ensure!(
+                    count > 0 && (count as usize) < windows_buffer.len(),
+                    "could not resolve Windows directory"
+                );
+                let windows = String::from_utf16(&windows_buffer[..count as usize])?;
+                let windows = windows.strip_prefix("\\\\?\\").unwrap_or(&windows);
+                let _ = command("echo SystemRoot=%SystemRoot% WINDIR=%WINDIR% COMSPEC=%COMSPEC%")?;
+                let _ = command(&format!(
+                    "set SystemRoot={windows}&& set WINDIR={windows}&& dir /b root.txt"
+                ))?;
                 fs::copy(
                     std::env::current_exe()?,
                     root.join("bello-delete-probe.exe"),
