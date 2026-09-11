@@ -9,7 +9,7 @@ temporarily grants the AppContainer SID access only to the requested roots.
 
 The separate fixed-argument commands `host-status`, `host-prepare`, and
 `host-remove` operate only on non-inherited metadata permissions for two fixed
-OS directories: the system-drive root and `FOLDERID_UserProfiles`. They
+OS directories: the system-drive root and the machine-configured profiles directory. They
 never enter command execution or recovery and accept no paths, commands, SIDs,
 or permission masks. Status is read-only. Prepare and remove require an
 administrator terminal; the helper does not elevate itself. The user-facing

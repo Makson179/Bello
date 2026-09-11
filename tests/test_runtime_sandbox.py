@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import shlex
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -185,6 +187,58 @@ def test_toolchain_discovery_uses_exact_under_home_version_roots(
     assert python_root.resolve() in toolchain.readable_roots
     assert home.resolve() not in toolchain.readable_roots
     assert all(not root.is_relative_to(malicious.parent) for root in toolchain.readable_roots)
+
+
+def test_windows_discovery_includes_current_unactivated_venv_not_on_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    base = tmp_path / "base-python"
+    home = tmp_path / "home"
+    venv = home / "pipx" / "venvs" / "bello"
+    root.mkdir()
+    base.mkdir()
+    executable = _make_executable(venv / "Scripts" / "python.exe")
+    (venv / "pyvenv.cfg").write_text(f"home = {base}\n", encoding="utf-8")
+    monkeypatch.setattr(sandbox, "sys", SimpleNamespace(
+        platform="win32", executable=str(executable), prefix=str(venv), base_prefix=str(base),
+    ))
+    monkeypatch.setattr(sandbox, "_real_home", lambda: home.resolve())
+    monkeypatch.setenv("PATH", "")
+    discovery = sandbox._discover_toolchain(SandboxPolicy(root))
+    assert base.resolve() in discovery.readable_roots
+    assert venv.resolve() in discovery.readable_roots
+    assert home.resolve() not in discovery.readable_roots
+    assert venv.parent.resolve() not in discovery.readable_roots
+    assert (venv / ".supervisor").resolve() in sandbox._private_candidates(discovery.readable_roots)
+    assert (venv / ".codex" / "bello-run").resolve() in sandbox._private_candidates(discovery.readable_roots)
+
+
+@pytest.mark.parametrize("layout", ["home", "workspace-parent", "unknown-root"])
+def test_windows_current_python_never_grants_overbroad_or_unverified_prefix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, layout: str,
+) -> None:
+    home = tmp_path / "home"
+    base = tmp_path / "base"
+    parent = home if layout == "home" else tmp_path / "runtime"
+    executable = _make_executable(parent / "Scripts" / "python.exe")
+    root = parent / "workspace" if layout == "workspace-parent" else tmp_path / "workspace"
+    root.mkdir()
+    base.mkdir()
+    if layout != "unknown-root":
+        (parent / "pyvenv.cfg").write_text(f"home = {base}\n", encoding="utf-8")
+    monkeypatch.setattr(sandbox, "sys", SimpleNamespace(
+        platform="win32", executable=str(executable), prefix=str(parent), base_prefix=str(base),
+    ))
+    monkeypatch.setattr(sandbox, "_real_home", lambda: home.resolve())
+    assert sandbox._windows_current_python_root(SandboxPolicy(root)) == executable.resolve()
+
+
+def test_current_python_runtime_discovery_change_is_windows_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(sandbox, "sys", SimpleNamespace(platform="linux"))
+    assert sandbox._windows_current_python_root(SandboxPolicy(tmp_path)) is None
 
 
 def test_toolchain_shims_precede_system_path_without_exposing_host_bin_directory(
@@ -584,6 +638,91 @@ async def test_native_windows_runner_enforces_workspace_and_private_state(
     assert not (root / "read-only-write.txt").exists()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="native Windows unactivated venv integration")
+def test_native_windows_current_venv_file_worker_works_without_path_activation(
+    tmp_path: Path,
+) -> None:
+    # Use a real copied base + real CPython venv, not module monkeypatches. This
+    # keeps every changed runtime ACL inside the fixture instead of touching the
+    # machine-wide Python installation or unrelated developer tools.
+    from tests.test_runtime_pipeline_integration import _stage_windows_pytest_runtime
+
+    base_python = _stage_windows_pytest_runtime(tmp_path / "base-python")
+    venv = tmp_path / "pipx-like-venv"
+    subprocess.run(
+        [str(base_python), "-I", "-m", "venv", "--copies", "--without-pip", str(venv)],
+        capture_output=True, text=True, timeout=60, check=True,
+    )
+    python = venv / "Scripts" / "python.exe"
+    assert python.is_file()
+    assert not python.is_symlink(), "the regression requires the Windows redirector, not a base symlink"
+    root = tmp_path / "workspace"
+    root.mkdir()
+    for authority in (root, venv):
+        private = authority / ".supervisor"
+        private.mkdir()
+        (private / "secret.txt").write_text("UNACTIVATED_VENV_PRIVATE_PAYLOAD", encoding="utf-8")
+    driver = tmp_path / "exercise-venv.py"
+    driver.write_text(r'''
+import asyncio, base64, json, os, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from supervisor.runtime import sandbox
+from supervisor.runtime.sandbox import SandboxPolicy, SandboxRunner, SandboxUnavailableError
+
+root, helper = map(Path, sys.argv[2:4])
+prefix = Path(sys.prefix).resolve()
+assert prefix != Path(sys.base_prefix).resolve()
+assert Path(sys.executable).resolve() == prefix / "Scripts" / "python.exe"
+assert all(Path(entry).resolve() != prefix / "Scripts" for entry in os.environ["PATH"].split(os.pathsep))
+assert "VIRTUAL_ENV" not in os.environ
+policy = SandboxPolicy(root, readable_roots=(helper,), network_access=False)
+discovered = sandbox._discover_toolchain(policy)
+assert prefix in discovered.readable_roots, discovered.readable_roots
+assert Path(sys.base_prefix).resolve() in discovered.readable_roots
+assert not discovered.shims, discovered.shims
+
+async def exercise():
+    runner = SandboxRunner(policy)
+    async def call(name, path, **arguments):
+        operation = {"name": name, "arguments": {"path": str(path), **arguments}}
+        encoded = base64.b64encode(json.dumps(operation).encode()).decode()
+        # This is the actual file-worker argv used by ToolHost; the interpreter
+        # and discovery both come from this running, unactivated venv process.
+        command = subprocess.list2cmdline([str(Path(sys.executable).resolve()), "-I", str(helper), encoded])
+        return await runner.run(command, root, 120)
+    written = await call("write_file", root / "result.txt", content="VENV_FILE_WORKER_OK")
+    assert written.exit_code == 0, written.output
+    read = await call("read_file", root / "result.txt")
+    assert read.exit_code == 0 and "VENV_FILE_WORKER_OK" in read.output, read.output
+    for authority in (root, prefix):
+        denied = await call("read_file", authority / ".supervisor" / "secret.txt")
+        assert denied.exit_code != 0, denied.output
+        assert "UNACTIVATED_VENV_PRIVATE_PAYLOAD" not in denied.output
+    print(json.dumps({"ok": True, "prefix": str(prefix), "basePrefix": sys.base_prefix}))
+
+try:
+    asyncio.run(exercise())
+except SandboxUnavailableError as error:
+    print(json.dumps({"unavailable": str(error)}))
+    raise SystemExit(77)
+''', encoding="utf-8")
+    environment = dict(os.environ)
+    environment["PATH"] = str(Path(os.environ["SystemRoot"]) / "System32")
+    for key in ("VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH"):
+        environment.pop(key, None)
+    completed = subprocess.run(
+        [str(python), "-I", str(driver), str(Path(__file__).resolve().parents[1]),
+         str(root.resolve()), str(Path(sandbox.__file__).with_name("file_worker.py").resolve())],
+        env=environment, capture_output=True, text=True, timeout=600,
+    )
+    if completed.returncode == 77 and os.environ.get("BELLO_REQUIRE_NATIVE_SANDBOX") != "1":
+        pytest.skip(completed.stdout)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert json.loads(completed.stdout)["ok"] is True
+    assert (root / "result.txt").read_text(encoding="utf-8") == "VENV_FILE_WORKER_OK"
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="native Windows AppContainer integration")
 @pytest.mark.asyncio
 async def test_native_windows_parallel_cleanup_preserves_other_command_access(
@@ -821,6 +960,8 @@ async def test_callback_failure_kills_command_tree(tmp_path: Path) -> None:
 async def test_callback_oserror_is_not_misreported_as_backend_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    import traceback
+
     async def fail(_chunk: str) -> None:
         raise OSError("consumer pipe failed")
 
@@ -836,10 +977,15 @@ async def test_callback_oserror_is_not_misreported_as_backend_failure(
             command, None, cwd, "test"
         ),
     )
-    with pytest.raises(OSError, match="consumer pipe failed"):
+    with pytest.raises(OSError) as caught:
         await SandboxRunner(SandboxPolicy(tmp_path, mode="workspace-write")).run(
             "printf now", tmp_path, 2, on_output=fail
         )
+    # Keep the same required error text, but do not hide the originating stack
+    # if an intermittent process/cleanup error replaces the callback exception.
+    assert "consumer pipe failed" in str(caught.value), "".join(
+        traceback.format_exception(caught.value)
+    )
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group behavior")

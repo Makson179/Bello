@@ -15,7 +15,8 @@ use std::ffi::c_void;
 use std::mem;
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_INSUFFICIENT_BUFFER, PSID, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    GetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, PSID, WAIT_ABANDONED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::{
     AddAccessAllowedAce, CheckTokenMembership, CreateWellKnownSid, EqualSid, GetAce,
@@ -27,13 +28,15 @@ use windows_sys::Win32::Security::{
     SECURITY_DESCRIPTOR, TOKEN_ELEVATION, TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
 };
 use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
-use windows_sys::Win32::System::Com::CoTaskMemFree;
+use windows_sys::Win32::System::Registry::{
+    RegGetValueW, HKEY_LOCAL_MACHINE, REG_EXPAND_SZ, REG_SZ, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ,
+    RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY,
+};
 use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 use windows_sys::Win32::System::Threading::{
     CreateMutexExW, GetCurrentProcess, OpenProcessToken, ReleaseMutex, WaitForSingleObject,
     SYNCHRONIZATION_SYNCHRONIZE,
 };
-use windows_sys::Win32::UI::Shell::{FOLDERID_UserProfiles, SHGetKnownFolderPath};
 
 const SETUP_LOCK: &str = "Global\\Bello.Sandbox.SystemRootMetadata.Setup.v1";
 const SETUP_LOCK_ACCESS: u32 = SYNCHRONIZATION_SYNCHRONIZE | READ_CONTROL;
@@ -134,7 +137,7 @@ fn root_from_windows_directory(directory: &str) -> Result<PathBuf> {
     )))
 }
 
-fn system_root() -> Result<PathBuf> {
+fn system_windows_directory() -> Result<String> {
     // Do not read SystemDrive/SystemRoot from an elevated process's environment.
     let mut buffer = vec![0_u16; 32768];
     let length = unsafe { GetSystemWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
@@ -145,7 +148,125 @@ fn system_root() -> Result<PathBuf> {
         return Err(anyhow!("OS Windows directory exceeds the supported size"));
     }
     let directory = String::from_utf16(&buffer[..length as usize])?;
-    root_from_windows_directory(&directory)
+    root_from_windows_directory(&directory)?;
+    Ok(directory)
+}
+
+#[cfg(test)]
+fn system_root() -> Result<PathBuf> {
+    root_from_windows_directory(&system_windows_directory()?)
+}
+
+fn profiles_directory_value() -> Result<(String, bool)> {
+    // Microsoft's User Profiles support tooling uses this exact machine value:
+    // https://learn.microsoft.com/en-us/troubleshoot/windows-server/support-tools/scripts-to-cleanup-profile-folder-information-and-prevent-temp-user-profiles-from-being-created
+    // NOEXPAND is essential: the helper normally has an empty environment and
+    // an elevated setup must never trust caller-provided SystemDrive/TEMP/etc.
+    let key = wide(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList");
+    let value = wide("ProfilesDirectory");
+    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND | RRF_SUBKEY_WOW6464KEY;
+    let mut size = 0;
+    let mut kind = 0;
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            flags,
+            &mut kind,
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if result != 0 {
+        return Err(anyhow!(
+            "RegGetValueW(ProfilesDirectory size) failed with Win32 error {result}"
+        ));
+    }
+    for _ in 0..3 {
+        if !(2..=65536).contains(&size) || size % 2 != 0 {
+            return Err(anyhow!("invalid machine ProfilesDirectory string size"));
+        }
+        let mut buffer = vec![0_u16; size as usize / 2 + 1];
+        let mut bytes = (buffer.len() * 2) as u32;
+        let result = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                value.as_ptr(),
+                flags,
+                &mut kind,
+                buffer.as_mut_ptr() as *mut c_void,
+                &mut bytes,
+            )
+        };
+        if matches!(result, ERROR_MORE_DATA | ERROR_INSUFFICIENT_BUFFER) {
+            size = bytes;
+            continue;
+        }
+        if result != 0 {
+            return Err(anyhow!(
+                "RegGetValueW(ProfilesDirectory) failed with Win32 error {result}"
+            ));
+        }
+        if !matches!(kind, REG_SZ | REG_EXPAND_SZ)
+            || bytes < 2
+            || bytes % 2 != 0
+            || bytes as usize > buffer.len() * 2
+        {
+            return Err(anyhow!(
+                "invalid machine ProfilesDirectory string type or length"
+            ));
+        }
+        let units = &buffer[..bytes as usize / 2];
+        if units.last() != Some(&0) || units[..units.len() - 1].contains(&0) {
+            return Err(anyhow!(
+                "machine ProfilesDirectory is not one terminated string"
+            ));
+        }
+        return Ok((
+            String::from_utf16(&units[..units.len() - 1])?,
+            kind == REG_EXPAND_SZ,
+        ));
+    }
+    Err(anyhow!("machine ProfilesDirectory changed size repeatedly"))
+}
+
+fn expand_profiles_directory(value: &str, expandable: bool, windows: &str) -> Result<PathBuf> {
+    let root = root_from_windows_directory(windows)?;
+    let drive = root
+        .to_str()
+        .ok_or_else(|| anyhow!("invalid OS drive"))?
+        .trim_end_matches('\\');
+    let mut expanded = String::new();
+    let mut remaining = value;
+    while expandable && remaining.contains('%') {
+        let start = remaining.find('%').expect("a percent is present");
+        expanded.push_str(&remaining[..start]);
+        let variable = &remaining[start + 1..];
+        let end = variable
+            .find('%')
+            .ok_or_else(|| anyhow!("unterminated ProfilesDirectory variable"))?;
+        let name = &variable[..end];
+        if name.eq_ignore_ascii_case("SystemDrive") {
+            expanded.push_str(drive);
+        } else if name.eq_ignore_ascii_case("SystemRoot") || name.eq_ignore_ascii_case("windir") {
+            expanded.push_str(windows);
+        } else {
+            return Err(anyhow!("unsupported machine ProfilesDirectory variable; caller environment is never expanded"));
+        }
+        remaining = &variable[end + 1..];
+    }
+    expanded.push_str(remaining);
+    // Also rejects UNC, device paths, parent traversal, NUL and a volume root.
+    root_from_windows_directory(&expanded)?;
+    let path = PathBuf::from(expanded);
+    if winutil::is_volume_root(&path) {
+        return Err(anyhow!(
+            "machine ProfilesDirectory must not be a volume root"
+        ));
+    }
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -169,22 +290,10 @@ fn open_system_root(root: &Path, write: bool) -> Result<Handle> {
 /// These are fixed OS locations, never caller-selected directories. A relocated
 /// UserProfiles folder remains a named target, not permission to grant its tree.
 pub fn fixed_targets() -> Result<Vec<FixedTarget>> {
-    let root = system_root()?;
-    let mut raw = std::ptr::null_mut();
-    let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_UserProfiles, 0, 0, &mut raw) };
-    if hr < 0 || raw.is_null() {
-        return Err(anyhow!(
-            "SHGetKnownFolderPath(UserProfiles) failed with HRESULT {:#010x}",
-            hr as u32
-        ));
-    }
-    let profiles = PathBuf::from(unsafe { winutil::wide_ptr_to_os_string(raw) });
-    unsafe { CoTaskMemFree(raw as *const c_void) };
-    // Keep the public confirmation path exact, ordinary drive-absolute Unicode,
-    // never a lossy rendering or a hidden device/UNC spelling.
-    root_from_windows_directory(profiles.to_str().ok_or_else(|| {
-        anyhow!("the OS UserProfiles folder cannot be represented in the setup report")
-    })?)?;
+    let windows = system_windows_directory()?;
+    let root = root_from_windows_directory(&windows)?;
+    let (value, expandable) = profiles_directory_value()?;
+    let profiles = expand_profiles_directory(&value, expandable, &windows)?;
     Ok(vec![
         FixedTarget {
             kind: "systemDriveRoot",
@@ -452,6 +561,92 @@ pub fn execute(operation: &'static str) -> Result<HostStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profiles_directory_expands_only_os_derived_variables() {
+        for (input, expected) in [
+            (r"%SystemDrive%\Users", r"D:\Users"),
+            (r"%sYsTeMdRiVe%\Profiles", r"D:\Profiles"),
+            (r"%SystemRoot%\Profiles", r"D:\Windows\Profiles"),
+            (r"%windir%\Profiles", r"D:\Windows\Profiles"),
+            (r"E:\Profiles", r"E:\Profiles"),
+        ] {
+            assert_eq!(
+                expand_profiles_directory(input, true, r"D:\Windows").unwrap(),
+                PathBuf::from(expected)
+            );
+        }
+        assert_eq!(
+            expand_profiles_directory(r"E:\Profiles", false, r"D:\Windows").unwrap(),
+            PathBuf::from(r"E:\Profiles")
+        );
+        for rejected in [
+            r"%TEMP%\Profiles",
+            r"%USERPROFILE%\Profiles",
+            r"%SystemDrive\Profiles",
+            r"%SystemDrive%\..\Profiles",
+            r"%SystemDrive%\",
+            r"%SystemDrive%\\",
+            r"\\server\Profiles",
+            r"\\?\C:\Profiles",
+            r"C:Profiles",
+        ] {
+            assert!(
+                expand_profiles_directory(rejected, true, r"D:\Windows").is_err(),
+                "accepted {rejected}"
+            );
+        }
+        // REG_SZ is literal, not expanded against either the OS or caller env.
+        assert!(expand_profiles_directory(r"%SystemDrive%\Users", false, r"D:\Windows").is_err());
+    }
+
+    #[test]
+    fn host_status_child() {
+        // A separate test process executes the exact host-status implementation.
+        // Do not mutate global env in this multithreaded native test binary.
+        println!(
+            "\nBELLO_HOST_STATUS={}",
+            serde_json::to_string(&execute("status").unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn fixed_host_targets_ignore_empty_and_poisoned_environment() {
+        let expected = serde_json::to_value(execute("status").unwrap()).unwrap();
+        for poisoned in [false, true] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "host_prepare::tests::host_status_child",
+                    "--nocapture",
+                ])
+                .env_clear();
+            if poisoned {
+                child
+                    .env("SystemDrive", "Z:")
+                    .env("SystemRoot", r"Z:\bello-not-the-windows-directory")
+                    .env("windir", r"Z:\bello-not-the-windows-directory")
+                    .env("TEMP", r"Z:\bello-not-the-profiles-directory");
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "host-status failed (poisoned={poisoned}): stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let json = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("BELLO_HOST_STATUS="))
+                .expect("host-status child must execute and report its actual targets");
+            let actual: serde_json::Value = serde_json::from_str(json).unwrap();
+            assert_eq!(actual["systemRoot"], expected["systemRoot"]);
+            assert_eq!(actual["capabilitySid"], expected["capabilitySid"]);
+            assert_eq!(actual["targets"], expected["targets"]);
+        }
+    }
 
     #[test]
     fn host_target_is_only_the_literal_os_drive_root() {

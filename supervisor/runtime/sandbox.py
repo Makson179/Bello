@@ -246,6 +246,44 @@ def _runtime_root() -> Path | None:
     return root
 
 
+def _windows_current_python_root(policy: SandboxPolicy) -> Path | None:
+    """Authorize the interpreter Bello actually uses, not whichever is on PATH.
+
+    A Windows venv/pipx executable is commonly a copied redirector, so resolving
+    sys.executable does not put it below sys.base_prefix. Its exact venv also
+    contains pyvenv.cfg, which the redirector needs before it loads the base
+    runtime. Never infer a generic parent directory as a runtime boundary.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        executable = Path(sys.executable)
+        prefix = Path(sys.prefix)
+        if not executable.is_absolute() or not prefix.is_absolute():
+            return None
+        executable = executable.resolve(strict=True)
+        prefix = prefix.resolve(strict=True)
+        base = Path(sys.base_prefix).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not executable.is_file():
+        return None
+    # Unconventional/overbroad layouts get the exact executable only, not a
+    # guessed containing tree. Normal base installs and venvs have a known root.
+    conventional = (
+        prefix.is_dir()
+        and executable.is_relative_to(prefix)
+        and (prefix == base or (prefix / "pyvenv.cfg").is_file())
+    )
+    if not conventional or (
+        prefix == Path(prefix.anchor)
+        or _contains(prefix, _real_home())
+        or (prefix != policy.root and _contains(prefix, policy.root))
+    ):
+        return executable
+    return prefix
+
+
 def _path_is_within_authority(path: Path, authority: Path) -> bool:
     return _contains(authority, path) if authority.is_dir() else path == authority
 
@@ -433,6 +471,13 @@ def _discover_toolchain(policy: SandboxPolicy) -> _Toolchain:
         _path_is_within_authority(runtime, authority) for authority in authorities
     ):
         roots.append(runtime)
+
+    current_python = _windows_current_python_root(policy)
+    if current_python is not None and not any(
+        _path_is_within_authority(current_python, authority)
+        for authority in (*authorities, *roots)
+    ):
+        roots.append(current_python)
 
     for name in _TOOLCHAIN_COMMANDS:
         try:
