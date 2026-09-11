@@ -48,20 +48,29 @@ try {
     if (`$identity.User.Value -ne $(Quote-PowerShellLiteral $ciUser.SID.Value) -or `$isAdmin) {
         throw 'standard-user launcher did not receive the exact non-admin CI identity'
     }
+    `$identityData = @{
+        userSid = `$identity.User.Value; isAdministrator = `$isAdmin
+        sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    }
+    `$identityData | ConvertTo-Json | Set-Content -LiteralPath $(Quote-PowerShellLiteral $identityReport) -Encoding utf8
     # Loading the user registry does not replace inherited USERPROFILE/TEMP.
     # Obtain these from this authenticated user's known folders, never the host.
-    `$env:USERPROFILE = [Environment]::GetFolderPath('UserProfile')
-    `$env:LOCALAPPDATA = [Environment]::GetFolderPath('LocalApplicationData')
-    `$env:APPDATA = [Environment]::GetFolderPath('ApplicationData')
-    if (-not `$env:USERPROFILE -or -not `$env:LOCALAPPDATA) { throw 'CI user profile did not load' }
+    # A fresh logon may not have created every folder; the default overload
+    # returns an empty string for a missing directory. Ask Windows to create it.
+    # https://learn.microsoft.com/dotnet/api/system.environment.specialfolderoption
+    `$knownFolders = @{}
+    foreach (`$folderName in @('UserProfile', 'LocalApplicationData', 'ApplicationData')) {
+        `$knownFolders[`$folderName] = [Environment]::GetFolderPath(`$folderName, 'Create')
+        `$identityData.knownFolders = `$knownFolders
+        `$identityData | ConvertTo-Json | Set-Content -LiteralPath $(Quote-PowerShellLiteral $identityReport) -Encoding utf8
+        if (-not `$knownFolders[`$folderName]) { throw "Windows could not initialize CI known folder: `$folderName" }
+        if (`$folderName -eq 'UserProfile') { `$env:USERPROFILE = `$knownFolders[`$folderName] }
+    }
+    `$env:LOCALAPPDATA = `$knownFolders.LocalApplicationData
+    `$env:APPDATA = `$knownFolders.ApplicationData
     `$env:TEMP = Join-Path `$env:LOCALAPPDATA 'Temp'
     `$env:TMP = `$env:TEMP
     New-Item -ItemType Directory -Force -Path `$env:TEMP | Out-Null
-    @{
-        userSid = `$identity.User.Value; isAdministrator = `$isAdmin
-        sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
-        userProfile = `$env:USERPROFILE
-    } | ConvertTo-Json | Set-Content -LiteralPath $(Quote-PowerShellLiteral $identityReport) -Encoding utf8
     `$child = Start-Process -FilePath $(Quote-PowerShellLiteral $Python) -ArgumentList $(Quote-PowerShellLiteral $pythonArguments) -Wait -PassThru -RedirectStandardOutput $(Quote-PowerShellLiteral $stdoutPath) -RedirectStandardError $(Quote-PowerShellLiteral $stderrPath)
     exit `$child.ExitCode
 }
