@@ -51,26 +51,93 @@ try {
     `$identityData = @{
         userSid = `$identity.User.Value; isAdministrator = `$isAdmin
         sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+        environmentBefore = @{
+            USERPROFILE = `$env:USERPROFILE; LOCALAPPDATA = `$env:LOCALAPPDATA
+            APPDATA = `$env:APPDATA; TEMP = `$env:TEMP
+        }
     }
     `$identityData | ConvertTo-Json | Set-Content -LiteralPath $(Quote-PowerShellLiteral $identityReport) -Encoding utf8
     # Loading the user registry does not replace inherited USERPROFILE/TEMP.
-    # Obtain these from this authenticated user's known folders, never the host.
-    # A fresh logon may not have created every folder; the default overload
-    # returns an empty string for a missing directory. Ask Windows to create it.
-    # https://learn.microsoft.com/dotnet/api/system.environment.specialfolderoption
+    # Compile only this CI helper in the account's already writable report dir.
+    `$env:TEMP = $(Quote-PowerShellLiteral $reportDirectory)
+    `$env:TMP = `$env:TEMP
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class BelloCiUserEnvironment {
+    [DllImport("userenv.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateEnvironmentBlock(out IntPtr block, IntPtr token, bool inherit);
+    [DllImport("userenv.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DestroyEnvironmentBlock(IntPtr block);
+    public static Dictionary<string, string> Read(IntPtr token) {
+        IntPtr block;
+        if (!CreateEnvironmentBlock(out block, token, false))
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateEnvironmentBlock failed");
+        Exception readError = null;
+        try {
+            var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            const int maxChars = 1024 * 1024;
+            int offset = 0;
+            while (offset < maxChars) {
+                if (Marshal.ReadInt16(block, offset * 2) == 0) return values;
+                int start = offset;
+                while (offset < maxChars && Marshal.ReadInt16(block, offset * 2) != 0) offset++;
+                if (offset == maxChars) break;
+                string entry = Marshal.PtrToStringUni(IntPtr.Add(block, start * 2), offset - start);
+                int separator = entry.IndexOf('=', 1);
+                if (separator < 1) throw new InvalidOperationException("Invalid OS environment entry");
+                // Windows may include hidden =C: drive-working-directory entries.
+                // These are not ordinary variables; the launcher sets its cwd explicitly.
+                if (entry[0] != '=') values[entry.Substring(0, separator)] = entry.Substring(separator + 1);
+                offset++;
+            }
+            throw new InvalidOperationException("OS environment block exceeded the CI parsing limit");
+        }
+        catch (Exception error) { readError = error; throw; }
+        finally {
+            if (!DestroyEnvironmentBlock(block)) {
+                var cleanupError = new Win32Exception(Marshal.GetLastWin32Error(), "DestroyEnvironmentBlock failed");
+                if (readError != null) throw new AggregateException(readError, cleanupError);
+                throw cleanupError;
+            }
+        }
+    }
+}
+'@
+    # Ask Windows for this actual user's variables, with no parent inheritance.
+    # https://learn.microsoft.com/windows/win32/api/userenv/nf-userenv-createenvironmentblock
+    `$userEnvironment = [BelloCiUserEnvironment]::Read(`$identity.Token)
+    foreach (`$variableName in @([Environment]::GetEnvironmentVariables().Keys)) {
+        if (-not `$variableName.StartsWith('=') -and -not `$userEnvironment.ContainsKey(`$variableName)) {
+            [Environment]::SetEnvironmentVariable(`$variableName, `$null, 'Process')
+        }
+    }
+    foreach (`$variable in `$userEnvironment.GetEnumerator()) {
+        [Environment]::SetEnvironmentVariable(`$variable.Key, `$variable.Value, 'Process')
+    }
+    `$identityData.environmentAfter = @{
+        USERPROFILE = `$env:USERPROFILE; LOCALAPPDATA = `$env:LOCALAPPDATA
+        APPDATA = `$env:APPDATA; TEMP = `$env:TEMP
+    }
+    `$identityData | ConvertTo-Json | Set-Content -LiteralPath $(Quote-PowerShellLiteral $identityReport) -Encoding utf8
+    # Use the OS-returned paths directly. Shell folder APIs in this already
+    # running PowerShell may have cached values from its former environment.
     `$knownFolders = @{}
-    foreach (`$folderName in @('UserProfile', 'LocalApplicationData', 'ApplicationData')) {
-        `$knownFolders[`$folderName] = [Environment]::GetFolderPath(`$folderName, 'Create')
+    `$folderVariables = @{ UserProfile = 'USERPROFILE'; LocalApplicationData = 'LOCALAPPDATA'; ApplicationData = 'APPDATA'; Temp = 'TEMP' }
+    foreach (`$folderName in @('UserProfile', 'LocalApplicationData', 'ApplicationData', 'Temp')) {
+        `$folderPath = `$userEnvironment[`$folderVariables[`$folderName]]
+        `$knownFolders[`$folderName] = `$folderPath
         `$identityData.knownFolders = `$knownFolders
         `$identityData | ConvertTo-Json | Set-Content -LiteralPath $(Quote-PowerShellLiteral $identityReport) -Encoding utf8
-        if (-not `$knownFolders[`$folderName]) { throw "Windows could not initialize CI known folder: `$folderName" }
-        if (`$folderName -eq 'UserProfile') { `$env:USERPROFILE = `$knownFolders[`$folderName] }
+        if (-not `$folderPath -or `$folderPath -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+(?:\\|$))') {
+            throw "Windows did not return an absolute CI user directory: `$folderName"
+        }
+        New-Item -ItemType Directory -Force -Path `$folderPath | Out-Null
     }
-    `$env:LOCALAPPDATA = `$knownFolders.LocalApplicationData
-    `$env:APPDATA = `$knownFolders.ApplicationData
-    `$env:TEMP = Join-Path `$env:LOCALAPPDATA 'Temp'
-    `$env:TMP = `$env:TEMP
-    New-Item -ItemType Directory -Force -Path `$env:TEMP | Out-Null
     `$child = Start-Process -FilePath $(Quote-PowerShellLiteral $Python) -ArgumentList $(Quote-PowerShellLiteral $pythonArguments) -Wait -PassThru -RedirectStandardOutput $(Quote-PowerShellLiteral $stdoutPath) -RedirectStandardError $(Quote-PowerShellLiteral $stderrPath)
     exit `$child.ExitCode
 }
