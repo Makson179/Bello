@@ -7,20 +7,30 @@ use crate::winutil::{
 };
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::ffi::c_void;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+use std::mem;
 use std::path::{Path, PathBuf};
-use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Foundation::{
+    GetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
+};
+use windows_sys::Win32::Security::{
+    AddAccessAllowedAce, GetLengthSid, GetTokenInformation, InitializeAcl,
+    InitializeSecurityDescriptor, IsValidSid, SetSecurityDescriptorDacl,
+    SetSecurityDescriptorOwner, TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION,
+    SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::Threading::{
-    CreateMutexW, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE,
+    CreateMutexW, GetCurrentProcess, OpenMutexW, OpenProcessToken, SYNCHRONIZATION_SYNCHRONIZE,
 };
 use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath};
 
-const JOURNAL_VERSION: u32 = 2;
+const JOURNAL_VERSION: u32 = 3;
 const MAX_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -101,6 +111,7 @@ impl Journal {
                 created_paths: Vec::new(),
             },
         };
+        validate_journal(&journal.data)?;
         journal.persist()?;
         Ok(journal)
     }
@@ -281,25 +292,117 @@ pub fn state_directory() -> Result<StateDirectory> {
 }
 
 pub fn mutex_name(profile_name: &str) -> String {
-    format!("Local\\{profile_name}")
+    format!("Global\\{profile_name}")
+}
+
+fn account_sid_buffer() -> Result<Vec<usize>> {
+    let mut token = 0;
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(crate::winutil::last_error("OpenProcessToken(live marker)"));
+    }
+    let token = Handle::new(token, "OpenProcessToken(live marker)")?;
+    let mut required = 0;
+    let queried = unsafe {
+        GetTokenInformation(
+            token.raw(),
+            TokenUser,
+            std::ptr::null_mut(),
+            0,
+            &mut required,
+        )
+    };
+    let code = unsafe { GetLastError() };
+    if queried != 0
+        || code != ERROR_INSUFFICIENT_BUFFER
+        || required < mem::size_of::<TOKEN_USER>() as u32
+        || required > 16 * 1024
+    {
+        return Err(anyhow!(
+            "invalid live-marker account SID query (Win32 error {code})"
+        ));
+    }
+    let mut buffer = vec![0_usize; (required as usize).div_ceil(mem::size_of::<usize>())];
+    if unsafe {
+        GetTokenInformation(
+            token.raw(),
+            TokenUser,
+            buffer.as_mut_ptr() as *mut c_void,
+            required,
+            &mut required,
+        )
+    } == 0
+    {
+        return Err(crate::winutil::last_error(
+            "GetTokenInformation(live-marker account)",
+        ));
+    }
+    let sid = unsafe { (*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid };
+    if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+        return Err(anyhow!("invalid live-marker account SID"));
+    }
+    Ok(buffer)
 }
 
 pub fn create_live_mutex(name: &str) -> Result<Handle> {
-    Handle::new(
-        unsafe { CreateMutexW(std::ptr::null(), 0, wide(name).as_ptr()) },
-        "CreateMutexW",
-    )
+    validate_profile_name(
+        name.strip_prefix("Global\\")
+            .ok_or_else(|| anyhow!("live marker must use the global namespace"))?,
+    )?;
+    // A per-run global object is visible from every session of this account.
+    // It is only held open, never acquired/waited on: commands remain parallel.
+    // Grant the account SID, not the session's logon SID, and no AppContainer SID.
+    let user = account_sid_buffer()?;
+    let sid = unsafe { (*(user.as_ptr() as *const TOKEN_USER)).User.Sid };
+    let acl_bytes = mem::size_of::<ACL>() + mem::size_of::<ACCESS_ALLOWED_ACE>()
+        - mem::size_of::<u32>()
+        + unsafe { GetLengthSid(sid) } as usize;
+    let mut acl_storage = vec![0_usize; acl_bytes.div_ceil(mem::size_of::<usize>())];
+    let dacl = acl_storage.as_mut_ptr() as *mut ACL;
+    let mut descriptor: SECURITY_DESCRIPTOR = unsafe { mem::zeroed() };
+    let descriptor_ptr = &mut descriptor as *mut _ as *mut c_void;
+    if unsafe { InitializeAcl(dacl, acl_bytes as u32, ACL_REVISION) } == 0
+        || unsafe { AddAccessAllowedAce(dacl, ACL_REVISION, SYNCHRONIZATION_SYNCHRONIZE, sid) } == 0
+        || unsafe { InitializeSecurityDescriptor(descriptor_ptr, 1) } == 0
+        || unsafe { SetSecurityDescriptorOwner(descriptor_ptr, sid, 0) } == 0
+        || unsafe { SetSecurityDescriptorDacl(descriptor_ptr, 1, dacl, 0) } == 0
+    {
+        return Err(crate::winutil::last_error(
+            "initialize live-marker security",
+        ));
+    }
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor_ptr,
+        bInheritHandle: 0,
+    };
+    let raw = unsafe { CreateMutexW(&attributes, 0, wide(name).as_ptr()) };
+    let code = unsafe { GetLastError() };
+    if raw == 0 {
+        return Err(anyhow!(
+            "CreateMutexW(live marker) failed with Win32 error {code}"
+        ));
+    }
+    let handle = Handle::new(raw, "CreateMutexW(live marker)")?;
+    if code == ERROR_ALREADY_EXISTS {
+        return Err(anyhow!(
+            "live-marker identity collision; refusing an existing mutex"
+        ));
+    }
+    Ok(handle)
 }
 
-fn mutex_is_live(name: &str) -> bool {
+fn mutex_is_live(name: &str) -> Result<bool> {
     let handle = unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, wide(name).as_ptr()) };
     if handle == 0 {
-        false
-    } else {
-        unsafe {
-            CloseHandle(handle);
+        let code = unsafe { GetLastError() };
+        if code == ERROR_FILE_NOT_FOUND {
+            Ok(false)
+        } else {
+            Err(anyhow!("could not establish sandbox liveness (Win32 error {code}); recovery journal retained"))
         }
-        true
+    } else {
+        drop(Handle::new(handle, "OpenMutexW(live marker)")?);
+        Ok(true)
     }
 }
 
@@ -342,7 +445,7 @@ pub fn recover_stale(state_dir: &Path) -> Result<()> {
                 "recovery journal filename does not match its profile identity"
             ));
         }
-        if mutex_is_live(&data.mutex_name) {
+        if mutex_is_live(&data.mutex_name)? {
             continue;
         }
         cleanup_data(&data)
@@ -354,10 +457,13 @@ pub fn recover_stale(state_dir: &Path) -> Result<()> {
 }
 
 fn validate_journal(data: &JournalData) -> Result<()> {
+    validate_profile_name(&data.profile_name)?;
+    if data.journal_version == 2 && data.mutex_name == format!("Local\\{}", data.profile_name) {
+        return Err(anyhow!("legacy session-local recovery journal retained: another Windows session may still own this run; automatic recovery cannot establish its liveness"));
+    }
     if data.journal_version != JOURNAL_VERSION {
         return Err(anyhow!("unsupported recovery journal version"));
     }
-    validate_profile_name(&data.profile_name)?;
     if data.mutex_name != mutex_name(&data.profile_name) {
         return Err(anyhow!("recovery journal mutex does not match its profile"));
     }
@@ -497,6 +603,206 @@ mod tests {
     use super::*;
     use std::process::{Command, Stdio};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
+    use windows_sys::Win32::Security::{
+        EqualSid, GetAce, GetKernelObjectSecurity, GetSecurityDescriptorDacl,
+        GetSecurityDescriptorOwner, SetKernelObjectSecurity, DACL_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::CreateEventW;
+
+    #[test]
+    fn live_marker_child_probe() {
+        let Ok(name) = std::env::var("BELLO_TEST_LIVE_MARKER") else {
+            return;
+        };
+        assert!(
+            mutex_is_live(&name).unwrap(),
+            "another helper cannot see the live marker"
+        );
+    }
+
+    #[test]
+    fn global_live_marker_has_account_only_access_and_is_not_inherited() {
+        let profile = crate::identity::random_profile_name().unwrap();
+        let name = mutex_name(&profile);
+        assert!(name.starts_with("Global\\"));
+        assert!(!mutex_is_live(&name).unwrap());
+        let marker = create_live_mutex(&name).unwrap();
+        assert!(mutex_is_live(&name).unwrap());
+        let mut flags = 0;
+        assert_ne!(unsafe { GetHandleInformation(marker.raw(), &mut flags) }, 0);
+        assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
+
+        let mut required = 0;
+        let information = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+        assert_eq!(
+            unsafe {
+                GetKernelObjectSecurity(
+                    marker.raw(),
+                    information,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            0
+        );
+        assert_eq!(unsafe { GetLastError() }, ERROR_INSUFFICIENT_BUFFER);
+        let mut descriptor = vec![0_usize; (required as usize).div_ceil(mem::size_of::<usize>())];
+        let sd = descriptor.as_mut_ptr() as *mut c_void;
+        assert_ne!(
+            unsafe {
+                GetKernelObjectSecurity(marker.raw(), information, sd, required, &mut required)
+            },
+            0
+        );
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut present = 0;
+        let mut defaulted = 0;
+        assert_ne!(
+            unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) },
+            0
+        );
+        assert_ne!(present, 0);
+        assert!(!dacl.is_null());
+        assert_eq!(unsafe { (*dacl).AceCount }, 1);
+        let mut ace = std::ptr::null_mut();
+        assert_ne!(unsafe { GetAce(dacl, 0, &mut ace) }, 0);
+        let ace = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
+        assert_eq!(ace.Header.AceType, 0);
+        assert_eq!(ace.Header.AceFlags, 0);
+        assert_eq!(ace.Mask, SYNCHRONIZATION_SYNCHRONIZE);
+        let account = account_sid_buffer().unwrap();
+        let account_sid = unsafe { (*(account.as_ptr() as *const TOKEN_USER)).User.Sid };
+        assert_ne!(
+            unsafe { EqualSid(account_sid, &ace.SidStart as *const _ as *mut c_void) },
+            0
+        );
+        let mut owner = std::ptr::null_mut();
+        assert_ne!(
+            unsafe { GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted) },
+            0
+        );
+        assert_ne!(unsafe { EqualSid(account_sid, owner) }, 0);
+        assert!(
+            create_live_mutex(&name).is_err(),
+            "existing identity must not be adopted"
+        );
+
+        // An independently started process must open the account-authorized
+        // object, not inherit our handle. This is not a two-session substitute.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "journal::tests::live_marker_child_probe",
+                "--nocapture",
+            ])
+            .env("BELLO_TEST_LIVE_MARKER", &name)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        drop(marker);
+        assert!(!mutex_is_live(&name).unwrap());
+    }
+
+    fn liveness_fixture() -> (PathBuf, Journal) {
+        let profile = crate::identity::random_profile_name().unwrap();
+        let base = std::env::temp_dir().join(format!("bello-liveness-{profile}"));
+        fs::create_dir(&base).unwrap();
+        fs::create_dir(base.join("workspace")).unwrap();
+        let root = fs::canonicalize(base.join("workspace")).unwrap();
+        fs::write(root.join("keep.txt"), "unchanged").unwrap();
+        let journal = Journal::create(
+            &base.join("state"),
+            &profile,
+            &mutex_name(&profile),
+            &[root],
+        )
+        .unwrap();
+        (base, journal)
+    }
+
+    #[test]
+    fn recovery_retains_live_and_ambiguous_markers_but_recovers_absent_ones() {
+        let (base, journal) = liveness_fixture();
+        let name = &journal.data.mutex_name;
+        let before = fs::read(&journal.path).unwrap();
+        let marker = create_live_mutex(name).unwrap();
+        recover_stale(&base.join("state")).unwrap();
+        assert_eq!(fs::read(&journal.path).unwrap(), before);
+
+        // Even the owning account has no implicit SYNCHRONIZE right. An
+        // inaccessible marker is unknown, not a dead helper to recover.
+        let mut empty_acl: ACL = unsafe { mem::zeroed() };
+        assert_ne!(
+            unsafe { InitializeAcl(&mut empty_acl, mem::size_of::<ACL>() as u32, ACL_REVISION) },
+            0
+        );
+        let mut descriptor: SECURITY_DESCRIPTOR = unsafe { mem::zeroed() };
+        let sd = &mut descriptor as *mut _ as *mut c_void;
+        assert_ne!(unsafe { InitializeSecurityDescriptor(sd, 1) }, 0);
+        assert_ne!(
+            unsafe { SetSecurityDescriptorDacl(sd, 1, &empty_acl, 0) },
+            0
+        );
+        assert_ne!(
+            unsafe { SetKernelObjectSecurity(marker.raw(), DACL_SECURITY_INFORMATION, sd) },
+            0
+        );
+        assert!(mutex_is_live(name)
+            .unwrap_err()
+            .to_string()
+            .contains("Win32 error 5"));
+        assert!(recover_stale(&base.join("state")).is_err());
+        assert_eq!(fs::read(&journal.path).unwrap(), before);
+        drop(marker);
+
+        let event = Handle::new(
+            unsafe { CreateEventW(std::ptr::null(), 0, 0, wide(name).as_ptr()) },
+            "CreateEventW(liveness collision fixture)",
+        )
+        .unwrap();
+        assert!(
+            mutex_is_live(name).is_err(),
+            "wrong object type is not an absent marker"
+        );
+        assert!(create_live_mutex(name).is_err());
+        assert!(recover_stale(&base.join("state")).is_err());
+        assert_eq!(fs::read(&journal.path).unwrap(), before);
+        drop(event);
+
+        recover_stale(&base.join("state")).unwrap();
+        assert!(!journal.path.exists());
+        assert_eq!(
+            fs::read_to_string(base.join("workspace/keep.txt")).unwrap(),
+            "unchanged"
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn legacy_local_journal_is_retained_even_without_a_marker_in_this_session() {
+        let (base, mut journal) = liveness_fixture();
+        journal.data.journal_version = 2;
+        journal.data.mutex_name = format!("Local\\{}", journal.data.profile_name);
+        journal.persist().unwrap();
+        let before = fs::read(&journal.path).unwrap();
+        assert!(!mutex_is_live(&journal.data.mutex_name).unwrap());
+        let error = recover_stale(&base.join("state")).unwrap_err();
+        assert!(error.to_string().contains("legacy session-local"));
+        assert_eq!(fs::read(&journal.path).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(base.join("workspace/keep.txt")).unwrap(),
+            "unchanged"
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn cleanup_follows_current_tree_after_rename_and_preserves_peer_grants() {
