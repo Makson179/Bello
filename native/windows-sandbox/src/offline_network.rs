@@ -514,29 +514,7 @@ fn filter_record(filter: &FWPM_FILTER0) -> Result<(LeaseRecord, usize)> {
         .iter()
         .position(|key| *key == key_text)
         .ok_or_else(|| anyhow!("lease record does not name this filter"))?;
-    let valid = unsafe {
-        filter.flags == FWPM_FILTER_FLAG_PERSISTENT
-            && !filter.providerKey.is_null()
-            && eq_guid(&*filter.providerKey, &PROVIDER_KEY)
-            && eq_guid(&filter.subLayerKey, &SUBLAYER_KEY)
-            && eq_guid(&filter.layerKey, &LAYERS[index])
-            && filter.action.r#type == FWP_ACTION_BLOCK
-            && filter.Anonymous.rawContext == 0
-            && filter.numFilterConditions == 1
-            && !filter.filterCondition.is_null()
-            && filter.weight.r#type == FWP_UINT64
-            && !filter.weight.Anonymous.uint64.is_null()
-            && *filter.weight.Anonymous.uint64 == u64::MAX
-            && filter.effectiveWeight.r#type == FWP_UINT64
-            && !filter.effectiveWeight.Anonymous.uint64.is_null()
-            && *filter.effectiveWeight.Anonymous.uint64 == u64::MAX
-            && filter.filterId != 0
-            && string_equals(filter.displayData.name, FILTER_NAME)
-            && filter.displayData.description.is_null()
-    };
-    if !valid {
-        bail!("offline lease filter has an unexpected policy shape");
-    }
+    validate_filter_shape(filter, index)?;
     let condition = unsafe { &*filter.filterCondition };
     if !eq_guid(&condition.fieldKey, &FWPM_CONDITION_ALE_PACKAGE_ID)
         || condition.matchType != FWP_MATCH_EQUAL
@@ -549,6 +527,79 @@ fn filter_record(filter: &FWPM_FILTER0) -> Result<(LeaseRecord, usize)> {
         bail!("offline filter package SID differs from lease");
     }
     Ok((record, index))
+}
+
+fn validate_filter_shape(filter: &FWPM_FILTER0, index: usize) -> Result<()> {
+    // A returned FWPM_FILTER0 has both submitted and BFE-assigned members.
+    // Report exactly which bounded scalar differs; do not dump providerData,
+    // display strings, pointers, or account/package identities into logs. This
+    // intentionally keeps all existing shape requirements unchanged until a
+    // real native readback establishes any required BFE normalization.
+    let mut mismatches = Vec::new();
+    if filter.flags != FWPM_FILTER_FLAG_PERSISTENT {
+        mismatches.push(format!(
+            "flags=0x{:08x}, expected=0x{:08x}",
+            filter.flags, FWPM_FILTER_FLAG_PERSISTENT
+        ));
+    }
+    if filter.providerKey.is_null() || !unsafe { eq_guid(&*filter.providerKey, &PROVIDER_KEY) } {
+        mismatches.push("providerKey mismatch".into());
+    }
+    if !eq_guid(&filter.subLayerKey, &SUBLAYER_KEY) {
+        mismatches.push("subLayerKey mismatch".into());
+    }
+    if !eq_guid(&filter.layerKey, &LAYERS[index]) {
+        mismatches.push(format!("layerKey mismatch for slot={index}"));
+    }
+    if filter.action.r#type != FWP_ACTION_BLOCK {
+        mismatches.push(format!(
+            "action=0x{:08x}, expected=0x{:08x}",
+            filter.action.r#type, FWP_ACTION_BLOCK
+        ));
+    }
+    if unsafe { filter.Anonymous.rawContext } != 0 {
+        mismatches.push("rawContext is nonzero".into());
+    }
+    if filter.numFilterConditions != 1 || filter.filterCondition.is_null() {
+        mismatches.push(format!(
+            "condition count={}, pointerPresent={}",
+            filter.numFilterConditions,
+            !filter.filterCondition.is_null()
+        ));
+    }
+    for (label, value) in [
+        ("weight", &filter.weight),
+        ("effectiveWeight", &filter.effectiveWeight),
+    ] {
+        let scalar = if value.r#type == FWP_UINT64 && !unsafe { value.Anonymous.uint64 }.is_null() {
+            Some(unsafe { *value.Anonymous.uint64 })
+        } else {
+            None
+        };
+        if scalar != Some(u64::MAX) {
+            mismatches.push(format!(
+                "{label}: type={}, uint64={scalar:?}, expectedType={FWP_UINT64}, expectedUint64={}",
+                value.r#type,
+                u64::MAX
+            ));
+        }
+    }
+    if filter.filterId == 0 {
+        mismatches.push("filterId is zero".into());
+    }
+    if !unsafe { string_equals(filter.displayData.name, FILTER_NAME) } {
+        mismatches.push("displayData.name mismatch".into());
+    }
+    if !filter.displayData.description.is_null() {
+        mismatches.push("displayData.description is present".into());
+    }
+    if !mismatches.is_empty() {
+        bail!(
+            "offline lease filter has an unexpected policy shape (slot={index}): {}",
+            mismatches.join("; ")
+        );
+    }
+    Ok(())
 }
 
 fn leases_in(engine: &Engine) -> Result<Vec<InstalledLease>> {
@@ -869,7 +920,11 @@ mod tests {
         assert!(filter_record(&bad).is_err());
         let mut bad = filter;
         bad.flags |= FWPM_FILTER_FLAG_DISABLED;
-        assert!(filter_record(&bad).is_err());
+        let error = filter_record(&bad).unwrap_err().to_string();
+        assert!(error.contains("flags=0x"));
+        assert!(error.len() < 512);
+        assert!(!error.contains(&record.package_sid));
+        assert!(!error.contains(&record.owner_sid));
         let mut bad = filter;
         bad.flags = 0;
         assert!(filter_record(&bad).is_err());
@@ -897,6 +952,30 @@ mod tests {
         let mut bad = filter;
         bad.weight.r#type = FWP_EMPTY;
         assert!(filter_record(&bad).is_err());
+        let mut bad = filter;
+        bad.effectiveWeight.r#type = FWP_EMPTY;
+        let error = filter_record(&bad).unwrap_err().to_string();
+        assert!(error.contains("effectiveWeight: type="));
+        assert!(error.contains("uint64=None"));
+        let mut bad = filter;
+        let mut smaller_weight = u64::MAX - 1;
+        bad.effectiveWeight.Anonymous.uint64 = &mut smaller_weight;
+        assert!(filter_record(&bad)
+            .unwrap_err()
+            .to_string()
+            .contains("effectiveWeight: type="));
+        let mut bad = filter;
+        bad.weight.Anonymous.uint64 = ptr::null_mut();
+        assert!(filter_record(&bad)
+            .unwrap_err()
+            .to_string()
+            .contains("weight: type="));
+        let mut bad = filter;
+        bad.flags |= FWPM_FILTER_FLAG_INDEXED;
+        bad.effectiveWeight.r#type = FWP_EMPTY;
+        let error = filter_record(&bad).unwrap_err().to_string();
+        assert!(error.contains("flags=0x") && error.contains("effectiveWeight:"));
+        assert!(error.len() < 512);
         let mut bad = filter;
         bad.Anonymous.rawContext = 1;
         assert!(filter_record(&bad).is_err());

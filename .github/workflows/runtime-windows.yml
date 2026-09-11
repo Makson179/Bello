@@ -110,7 +110,18 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
-          cargo test --locked --manifest-path native/windows-sandbox/Cargo.toml
+          $nativeTestLog = Join-Path $env:RUNNER_TEMP "bello-native-rust-tests.log"
+          & cargo test --locked --manifest-path native/windows-sandbox/Cargo.toml 2>&1 |
+            Tee-Object -FilePath $nativeTestLog
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) { throw "Native Rust unit tests failed with exit $testExit" }
+      - name: Upload native Rust test output immediately
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-rust-tests-${{ matrix.os }}
+          path: ${{ runner.temp }}/bello-native-rust-tests.log
+          if-no-files-found: ignore
       - name: Run serial offline broker lifecycle tests
         id: network_lifecycle_tests
         continue-on-error: true

@@ -27,15 +27,16 @@ use windows_sys::Win32::Foundation::{
     WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+    SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
     AccessCheck, DuplicateTokenEx, GetSidSubAuthority, GetSidSubAuthorityCount,
     GetTokenInformation, IsValidSid, RevertToSelf, SecurityIdentification, TokenAppContainerSid,
     TokenGroups, TokenImpersonation, TokenIntegrityLevel, TokenIsAppContainer, TokenUser,
-    GENERIC_MAPPING, PRIVILEGE_SET, SECURITY_ATTRIBUTES, TOKEN_APPCONTAINER_INFORMATION,
-    TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
-    TOKEN_USER,
+    GENERIC_MAPPING, OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, SECURITY_ATTRIBUTES,
+    TOKEN_APPCONTAINER_INFORMATION, TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS,
+    TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
@@ -803,8 +804,92 @@ fn image_path(process: HANDLE) -> Result<PathBuf> {
     )))
 }
 
-fn client(request: &BrokerRequest) -> Result<BrokerReply> {
+fn verify_pipe_identity(
+    before: &(u32, PathBuf),
+    first_pipe_pid: u32,
+    after: &(u32, PathBuf),
+    second_pipe_pid: u32,
+) -> Result<()> {
+    if before.0 == 0
+        || before.0 != first_pipe_pid
+        || before.0 != after.0
+        || before.0 != second_pipe_pid
+        || !crate::winutil::path_eq(&before.1, &after.1)
+    {
+        return Err(anyhow!(
+            "network pipe identity changed or differs from the protected running service"
+        ));
+    }
+    Ok(())
+}
+
+fn pipe_server_pid(pipe: HANDLE) -> Result<u32> {
+    let mut pid = 0;
+    if unsafe { GetNamedPipeServerProcessId(pipe, &mut pid) } == 0 || pid == 0 {
+        return Err(last_error("GetNamedPipeServerProcessId(network broker)"));
+    }
+    Ok(pid)
+}
+
+fn verify_service_self_identity() -> Result<()> {
     let (expected_pid, expected_image) = crate::network_setup::running_service_identity()?;
+    let actual_pid = unsafe { GetCurrentProcessId() };
+    let actual_image = std::fs::canonicalize(image_path(unsafe { GetCurrentProcess() })?)?;
+    let expected_image = std::fs::canonicalize(expected_image)?;
+    if actual_pid != expected_pid || !crate::winutil::path_eq(&actual_image, &expected_image) {
+        return Err(anyhow!(
+            "network service process differs from its protected SCM PID or image"
+        ));
+    }
+    Ok(())
+}
+
+fn require_system_owned_pipe(pipe: HANDLE) -> Result<()> {
+    // Use the pipe's existing READ_CONTROL, not foreign process/token access.
+    // An unprivileged process cannot create a counterfeit SYSTEM-owned pipe.
+    let mut owner = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    let code = unsafe {
+        GetSecurityInfo(
+            pipe,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    let result = if code != 0 {
+        Err(anyhow!(
+            "GetSecurityInfo(network pipe owner) failed with Win32 {code}"
+        ))
+    } else if descriptor.is_null() || owner.is_null() {
+        Err(anyhow!("network pipe has no valid owner descriptor"))
+    } else {
+        identity::sid_string(owner).and_then(|sid| {
+            if sid == "S-1-5-18" {
+                Ok(())
+            } else {
+                Err(anyhow!("network pipe is not owned by LocalSystem"))
+            }
+        })
+    };
+    if !descriptor.is_null() {
+        unsafe { LocalFree(descriptor) };
+    }
+    result
+}
+
+fn client(request: &BrokerRequest) -> Result<BrokerReply> {
+    let before = crate::network_setup::running_service_identity()?;
+    // Keep the validated administrator-owned executable pinned throughout the
+    // exchange. Ordinary users need only the image's existing read permission,
+    // never process/token access or SeDebugPrivilege against the SYSTEM service.
+    let _image = crate::winutil::open_regular_file_read(&crate::winutil::verbatim_local_absolute(
+        &before.1,
+    )?)?;
     let deadline = Instant::now() + IO_TIMEOUT;
     let pipe = loop {
         let raw = unsafe {
@@ -829,30 +914,15 @@ fn client(request: &BrokerRequest) -> Result<BrokerReply> {
             return Err(last_error("WaitNamedPipeW(network broker)"));
         }
     };
-    let mut actual_pid = 0;
-    if unsafe { GetNamedPipeServerProcessId(pipe.raw(), &mut actual_pid) } == 0
-        || actual_pid != expected_pid
-    {
-        return Err(anyhow!(
-            "network pipe server is not the running registered service"
-        ));
-    }
-    let server = Handle::new(
-        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, actual_pid) },
-        "OpenProcess(network service)",
-    )?;
-    // running_service_identity verifies the protected SCM configuration names
-    // LocalSystem and this running PID. Together with the kernel-reported pipe
-    // PID and pinned trusted image this identifies the service. Querying the
-    // foreign SYSTEM token here would unnecessarily require SeDebugPrivilege
-    // for an ordinary user; the service independently verifies its own token.
-    let actual_image = std::fs::canonicalize(image_path(server.raw())?)?;
-    let expected_image = std::fs::canonicalize(expected_image)?;
-    if !crate::winutil::path_eq(&actual_image, &expected_image) {
-        return Err(anyhow!(
-            "network broker process image differs from its trusted service image"
-        ));
-    }
+    // Trust is anchored in SCM's protected LocalSystem/own-process/exact-image
+    // configuration and the kernel-reported pipe endpoint PID, not a PID or
+    // path supplied in a broker response. Recheck the fixed service after
+    // connecting: a stop/restart/configuration replacement must fail closed.
+    let first_pid = pipe_server_pid(pipe.raw())?;
+    require_system_owned_pipe(pipe.raw())?;
+    let after = crate::network_setup::running_service_identity()?;
+    let actual_pid = pipe_server_pid(pipe.raw())?;
+    verify_pipe_identity(&before, first_pid, &after, actual_pid)?;
     send(pipe.raw(), request, deadline)?;
     let reply: BrokerReply = receive(pipe.raw(), deadline)?;
     if reply.protocol_version != BROKER_PROTOCOL_VERSION
@@ -1069,10 +1139,22 @@ fn service_loop() -> Result<()> {
             .lock()
             .map_err(|_| anyhow!("broker admission lock poisoned"))?;
         admission.leases = state.retained.len();
-        admission.accepting = true;
+        admission.accepting = false;
     }
     let pipe = create_pipe()?;
     report_service(SERVICE_RUNNING, 0)?;
+    // SCM exposes a valid running PID only after SERVICE_RUNNING. No request
+    // is read or ACKed yet: verify our own image using the self pseudo-handle,
+    // then atomically enable admission unless a concurrent STOP won first.
+    verify_service_self_identity()?;
+    {
+        let mut admission = ADMISSION
+            .lock()
+            .map_err(|_| anyhow!("broker admission lock poisoned"))?;
+        if !STOP.load(Ordering::Acquire) {
+            admission.accepting = true;
+        }
+    }
     while !STOP.load(Ordering::Acquire) {
         state.reap(false)?;
         let mut operation = Operation::new()?;
@@ -1172,6 +1254,100 @@ mod tests {
     use super::*;
     use std::fs;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn client_identity_rejects_pipe_pid_restart_or_image_change() {
+        let before = (42, PathBuf::from(r"C:\Program Files\Bello\broker.exe"));
+        assert!(verify_pipe_identity(&before, 42, &before, 42).is_ok());
+        for (first, after, second) in [
+            (41, before.clone(), 42),
+            (42, (43, before.1.clone()), 42),
+            (42, before.clone(), 43),
+            (43, (43, before.1.clone()), 43),
+            (42, (42, PathBuf::from(r"C:\Users\attacker\broker.exe")), 42),
+        ] {
+            assert!(verify_pipe_identity(&before, first, &after, second).is_err());
+        }
+        let absent = (0, before.1.clone());
+        assert!(verify_pipe_identity(&absent, 0, &absent, 0).is_err());
+    }
+
+    #[test]
+    fn ordinary_client_never_requests_foreign_process_or_token_access() {
+        // Keep the normal-user contract explicit: its trust anchor is protected
+        // SCM + kernel pipe identity. Real non-admin CI executes this path too.
+        let source = include_str!("network_broker.rs");
+        let client_body = source
+            .split("fn client(request:")
+            .nth(1)
+            .unwrap()
+            .split("\npub fn status(")
+            .next()
+            .unwrap();
+        for forbidden in [
+            "OpenProcess(",
+            "process_token(",
+            "image_path(",
+            "QueryFullProcessImageNameW(",
+        ] {
+            assert!(
+                !client_body.contains(forbidden),
+                "ordinary client reintroduced {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn counterfeit_user_owned_pipe_is_not_a_system_service_endpoint() {
+        let token = process_token(unsafe { GetCurrentProcess() }).unwrap();
+        let user = user_sid(token.raw()).unwrap();
+        assert_ne!(
+            user, "S-1-5-18",
+            "fixture must run as an ordinary/elevated user, not SYSTEM"
+        );
+        let mut descriptor = std::ptr::null_mut();
+        let sddl = format!("O:{user}D:P(A;;GA;;;{user})");
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide(sddl).as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let name = format!(
+            r"\\.\pipe\Bello.Test.UserOwned.{}",
+            identity::random_profile_name().unwrap()
+        );
+        let raw = unsafe {
+            CreateNamedPipeW(
+                wide(name).as_ptr(),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                128,
+                128,
+                0,
+                &attributes,
+            )
+        };
+        let pipe = Handle::new(raw, "create disposable user-owned pipe");
+        unsafe { LocalFree(descriptor) };
+        let pipe = pipe.unwrap();
+        let error = require_system_owned_pipe(pipe.raw()).unwrap_err();
+        assert!(
+            error.to_string().contains("not owned by LocalSystem"),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn strict_broker_protocol_rejects_paths_masks_and_unknown_versions() {
