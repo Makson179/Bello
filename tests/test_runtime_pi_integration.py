@@ -26,6 +26,14 @@ _MIN_NODE = Version("22.19.0")
 _DUMMY_KEY = "bello-local-integration-dummy-key"
 
 
+def _bounded_fixture_json(value: Any) -> str:
+    text = json.dumps(value, ensure_ascii=False)
+    if len(text) <= 2400:
+        return text
+    marker = "\n...[diagnostic middle omitted]...\n"
+    return text[:700] + marker + text[-(2400 - 700 - len(marker)):]
+
+
 def _fixture_exchange_diagnostic(body: dict[str, Any]) -> list[dict[str, Any]]:
     """Show bounded synthetic tool results/retry hints, never headers or system prompts."""
     messages = [
@@ -36,7 +44,7 @@ def _fixture_exchange_diagnostic(body: dict[str, Any]) -> list[dict[str, Any]]:
         {
             "role": message["role"],
             "tool_call_id": message.get("tool_call_id"),
-            "content": json.dumps(message.get("content"), ensure_ascii=False)[:2400],
+            "content": _bounded_fixture_json(message.get("content")),
         }
         for message in messages[-6:]
     ]
@@ -496,7 +504,16 @@ async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(
                     f"call-{flow.lower()}-read_file",
                     f"call-{flow.lower()}-exec_command",
                 ]
-                assert all(item["status"] == "completed" for item in host_items)
+                assert all(item["status"] == "completed" for item in host_items), json.dumps([
+                    {
+                        "id": item["id"],
+                        "name": item.get("name"),
+                        "status": item["status"],
+                        "error": _bounded_fixture_json(item.get("error")),
+                        "result": _bounded_fixture_json(item.get("result")),
+                    }
+                    for item in host_items
+                ], ensure_ascii=False, indent=2)
 
             started_host_items = {
                 raw["params"]["item"]["id"]

@@ -40,6 +40,24 @@ _MODEL = "bello-local/pipeline-model"
 _DUMMY_KEY = "bello-offline-pipeline-dummy-key"
 
 
+def _bounded_fixture_json(value: Any) -> str:
+    text = json.dumps(value, ensure_ascii=False)
+    if len(text) <= 2400:
+        return text
+    marker = "\n...[diagnostic middle omitted]...\n"
+    return text[:700] + marker + text[-(2400 - 700 - len(marker)):]
+
+
+def test_fixture_diagnostic_keeps_error_tail_without_exceeding_limit() -> None:
+    value = {"output": "TRACEBACK-START\n" + "middle\n" * 1000 + "FINAL-ERROR"}
+    rendered = _bounded_fixture_json(value)
+    assert len(rendered) == 2400
+    assert rendered.startswith('{"output": "TRACEBACK-START')
+    assert rendered.endswith('FINAL-ERROR"}')
+    assert "[diagnostic middle omitted]" in rendered
+    assert _bounded_fixture_json({"output": "short"}) == '{"output": "short"}'
+
+
 def _fixture_exchange_diagnostic(body: dict[str, Any]) -> list[dict[str, Any]]:
     """Show bounded synthetic tool results/retry hints, never headers or system prompts."""
     messages = [
@@ -50,7 +68,7 @@ def _fixture_exchange_diagnostic(body: dict[str, Any]) -> list[dict[str, Any]]:
         {
             "role": message["role"],
             "tool_call_id": message.get("tool_call_id"),
-            "content": json.dumps(message.get("content"), ensure_ascii=False)[:2400],
+            "content": _bounded_fixture_json(message.get("content")),
         }
         for message in messages[-6:]
     ]
