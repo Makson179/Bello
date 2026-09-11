@@ -144,6 +144,15 @@ jobs:
               -SnapshotPath (Join-Path $env:RUNNER_TEMP "bello-checkout-drive-baseline.json") `
               -Report (Join-Path $env:RUNNER_TEMP "bello-checkout-drive-prepare.json")
           }
+      - name: Prepare and verify the Windows null device
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe"
+          ./native/windows-sandbox/ci/verify_null_device.ps1 `
+            -Helper $helper -Phase Prepare `
+            -SnapshotPath (Join-Path $env:RUNNER_TEMP "bello-null-device-baseline.json") `
+            -Report (Join-Path $env:RUNNER_TEMP "bello-null-device-prepare.json")
       - name: Run Pi worker tests
         working-directory: supervisor/pi_worker
         run: npm test
@@ -165,6 +174,17 @@ jobs:
       - name: Verify doctor has no legacy executor dependency
         if: runner.os == 'Windows'
         run: python -m pytest -q tests/test_doctor.py::test_doctor_does_not_start_the_removed_codex_executor
+      - name: Restore and verify the Windows null-device security
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $snapshot = Join-Path $env:RUNNER_TEMP "bello-null-device-baseline.json"
+          if (Test-Path -LiteralPath $snapshot) {
+            $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe"
+            ./native/windows-sandbox/ci/verify_null_device.ps1 `
+              -Helper $helper -Phase Restore -SnapshotPath $snapshot `
+              -Report (Join-Path $env:RUNNER_TEMP "bello-null-device-restore.json")
+          }
       - name: Restore the Windows checkout-drive setup ACL
         if: always() && runner.os == 'Windows'
         shell: pwsh
@@ -198,4 +218,6 @@ jobs:
             ${{ runner.temp }}/bello-host-setup-restore.json
             ${{ runner.temp }}/bello-checkout-drive-prepare.json
             ${{ runner.temp }}/bello-checkout-drive-restore.json
+            ${{ runner.temp }}/bello-null-device-prepare.json
+            ${{ runner.temp }}/bello-null-device-restore.json
           if-no-files-found: ignore

@@ -89,7 +89,7 @@ fn known_sid(kind: WELL_KNOWN_SID_TYPE) -> Result<Vec<usize>> {
     Ok(value)
 }
 
-fn require_elevated_admin() -> Result<()> {
+pub(crate) fn require_elevated_admin() -> Result<()> {
     let mut raw = 0;
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } == 0 {
         return Err(winutil::last_error("OpenProcessToken(host preparation)"));

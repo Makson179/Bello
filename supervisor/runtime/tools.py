@@ -17,12 +17,14 @@ import shlex
 import subprocess
 import sys
 import os
+import secrets
 from typing import Any
 
 from jsonschema import Draft202012Validator
 
 from supervisor.policy import is_secret_path
 from supervisor.runtime.journal import RuntimeJournal
+from supervisor.runtime.file_worker import parse_response
 from supervisor.runtime.command_sessions import CommandCompletion, CommandSessionManager
 from supervisor.runtime.output_budget import budget_output
 from supervisor.runtime.sandbox import SandboxPolicy, SandboxRunner
@@ -31,6 +33,16 @@ from supervisor.runtime.sandbox import SandboxPolicy, SandboxRunner
 TOOL_DEFINITIONS = json.loads(Path(__file__).with_name("tools.json").read_text(encoding="utf-8"))
 _SCHEMAS = {entry["name"]: Draft202012Validator(entry["parameters"]) for entry in TOOL_DEFINITIONS}
 _CHILD_TOOLS = frozenset({"spawn_agent", "send_message", "wait_agent", "close_agent"})
+
+# These validate the trusted filesystem worker's transport, not model answers.
+_FILE_RESULTS = {
+    "read_file": {"text": str, "offset": int, "returned_lines": int, "total_lines": int},
+    "search": {"matches": list, "errors": list},
+    "list_directory": {"entries": list},
+    "view_image": {"mimeType": str, "size": int, "data": str},
+    "write_file": {"path": str, "bytes_written": int},
+    "edit_file": {"path": str, "bytes_written": int},
+}
 
 
 @dataclass(frozen=True)
@@ -162,7 +174,8 @@ class ToolHost:
                         "reason": args.get("justification", "This command requests execution outside its sandbox."),
                         "availableDecisions": ["accept", "decline"]}
         else:
-            operation = {"name": name, "arguments": {**args, "path": str(path)}}
+            response_nonce = secrets.token_hex(16)
+            operation = {"name": name, "arguments": {**args, "path": str(path)}, "response_nonce": response_nonce}
             encoded = base64.b64encode(json.dumps(operation).encode()).decode()
             argv = [str(Path(sys.executable).resolve()), "-I", str(helper), encoded]
             command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
@@ -221,23 +234,47 @@ class ToolHost:
                 return self._command_packet(snapshot)
 
             result = await runner.run(command, cwd, args.get("timeout", 120), on_output=output_delta)
+            # Preserve the complete transport for diagnostics even if parsing fails.
+            item.update(exitCode=result.exit_code, aggregatedOutput=result.output,
+                        durationMs=round(result.duration * 1000), timedOut=result.timed_out)
+            data = None
+            diagnostics = ""
+            output = result.output
+            if result.exit_code == 0:
+                data, diagnostics = parse_response(result.output, response_nonce, name)
+                fields = _FILE_RESULTS[name]
+                if set(data) != set(fields) or any(type(data[key]) is not kind for key, kind in fields.items()):
+                    raise ValueError("file-worker response has invalid result fields")
+                output = json.dumps(data, ensure_ascii=False)
+                # Keep stderr outside the result, without silently discarding it.
+                item.update(aggregatedOutput=output, diagnostics=diagnostics)
+            else:
+                # A normal worker error has the same frame. If the interpreter
+                # itself failed before producing it, retain the original output.
+                try:
+                    error_data, error_diagnostics = parse_response(result.output, response_nonce, name)
+                except ValueError:
+                    pass
+                else:
+                    if set(error_data) == {"error"} and isinstance(error_data["error"], str):
+                        output = json.dumps(error_data, ensure_ascii=False)
+                        diagnostics = error_diagnostics
+                        item.update(aggregatedOutput=output, diagnostics=diagnostics)
             if name == "view_image" and result.exit_code == 0:
-                image = json.loads(result.output)
+                image = data
                 summary = f"Opened {path.name}: {image['mimeType']}, {image['size']} bytes."
                 item.update(status="completed", exitCode=0, aggregatedOutput=summary,
                             durationMs=round(result.duration * 1000))
                 completed = True
                 return {"content": [{"type": "text", "text": summary},
                                     {"type": "image", "mimeType": image["mimeType"], "data": image["data"]}],
-                        "details": {"path": str(path)}, "isError": False}
+                        "details": {"path": str(path), "diagnostics": budget_output(diagnostics, mode="tail").text}, "isError": False}
             item.update(status="completed" if result.exit_code == 0 else "failed", exitCode=result.exit_code,
-                        aggregatedOutput=result.output, durationMs=round(result.duration * 1000), timedOut=result.timed_out)
+                        aggregatedOutput=output, durationMs=round(result.duration * 1000), timedOut=result.timed_out)
             completed = True
-            output = result.output
             offset = None
             continuation = ""
             if result.exit_code == 0 and name in {"read_file", "search", "list_directory"}:
-                data = json.loads(output)
                 if name == "read_file":
                     output = data["text"]
                     offset = data["offset"]
@@ -251,7 +288,8 @@ class ToolHost:
             bounded = budget_output(output, mode="head", offset=offset)
             return tool_result(bounded.text + (continuation if not bounded.metadata["truncated"] else ""),
                                details={"exitCode": result.exit_code, "duration": result.duration,
-                                        "timedOut": result.timed_out, "outputBudget": bounded.metadata},
+                                        "timedOut": result.timed_out, "outputBudget": bounded.metadata,
+                                        "diagnostics": budget_output(diagnostics, mode="tail").text},
                                error=result.exit_code != 0)
         except asyncio.CancelledError:
             item["status"] = "interrupted"

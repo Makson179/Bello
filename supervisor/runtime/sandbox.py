@@ -31,6 +31,7 @@ import asyncio
 import codecs
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
+import errno
 import math
 import os
 from pathlib import Path
@@ -1000,22 +1001,39 @@ async def _probe_backend(invocation: _Invocation) -> None:
     _PROBED_BACKENDS.add(key)
 
 
+async def _signal_process_group(group: int, sig: signal.Signals) -> None:
+    deadline = asyncio.get_running_loop().time() + _TERMINATE_GRACE_SECONDS
+    while True:
+        try:
+            os.killpg(group, sig)
+            return
+        except ProcessLookupError:
+            return
+        except PermissionError as exc:
+            # Darwin's killpg1 skips zombies and returns EPERM when their
+            # still-existing group has no signalable members. After SIGTERM,
+            # reaping can therefore race our final SIGKILL. Retry only this
+            # bounded transition on the original group; never treat EPERM
+            # itself as successful cleanup or fall back to wider signalling.
+            if (
+                sys.platform != "darwin"
+                or exc.errno != errno.EPERM
+                or asyncio.get_running_loop().time() >= deadline
+            ):
+                raise
+            await asyncio.sleep(0.01)
+
+
 async def _terminate_process_tree(process: asyncio.subprocess.Process, *, descendants_only: bool = False) -> None:
     if os.name == "posix":
         group = process.pid
         if not descendants_only and process.returncode is None:
-            try:
-                os.killpg(group, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+            await _signal_process_group(group, signal.SIGTERM)
             try:
                 await asyncio.wait_for(process.wait(), _TERMINATE_GRACE_SECONDS)
             except asyncio.TimeoutError:
                 pass
-        try:
-            os.killpg(group, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        await _signal_process_group(group, signal.SIGKILL)
         if process.returncode is None:
             try:
                 await asyncio.wait_for(process.wait(), _TERMINATE_GRACE_SECONDS)

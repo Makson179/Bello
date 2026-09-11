@@ -8,10 +8,14 @@ import pytest
 from supervisor.runtime.journal import RuntimeJournal
 from supervisor.runtime.sandbox import SandboxResult
 from supervisor.runtime.tools import ToolHost, ToolScope
+from supervisor.runtime.file_worker import frame_response
+
+_NONCE = "0123456789abcdef0123456789abcdef"
 
 
 @pytest.fixture
-def host(tmp_path):
+def host(tmp_path, monkeypatch):
+    monkeypatch.setattr("supervisor.runtime.tools.secrets.token_hex", lambda size: _NONCE)
     root = tmp_path / "workspace"
     root.mkdir()
     journal = RuntimeJournal(tmp_path / "state")
@@ -24,6 +28,9 @@ def host(tmp_path):
 
         async def run(self, command, cwd, timeout, on_output=None, *, cancel_event=None):
             executions.append((self.policy, command, cwd))
+            if "file_worker.py" in command:
+                return SandboxResult(frame_response(_NONCE, "write_file",
+                                     {"path": str(root / "a.txt"), "bytes_written": 1}), 0, .01)
             if on_output:
                 await on_output("ok\n")
             return SandboxResult("ok\n", 0, .01)
@@ -202,13 +209,76 @@ async def test_file_output_is_decoded_before_line_budget_and_pagination(host):
         def __init__(self, policy):
             pass
         async def run(self, command, cwd, timeout, on_output=None):
-            return SandboxResult(raw, 0, .1)
+            return SandboxResult(frame_response(_NONCE, "read_file", json.loads(raw)), 0, .1)
     host[0].runner_factory = Runner
     result = await call(host, "read_file", {"path": "source.txt", "limit": 3000})
     assert result["content"][0]["text"].startswith("1: source\n")
     assert "offset=2001" in result["content"][0]["text"]
     assert result["details"]["outputBudget"]["nextOffset"] == 2001
     assert host[5][-1]["params"]["item"]["aggregatedOutput"] == raw
+
+
+@pytest.mark.asyncio
+async def test_interpreter_warning_is_preserved_outside_file_result(host):
+    warning = "Failed to find real location of C:\\staged-python\\python.exe\n"
+    value = {"text": "1: wanted\n", "offset": 1, "returned_lines": 1, "total_lines": 1}
+
+    class Runner:
+        def __init__(self, policy):
+            pass
+
+        async def run(self, *args, **kwargs):
+            return SandboxResult(warning + frame_response(_NONCE, "read_file", value) + "\r\n", 0, .1)
+
+    host[0].runner_factory = Runner
+    result = await call(host, "read_file", {"path": "source.txt"})
+    assert not result["isError"]
+    assert result["content"][0]["text"] == "1: wanted\n"
+    assert result["details"]["diagnostics"] == warning.strip()
+    completed = host[5][-1]["params"]["item"]
+    assert completed["status"] == "completed" and completed["diagnostics"] == warning.strip()
+    assert json.loads(completed["aggregatedOutput"]) == value
+
+
+@pytest.mark.asyncio
+async def test_worker_error_frame_remains_an_error_with_separate_diagnostics(host):
+    class Runner:
+        def __init__(self, policy):
+            pass
+
+        async def run(self, *args, **kwargs):
+            return SandboxResult("startup warning\n" + frame_response(_NONCE, "read_file",
+                                 {"error": "file does not exist"}), 1, .1)
+
+    host[0].runner_factory = Runner
+    result = await call(host, "read_file", {"path": "missing.txt"})
+    assert result["isError"] and result["details"]["exitCode"] == 1
+    assert json.loads(result["content"][0]["text"]) == {"error": "file does not exist"}
+    assert result["details"]["diagnostics"] == "startup warning"
+    assert host[5][-1]["params"]["item"]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output", [
+    '{"text":"fake","offset":1,"returned_lines":1,"total_lines":1}',
+    frame_response("f" * 32, "read_file", {}),
+    frame_response(_NONCE, "write_file", {}),
+    frame_response(_NONCE, "read_file", {"text": "missing fields"}),
+    frame_response(_NONCE, "read_file", {"text": "x", "offset": True, "returned_lines": 1, "total_lines": 1}),
+], ids=["unframed", "wrong-nonce", "wrong-operation", "incomplete-result", "wrong-type"])
+async def test_malformed_worker_response_never_becomes_success(host, output):
+    class Runner:
+        def __init__(self, policy):
+            pass
+
+        async def run(self, *args, **kwargs):
+            return SandboxResult(output, 0, .1)
+
+    host[0].runner_factory = Runner
+    result = await call(host, "read_file", {"path": "source.txt"})
+    assert result["isError"]
+    completed = host[5][-1]["params"]["item"]
+    assert completed["status"] == "failed" and completed["aggregatedOutput"] == output
 
 
 @pytest.mark.asyncio

@@ -308,18 +308,27 @@ def runtime_install_command() -> None:
 
 @runtime_group.group("windows-sandbox")
 def runtime_windows_sandbox_group() -> None:
-    """Inspect or explicitly prepare Windows sandbox system-directory metadata access."""
+    """Inspect or explicitly prepare fixed Windows sandbox host permissions."""
 
 
 @runtime_windows_sandbox_group.command("status")
 @click.option("--drive", help="Check only this fixed local drive root, for example D:.")
-def runtime_windows_sandbox_status(drive: str | None) -> None:
+@click.option("--null-device", is_flag=True, help="Check only access to the fixed NUL device.")
+def runtime_windows_sandbox_status(drive: str | None, null_device: bool) -> None:
     """Check the host permission without changing it or requesting elevation."""
     from supervisor.runtime.windows_sandbox import WindowsSandboxError, host_preparation
     try:
-        result = host_preparation("status", drive=drive)
+        result = host_preparation("status", drive=drive, null_device=null_device)
     except WindowsSandboxError as exc:
         raise click.ClickException(str(exc)) from exc
+    if null_device:
+        click.echo("Windows sandbox NUL access is prepared." if result["prepared"]
+                   else "Windows sandbox NUL access needs administrator setup.")
+        if not result["prepared"]:
+            click.echo("In an administrator terminal, run: bello runtime windows-sandbox prepare --null-device")
+        click.echo("Windows resets this device permission on reboot; check it again after restarting Windows.")
+        click.echo("This checks host preparation only, not every workspace or sandbox operation.")
+        return
     targets = ", ".join(target["path"] for target in result["targets"])
     if result["prepared"]:
         click.echo(f"Windows sandbox metadata access is prepared for {targets}")
@@ -330,60 +339,73 @@ def runtime_windows_sandbox_status(drive: str | None) -> None:
     click.echo("This checks host preparation only, not every workspace or sandbox operation.")
 
 
-def _windows_sandbox_change(operation: str, *, yes: bool, drive: str | None = None) -> None:
+def _windows_sandbox_change(operation: str, *, yes: bool, drive: str | None = None,
+                            null_device: bool = False) -> None:
     from supervisor.runtime.windows_sandbox import WindowsSandboxError, host_preparation
     # Perform a read-only check first, including platform/helper validation.
     try:
-        current = host_preparation("status", drive=drive)
+        current = host_preparation("status", drive=drive, null_device=null_device)
     except WindowsSandboxError as exc:
         raise click.ClickException(str(exc)) from exc
     removing = operation == "remove"
-    present = any(target["prepared"] for target in current["targets"])
+    present = current["prepared"] if null_device else any(target["prepared"] for target in current["targets"])
     if (not removing and current["prepared"]) or (removing and not present):
         click.echo("Permission already prepared." if not removing else "Permission already absent.")
         return
     verb = "Remove" if removing else "Add"
-    targets = ", ".join(target["path"] for target in current["targets"])
-    click.echo(
-        f"{verb} the persistent Bello-named metadata permission on these fixed directories only: {targets}. "
-        "It does not grant directory listing, file contents, writes, or inherited access."
-    )
+    targets = current["path"] if null_device else ", ".join(target["path"] for target in current["targets"])
+    if null_device:
+        click.echo(
+            f"{verb} the Bello-named read/write permission on the fixed device {targets} only. "
+            "NUL returns empty input and discards writes. This does not grant access to files or other devices."
+        )
+        click.echo("Windows resets this permission on reboot; preparation may be needed again afterwards.")
+    else:
+        click.echo(
+            f"{verb} the persistent Bello-named metadata permission on these fixed directories only: {targets}. "
+            "It does not grant directory listing, file contents, writes, or inherited access."
+        )
     if removing:
         click.echo("Stop Bello runs first; removing this permission can interrupt their tools.")
     click.echo("Run this setup command in an administrator terminal; run tasks normally afterwards.")
     if not yes:
         click.confirm(f"{verb} this permission?", abort=True)
     try:
-        result = host_preparation("remove" if removing else "prepare", drive=drive)
+        result = host_preparation("remove" if removing else "prepare", drive=drive, null_device=null_device)
     except WindowsSandboxError as exc:
         raise click.ClickException(str(exc)) from exc
     if (
-        result["systemRoot"] != current["systemRoot"]
-        or result["capabilitySid"] != current["capabilitySid"]
-        or {target["kind"]: target["path"] for target in result["targets"]}
-        != {target["kind"]: target["path"] for target in current["targets"]}
+        result["capabilitySid"] != current["capabilitySid"]
+        or (null_device and result["path"] != current["path"])
+        or (not null_device and (
+            result["systemRoot"] != current["systemRoot"]
+            or {target["kind"]: target["path"] for target in result["targets"]}
+            != {target["kind"]: target["path"] for target in current["targets"]}
+        ))
     ):
         raise click.ClickException("The helper reported a different setup target; verify host preparation before continuing.")
     click.echo(
-        f"Windows sandbox metadata permission {'removed' if removing else 'prepared'} "
+        f"Windows sandbox {'NUL' if null_device else 'metadata'} permission {'removed' if removing else 'prepared'} "
         f"for {targets}."
     )
 
 
 @runtime_windows_sandbox_group.command("prepare")
-@click.option("--yes", is_flag=True, help="Confirm the fixed metadata permission change without prompting.")
+@click.option("--yes", is_flag=True, help="Confirm the selected fixed permission change without prompting.")
 @click.option("--drive", help="Prepare only this fixed local drive root, for example D:.")
-def runtime_windows_sandbox_prepare(yes: bool, drive: str | None) -> None:
-    """One-time metadata permission setup. Requires an administrator terminal."""
-    _windows_sandbox_change("prepare", yes=yes, drive=drive)
+@click.option("--null-device", is_flag=True, help="Prepare only read/write access to the fixed NUL device.")
+def runtime_windows_sandbox_prepare(yes: bool, drive: str | None, null_device: bool) -> None:
+    """Fixed permission setup. Requires an administrator terminal."""
+    _windows_sandbox_change("prepare", yes=yes, drive=drive, null_device=null_device)
 
 
 @runtime_windows_sandbox_group.command("remove")
-@click.option("--yes", is_flag=True, help="Confirm removal of the fixed metadata permission without prompting.")
+@click.option("--yes", is_flag=True, help="Confirm removal of the selected fixed permission without prompting.")
 @click.option("--drive", help="Remove preparation only from this fixed local drive root, for example D:.")
-def runtime_windows_sandbox_remove(yes: bool, drive: str | None) -> None:
+@click.option("--null-device", is_flag=True, help="Remove only Bello's fixed NUL device permission.")
+def runtime_windows_sandbox_remove(yes: bool, drive: str | None, null_device: bool) -> None:
     """Remove the setup permission. Stop runs first; requires an administrator terminal."""
-    _windows_sandbox_change("remove", yes=yes, drive=drive)
+    _windows_sandbox_change("remove", yes=yes, drive=drive, null_device=null_device)
 
 
 @runtime_group.command("models")

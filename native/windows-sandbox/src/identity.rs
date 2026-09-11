@@ -22,6 +22,9 @@ pub const PROFILE_PREFIX: &str = "Bello.Sandbox.";
 // other host programs can derive/request it. Its only prepared permission is
 // non-inheriting metadata access on the fixed OS host-preparation targets.
 pub const SYSTEM_ROOT_METADATA_CAPABILITY: &str = "Bello.Sandbox.SystemRootMetadata.v1";
+// Only explicit host preparation grants this recipient access to the null
+// device. It carries no general filesystem or other device permissions.
+pub const NULL_DEVICE_CAPABILITY: &str = "Bello.Sandbox.NullDevice.v1";
 
 pub struct AppContainerSid(pub PSID);
 
@@ -49,7 +52,12 @@ impl CapabilitySids {
             owned: Vec::new(),
             attributes: Vec::new(),
         };
-        for name in ["registryRead", "lpacCom", SYSTEM_ROOT_METADATA_CAPABILITY] {
+        for name in [
+            "registryRead",
+            "lpacCom",
+            SYSTEM_ROOT_METADATA_CAPABILITY,
+            NULL_DEVICE_CAPABILITY,
+        ] {
             value.add_named(name)?;
         }
         if enabled {
@@ -82,6 +90,16 @@ impl CapabilitySids {
             [sid] => Ok(*sid),
             _ => Err(anyhow!("expected a single capability SID")),
         }
+    }
+
+    pub fn null_device() -> Result<Self> {
+        let mut value = Self {
+            owned: Vec::new(),
+            attributes: Vec::new(),
+        };
+        value.add_named(NULL_DEVICE_CAPABILITY)?;
+        value.single_sid()?;
+        Ok(value)
     }
 
     fn add_named(&mut self, name: &str) -> Result<()> {

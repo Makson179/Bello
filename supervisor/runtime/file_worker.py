@@ -15,6 +15,44 @@ import sys
 import tempfile
 
 
+def _frame_markers(nonce: str, name: str) -> tuple[str, str]:
+    if not isinstance(nonce, str) or re.fullmatch(r"[0-9a-f]{32}", nonce) is None:
+        raise ValueError("invalid file-worker response identifier")
+    if name not in {"read_file", "list_directory", "search", "view_image", "write_file", "edit_file"}:
+        raise ValueError("unknown filesystem operation")
+    return f"\x1eBELLO_FILE_V1:{nonce}:{name}:", f"\x1fBELLO_FILE_END:{nonce}\x1e"
+
+
+def frame_response(nonce: str, name: str, value: dict) -> str:
+    start, end = _frame_markers(nonce, name)
+    # ASCII JSON escapes control characters, so file contents cannot introduce
+    # protocol delimiters. It also works under Windows' legacy stdout encoding.
+    return start + json.dumps(value, ensure_ascii=True, allow_nan=False) + end
+
+
+def parse_response(output: str, nonce: str, name: str) -> tuple[dict, str]:
+    """Decode only our invocation's frame; retain interpreter diagnostics.
+
+    stderr and stdout share the sandbox's output pipe. A startup warning is not
+    a result, and scanning for the first JSON object could mistake it for one.
+    This framing is not an authentication or filesystem-security boundary.
+    """
+    start, end = _frame_markers(nonce, name)
+    if output.count(start) != 1 or output.count(end) != 1:
+        raise ValueError("file-worker response frame is missing or duplicated")
+    before, _, tail = output.partition(start)
+    body, _, after = tail.partition(end)
+    if end in before or not body or "\n" in body or "\r" in body:
+        raise ValueError("file-worker response frame is malformed")
+    try:
+        value = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise ValueError("file-worker response frame contains invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError("file-worker response must be an object")
+    return value, (before + after).strip()
+
+
 def operate(name: str, args: dict) -> dict:
     path = Path(args["path"])
     if name == "view_image":
@@ -93,13 +131,17 @@ def operate(name: str, args: dict) -> dict:
 
 
 def main() -> int:
+    # Validate the trusted caller's frame identifier before any filesystem action.
+    request = json.loads(base64.b64decode(sys.argv[1], validate=True))
+    nonce, name = request["response_nonce"], request["name"]
+    _frame_markers(nonce, name)
     try:
-        request = json.loads(base64.b64decode(sys.argv[1], validate=True))
-        print(json.dumps(operate(request["name"], request["arguments"]), ensure_ascii=False))
-        return 0
+        result = operate(name, request["arguments"])
+        code = 0
     except Exception as exc:
-        print(json.dumps({"error": str(exc)}, ensure_ascii=False))
-        return 1
+        result, code = {"error": str(exc)}, 1
+    print(frame_response(nonce, name, result), flush=True)
+    return code
 
 
 if __name__ == "__main__":

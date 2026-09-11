@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -685,7 +687,8 @@ assert not discovered.shims, discovered.shims
 async def exercise():
     runner = SandboxRunner(policy)
     async def call(name, path, **arguments):
-        operation = {"name": name, "arguments": {"path": str(path), **arguments}}
+        operation = {"name": name, "arguments": {"path": str(path), **arguments},
+                     "response_nonce": "0123456789abcdef0123456789abcdef"}
         encoded = base64.b64encode(json.dumps(operation).encode()).decode()
         # This is the actual file-worker argv used by ToolHost; the interpreter
         # and discovery both come from this running, unactivated venv process.
@@ -865,6 +868,138 @@ async def test_stream_decoder_preserves_split_utf8_and_output_cap(
     )
     assert capped.output == "abcde" + sandbox._OUTPUT_TRUNCATED
     assert "".join(deltas) == capped.output
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group behavior")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disappeared", [False, True])
+async def test_macos_group_signal_retries_only_until_success_or_disappearance(
+    monkeypatch: pytest.MonkeyPatch, disappeared: bool,
+) -> None:
+    monkeypatch.setattr(sandbox.sys, "platform", "darwin")
+    calls: list[tuple[int, signal.Signals]] = []
+
+    def killpg(group: int, sig: signal.Signals) -> None:
+        calls.append((group, sig))
+        if len(calls) == 1:
+            raise PermissionError(errno.EPERM, "zombie group awaiting reap")
+        if disappeared:
+            raise ProcessLookupError(errno.ESRCH, "group reaped")
+
+    monkeypatch.setattr(sandbox.os, "killpg", killpg)
+    await sandbox._signal_process_group(12345, signal.SIGKILL)
+    assert calls == [(12345, signal.SIGKILL), (12345, signal.SIGKILL)]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group behavior")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform, error_number", [
+    ("darwin", errno.EPERM), ("darwin", errno.EACCES), ("linux", errno.EPERM),
+])
+async def test_group_signal_does_not_hide_persistent_permission_failure(
+    monkeypatch: pytest.MonkeyPatch, platform: str, error_number: int,
+) -> None:
+    monkeypatch.setattr(sandbox.sys, "platform", platform)
+    monkeypatch.setattr(sandbox, "_TERMINATE_GRACE_SECONDS", 0.025)
+    calls: list[tuple[int, signal.Signals]] = []
+    error = PermissionError(error_number, "real signal denial")
+
+    def killpg(group: int, sig: signal.Signals) -> None:
+        calls.append((group, sig))
+        raise error
+
+    monkeypatch.setattr(sandbox.os, "killpg", killpg)
+    with pytest.raises(PermissionError) as caught:
+        await asyncio.wait_for(sandbox._signal_process_group(12345, signal.SIGKILL), 1)
+    assert caught.value is error
+    assert all(call == (12345, signal.SIGKILL) for call in calls)
+    assert (len(calls) > 1) == (platform == "darwin" and error_number == errno.EPERM)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group behavior")
+@pytest.mark.asyncio
+async def test_cancelled_group_cleanup_still_reports_persistent_permission_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox.sys, "platform", "darwin")
+    monkeypatch.setattr(sandbox, "_TERMINATE_GRACE_SECONDS", 0.025)
+    started = asyncio.Event()
+    error = PermissionError(errno.EPERM, "real signal denial")
+
+    def killpg(_group: int, _sig: signal.Signals) -> None:
+        started.set()
+        raise error
+
+    monkeypatch.setattr(sandbox.os, "killpg", killpg)
+    cleanup = asyncio.create_task(sandbox._signal_process_group(12345, signal.SIGKILL))
+    caller = asyncio.create_task(sandbox._finish_cleanup(cleanup))
+    try:
+        await started.wait()
+        caller.cancel()
+        await asyncio.sleep(0)
+        caller.cancel()
+        with pytest.raises(PermissionError) as caught:
+            await asyncio.wait_for(caller, 1)
+        assert caught.value is error
+        assert cleanup.done() and not cleanup.cancelled()
+    finally:
+        for task in (caller, cleanup):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(caller, cleanup, return_exceptions=True)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin zombie-only process-group behavior")
+@pytest.mark.asyncio
+async def test_native_macos_group_signal_waits_for_zombie_reaping() -> None:
+    # The keeper is outside the child's new session and deliberately defers
+    # reaping. This reproduces Darwin EPERM without a timing-dependent fork race.
+    code = """\
+import os, sys
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    os._exit(0)
+try:
+    os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+    print(pid, flush=True)
+    sys.stdin.buffer.read(1)
+finally:
+    os.waitpid(pid, 0)
+"""
+    keeper = await asyncio.create_subprocess_exec(
+        sys.executable, "-I", "-c", code,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    assert keeper.stdin is not None and keeper.stdout is not None
+    cleanup: asyncio.Task[None] | None = None
+    try:
+        group = int(await asyncio.wait_for(keeper.stdout.readline(), 5))
+        with pytest.raises(PermissionError) as caught:
+            os.killpg(group, signal.SIGKILL)
+        assert caught.value.errno == errno.EPERM
+        cleanup = asyncio.create_task(sandbox._signal_process_group(group, signal.SIGKILL))
+        await asyncio.sleep(0)
+        assert not cleanup.done(), "EPERM must not be accepted as successful cleanup"
+        keeper.stdin.write(b"r")
+        await keeper.stdin.drain()
+        await asyncio.wait_for(cleanup, 2)
+        await asyncio.wait_for(keeper.communicate(), 5)
+        assert keeper.returncode == 0
+        with pytest.raises(ProcessLookupError):
+            os.killpg(group, 0)
+    finally:
+        keeper.stdin.close()
+        try:
+            await asyncio.wait_for(keeper.communicate(), 5)
+        finally:
+            if keeper.returncode is None:
+                keeper.kill()
+                await keeper.wait()
+        if cleanup is not None and not cleanup.done():
+            cleanup.cancel()
+            await asyncio.gather(cleanup, return_exceptions=True)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group behavior")

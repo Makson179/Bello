@@ -19,6 +19,8 @@ mod identity;
 #[cfg(windows)]
 mod journal;
 #[cfg(windows)]
+mod null_device;
+#[cfg(windows)]
 mod process;
 #[cfg(windows)]
 mod windows;
@@ -81,7 +83,7 @@ fn normalize_drive(value: &str) -> Result<String> {
 
 fn parse_host_arguments(
     mut arguments: impl Iterator<Item = std::ffi::OsString>,
-) -> Result<(&'static str, Option<String>)> {
+) -> Result<(&'static str, Option<String>, bool)> {
     let argument = arguments
         .next()
         .ok_or_else(|| anyhow!("missing fixed host operation"))?;
@@ -95,30 +97,34 @@ fn parse_host_arguments(
             ))
         }
     };
-    let drive = match arguments.next() {
-        None => None,
+    let (drive, null_device) = match arguments.next() {
+        None => (None, false),
+        Some(option) if option == "--null-device" => (None, true),
         Some(option) if option == "--drive" => {
             let value = arguments
                 .next()
                 .ok_or_else(|| anyhow!("--drive requires one drive letter"))?;
-            Some(normalize_drive(
-                value
-                    .to_str()
-                    .ok_or_else(|| anyhow!("--drive must be ASCII"))?,
-            )?)
+            (
+                Some(normalize_drive(
+                    value
+                        .to_str()
+                        .ok_or_else(|| anyhow!("--drive must be ASCII"))?,
+                )?),
+                false,
+            )
         }
         _ => {
             return Err(anyhow!(
-                "only an optional --drive D: selector is accepted; no paths or commands"
+                "only --drive D: or --null-device is accepted; no paths or commands"
             ))
         }
     };
     if arguments.next().is_some() {
         return Err(anyhow!(
-            "host preparation accepts only one optional drive selector"
+            "host preparation accepts only one selector: --drive D: or --null-device"
         ));
     }
-    Ok((operation, drive))
+    Ok((operation, drive, null_device))
 }
 
 fn dispatch() -> Result<Option<i32>> {
@@ -126,25 +132,29 @@ fn dispatch() -> Result<Option<i32>> {
     if arguments.is_empty() {
         return read_request().and_then(execute).map(Some);
     }
-    let (operation, drive) = parse_host_arguments(arguments.into_iter())?;
+    let (operation, drive, null_device) = parse_host_arguments(arguments.into_iter())?;
     #[cfg(windows)]
     {
         // This branch never reads framed stdin, configuration, run/recovery
         // requests, or invokes a user-controlled command with elevated rights.
-        let report = match drive.as_deref() {
-            Some(drive) => host_prepare::execute_on_drive(operation, drive)?,
-            None => host_prepare::execute(operation)?,
-        };
         let stdout = io::stdout();
         let mut writer = stdout.lock();
-        serde_json::to_writer(&mut writer, &report)?;
+        if null_device {
+            serde_json::to_writer(&mut writer, &null_device::execute(operation)?)?;
+        } else {
+            let report = match drive.as_deref() {
+                Some(drive) => host_prepare::execute_on_drive(operation, drive)?,
+                None => host_prepare::execute(operation)?,
+            };
+            serde_json::to_writer(&mut writer, &report)?;
+        }
         writer.write_all(b"\n")?;
         writer.flush()?;
         Ok(None)
     }
     #[cfg(not(windows))]
     {
-        let _ = (operation, drive);
+        let _ = (operation, drive, null_device);
         Err(anyhow!("Windows host preparation can run only on Windows"))
     }
 }
@@ -196,10 +206,14 @@ mod host_argument_tests {
     #[test]
     fn only_a_single_literal_drive_selector_is_accepted() {
         let parse = |args: &[&str]| parse_host_arguments(args.iter().map(std::ffi::OsString::from));
-        assert_eq!(parse(&["host-status"]).unwrap(), ("status", None));
+        assert_eq!(parse(&["host-status"]).unwrap(), ("status", None, false));
         assert_eq!(
             parse(&["host-prepare", "--drive", "d:"]).unwrap(),
-            ("prepare", Some("D:".to_owned()))
+            ("prepare", Some("D:".to_owned()), false)
+        );
+        assert_eq!(
+            parse(&["host-prepare", "--null-device"]).unwrap(),
+            ("prepare", None, true)
         );
         for drive in [
             "D",
@@ -225,6 +239,10 @@ mod host_argument_tests {
             vec!["host-remove", "--drive", "D:", "--drive", "C:"],
             vec!["host-prepare", "--drive=D:"],
             vec!["run", "--drive", "D:"],
+            vec!["host-prepare", "--null-device", "--drive", "D:"],
+            vec!["host-prepare", "--drive", "D:", "--null-device"],
+            vec!["host-status", "--null-device", "NUL"],
+            vec!["host-remove", "--null-device=NUL"],
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
         }

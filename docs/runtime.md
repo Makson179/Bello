@@ -75,7 +75,22 @@ bello runtime windows-sandbox prepare --drive D:
 It accepts a drive letter, not a directory path. Network and substituted drives
 are not supported. Use `remove --drive D:` to undo that drive's preparation.
 
-This grants only attributes, extended attributes, permission-descriptor reads
+Python test capture and shell redirection also use the fixed `NUL` device: reads
+return empty input and writes are discarded. Check it separately:
+
+```powershell
+bello runtime windows-sandbox status --null-device
+```
+
+If missing, explicitly run `bello runtime windows-sandbox prepare --null-device`
+in the administrator terminal. This grants only Bello's named capability
+read/write access to `\Device\Null`, not to files or other devices. It does not
+change the device's owner or integrity label. Windows resets this permission on
+reboot, so check and, if needed, repeat preparation after restarting Windows.
+`remove --null-device` removes only this permission. This selector cannot be
+combined with `--drive`. No service or scheduled task prepares it automatically.
+
+Directory preparation grants only attributes, extended attributes, permission-descriptor reads
 and synchronization on those two directories. It does not grant listing,
 file-content reads, writes, or inherited access to descendants. The permission
 persists until explicitly removed with `bello runtime windows-sandbox remove`

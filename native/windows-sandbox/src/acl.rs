@@ -670,7 +670,7 @@ pub fn set_system_root_metadata(handle: &Handle, sid: PSID, prepared: bool) -> R
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 
-fn ace_has_sid(raw: *mut c_void, sid: PSID) -> Result<bool> {
+pub(crate) fn ace_has_sid(raw: *mut c_void, sid: PSID) -> Result<bool> {
     let header = unsafe { &*(raw as *const ACE_HEADER) };
     let size = usize::from(header.AceSize);
     let bytes = unsafe { std::slice::from_raw_parts(raw as *const u8, size) };

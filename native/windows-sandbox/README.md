@@ -43,6 +43,19 @@ directory paths, custom SIDs, masks or commands. The helper rejects network,
 substituted and non-fixed drives and pins the selected root before mutation.
 Preparation/removal still require an administrator terminal; no run elevates.
 
+The mutually exclusive selector `--null-device` instead operates only on the
+fixed NT device `\Device\Null`. Its separate capability
+`Bello.Sandbox.NullDevice.v1` receives non-inherited `0x0012019f` read/write
+access, without execute, delete, ownership or ACL-management rights. NUL supplies
+EOF and discards output; standard Python test capture requires it. Device setup
+does not grant access to files or other devices and preserves unrelated ACEs,
+owner, group and integrity label. Windows resets its descriptor on reboot:
+check `host-status --null-device` again afterwards and explicitly prepare it
+from an administrator terminal if needed. No automatic elevation, service or
+scheduled task is installed. `host-remove --null-device` removes only the exact
+named permission. The capability's narrow rights, not secrecy of its name,
+define the access granted.
+
 For other strict ancestors of allowed roots, the helper checks the actual child
 token and temporarily adds only missing metadata access for the unique per-run
 SID. The directories and their ancestry are pinned before mutation. Windows

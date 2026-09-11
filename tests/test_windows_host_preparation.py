@@ -168,7 +168,7 @@ def test_cli_approved_change_runs_only_requested_setup(monkeypatch, operation):
     calls = []
 
     def run(op, **kwargs):
-        assert kwargs == {"drive": None}
+        assert kwargs == {"drive": None, "null_device": False}
         calls.append(op)
         return response(op, prepared=(operation == "remove") if op == "status" else operation == "prepare")
 
@@ -193,7 +193,7 @@ def test_cli_mixed_setup_runs_requested_operation(monkeypatch, operation):
     calls = []
 
     def run(op, **kwargs):
-        assert kwargs == {"drive": None}
+        assert kwargs == {"drive": None, "null_device": False}
         calls.append(op)
         if op == "status":
             value = response(prepared=False)
@@ -267,7 +267,8 @@ def test_helper_cannot_swap_default_and_selected_drive_modes(monkeypatch, host, 
 def test_cli_preserves_drive_selection_for_every_helper_call(monkeypatch, operation):
     calls = []
 
-    def run(op, *, drive=None):
+    def run(op, *, drive=None, null_device=False):
+        assert null_device is False
         calls.append((op, drive))
         return drive_response(op, prepared=(operation == "remove") if op == "status" else operation == "prepare")
 
@@ -279,3 +280,86 @@ def test_cli_preserves_drive_selection_for_every_helper_call(monkeypatch, operat
     assert "D:" in result.output
     if operation == "status":
         assert "prepare --drive D:" in result.output
+
+
+def null_response(operation="status", *, prepared=True, changed=False):
+    return {"protocolVersion": 1, "kind": "nullDevicePreparation", "operation": operation,
+            "path": "\\Device\\Null", "capabilityName": "Bello.Sandbox.NullDevice.v1",
+            "capabilitySid": "S-1-15-3-1024-1", "accessMask": 0x12019f,
+            "prepared": prepared, "changed": changed, "lifetime": "untilReboot"}
+
+
+@pytest.mark.parametrize("operation", ["status", "prepare", "remove"])
+def test_null_device_selects_only_fixed_helper_operation(monkeypatch, host, operation):
+    value = null_response(operation, prepared=operation != "remove", changed=operation != "status")
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        assert kwargs["env"] == {} and not kwargs.get("shell")
+        return subprocess.CompletedProcess(command, 0, json.dumps(value).encode(), b"")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert backend.host_preparation(operation, null_device=True) == value
+    assert calls == [[str(host), f"host-{operation}", "--null-device"]]
+
+
+@pytest.mark.parametrize("kwargs", [{"drive": "D:", "null_device": True},
+                                    {"null_device": "NUL"}, {"null_device": 1}])
+def test_null_selector_is_explicit_and_exclusive(monkeypatch, kwargs):
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: pytest.fail("unexpected process"))
+    with pytest.raises(backend.WindowsSandboxBackendError, match="either"):
+        backend.host_preparation("prepare", **kwargs)
+
+
+@pytest.mark.parametrize("patch", [
+    {"protocolVersion": True}, {"kind": "hostPreparation"}, {"path": "NUL"},
+    {"path": "\\Device\\Other"}, {"accessMask": 0x1f01ff}, {"accessMask": True},
+    {"capabilityName": "internetClient"}, {"capabilitySid": "S-1-15-2-1"},
+    {"lifetime": "permanent"}, {"operation": "prepare"}, {"prepared": 1},
+    {"changed": True}, {"changed": "false"}, {"targets": []},
+])
+def test_null_status_rejects_other_targets_rights_or_lifetime(monkeypatch, host, patch):
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(
+        a[0], 0, json.dumps(null_response() | patch).encode(), b""
+    ))
+    with pytest.raises(backend.WindowsSandboxBackendError):
+        backend.host_preparation("status", null_device=True)
+
+
+@pytest.mark.parametrize(("operation", "prepared"), [("prepare", False), ("remove", True)])
+def test_null_failed_postcondition_never_reports_success(monkeypatch, host, operation, prepared):
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(
+        a[0], 0, json.dumps(null_response(operation, prepared=prepared)).encode(), b""
+    ))
+    with pytest.raises(backend.WindowsSandboxBackendError):
+        backend.host_preparation(operation, null_device=True)
+
+
+@pytest.mark.parametrize("operation", ["status", "prepare", "remove"])
+def test_cli_null_selection_and_reboot_notice(monkeypatch, operation):
+    calls = []
+
+    def run(op, *, drive=None, null_device=False):
+        assert drive is None and null_device is True
+        calls.append(op)
+        return null_response(op, prepared=(operation == "remove") if op == "status" else operation == "prepare")
+
+    monkeypatch.setattr(backend, "host_preparation", run)
+    result = CliRunner().invoke(cli, ["runtime", "windows-sandbox", operation, "--null-device",
+                                     *([] if operation == "status" else ["--yes"])])
+    assert result.exit_code == 0, result.output
+    assert calls == ["status"] + ([] if operation == "status" else [operation])
+    assert "reboot" in result.output
+    assert "persistent" not in result.output and "one-time" not in result.output
+    if operation == "status":
+        assert "prepare --null-device" in result.output
+
+
+@pytest.mark.parametrize("operation", ["prepare", "remove"])
+def test_cli_null_change_still_requires_confirmation(monkeypatch, operation):
+    calls = []
+    monkeypatch.setattr(backend, "host_preparation", lambda op, **kw:
+                        calls.append(op) or null_response(prepared=operation == "remove"))
+    result = CliRunner().invoke(cli, ["runtime", "windows-sandbox", operation, "--null-device"], input="n\n")
+    assert result.exit_code != 0 and calls == ["status"]

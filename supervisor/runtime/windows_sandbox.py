@@ -36,6 +36,8 @@ _RECOVERY_TIMEOUT_SECONDS = 30.0
 _HELPER_NAME = "bello-windows-sandbox.exe"
 _HOST_CAPABILITY = "Bello.Sandbox.SystemRootMetadata.v1"
 _HOST_METADATA_MASK = 0x00120088
+_NULL_CAPABILITY = "Bello.Sandbox.NullDevice.v1"
+_NULL_ACCESS_MASK = 0x0012019F
 
 
 class WindowsSandboxError(RuntimeError):
@@ -116,16 +118,19 @@ def _helper_environment() -> dict[str, str]:
 
 def host_preparation(
     operation: Literal["status", "prepare", "remove"], *, drive: str | None = None,
+    null_device: bool = False,
 ) -> dict[str, object]:
-    """Run only the helper's fixed host-metadata setup command, never an agent.
+    """Run only a fixed host preparation command, never an agent.
 
     Elevation is deliberately external: the user opens an administrator terminal
-    for prepare/remove. Only an optional drive letter such as D: can be selected,
+    for prepare/remove. Only a drive letter or the fixed NUL device can be selected,
     never a task, shell command, directory path, SID, or permission mask. The
     native helper checks elevation and resolves and pins actual Windows targets.
     """
     if operation not in {"status", "prepare", "remove"}:
         raise WindowsSandboxBackendError("unknown Windows sandbox preparation operation")
+    if type(null_device) is not bool or (null_device and drive is not None):
+        raise WindowsSandboxBackendError("select either --null-device or --drive, not both")
     if drive is not None:
         if (
             not isinstance(drive, str) or len(drive) != 2
@@ -139,7 +144,8 @@ def host_preparation(
     helper = _helper_path(Path.cwd(), "read-only")
     try:
         completed = subprocess.run(
-            [os.fspath(helper), f"host-{operation}", *(["--drive", drive] if drive else [])],
+            [os.fspath(helper), f"host-{operation}",
+             *(["--null-device"] if null_device else ["--drive", drive] if drive else [])],
             cwd=helper.parent,
             env=_helper_environment(),
             stdin=subprocess.DEVNULL,
@@ -165,6 +171,8 @@ def host_preparation(
         value = json.loads(completed.stdout.decode("utf-8", "strict"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise WindowsSandboxBackendError("Windows sandbox preparation response is not JSON") from exc
+    if null_device:
+        return _validate_null_preparation(value, operation)
     if (
         not isinstance(value, dict)
         or type(value.get("protocolVersion")) is not int
@@ -224,6 +232,32 @@ def host_preparation(
         raise WindowsSandboxBackendError("Windows sandbox preparation did not establish the required permission")
     if operation == "remove" and any(target["prepared"] for target in targets):
         raise WindowsSandboxBackendError("Windows sandbox preparation permission was not removed")
+    return value
+
+
+def _validate_null_preparation(value: object, operation: str) -> dict[str, object]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"protocolVersion", "kind", "operation", "path", "capabilityName",
+                          "capabilitySid", "accessMask", "prepared", "changed", "lifetime"}
+        or type(value.get("protocolVersion")) is not int
+        or value["protocolVersion"] != PROTOCOL_VERSION
+        or value.get("kind") != "nullDevicePreparation"
+        or value.get("operation") != operation
+        or value.get("path") != "\\Device\\Null"
+        or value.get("capabilityName") != _NULL_CAPABILITY
+        or not isinstance(value.get("capabilitySid"), str)
+        or not value["capabilitySid"].startswith("S-1-15-3-1024-")
+        or type(value.get("accessMask")) is not int
+        or value["accessMask"] != _NULL_ACCESS_MASK
+        or value.get("lifetime") != "untilReboot"
+        or type(value.get("prepared")) is not bool
+        or type(value.get("changed")) is not bool
+        or (operation == "status" and value["changed"])
+        or (operation == "prepare" and not value["prepared"])
+        or (operation == "remove" and value["prepared"])
+    ):
+        raise WindowsSandboxBackendError("Windows sandbox NUL preparation response has invalid fields")
     return value
 
 
