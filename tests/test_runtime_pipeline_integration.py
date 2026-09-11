@@ -58,6 +58,26 @@ def test_fixture_diagnostic_keeps_error_tail_without_exceeding_limit() -> None:
     assert _bounded_fixture_json({"output": "short"}) == '{"output": "short"}'
 
 
+def test_afd_diagnostic_does_not_treat_endpoint_parameter_error_as_denial() -> None:
+    import ctypes
+
+    from tests.windows_fixtures import socket_initialization_probe as probe
+
+    class Nt:
+        def NtOpenFile(self, handle, access, attributes, io, share, options):
+            assert access == 0x20000 and share == 7 and options == 0
+            assert ctypes.cast(attributes, ctypes.POINTER(probe.ObjectAttributes)).contents.Attributes == 0x1040
+            return ctypes.c_int32(0xc000000d).value
+
+    def close(_handle):
+        raise AssertionError("a failed open must not close an unowned handle")
+
+    result, descriptor = probe.afd_descriptor(r"\Device\Afd\Endpoint", Nt(), close)
+    assert descriptor is None and result["openNtStatus"] == "0xc000000d"
+    assert not result["descriptorAvailable"]
+    assert "without EA does not test socket authorization" in result["inconclusive"]
+
+
 def _fixture_exchange_diagnostic(body: dict[str, Any]) -> list[dict[str, Any]]:
     """Show bounded synthetic tool results/retry hints, never headers or system prompts."""
     messages = [
@@ -213,62 +233,25 @@ async def _windows_socket_initialization_diagnostic(python: Path, root: Path) ->
     The network-enabled case is an explicitly separate diagnostic control. It
     does not change the failed C+A run's network-disabled policy or assertions.
     """
-    import base64
-
     from supervisor.runtime.sandbox import SandboxPolicy, SandboxRunner
 
-    source = r'''
-import ctypes, importlib, json, socket, uuid
-report = {}
-try:
-    importlib.import_module('_overlapped')
-    report['import_overlapped'] = {'ok': True}
-except Exception as exc:
-    report['import_overlapped'] = {'ok': False, 'type': type(exc).__name__,
-        'winerror': getattr(exc, 'winerror', None), 'errno': getattr(exc, 'errno', None), 'error': str(exc)}
-# Importing socket initialized Winsock. Use the exact C socket() call from
-# CPython Modules/overlapped.c, rather than Python's WSASocketW wrapper.
-ws2 = ctypes.WinDLL('ws2_32')
-ws2.socket.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
-ws2.socket.restype = ctypes.c_size_t
-ws2.WSAGetLastError.argtypes = []
-ws2.WSAGetLastError.restype = ctypes.c_int
-ws2.closesocket.argtypes = [ctypes.c_size_t]
-ws2.closesocket.restype = ctypes.c_int
-ws2.WSAIoctl.argtypes = [ctypes.c_size_t, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32,
-    ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p, ctypes.c_void_p]
-ws2.WSAIoctl.restype = ctypes.c_int
-handle = ws2.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
-error = ws2.WSAGetLastError() if handle == ctypes.c_size_t(-1).value else 0
-report['socket_AF_INET_STREAM_TCP'] = {'ok': handle != ctypes.c_size_t(-1).value, 'winerror': error}
-if handle != ctypes.c_size_t(-1).value:
-    try:
-        # WSAID_ACCEPTEX is the first extension queried by _overlapped at import.
-        guid = ctypes.create_string_buffer(uuid.UUID('b5367df1-cbac-11cf-95ca-00805f48a192').bytes_le)
-        pointer, returned = ctypes.c_void_p(), ctypes.c_uint32()
-        result = ws2.WSAIoctl(handle, 0xc8000006, guid, 16, ctypes.byref(pointer),
-            ctypes.sizeof(pointer), ctypes.byref(returned), None, None)
-        error = ws2.WSAGetLastError() if result == -1 else 0
-        report['WSAIoctl_SIO_GET_EXTENSION_FUNCTION_POINTER_AcceptEx'] = {
-            'ok': result == 0, 'winerror': error, 'returnedBytes': returned.value, 'nonNullPointer': bool(pointer.value)}
-    finally:
-        result = ws2.closesocket(handle)
-        error = ws2.WSAGetLastError() if result == -1 else 0
-        report['closesocket'] = {'ok': result == 0, 'winerror': error}
-print(json.dumps(report, sort_keys=True), flush=True)
-'''
+    # Keep the script and raw host SD in the already-authorized copied runtime;
+    # no new readable directory or long, base64-expanded command line is needed.
+    source = Path(__file__).with_name("windows_fixtures") / "socket_initialization_probe.py"
+    probe = python.parent / "bello_socket_initialization_probe.py"
+    descriptors = python.parent / "bello_socket_host_descriptors.json"
+    shutil.copy2(source, probe)
+    descriptors.write_text("{}", encoding="ascii")
     result: dict[str, Any] = {}
     try:
-        host = subprocess.run([str(python), "-I", "-c", source],
+        host = subprocess.run([str(python), "-I", str(probe), "host", str(descriptors)],
                               capture_output=True, text=True, timeout=20)
-        result["host_control"] = {"exitCode": host.returncode, "stdout": host.stdout[-2400:],
+        result["host_control"] = {"exitCode": host.returncode, "stdout": host.stdout[-6500:],
                                   "stderr": host.stderr[-1200:]}
     except Exception as exc:
         result["host_control"] = {"diagnosticError": f"{type(exc).__name__}: {exc}"}
     root.mkdir()
-    encoded = base64.b64encode(source.encode()).decode()
-    command = subprocess.list2cmdline([str(python), "-I", "-c",
-                                      f"import base64;exec(base64.b64decode('{encoded}'))"])
+    command = subprocess.list2cmdline([str(python), "-I", str(probe), "sandbox", str(descriptors)])
     for network_access in (False, True):
         key = f"sandbox_network_access_{str(network_access).lower()}"
         try:
@@ -276,7 +259,7 @@ print(json.dumps(report, sort_keys=True), flush=True)
                 network_access=network_access, readable_roots=(python.parent,)))
             outcome = await runner.run(command, root, 20)
             result[key] = {"exitCode": outcome.exit_code, "timedOut": outcome.timed_out,
-                           "output": outcome.output[-3600:]}
+                           "output": outcome.output[-6500:]}
         except Exception as exc:
             result[key] = {"diagnosticError": f"{type(exc).__name__}: {exc}"}
     return result
