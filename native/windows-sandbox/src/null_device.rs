@@ -445,14 +445,89 @@ mod tests {
     fn conflicting_owned_kernel_tuple_is_not_repaired() {
         // A disposable, unnamed kernel object exercises malformed-tuple refusal
         // without placing conflicting permissions on the real host null device.
+        // Do not inherit the test runner's ambient default DACL: CI can have a
+        // null default DACL, which production correctly refuses to mutate.
+        use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TokenPrimaryGroup, SECURITY_ATTRIBUTES, TOKEN_PRIMARY_GROUP,
+            TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        let owner = crate::acl::current_account_sid_string().unwrap();
+        let mut raw_token = 0;
+        assert_ne!(
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) },
+            0
+        );
+        let token = Handle::new(raw_token, "test event creator token").unwrap();
+        let mut required = 0;
+        unsafe {
+            GetTokenInformation(
+                token.raw(),
+                TokenPrimaryGroup,
+                std::ptr::null_mut(),
+                0,
+                &mut required,
+            );
+        }
+        assert!((mem::size_of::<TOKEN_PRIMARY_GROUP>() as u32..=4096).contains(&required));
+        let mut group_storage =
+            vec![0_usize; (required as usize).div_ceil(mem::size_of::<usize>())];
+        assert_ne!(
+            unsafe {
+                GetTokenInformation(
+                    token.raw(),
+                    TokenPrimaryGroup,
+                    group_storage.as_mut_ptr() as *mut c_void,
+                    required,
+                    &mut required,
+                )
+            },
+            0
+        );
+        let group = sid_string(unsafe {
+            (*(group_storage.as_ptr() as *const TOKEN_PRIMARY_GROUP)).PrimaryGroup
+        })
+        .unwrap();
+        let sddl = format!("O:{owner}G:{group}D:P(A;;GA;;;{owner})");
+        let mut raw_descriptor = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide(&sddl).as_ptr(),
+                    1,
+                    &mut raw_descriptor,
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        struct TestDescriptor(*mut c_void);
+        impl Drop for TestDescriptor {
+            fn drop(&mut self) {
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
+        let security = TestDescriptor(raw_descriptor);
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: security.0,
+            bInheritHandle: 0,
+        };
         let handle = Handle::new(
-            unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) },
+            unsafe { CreateEventW(&attributes, 0, 0, std::ptr::null()) },
             "null ACL test event",
         )
         .unwrap();
         let sid = identity::derive_profile_sid(&identity::random_profile_name().unwrap()).unwrap();
         let _lock = GlobalAclLock::acquire().unwrap();
         let descriptor = Descriptor::read(&handle).unwrap();
+        let initial = descriptor.snapshot().unwrap();
+        assert_eq!(initial.owner, owner);
+        assert_eq!(initial.group, group);
+        assert_eq!(initial.entries.len(), 1);
         let mut modified = replacement(&descriptor, sid.0, true).unwrap();
         for raw in ace_pointers(modified.as_mut_ptr() as *mut ACL).unwrap() {
             if crate::acl::ace_has_sid(raw, sid.0).unwrap() {
@@ -463,8 +538,15 @@ mod tests {
         }
         write_dacl(&handle, &mut modified).unwrap();
         let before = Descriptor::read(&handle).unwrap().snapshot().unwrap();
-        assert!(set_prepared(&handle, sid.0, true).is_err());
-        assert!(set_prepared(&handle, sid.0, false).is_err());
+        for prepared in [true, false] {
+            let error = set_prepared(&handle, sid.0, prepared).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("conflicting null-device capability ACE"),
+                "{error:#}"
+            );
+        }
         assert_eq!(
             Descriptor::read(&handle).unwrap().snapshot().unwrap(),
             before

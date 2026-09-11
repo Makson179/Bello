@@ -207,6 +207,81 @@ def _use_staged_windows_file_tools(
     return commands
 
 
+async def _windows_socket_initialization_diagnostic(python: Path, root: Path) -> dict[str, Any]:
+    """Failure-only comparison; create/query/close sockets, never bind/connect.
+
+    The network-enabled case is an explicitly separate diagnostic control. It
+    does not change the failed C+A run's network-disabled policy or assertions.
+    """
+    import base64
+
+    from supervisor.runtime.sandbox import SandboxPolicy, SandboxRunner
+
+    source = r'''
+import ctypes, importlib, json, socket, uuid
+report = {}
+try:
+    importlib.import_module('_overlapped')
+    report['import_overlapped'] = {'ok': True}
+except Exception as exc:
+    report['import_overlapped'] = {'ok': False, 'type': type(exc).__name__,
+        'winerror': getattr(exc, 'winerror', None), 'errno': getattr(exc, 'errno', None), 'error': str(exc)}
+# Importing socket initialized Winsock. Use the exact C socket() call from
+# CPython Modules/overlapped.c, rather than Python's WSASocketW wrapper.
+ws2 = ctypes.WinDLL('ws2_32')
+ws2.socket.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+ws2.socket.restype = ctypes.c_size_t
+ws2.WSAGetLastError.argtypes = []
+ws2.WSAGetLastError.restype = ctypes.c_int
+ws2.closesocket.argtypes = [ctypes.c_size_t]
+ws2.closesocket.restype = ctypes.c_int
+ws2.WSAIoctl.argtypes = [ctypes.c_size_t, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32,
+    ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p, ctypes.c_void_p]
+ws2.WSAIoctl.restype = ctypes.c_int
+handle = ws2.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+error = ws2.WSAGetLastError() if handle == ctypes.c_size_t(-1).value else 0
+report['socket_AF_INET_STREAM_TCP'] = {'ok': handle != ctypes.c_size_t(-1).value, 'winerror': error}
+if handle != ctypes.c_size_t(-1).value:
+    try:
+        # WSAID_ACCEPTEX is the first extension queried by _overlapped at import.
+        guid = ctypes.create_string_buffer(uuid.UUID('b5367df1-cbac-11cf-95ca-00805f48a192').bytes_le)
+        pointer, returned = ctypes.c_void_p(), ctypes.c_uint32()
+        result = ws2.WSAIoctl(handle, 0xc8000006, guid, 16, ctypes.byref(pointer),
+            ctypes.sizeof(pointer), ctypes.byref(returned), None, None)
+        error = ws2.WSAGetLastError() if result == -1 else 0
+        report['WSAIoctl_SIO_GET_EXTENSION_FUNCTION_POINTER_AcceptEx'] = {
+            'ok': result == 0, 'winerror': error, 'returnedBytes': returned.value, 'nonNullPointer': bool(pointer.value)}
+    finally:
+        result = ws2.closesocket(handle)
+        error = ws2.WSAGetLastError() if result == -1 else 0
+        report['closesocket'] = {'ok': result == 0, 'winerror': error}
+print(json.dumps(report, sort_keys=True), flush=True)
+'''
+    result: dict[str, Any] = {}
+    try:
+        host = subprocess.run([str(python), "-I", "-c", source],
+                              capture_output=True, text=True, timeout=20)
+        result["host_control"] = {"exitCode": host.returncode, "stdout": host.stdout[-2400:],
+                                  "stderr": host.stderr[-1200:]}
+    except Exception as exc:
+        result["host_control"] = {"diagnosticError": f"{type(exc).__name__}: {exc}"}
+    root.mkdir()
+    encoded = base64.b64encode(source.encode()).decode()
+    command = subprocess.list2cmdline([str(python), "-I", "-c",
+                                      f"import base64;exec(base64.b64decode('{encoded}'))"])
+    for network_access in (False, True):
+        key = f"sandbox_network_access_{str(network_access).lower()}"
+        try:
+            runner = SandboxRunner(SandboxPolicy(root=root, mode="workspace-write",
+                network_access=network_access, readable_roots=(python.parent,)))
+            outcome = await runner.run(command, root, 20)
+            result[key] = {"exitCode": outcome.exit_code, "timedOut": outcome.timed_out,
+                           "output": outcome.output[-3600:]}
+        except Exception as exc:
+            result[key] = {"diagnosticError": f"{type(exc).__name__}: {exc}"}
+    return result
+
+
 def shlex_quote(value: str) -> str:
     # Keep the test import surface small while producing an ordinary POSIX command.
     import shlex
@@ -898,8 +973,14 @@ async def test_real_pi_offline_coder_completion_adversary_pipeline(
 
             await asyncio.wait_for(controller.run(), timeout=240 if os.name == "nt" else 90)
 
+            socket_diagnostic = None
+            if provider.errors and windows_python is not None:
+                socket_diagnostic = await _windows_socket_initialization_diagnostic(
+                    windows_python, tmp_path / "socket-diagnostic",
+                )
             assert not provider.errors, json.dumps({
                 "errors": provider.errors,
+                "windows_socket_initialization_diagnostic": socket_diagnostic,
                 "recent_exchanges_by_role": {
                     role: _fixture_exchange_diagnostic(body)
                     for role, body in provider.requests
