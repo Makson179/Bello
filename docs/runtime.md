@@ -43,12 +43,37 @@ cache; `BELLO_PI_AGENT_DIR` selects the user's Pi authentication/config director
 
 Linux restricted execution requires `bwrap` (the `bubblewrap` package) and
 working unprivileged user namespaces. macOS uses the operating system's Seatbelt
-sandbox. Native Windows support uses a separate helper whose source and protocol
-checks pass, but native verification is pending. Windows source builds require
-Rust/Cargo; Windows release wheels are prepared to include the compiled helper.
-Do not treat a passing non-Windows test run as Windows certification. The
-current Windows helper requires permission to modify ACLs on exact toolchain
-roots; protected machine-wide installations need further ordinary-user testing.
+sandbox. Native Windows uses Bello's packaged LPAC helper. Windows source builds
+require Rust/Cargo; Windows release wheels include the compiled helper. LPAC is
+Windows process isolation with restricted filesystem and network permissions.
+Native Windows verification is tracked separately; passing non-Windows tests
+does not certify the Windows boundary.
+
+Windows tools such as Node and CMD also need metadata access to the system-drive
+root. Check the one-time preparation without changing permissions:
+
+```powershell
+bello runtime windows-sandbox status
+```
+
+If preparation is missing, open a terminal with **Run as administrator** and run
+`bello runtime windows-sandbox prepare`. It asks for confirmation before adding
+the fixed permission. Close that terminal afterwards and run tasks normally,
+without administrator rights. Installation and ordinary runs never silently
+elevate or perform this setup.
+
+This grants only attributes, extended attributes, permission-descriptor reads
+and synchronization on the system-drive root. It does not grant listing,
+file-content reads, writes, or inherited access to descendants. The permission
+persists until explicitly removed with `bello runtime windows-sandbox remove`
+from an administrator terminal; stop runs before removal. Existing unrelated
+permissions are preserved. The named capability is not an authentication check:
+another process can request the same capability. Its access remains limited to
+this fixed metadata permission, rather than applying to all AppContainers.
+
+Preparation does not grant access to arbitrary drives or protected machine-wide
+toolchains. Exposed toolchain roots must still allow the invoking account to
+manage their exact permissions; use host-controlled per-user installations.
 
 ## Sign in and choose models
 

@@ -17,6 +17,7 @@ import json
 import math
 import os
 from pathlib import Path
+import platform
 import stat
 import struct
 import subprocess
@@ -33,6 +34,8 @@ _ABORT_GRACE_SECONDS = 5.0
 _PIPE_DRAIN_GRACE_SECONDS = 1.0
 _RECOVERY_TIMEOUT_SECONDS = 30.0
 _HELPER_NAME = "bello-windows-sandbox.exe"
+_HOST_CAPABILITY = "Bello.Sandbox.SystemRootMetadata.v1"
+_HOST_METADATA_MASK = 0x00120088
 
 
 class WindowsSandboxError(RuntimeError):
@@ -109,6 +112,75 @@ def _helper_environment() -> dict[str, str]:
     # Windows APIs.  An empty environment prevents tokens, proxies, loader
     # controls, and caller-controlled path authorities from reaching it.
     return {}
+
+
+def host_preparation(operation: Literal["status", "prepare", "remove"]) -> dict[str, object]:
+    """Run only the helper's fixed host-metadata setup command, never an agent.
+
+    Elevation is deliberately external: the user opens an administrator terminal
+    for prepare/remove. No task, shell command, path, SID, or permission mask is
+    accepted by this interface. The native helper independently checks elevation
+    and obtains the system-drive root from Windows, not the caller's environment.
+    """
+    if operation not in {"status", "prepare", "remove"}:
+        raise WindowsSandboxBackendError("unknown Windows sandbox preparation operation")
+    if platform.system() != "Windows":
+        raise WindowsSandboxUnavailableError("Windows sandbox preparation is available only on Windows")
+    helper = _helper_path(Path.cwd(), "read-only")
+    try:
+        completed = subprocess.run(
+            [os.fspath(helper), f"host-{operation}"],
+            cwd=helper.parent,
+            env=_helper_environment(),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=60,
+            check=False,
+            creationflags=_creation_flags(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise WindowsSandboxUnavailableError(f"Windows sandbox {operation} failed: {exc}") from exc
+    if completed.returncode:
+        try:
+            record = _parse_terminal(completed.stderr)
+        except WindowsSandboxBackendError:
+            raise WindowsSandboxBackendError(
+                f"Windows sandbox {operation} failed with exit code {completed.returncode}"
+            ) from None
+        message = record.message if isinstance(record, _ErrorRecord) else "unexpected helper exit"
+        raise WindowsSandboxBackendError(message)
+    if not completed.stdout or len(completed.stdout) > MAX_CONTROL_BYTES or completed.stderr:
+        raise WindowsSandboxBackendError("Windows sandbox preparation returned an invalid response")
+    try:
+        value = json.loads(completed.stdout.decode("utf-8", "strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WindowsSandboxBackendError("Windows sandbox preparation response is not JSON") from exc
+    if (
+        not isinstance(value, dict)
+        or type(value.get("protocolVersion")) is not int
+        or value["protocolVersion"] != PROTOCOL_VERSION
+        or value.get("kind") != "hostPreparation"
+        or value.get("operation") != operation
+        or value.get("capabilityName") != _HOST_CAPABILITY
+        or type(value.get("metadataMask")) is not int
+        or value["metadataMask"] != _HOST_METADATA_MASK
+        or not isinstance(value.get("capabilitySid"), str)
+        or not value["capabilitySid"].startswith("S-1-15-3-1024-")
+        or type(value.get("prepared")) is not bool
+        or type(value.get("changed")) is not bool
+        or not isinstance(value.get("systemRoot"), str)
+        or len(value["systemRoot"]) != 3
+        or value["systemRoot"][0] not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        or value["systemRoot"][1:] != ":\\"
+    ):
+        raise WindowsSandboxBackendError("Windows sandbox preparation response has invalid fields")
+    if operation == "status" and value["changed"]:
+        raise WindowsSandboxBackendError("Windows sandbox status unexpectedly reported a change")
+    if operation == "prepare" and not value["prepared"]:
+        raise WindowsSandboxBackendError("Windows sandbox preparation did not establish the required permission")
+    if operation == "remove" and value["prepared"]:
+        raise WindowsSandboxBackendError("Windows sandbox preparation permission was not removed")
+    return value
 
 
 def _encode_request(request: dict[str, object]) -> bytes:

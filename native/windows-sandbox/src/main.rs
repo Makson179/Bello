@@ -11,6 +11,8 @@ mod acl;
 #[cfg(windows)]
 mod acl_lock;
 #[cfg(windows)]
+mod host_prepare;
+#[cfg(windows)]
 mod identity;
 #[cfg(windows)]
 mod journal;
@@ -67,10 +69,50 @@ fn execute(_request: Request) -> Result<i32> {
     Err(anyhow!("bello-windows-sandbox can run only on Windows"))
 }
 
+fn dispatch() -> Result<Option<i32>> {
+    let mut arguments = std::env::args_os().skip(1);
+    let Some(argument) = arguments.next() else {
+        return read_request().and_then(execute).map(Some);
+    };
+    if arguments.next().is_some() {
+        return Err(anyhow!(
+            "host preparation accepts exactly one fixed subcommand and no paths or commands"
+        ));
+    }
+    let operation = match argument.to_str() {
+        Some("host-status") => "status",
+        Some("host-prepare") => "prepare",
+        Some("host-remove") => "remove",
+        _ => {
+            return Err(anyhow!(
+                "expected host-status, host-prepare, or host-remove"
+            ))
+        }
+    };
+    #[cfg(windows)]
+    {
+        // This branch never reads framed stdin, configuration, run/recovery
+        // requests, or invokes a user-controlled command with elevated rights.
+        let report = host_prepare::execute(operation)?;
+        let stdout = io::stdout();
+        let mut writer = stdout.lock();
+        serde_json::to_writer(&mut writer, &report)?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        Ok(None)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = operation;
+        Err(anyhow!("Windows host preparation can run only on Windows"))
+    }
+}
+
 fn real_main() -> i32 {
     std::panic::set_hook(Box::new(|_| {}));
-    match std::panic::catch_unwind(|| read_request().and_then(execute)) {
-        Ok(Ok(exit_code)) => {
+    match std::panic::catch_unwind(dispatch) {
+        Ok(Ok(None)) => 0,
+        Ok(Ok(Some(exit_code))) => {
             if write_record(&TerminalRecord::Exit {
                 protocol_version: PROTOCOL_VERSION,
                 exit_code,

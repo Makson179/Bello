@@ -151,10 +151,14 @@ def _sandbox_dependency_result() -> DoctorResult:
             detail += f". {_bubblewrap_install_hint()}"
         detail += ". Bello will not silently run outside its configured sandbox."
         return DoctorResult("fail", "No supported OS sandbox is available", detail)
-    return DoctorResult(
-        "ok", f"OS sandbox executable found: {backend}",
-        "The run preflight also checks whether the sandbox can actually start with the requested workspace permissions.",
-    )
+    detail = "The run preflight also checks whether the sandbox can actually start with the requested workspace permissions."
+    if system == "Windows":
+        detail += (
+            " Check one-time host preparation with `bello runtime windows-sandbox status`. "
+            "If needed, run `bello runtime windows-sandbox prepare` in an administrator terminal; "
+            "normal tasks do not require elevation."
+        )
+    return DoctorResult("ok", f"OS sandbox executable found: {backend}", detail)
 
 
 def _bubblewrap_install_hint() -> str:

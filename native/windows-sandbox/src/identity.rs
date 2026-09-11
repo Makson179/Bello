@@ -18,6 +18,10 @@ use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
 
 pub const PROFILE_PREFIX: &str = "Bello.Sandbox.";
+// A named capability is a permission recipient, not proof of Bello identity:
+// other host programs can derive/request it. Its only prepared permission is
+// non-inheriting metadata access on the OS system-drive root.
+pub const SYSTEM_ROOT_METADATA_CAPABILITY: &str = "Bello.Sandbox.SystemRootMetadata.v1";
 
 pub struct AppContainerSid(pub PSID);
 
@@ -45,7 +49,7 @@ impl CapabilitySids {
             owned: Vec::new(),
             attributes: Vec::new(),
         };
-        for name in ["registryRead", "lpacCom"] {
+        for name in ["registryRead", "lpacCom", SYSTEM_ROOT_METADATA_CAPABILITY] {
             value.add_named(name)?;
         }
         if enabled {
@@ -57,6 +61,27 @@ impl CapabilitySids {
             }
         }
         Ok(value)
+    }
+
+    pub fn system_root_metadata() -> Result<Self> {
+        let mut value = Self {
+            owned: Vec::new(),
+            attributes: Vec::new(),
+        };
+        value.add_named(SYSTEM_ROOT_METADATA_CAPABILITY)?;
+        if value.owned.len() != 1 {
+            return Err(anyhow!(
+                "system-root metadata capability must resolve to one SID"
+            ));
+        }
+        Ok(value)
+    }
+
+    pub fn single_sid(&self) -> Result<PSID> {
+        match self.owned.as_slice() {
+            [sid] => Ok(*sid),
+            _ => Err(anyhow!("expected a single capability SID")),
+        }
     }
 
     fn add_named(&mut self, name: &str) -> Result<()> {
@@ -240,7 +265,7 @@ pub fn delete_profile(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn sid_string(sid: PSID) -> Result<String> {
+pub fn sid_string(sid: PSID) -> Result<String> {
     let mut string_ptr: *mut u16 = std::ptr::null_mut();
     if unsafe { ConvertSidToStringSidW(sid, &mut string_ptr) } == 0 {
         return Err(last_error("ConvertSidToStringSidW"));

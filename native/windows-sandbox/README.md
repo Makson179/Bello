@@ -5,6 +5,37 @@ It launches the fixed system `cmd.exe` inside a unique less-privileged
 AppContainer (LPAC), atomically attaches it to a kill-on-close Job Object, and
 temporarily grants the AppContainer SID access only to the requested roots.
 
+## System-drive preparation
+
+The separate fixed-argument commands `host-status`, `host-prepare`, and
+`host-remove` operate only on a non-inherited root-metadata permission. They
+never enter command execution or recovery and accept no paths, commands, SIDs,
+or permission masks. Status is read-only. Prepare and remove require an
+administrator terminal; the helper does not elevate itself. The user-facing
+commands are `bello runtime windows-sandbox status|prepare|remove`.
+
+The system root is obtained from Windows, not environment variables. The
+permission recipient is the capability `Bello.Sandbox.SystemRootMetadata.v1`,
+also present in Bello's command tokens. Its fixed mask `0x00120088` permits
+attributes, extended attributes, permission-descriptor reads and synchronization.
+It does not permit directory listing, content access, writes, or inheritance.
+This is a persistent machine-level permission, not part of per-command cleanup.
+It does not grant rights to AAP/ARAP as a whole. The capability name is not an
+unforgeable application identity: another launcher may request it, so its narrow
+rights, not secrecy, are the boundary.
+
+Setup preserves unrelated ACEs and refuses conflicting entries for the same
+capability. Removal targets only the exact fixed permission, never a saved
+whole-drive ACL. Stop runs before removal. The setup lock serializes Bello's
+administrative changes; it cannot serialize unrelated administrators editing
+the same ACL. Do not run independent ACL-management tools concurrently.
+
+Preparing the system drive does not authorize metadata on other drive roots or
+provide access to protected toolchain directories. Native tests must still prove
+real CMD/Node operation and private-file denial after preparation.
+
+## Command protocol and cleanup
+
 The controller sends one little-endian `u32` length followed by a UTF-8 JSON
 request and deliberately keeps stdin open. EOF is a parent-death signal: the
 helper terminates its Job Object, so a controller crash or cancellation cannot

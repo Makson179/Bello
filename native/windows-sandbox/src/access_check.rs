@@ -406,6 +406,12 @@ mod tests {
                 FILE_GENERIC_READ
             );
         }
+        let metadata = named_capability(crate::identity::SYSTEM_ROOT_METADATA_CAPABILITY);
+        assert_eq!(
+            check_sddl(&verifier, &format!("{base}(A;;0x120088;;;{metadata})")),
+            crate::acl::SYSTEM_ROOT_METADATA_MASK,
+            "the actual LPAC token must carry the metadata capability, without content/write rights"
+        );
         let mut required = 0;
         unsafe {
             GetTokenInformation(

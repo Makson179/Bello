@@ -12,19 +12,19 @@ use windows_sys::Win32::Security::Authorization::{
     SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
-    AclSizeInformation, DeleteAce, EqualSid, GetAce, GetAclInformation, GetLengthSid,
-    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetTokenInformation,
-    InitializeSecurityDescriptor, IsValidSid, SetSecurityDescriptorControl,
-    SetSecurityDescriptorDacl, SetSecurityDescriptorOwner, TokenUser, ACCESS_ALLOWED_ACE,
-    ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
-    DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
-    SE_DACL_AUTO_INHERITED, SE_DACL_AUTO_INHERIT_REQ, SE_DACL_DEFAULTED, SE_DACL_PROTECTED,
-    TOKEN_QUERY, TOKEN_USER,
+    AclSizeInformation, AddAccessAllowedAce, AddAce, DeleteAce, EqualSid, GetAce,
+    GetAclInformation, GetLengthSid, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+    GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor, IsValidSid,
+    SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner, TokenUser,
+    ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
+    CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERITED_ACE, INHERIT_ONLY_ACE,
+    OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_AUTO_INHERITED, SE_DACL_AUTO_INHERIT_REQ,
+    SE_DACL_DEFAULTED, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, DELETE, FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
-    FILE_GENERIC_WRITE,
+    FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_READ_EA, READ_CONTROL, SYNCHRONIZE,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -500,6 +500,133 @@ pub fn revoke(handle: &Handle, sid: PSID) -> Result<()> {
     set_object_dacl(handle, filtered.as_mut_ptr() as *mut ACL)
 }
 
+// This mask does not include listing, content, traversal, delete, or writes.
+// It matches the metadata-only system-drive preparation documented by Microsoft:
+// https://github.com/microsoft/mxc/blob/main/docs/host-prep.md
+pub const SYSTEM_ROOT_METADATA_MASK: u32 =
+    FILE_READ_ATTRIBUTES | FILE_READ_EA | READ_CONTROL | SYNCHRONIZE;
+
+fn metadata_entry_present(dacl: *mut ACL, sid: PSID) -> Result<bool> {
+    let mut present = false;
+    for index in 0..u32::from(unsafe { (*dacl).AceCount }) {
+        let mut raw = std::ptr::null_mut();
+        if unsafe { GetAce(dacl, index, &mut raw) } == 0 {
+            return Err(crate::winutil::last_error("GetAce(host preparation)"));
+        }
+        if !ace_has_sid(raw, sid)? {
+            continue;
+        }
+        let header = unsafe { &*(raw as *const ACE_HEADER) };
+        if header.AceType != ACCESS_ALLOWED_ACE_TYPE
+            || header.AceFlags != 0
+            || unsafe { (*(raw as *const ACCESS_ALLOWED_ACE)).Mask } != SYSTEM_ROOT_METADATA_MASK
+            || present
+        {
+            return Err(anyhow!(
+                "conflicting system-root capability ACE; no permissions changed"
+            ));
+        }
+        present = true;
+    }
+    Ok(present)
+}
+
+pub fn system_root_metadata_prepared(handle: &Handle, sid: PSID) -> Result<bool> {
+    let (dacl, _descriptor) = raw_object_dacl(handle)?;
+    metadata_entry_present(dacl, sid)
+}
+
+/// The host-preparation caller pins the fixed OS root and holds its admin-only
+/// mutation lock. Never use GRANT_ACCESS merging or recursively propagate here.
+pub fn set_system_root_metadata(handle: &Handle, sid: PSID, prepared: bool) -> Result<bool> {
+    let (dacl, _descriptor) = raw_object_dacl(handle)?;
+    let present = metadata_entry_present(dacl, sid)?;
+    if present == prepared {
+        return Ok(false);
+    }
+    if !prepared {
+        // Presence validation proved the sole matching SID entry is our exact
+        // non-inheriting tuple. Foreign entries are copied unchanged.
+        let mut filtered = dacl_without_access_sid(dacl, sid)?;
+        set_object_dacl(handle, filtered.as_mut_ptr() as *mut ACL)?;
+    } else {
+        let mut info: ACL_SIZE_INFORMATION = unsafe { mem::zeroed() };
+        if unsafe {
+            GetAclInformation(
+                dacl,
+                &mut info as *mut _ as *mut c_void,
+                mem::size_of_val(&info) as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(crate::winutil::last_error(
+                "GetAclInformation(host preparation)",
+            ));
+        }
+        let ace_size = mem::size_of::<ACCESS_ALLOWED_ACE>() - mem::size_of::<u32>()
+            + unsafe { GetLengthSid(sid) } as usize;
+        let size = (info.AclBytesInUse as usize)
+            .checked_add(ace_size)
+            .filter(|value| *value <= u16::MAX as usize)
+            .ok_or_else(|| anyhow!("system-root DACL is too large for metadata preparation"))?;
+        let mut buffer = vec![0_usize; size.div_ceil(mem::size_of::<usize>())];
+        let replacement = buffer.as_mut_ptr() as *mut ACL;
+        let revision = u32::from(unsafe { (*dacl).AclRevision });
+        if unsafe { InitializeAcl(replacement, size as u32, revision) } == 0 {
+            return Err(crate::winutil::last_error(
+                "InitializeAcl(host preparation)",
+            ));
+        }
+        let mut inserted = false;
+        for index in 0..info.AceCount {
+            let mut raw = std::ptr::null_mut();
+            if unsafe { GetAce(dacl, index, &mut raw) } == 0 {
+                return Err(crate::winutil::last_error("GetAce(host preparation copy)"));
+            }
+            let header = unsafe { &*(raw as *const ACE_HEADER) };
+            if !inserted && u32::from(header.AceFlags) & INHERITED_ACE != 0 {
+                if unsafe {
+                    AddAccessAllowedAce(replacement, revision, SYSTEM_ROOT_METADATA_MASK, sid)
+                } == 0
+                {
+                    return Err(crate::winutil::last_error(
+                        "AddAccessAllowedAce(host preparation)",
+                    ));
+                }
+                inserted = true;
+            }
+            if unsafe {
+                AddAce(
+                    replacement,
+                    revision,
+                    u32::MAX,
+                    raw,
+                    u32::from(header.AceSize),
+                )
+            } == 0
+            {
+                return Err(crate::winutil::last_error("AddAce(host preparation copy)"));
+            }
+        }
+        if !inserted
+            && unsafe { AddAccessAllowedAce(replacement, revision, SYSTEM_ROOT_METADATA_MASK, sid) }
+                == 0
+        {
+            return Err(crate::winutil::last_error(
+                "AddAccessAllowedAce(host preparation)",
+            ));
+        }
+        set_object_dacl(handle, replacement)?;
+    }
+    if system_root_metadata_prepared(handle, sid)? != prepared {
+        return Err(anyhow!(
+            "system-root metadata read-back did not match the requested state"
+        ));
+    }
+    Ok(true)
+}
+
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 
@@ -753,6 +880,82 @@ mod tests {
             "GetSecurityInfo changed the actual object DACL"
         );
         Ok((raw, high_level))
+    }
+
+    #[test]
+    fn metadata_preparation_is_exact_noninheriting_and_reversible() {
+        let profile = crate::identity::random_profile_name().unwrap();
+        let base = std::env::temp_dir().join(format!("bello-host-metadata-{profile}"));
+        std::fs::create_dir(&base).unwrap();
+        let base = std::fs::canonicalize(base).unwrap();
+        let existing = base.join("existing.txt");
+        std::fs::write(&existing, "private fixture content").unwrap();
+        let root = open_path(&base, true).unwrap();
+        let child = open_path(&existing, false).unwrap();
+        let root_before = paired_dacl_snapshot(&root).unwrap();
+        let child_before = paired_dacl_snapshot(&child).unwrap();
+        let capability = crate::identity::CapabilitySids::system_root_metadata().unwrap();
+        let sid = capability.single_sid().unwrap();
+        assert!(!system_root_metadata_prepared(&root, sid).unwrap());
+        assert!(set_system_root_metadata(&root, sid, true).unwrap());
+        assert!(system_root_metadata_prepared(&root, sid).unwrap());
+        assert!(!set_system_root_metadata(&root, sid, true).unwrap());
+        assert_eq!(paired_dacl_snapshot(&child).unwrap(), child_before);
+        assert!(!system_root_metadata_prepared(&child, sid).unwrap());
+        let new_path = base.join("new.txt");
+        std::fs::write(&new_path, "new fixture content").unwrap();
+        let new_child = open_path(&new_path, false).unwrap();
+        assert!(!system_root_metadata_prepared(&new_child, sid).unwrap());
+        let (dacl, _descriptor) = raw_object_dacl(&root).unwrap();
+        assert_eq!(
+            masks_for_sid(dacl, sid, true).unwrap(),
+            (SYSTEM_ROOT_METADATA_MASK, 0)
+        );
+        let without_ours = dacl_without_access_sid(dacl, sid).unwrap();
+        assert_eq!(
+            ace_bytes(without_ours.as_ptr() as *mut ACL),
+            root_before.0 .0
+        );
+        assert!(set_system_root_metadata(&root, sid, false).unwrap());
+        assert!(!set_system_root_metadata(&root, sid, false).unwrap());
+        assert_eq!(paired_dacl_snapshot(&root).unwrap(), root_before);
+        assert_eq!(paired_dacl_snapshot(&child).unwrap(), child_before);
+        drop((root, child, new_child));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn metadata_preparation_refuses_to_merge_or_remove_conflicting_capability_rights() {
+        let profile = crate::identity::random_profile_name().unwrap();
+        let path = std::env::temp_dir().join(format!("bello-host-conflict-{profile}"));
+        std::fs::create_dir(&path).unwrap();
+        let path = std::fs::canonicalize(path).unwrap();
+        let root = open_path(&path, true).unwrap();
+        let capability = crate::identity::CapabilitySids::system_root_metadata().unwrap();
+        let sid = capability.single_sid().unwrap();
+        for (mask, flags) in [
+            (FILE_ALL_ACCESS, 0),
+            (SYSTEM_ROOT_METADATA_MASK, OBJECT_INHERIT_ACE),
+        ] {
+            set_object_entries(
+                &root,
+                &[EXPLICIT_ACCESS_W {
+                    grfAccessPermissions: mask,
+                    grfAccessMode: GRANT_ACCESS,
+                    grfInheritance: flags,
+                    Trustee: trustee(sid),
+                }],
+            )
+            .unwrap();
+            let before = paired_dacl_snapshot(&root).unwrap();
+            assert!(system_root_metadata_prepared(&root, sid).is_err());
+            assert!(set_system_root_metadata(&root, sid, true).is_err());
+            assert!(set_system_root_metadata(&root, sid, false).is_err());
+            assert_eq!(paired_dacl_snapshot(&root).unwrap(), before);
+            revoke(&root, sid).unwrap();
+        }
+        drop(root);
+        std::fs::remove_dir(path).unwrap();
     }
 
     #[test]

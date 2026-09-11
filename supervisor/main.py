@@ -306,6 +306,74 @@ def runtime_install_command() -> None:
     click.echo(f"Pi runtime installed: {destination}")
 
 
+@runtime_group.group("windows-sandbox")
+def runtime_windows_sandbox_group() -> None:
+    """Inspect or explicitly prepare Windows sandbox system-root metadata access."""
+
+
+@runtime_windows_sandbox_group.command("status")
+def runtime_windows_sandbox_status() -> None:
+    """Check the host permission without changing it or requesting elevation."""
+    from supervisor.runtime.windows_sandbox import WindowsSandboxError, host_preparation
+    try:
+        result = host_preparation("status")
+    except WindowsSandboxError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if result["prepared"]:
+        click.echo(f"Windows sandbox metadata access is prepared for {result['systemRoot']}")
+    else:
+        click.echo("Windows sandbox metadata access needs one-time administrator setup.")
+        click.echo("In an administrator terminal, run: bello runtime windows-sandbox prepare")
+    click.echo("This checks host preparation only, not every workspace or sandbox operation.")
+
+
+def _windows_sandbox_change(operation: str, *, yes: bool) -> None:
+    from supervisor.runtime.windows_sandbox import WindowsSandboxError, host_preparation
+    # Perform a read-only check first, including platform/helper validation.
+    try:
+        current = host_preparation("status")
+    except WindowsSandboxError as exc:
+        raise click.ClickException(str(exc)) from exc
+    removing = operation == "remove"
+    if current["prepared"] == (not removing):
+        click.echo("Permission already prepared." if not removing else "Permission already absent.")
+        return
+    verb = "Remove" if removing else "Add"
+    click.echo(
+        f"{verb} the persistent Bello-named metadata permission on {current['systemRoot']} only. "
+        "It does not grant directory listing, file contents, writes, or inherited access."
+    )
+    if removing:
+        click.echo("Stop Bello runs first; removing this permission can interrupt their tools.")
+    click.echo("Run this setup command in an administrator terminal; run tasks normally afterwards.")
+    if not yes:
+        click.confirm(f"{verb} this permission?", abort=True)
+    try:
+        result = host_preparation("remove" if removing else "prepare")
+    except WindowsSandboxError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if result["systemRoot"] != current["systemRoot"] or result["capabilitySid"] != current["capabilitySid"]:
+        raise click.ClickException("The helper reported a different setup target; verify host preparation before continuing.")
+    click.echo(
+        f"Windows sandbox metadata permission {'removed' if removing else 'prepared'} "
+        f"for {result['systemRoot']}."
+    )
+
+
+@runtime_windows_sandbox_group.command("prepare")
+@click.option("--yes", is_flag=True, help="Confirm the fixed metadata permission change without prompting.")
+def runtime_windows_sandbox_prepare(yes: bool) -> None:
+    """One-time metadata permission setup. Requires an administrator terminal."""
+    _windows_sandbox_change("prepare", yes=yes)
+
+
+@runtime_windows_sandbox_group.command("remove")
+@click.option("--yes", is_flag=True, help="Confirm removal of the fixed metadata permission without prompting.")
+def runtime_windows_sandbox_remove(yes: bool) -> None:
+    """Remove the setup permission. Stop runs first; requires an administrator terminal."""
+    _windows_sandbox_change("remove", yes=yes)
+
+
 @runtime_group.command("models")
 @click.option("--engine", type=click.Choice(["all", "pi", "claude-code"]), default="all", show_default=True)
 def runtime_models_command(engine: str) -> None:
