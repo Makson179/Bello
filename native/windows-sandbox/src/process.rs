@@ -13,7 +13,11 @@ use std::sync::{Arc, Mutex};
 use windows_sys::Win32::Foundation::{
     GetLastError, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
 };
-use windows_sys::Win32::Security::SECURITY_CAPABILITIES;
+use windows_sys::Win32::Security::{
+    EqualSid, GetTokenInformation, TokenAppContainerSid, TokenIsAppContainer,
+    TokenIsLessPrivilegedAppContainer, SECURITY_CAPABILITIES, TOKEN_APPCONTAINER_INFORMATION,
+    TOKEN_INFORMATION_CLASS, TOKEN_QUERY,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     OPEN_EXISTING,
@@ -31,7 +35,7 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, ResumeThread, UpdateProcThreadAttribute,
+    InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread, UpdateProcThreadAttribute,
     WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION,
     PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
@@ -470,6 +474,89 @@ fn command_processor_cwd(cwd: &Path) -> Result<PathBuf> {
     )))
 }
 
+fn token_flag(token: HANDLE, class: TOKEN_INFORMATION_CLASS, label: &str) -> Result<u32> {
+    let mut value = 0_u32;
+    let mut returned = 0_u32;
+    if unsafe {
+        GetTokenInformation(
+            token,
+            class,
+            &mut value as *mut _ as *mut c_void,
+            mem::size_of_val(&value) as u32,
+            &mut returned,
+        )
+    } == 0
+    {
+        return Err(last_error(&format!("GetTokenInformation({label})")));
+    }
+    if returned != mem::size_of_val(&value) as u32 {
+        return Err(anyhow!("invalid {label} token information length"));
+    }
+    Ok(value)
+}
+
+fn verify_child_token(process: HANDLE, expected_sid: *mut c_void) -> Result<()> {
+    let mut raw_token = 0;
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut raw_token) } == 0 {
+        return Err(last_error("OpenProcessToken(sandbox child)"));
+    }
+    let token = Handle::new(raw_token, "OpenProcessToken(sandbox child)")?;
+    if token_flag(token.raw(), TokenIsAppContainer, "TokenIsAppContainer")? != 1 {
+        return Err(anyhow!(
+            "sandbox child token is not AppContainer; command not resumed"
+        ));
+    }
+    let mut required = 0_u32;
+    unsafe {
+        GetTokenInformation(
+            token.raw(),
+            TokenAppContainerSid,
+            std::ptr::null_mut(),
+            0,
+            &mut required,
+        );
+    }
+    if required < mem::size_of::<TOKEN_APPCONTAINER_INFORMATION>() as u32 {
+        return Err(anyhow!(
+            "invalid sandbox child AppContainer SID information length"
+        ));
+    }
+    let mut buffer = vec![0_usize; (required as usize).div_ceil(mem::size_of::<usize>())];
+    if unsafe {
+        GetTokenInformation(
+            token.raw(),
+            TokenAppContainerSid,
+            buffer.as_mut_ptr() as *mut c_void,
+            required,
+            &mut required,
+        )
+    } == 0
+    {
+        return Err(last_error("GetTokenInformation(TokenAppContainerSid)"));
+    }
+    let actual_sid =
+        unsafe { (*(buffer.as_ptr() as *const TOKEN_APPCONTAINER_INFORMATION)).TokenAppContainer };
+    if actual_sid.is_null()
+        || expected_sid.is_null()
+        || unsafe { EqualSid(actual_sid, expected_sid) } == 0
+    {
+        return Err(anyhow!(
+            "sandbox child AppContainer SID does not match the run; command not resumed"
+        ));
+    }
+    if token_flag(
+        token.raw(),
+        TokenIsLessPrivilegedAppContainer,
+        "TokenIsLessPrivilegedAppContainer",
+    )? != 1
+    {
+        return Err(anyhow!(
+            "sandbox child token is not LPAC; command not resumed"
+        ));
+    }
+    Ok(())
+}
+
 pub fn run_child(
     command: &str,
     cwd: &Path,
@@ -558,6 +645,10 @@ pub fn run_child(
     }
     let process_handle = Handle(process.hProcess);
     let thread_handle = Handle(process.hThread);
+    if let Err(error) = verify_child_token(process_handle.raw(), appcontainer_sid) {
+        let _ = job.terminate(125);
+        return Err(error);
+    }
     if cancelled.load(Ordering::Acquire) {
         job.terminate(130)?;
     } else if unsafe { ResumeThread(thread_handle.raw()) } == u32::MAX {
@@ -590,6 +681,19 @@ pub fn run_child(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_process_token_is_rejected_before_sandbox_resume() {
+        let sid =
+            crate::identity::derive_profile_sid(&crate::identity::random_profile_name().unwrap())
+                .unwrap();
+        let error = verify_child_token(
+            unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() },
+            sid.0,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not AppContainer"));
+    }
 
     #[test]
     fn command_processor_cwd_preserves_local_path_and_utf16() {
