@@ -168,6 +168,9 @@ impl Journal {
     pub fn cleanup(self) -> Result<()> {
         let result = cleanup_data(&self.data);
         if result.is_ok() {
+            // State-directory DACL propagation uses this same global lock.
+            // Hold it only for this journal unlink, never the command or tree cleanup.
+            let _acl_lock = crate::global_acl_lock::GlobalAclLock::acquire()?;
             fs::remove_file(&self.path).with_context(|| {
                 format!("could not remove completed journal {}", self.path.display())
             })?;
@@ -186,6 +189,11 @@ impl Journal {
         if bytes.len() as u64 > MAX_JOURNAL_BYTES {
             return Err(anyhow!("Windows sandbox recovery journal exceeded 4 MiB"));
         }
+        // Another helper protects the state directory before acquiring the
+        // account lock. Its inheritable DACL update may open journal children;
+        // serialize our complete temp-write/replace/cleanup window with that
+        // update. The guard never outlives persistence or covers model commands.
+        let _acl_lock = crate::global_acl_lock::GlobalAclLock::acquire()?;
         let temporary = self.path.with_extension("json.new");
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -204,11 +212,12 @@ impl Journal {
             )
         };
         if replaced == 0 {
+            // Cleanup can overwrite the thread's last-error value. Capture the
+            // failed replacement before doing any further filesystem work.
+            let error =
+                crate::winutil::last_error(&format!("MoveFileExW({})", self.path.display()));
             let _ = fs::remove_file(&temporary);
-            return Err(crate::winutil::last_error(&format!(
-                "MoveFileExW({})",
-                self.path.display()
-            )));
+            return Err(error);
         }
         Ok(())
     }
@@ -472,6 +481,7 @@ pub fn recover_stale(state_dir: &Path) -> Result<()> {
         }
         cleanup_data(&data)
             .with_context(|| format!("could not recover stale sandbox {}", data.profile_name))?;
+        let _acl_lock = crate::global_acl_lock::GlobalAclLock::acquire()?;
         fs::remove_file(&path)
             .with_context(|| format!("could not remove recovered journal {}", path.display()))?;
     }
@@ -816,6 +826,146 @@ mod tests {
         )
         .unwrap();
         (base, journal)
+    }
+
+    #[test]
+    fn failed_journal_replace_preserves_original_error_and_complete_old_record() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+        let (base, mut journal) = liveness_fixture();
+        let before = fs::read(&journal.path).unwrap();
+        // This intentionally refuses delete sharing, forcing a real native
+        // replacement failure rather than an injected mock error.
+        let held = open_regular_file_read(&journal.path).unwrap();
+        let probe = journal.path.with_extension("json.probe");
+        fs::write(&probe, b"not a journal").unwrap();
+        let replaced = unsafe {
+            MoveFileExW(
+                wide(&probe).as_ptr(),
+                wide(&journal.path).as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        let original_code = unsafe { GetLastError() };
+        assert_eq!(replaced, 0);
+        assert!(
+            matches!(original_code, ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION),
+            "unexpected native sharing denial {original_code}"
+        );
+        fs::remove_file(probe).unwrap();
+        journal
+            .data
+            .touched_paths
+            .push(record_existing_path(&base.join("workspace")).unwrap());
+        let error = journal.persist().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .ends_with(&format!("Win32 error {original_code}")),
+            "replacement error was lost during cleanup: {error:#}"
+        );
+        assert_eq!(fs::read(&journal.path).unwrap(), before);
+        validate_journal(&serde_json::from_slice::<JournalData>(&before).unwrap()).unwrap();
+        assert!(!journal.path.with_extension("json.new").exists());
+        drop(held);
+        journal.persist().unwrap();
+        assert_eq!(
+            fs::read(&journal.path).unwrap(),
+            serde_json::to_vec(&journal.data).unwrap()
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn concurrent_state_protection_and_persist_keep_complete_immutable_journals() {
+        use std::sync::{mpsc, Arc, Barrier};
+        const UPDATES: usize = 40;
+        let profile = crate::identity::random_profile_name().unwrap();
+        let base = std::env::temp_dir().join(format!("bello-journal-concurrency-{profile}"));
+        acl::create_state_directory(&base).unwrap();
+        let base = fs::canonicalize(base).unwrap();
+        let state = base.join("state");
+        acl::create_state_directory(&state).unwrap();
+        let root = base.join("workspace");
+        fs::create_dir(&root).unwrap();
+        let records = (0..UPDATES)
+            .map(|index| {
+                let path = root.join(format!("evidence-{index}.txt"));
+                fs::write(&path, format!("evidence-{index}")).unwrap();
+                record_existing_path(&path).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let journal = Journal::create(
+            &state,
+            &profile,
+            &mutex_name(&profile),
+            std::slice::from_ref(&root),
+        )
+        .unwrap();
+        let peer_profile = crate::identity::random_profile_name().unwrap();
+        let peer = Journal::create(
+            &state,
+            &peer_profile,
+            &mutex_name(&peer_profile),
+            std::slice::from_ref(&root),
+        )
+        .unwrap();
+        let immutable = fs::read(&peer.path).unwrap();
+        let state_handle = open_path(&state, true).unwrap();
+        acl::protect_state_directory(&state_handle).unwrap();
+        let initial_acl = acl::tests::paired_dacl_snapshot(&state_handle).unwrap();
+        let start = Arc::new(Barrier::new(3));
+        let (updates, received) = mpsc::channel();
+        let writer_start = Arc::clone(&start);
+        let writer = std::thread::spawn(move || {
+            let mut journal = journal;
+            writer_start.wait();
+            for (index, record) in records.into_iter().enumerate() {
+                journal.data.touched_paths.push(record);
+                journal.persist().unwrap();
+                updates.send(index + 1).unwrap();
+                std::thread::yield_now();
+            }
+            journal
+        });
+        let protector_start = Arc::clone(&start);
+        let peer_path = peer.path.clone();
+        let immutable_peer = immutable.clone();
+        let protector = std::thread::spawn(move || {
+            protector_start.wait();
+            for _ in 0..UPDATES {
+                // The actual production setter propagates its inheritable DACL.
+                // It and persist must share the same short global guard.
+                acl::protect_state_directory(&state_handle).unwrap();
+                assert_eq!(fs::read(&peer_path).unwrap(), immutable_peer);
+                std::thread::yield_now();
+            }
+        });
+        start.wait();
+        let path = state.join(format!("{profile}.json"));
+        let mut observed = 0;
+        for minimum in received {
+            // No reader lock: atomic replacement must expose a whole old or new
+            // record, never partially written JSON or unrelated record contents.
+            let current: JournalData = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            validate_journal(&current).unwrap();
+            assert_eq!(current.profile_name, profile);
+            assert!((minimum..=UPDATES).contains(&current.touched_paths.len()));
+            observed += 1;
+        }
+        let journal = writer.join().unwrap();
+        protector.join().unwrap();
+        assert_eq!(observed, UPDATES);
+        assert_eq!(
+            fs::read(&journal.path).unwrap(),
+            serde_json::to_vec(&journal.data).unwrap()
+        );
+        assert_eq!(fs::read(&peer.path).unwrap(), immutable);
+        assert!(!journal.path.with_extension("json.new").exists());
+        assert_eq!(
+            acl::tests::paired_dacl_snapshot(&open_path(&state, true).unwrap()).unwrap(),
+            initial_acl
+        );
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
