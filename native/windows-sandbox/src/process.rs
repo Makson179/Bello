@@ -15,8 +15,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::{
     EqualSid, GetTokenInformation, TokenAppContainerSid, TokenIsAppContainer,
-    TokenIsLessPrivilegedAppContainer, SECURITY_CAPABILITIES, TOKEN_APPCONTAINER_INFORMATION,
-    TOKEN_INFORMATION_CLASS, TOKEN_QUERY,
+    SECURITY_CAPABILITIES, TOKEN_APPCONTAINER_INFORMATION, TOKEN_INFORMATION_CLASS, TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -544,16 +543,10 @@ fn verify_child_token(process: HANDLE, expected_sid: *mut c_void) -> Result<()> 
             "sandbox child AppContainer SID does not match the run; command not resumed"
         ));
     }
-    if token_flag(
-        token.raw(),
-        TokenIsLessPrivilegedAppContainer,
-        "TokenIsLessPrivilegedAppContainer",
-    )? != 1
-    {
-        return Err(anyhow!(
-            "sandbox child token is not LPAC; command not resumed"
-        ));
-    }
+    // GetTokenInformation rejects TokenIsLessPrivilegedAppContainer on the
+    // supported Windows Server versions. LPAC is requested by the checked
+    // ALL_APPLICATION_PACKAGES_POLICY attribute; native tests additionally
+    // prove that ALL_APPLICATION_PACKAGES alone does not grant file access.
     Ok(())
 }
 

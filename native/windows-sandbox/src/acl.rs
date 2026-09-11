@@ -594,6 +594,180 @@ mod tests {
     }
 
     #[test]
+    fn sparse_root_grant_supports_new_children_without_exposing_private_files() {
+        use crate::identity::{
+            create_profile, delete_profile, profile_local_app_data, random_profile_name,
+            CapabilitySids,
+        };
+        use crate::process::{clean_environment, run_child, Job};
+        use anyhow::ensure;
+        use std::fs;
+        use std::io::Write;
+        use windows_sys::Win32::Security::{CreateWellKnownSid, WinBuiltinAnyPackageSid};
+
+        let supplied = std::env::temp_dir().join(format!(
+            "bello-sparse-probe-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        fs::create_dir_all(supplied.join(".supervisor")).unwrap();
+        fs::write(supplied.join(".supervisor").join("sentinel.txt"), "PRIVATE").unwrap();
+        fs::write(supplied.join("aap-only.txt"), "AAP_ONLY").unwrap();
+        fs::create_dir(supplied.join("ordinary")).unwrap();
+        fs::write(supplied.join("ordinary").join("existing.txt"), "EXISTING").unwrap();
+        let root = fs::canonicalize(&supplied).unwrap();
+        let profile = random_profile_name().unwrap();
+        let mut capabilities = CapabilitySids::for_network(false).unwrap();
+        let sid = create_profile(&profile, &capabilities).unwrap();
+
+        let operation = (|| -> Result<()> {
+            let handle = open_path(&root, true)?;
+            // Test-only candidate: no inheritable package grant reaches the
+            // pre-existing private tree. Production grant remains unchanged.
+            set_entries(
+                &handle,
+                &[EXPLICIT_ACCESS_W {
+                    grfAccessPermissions: FILE_GENERIC_READ
+                        | FILE_GENERIC_WRITE
+                        | FILE_GENERIC_EXECUTE,
+                    grfAccessMode: GRANT_ACCESS,
+                    grfInheritance: 0,
+                    Trustee: trustee(sid.0),
+                }],
+            )?;
+            let mut aap_sid = [0_usize; 9];
+            let mut aap_size = mem::size_of_val(&aap_sid) as u32;
+            ensure!(
+                unsafe {
+                    CreateWellKnownSid(
+                        WinBuiltinAnyPackageSid,
+                        std::ptr::null_mut(),
+                        aap_sid.as_mut_ptr() as PSID,
+                        &mut aap_size,
+                    )
+                } != 0,
+                "could not create ALL_APPLICATION_PACKAGES SID"
+            );
+            set_entries(
+                &open_path(&root.join("aap-only.txt"), true)?,
+                &[EXPLICIT_ACCESS_W {
+                    grfAccessPermissions: FILE_GENERIC_READ,
+                    grfAccessMode: GRANT_ACCESS,
+                    grfInheritance: 0,
+                    Trustee: trustee(aap_sid.as_mut_ptr() as PSID),
+                }],
+            )?;
+            set_entries(
+                &open_path(&root.join("ordinary"), true)?,
+                &[EXPLICIT_ACCESS_W {
+                    grfAccessPermissions: FILE_GENERIC_READ
+                        | FILE_GENERIC_WRITE
+                        | FILE_GENERIC_EXECUTE
+                        | DELETE,
+                    grfAccessMode: GRANT_ACCESS,
+                    grfInheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+                    Trustee: trustee(sid.0),
+                }],
+            )?;
+            let mut environment = clean_environment(&profile_local_app_data(sid.0)?, &root, &[])?;
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let mut command = |text: &str| -> Result<i32> {
+                let job = Job::create()?;
+                let outcome = run_child(
+                    text,
+                    &root,
+                    sid.0,
+                    &mut capabilities,
+                    &mut environment,
+                    &job,
+                    &cancelled,
+                );
+                job.terminate(125)?;
+                job.ensure_empty()?;
+                outcome
+            };
+            ensure!(command("mkdir fresh && echo CHILD>fresh\\first.txt && type fresh\\first.txt && ren fresh\\first.txt second.txt && ren fresh renamed && type renamed\\second.txt && echo ROOT>root.txt")? == 0,
+                "sparse root failed create/read/rename of new files or directories");
+            ensure!(
+                command("type .supervisor\\sentinel.txt")? != 0,
+                "sparse root exposed pre-existing private file"
+            );
+            ensure!(
+                command("type aap-only.txt")? != 0,
+                "LPAC process read a file allowed only to ALL_APPLICATION_PACKAGES"
+            );
+            ensure!(
+                command("ren ordinary moved-ordinary && type moved-ordinary\\existing.txt")? == 0,
+                "sparse grants prevented renaming an ordinary existing subtree"
+            );
+            ensure!(
+                fs::read_to_string(root.join("renamed").join("second.txt"))?.trim() == "CHILD",
+                "child payload changed"
+            );
+            ensure!(command("del root.txt && del renamed\\second.txt && rmdir renamed && mkdir remaining && echo RETAINED>remaining\\kept.txt")? == 0,
+                "sparse root failed delete/recreate of new files or directories");
+            ensure!(
+                !root.join("root.txt").exists() && !root.join("renamed").exists(),
+                "new objects were not deleted"
+            );
+            for relative in [
+                "remaining",
+                "remaining\\kept.txt",
+                ".supervisor\\sentinel.txt",
+            ] {
+                let child = open_path(&root.join(relative), false)?;
+                let (dacl, _descriptor) = current_dacl(&child)?;
+                let masks = masks_for_sid(dacl, sid.0, true)?;
+                // Write directly so successful CI probes retain this evidence.
+                writeln!(
+                    std::io::stderr(),
+                    "sparse probe {relative}: package allow={:#x}, deny={:#x}",
+                    masks.0,
+                    masks.1
+                )?;
+                if relative.starts_with(".supervisor") {
+                    ensure!(masks == (0, 0), "private file received a package ACE");
+                }
+            }
+            revoke(&handle, sid.0)?;
+            let root_only_cleanup = verify_absent_tree(&root, sid.0);
+            writeln!(
+                std::io::stderr(),
+                "sparse probe root-only cleanup: {root_only_cleanup:?}"
+            )?;
+            Ok(())
+        })();
+
+        // Probe cleanup deliberately handles explicit package ACEs on newly
+        // created children too. Verify absence rather than hiding leftovers by
+        // deleting the fixture. No unrelated SID or inheritance bit changes.
+        let cleanup = (|| -> Result<()> {
+            let mut paths = Vec::new();
+            let mut pending = vec![root.clone()];
+            while let Some(path) = pending.pop() {
+                if path.is_dir() {
+                    for entry in fs::read_dir(&path)? {
+                        pending.push(entry?.path());
+                    }
+                }
+                paths.push(path);
+            }
+            for path in paths.iter().rev() {
+                revoke(&open_path(path, true)?, sid.0)?;
+            }
+            verify_absent_tree(&root, sid.0)?;
+            delete_profile(&profile)?;
+            fs::remove_dir_all(&root)?;
+            Ok(())
+        })();
+        assert!(cleanup.is_ok(), "sparse probe cleanup failed: {cleanup:?}");
+        assert!(operation.is_ok(), "sparse probe failed: {operation:?}");
+    }
+
+    #[test]
     fn revoke_filters_only_run_allow_and_deny_aces_without_changing_other_entries() {
         let ours =
             crate::identity::derive_profile_sid(&crate::identity::random_profile_name().unwrap())
