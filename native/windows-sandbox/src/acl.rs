@@ -778,6 +778,59 @@ mod tests {
     }
 
     #[test]
+    fn native_delete_probe_child() {
+        use std::io::Write;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, DeleteFileW, GetFileAttributesW, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        if std::env::var("BELLO_TEST_DELETE_PROBE").as_deref() != Ok("1")
+            || std::env::current_exe()
+                .unwrap()
+                .file_name()
+                .and_then(|name| name.to_str())
+                != Some("bello-delete-probe.exe")
+        {
+            return;
+        }
+        let name = wide("root.txt");
+        writeln!(
+            std::io::stderr(),
+            "native delete probe attributes: {:#x}",
+            unsafe { GetFileAttributesW(name.as_ptr()) }
+        )
+        .unwrap();
+        let opened = Handle::new(
+            unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    DELETE | FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    0,
+                )
+            },
+            "CreateFileW(child DELETE)",
+        );
+        writeln!(
+            std::io::stderr(),
+            "native delete probe open DELETE: {:?}",
+            opened.as_ref().map(|_| ())
+        )
+        .unwrap();
+        drop(opened);
+        let deleted = if unsafe { DeleteFileW(name.as_ptr()) } == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        };
+        writeln!(std::io::stderr(), "native DeleteFileW: {deleted:?}").unwrap();
+        assert!(deleted.is_ok(), "native DeleteFileW failed: {deleted:?}");
+    }
+
+    #[test]
     fn object_only_dacl_updates_preserve_peer_aces_control_and_existing_children() {
         let ours =
             crate::identity::derive_profile_sid(&crate::identity::random_profile_name().unwrap())
@@ -1069,8 +1122,46 @@ mod tests {
                 fs::read_to_string(root.join("renamed").join("second.txt"))?.trim() == "CHILD",
                 "child payload changed"
             );
-            ensure!(command("del root.txt && del renamed\\second.txt && rmdir renamed && mkdir remaining && echo RETAINED>remaining\\kept.txt")? == 0,
-                "sparse root failed delete/recreate of new files or directories");
+            {
+                use std::os::windows::fs::MetadataExt;
+                let file = open_path(&root.join("root.txt"), false)?;
+                let (dacl, _descriptor) = raw_object_dacl(&file)?;
+                writeln!(
+                    std::io::stderr(),
+                    "before DEL root.txt: attributes={:#x}, effective package masks={:?}, raw={:?}",
+                    fs::metadata(root.join("root.txt"))?.file_attributes(),
+                    masks_for_sid(dacl, sid.0, false)?,
+                    raw_dacl_snapshot(&file)?
+                )?;
+            }
+            let del_result = command("del root.txt")?;
+            if del_result != 0 || root.join("root.txt").exists() {
+                // Diagnose the actual kernel operation without giving the
+                // child extra rights or accepting a failed shell operation.
+                let enumeration = command("dir /b root.txt")?;
+                writeln!(
+                    std::io::stderr(),
+                    "CMD enumeration diagnostic: {enumeration}"
+                )?;
+                fs::copy(
+                    std::env::current_exe()?,
+                    root.join("bello-delete-probe.exe"),
+                )?;
+                let native_result = command("set BELLO_TEST_DELETE_PROBE=1&& bello-delete-probe.exe --exact acl::tests::native_delete_probe_child --nocapture")?;
+                writeln!(
+                    std::io::stderr(),
+                    "standalone DEL={del_result}, direct native child={native_result}"
+                )?;
+                return Err(anyhow!("standalone DEL failed despite direct native diagnostic: shell={del_result}, native={native_result}"));
+            }
+            for step in [
+                "del renamed\\second.txt",
+                "rmdir renamed",
+                "mkdir remaining",
+                "echo RETAINED>remaining\\kept.txt",
+            ] {
+                ensure!(command(step)? == 0, "sparse delete/recreate failed: {step}");
+            }
             ensure!(
                 !root.join("root.txt").exists() && !root.join("renamed").exists(),
                 "new objects were not deleted"
