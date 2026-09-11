@@ -2,17 +2,24 @@ param(
     [Parameter(Mandatory = $true)][string]$Helper,
     [Parameter(Mandatory = $true)][ValidateSet("Prepare", "Restore")][string]$Phase,
     [Parameter(Mandatory = $true)][string]$SnapshotPath,
-    [Parameter(Mandatory = $true)][string]$Report
+    [Parameter(Mandatory = $true)][string]$Report,
+    [ValidatePattern('^[A-Za-z]:$')][string]$Drive
 )
 
 $ErrorActionPreference = "Stop"
 $expectedMask = 0x120088
 $expectedCapability = "Bello.Sandbox.SystemRootMetadata.v1"
+$selectedDrive = if ($Drive) { $Drive.ToUpperInvariant() } else { "" }
+$expectedKinds = if ($selectedDrive) { @("additionalDriveRoot") } else { @("systemDriveRoot", "userProfiles") }
 
 function Invoke-HostOperation([string]$Operation) {
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = $Helper
     $start.ArgumentList.Add($Operation)
+    if ($selectedDrive) {
+        $start.ArgumentList.Add("--drive")
+        $start.ArgumentList.Add($selectedDrive)
+    }
     $start.UseShellExecute = $false
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
@@ -38,17 +45,19 @@ function Invoke-HostOperation([string]$Operation) {
             throw "unexpected host setup response: $output"
         }
         $targets = @($status.targets)
-        if ($targets.Count -ne 2) { throw "expected exactly the two fixed OS host targets" }
-        foreach ($kind in @("systemDriveRoot", "userProfiles")) {
+        if ($targets.Count -ne $expectedKinds.Count) { throw "unexpected number of selected host targets" }
+        foreach ($kind in $expectedKinds) {
             $matching = @($targets | Where-Object { $_.kind -eq $kind })
             if ($matching.Count -ne 1 -or $matching[0].path -notmatch '^[A-Za-z]:\\' -or
                 $matching[0].prepared -isnot [bool] -or $matching[0].changed -isnot [bool]) {
                 throw "invalid or duplicated fixed host target: $kind"
             }
         }
-        $drive = @($targets | Where-Object { $_.kind -eq "systemDriveRoot" })[0]
-        if ($drive.path -cne $status.systemRoot -or
-            $status.prepared -ne (@($targets | Where-Object { $_.prepared }).Count -eq 2) -or
+        $expectedRoot = if ($selectedDrive) { "$selectedDrive\" } else { $status.systemRoot }
+        $rootKind = if ($selectedDrive) { "additionalDriveRoot" } else { "systemDriveRoot" }
+        $rootTarget = @($targets | Where-Object { $_.kind -eq $rootKind })[0]
+        if ($rootTarget.path -cne $expectedRoot -or
+            $status.prepared -ne (@($targets | Where-Object { $_.prepared }).Count -eq $expectedKinds.Count) -or
             $status.changed -ne (@($targets | Where-Object { $_.changed }).Count -gt 0)) {
             throw "inconsistent host target aggregate status"
         }
@@ -106,10 +115,12 @@ if ($Phase -eq "Prepare") {
     # The product supports mixed states. This disposable CI fixture refuses one
     # before any mutation so all-target removal cannot erase pre-existing setup.
     $preparedCount = @($beforeStatus.targets | Where-Object { $_.prepared }).Count
-    if ($preparedCount -eq 1) { throw "CI setup fixture requires both targets initially prepared or both absent" }
+    if ($preparedCount -gt 0 -and $preparedCount -lt $expectedKinds.Count) {
+        throw "CI setup fixture requires selected targets initially all prepared or all absent"
+    }
     $before = @{}
     foreach ($target in $beforeStatus.targets) { $before[$target.kind] = Read-AclSnapshot $target.path }
-    $snapshot = @{ status = $beforeStatus; acls = $before }
+    $snapshot = @{ selectedDrive = $selectedDrive; status = $beforeStatus; acls = $before }
     # Save before the first mutation, so an assertion failure still permits rollback.
     $snapshot | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $SnapshotPath -Encoding utf8
     $prepared = Invoke-HostOperation "host-prepare"
@@ -155,6 +166,9 @@ if ($Phase -eq "Prepare") {
 }
 else {
     $snapshot = Get-Content -LiteralPath $SnapshotPath -Raw | ConvertFrom-Json -AsHashtable
+    if ([string]$snapshot.selectedDrive -cne $selectedDrive) {
+        throw "host cleanup selection does not match the saved setup selection"
+    }
     $status = Invoke-HostOperation "host-status"
     if ($status.systemRoot -cne $snapshot.status.systemRoot -or
         $status.capabilitySid -cne $snapshot.status.capabilitySid) {

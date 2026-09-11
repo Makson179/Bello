@@ -7,11 +7,11 @@ temporarily grants the AppContainer SID access only to the requested roots.
 
 ## System-directory preparation
 
-The separate fixed-argument commands `host-status`, `host-prepare`, and
-`host-remove` operate only on non-inherited metadata permissions for two fixed
-OS directories: the system-drive root and the machine-configured profiles directory. They
-never enter command execution or recovery and accept no paths, commands, SIDs,
-or permission masks. Status is read-only. Prepare and remove require an
+The separate commands `host-status`, `host-prepare`, and `host-remove` operate
+only on non-inherited metadata permissions. Without `--drive`, they select two
+fixed OS directories: the system-drive root and machine-configured profiles
+directory. They never enter command execution or recovery and accept no
+directory paths, commands, SIDs or permission masks. Status is read-only. Prepare and remove require an
 administrator terminal; the helper does not elevate itself. The user-facing
 commands are `bello runtime windows-sandbox status|prepare|remove`.
 
@@ -34,6 +34,14 @@ the same ACL. Do not run independent ACL-management tools concurrently.
 Preparing these two directories does not authorize metadata on other drive roots or
 provide access to protected toolchain directories. Native tests must still prove
 real CMD/Node operation and private-file denial after preparation.
+
+For a workspace or toolchain on another fixed local drive, explicit preparation
+accepts `host-status --drive D:`, `host-prepare --drive D:` and
+`host-remove --drive D:`. This selects only that drive root, with the same exact
+non-inheriting metadata capability. It does not prepare other drives or accept
+directory paths, custom SIDs, masks or commands. The helper rejects network,
+substituted and non-fixed drives and pins the selected root before mutation.
+Preparation/removal still require an administrator terminal; no run elevates.
 
 For other strict ancestors of allowed roots, the helper checks the actual child
 token and temporarily adds only missing metadata access for the unique per-run

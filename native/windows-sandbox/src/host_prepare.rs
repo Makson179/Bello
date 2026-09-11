@@ -27,7 +27,9 @@ use windows_sys::Win32::Security::{
     ACL_REVISION, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, SECURITY_ATTRIBUTES,
     SECURITY_DESCRIPTOR, TOKEN_ELEVATION, TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
 };
-use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
+use windows_sys::Win32::Storage::FileSystem::{
+    GetDriveTypeW, GetFinalPathNameByHandleW, QueryDosDeviceW, READ_CONTROL, VOLUME_NAME_NT,
+};
 use windows_sys::Win32::System::Registry::{
     RegGetValueW, HKEY_LOCAL_MACHINE, REG_EXPAND_SZ, REG_SZ, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ,
     RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY,
@@ -483,6 +485,94 @@ fn validate_setup_lock(handle: &Handle, admin: PSID, system: PSID) -> Result<()>
 }
 
 pub fn execute(operation: &'static str) -> Result<HostStatus> {
+    execute_targets(operation, None)
+}
+
+pub fn execute_on_drive(operation: &'static str, drive: &str) -> Result<HostStatus> {
+    execute_targets(operation, Some(drive))
+}
+
+fn drive_device(drive: &str) -> Result<String> {
+    let drive = crate::normalize_drive(drive)?;
+    let root = format!("{drive}\\");
+    // DRIVE_FIXED = 3. Removable, RAM, absent, and network drives are not part
+    // of this explicit fixed-local-volume preparation contract.
+    if unsafe { GetDriveTypeW(wide(&root).as_ptr()) } != 3 {
+        return Err(anyhow!(
+            "selected drive must be an existing fixed local drive"
+        ));
+    }
+    let mut buffer = vec![0_u16; 32768];
+    let length = unsafe {
+        QueryDosDeviceW(
+            wide(&drive).as_ptr(),
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+        )
+    };
+    if length == 0 {
+        return Err(winutil::last_error("QueryDosDeviceW(selected drive)"));
+    }
+    if length as usize > buffer.len() {
+        return Err(anyhow!("invalid selected drive mapping length"));
+    }
+    let first = buffer[..length as usize]
+        .iter()
+        .position(|unit| *unit == 0)
+        .ok_or_else(|| anyhow!("unterminated selected drive mapping"))?;
+    let mapping = String::from_utf16(&buffer[..first])?;
+    validate_drive_device(&mapping)?;
+    Ok(mapping)
+}
+
+fn validate_drive_device(mapping: &str) -> Result<()> {
+    // QueryDosDevice's first string is the current mapping. A SUBST path maps
+    // through \??\<drive>\<directory>, not a direct local volume device root.
+    let leaf = mapping.strip_prefix(r"\Device\").ok_or_else(|| anyhow!("selected drive is not a direct volume device; SUBST and redirected paths are not supported"))?;
+    if leaf.is_empty() || leaf.contains(['\\', '/', '\0']) || matches!(leaf, "." | "..") {
+        return Err(anyhow!(
+            "selected drive mapping contains a directory or redirector"
+        ));
+    }
+    Ok(())
+}
+
+fn verify_selected_root(drive: &str, expected_device: &str, handle: &Handle) -> Result<()> {
+    if drive_device(drive)? != expected_device {
+        return Err(anyhow!(
+            "selected drive mapping changed while opening its root"
+        ));
+    }
+    let mut buffer = vec![0_u16; 32768];
+    let length = unsafe {
+        GetFinalPathNameByHandleW(
+            handle.raw(),
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            VOLUME_NAME_NT,
+        )
+    };
+    if length == 0 {
+        return Err(winutil::last_error(
+            "GetFinalPathNameByHandleW(selected drive NT path)",
+        ));
+    }
+    if length as usize >= buffer.len() {
+        return Err(anyhow!("selected drive NT path exceeds supported size"));
+    }
+    let actual = String::from_utf16(&buffer[..length as usize])?;
+    if !actual
+        .trim_end_matches('\\')
+        .eq_ignore_ascii_case(expected_device)
+    {
+        return Err(anyhow!(
+            "selected drive handle does not refer to the declared volume root"
+        ));
+    }
+    Ok(())
+}
+
+fn execute_targets(operation: &'static str, drive: Option<&str>) -> Result<HostStatus> {
     let write = match operation {
         "status" => false,
         "prepare" | "remove" => true,
@@ -496,7 +586,21 @@ pub fn execute(operation: &'static str) -> Result<HostStatus> {
     } else {
         None
     };
-    let fixed = fixed_targets()?;
+    let system_root = root_from_windows_directory(&system_windows_directory()?)?;
+    let selection = drive
+        .map(|drive| -> Result<_> {
+            let drive = crate::normalize_drive(drive)?;
+            let device = drive_device(&drive)?;
+            Ok((drive, device))
+        })
+        .transpose()?;
+    let fixed = match &selection {
+        Some((drive, _)) => vec![FixedTarget {
+            kind: "additionalDriveRoot",
+            path: PathBuf::from(format!("{drive}\\")),
+        }],
+        None => fixed_targets()?,
+    };
     // Pin and validate every target before making even the first change.
     // This preserves a pre-existing grant if another target has a conflict.
     let pins = fixed
@@ -509,6 +613,9 @@ pub fn execute(operation: &'static str) -> Result<HostStatus> {
         .iter()
         .map(|chain| &chain.last().expect("fixed target has a directory pin").1)
         .collect::<Vec<_>>();
+    if let Some((drive, device)) = &selection {
+        verify_selected_root(drive, device, handles[0])?;
+    }
     let before = handles
         .iter()
         .map(|handle| acl::system_root_metadata_prepared(handle, sid))
@@ -558,7 +665,7 @@ pub fn execute(operation: &'static str) -> Result<HostStatus> {
         protocol_version: crate::protocol::PROTOCOL_VERSION,
         kind: "hostPreparation",
         operation,
-        system_root: fixed[0].path.to_string_lossy().into_owned(),
+        system_root: system_root.to_string_lossy().into_owned(),
         capability_name: SYSTEM_ROOT_METADATA_CAPABILITY,
         capability_sid: sid_string(sid)?,
         metadata_mask: SYSTEM_ROOT_METADATA_MASK,
@@ -571,6 +678,54 @@ pub fn execute(operation: &'static str) -> Result<HostStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_drive_rejects_subst_and_directory_device_mappings() {
+        validate_drive_device(r"\Device\HarddiskVolume3").unwrap();
+        for mapping in [
+            r"\??\C:\project",
+            r"\??\C:\",
+            r"\Device\HarddiskVolume3\project",
+            r"\Device\LanmanRedirector\server\share",
+            r"\\server\share",
+            r"\Device\",
+            r"\Device\..",
+            "\\Device\\Disk\0alias",
+        ] {
+            assert!(
+                validate_drive_device(mapping).is_err(),
+                "accepted {mapping:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_drive_status_has_exactly_one_real_volume_target() {
+        // CI's test executable is on the checkout drive (normally D:), not
+        // necessarily the OS drive. This exercises the actual extra-drive path.
+        let executable = std::env::current_exe().unwrap();
+        let text = executable.to_str().unwrap();
+        let plain = text.strip_prefix(r"\\?\").unwrap_or(text);
+        let drive = crate::normalize_drive(&plain[..2]).unwrap();
+        let report = execute_on_drive("status", &drive).unwrap();
+        assert_eq!(report.operation, "status");
+        assert_eq!(report.targets.len(), 1);
+        assert_eq!(report.targets[0].kind, "additionalDriveRoot");
+        assert_eq!(report.targets[0].path, format!("{drive}\\"));
+        assert!(!report.changed);
+        assert!(!report.targets[0].changed);
+        assert_eq!(report.system_root, system_root().unwrap().to_string_lossy());
+        for invalid in [
+            "D:\\",
+            "D:\\folder",
+            "D:folder",
+            "\\\\server\\share",
+            "D: ",
+            "D:;cmd",
+        ] {
+            assert!(execute_on_drive("status", invalid).is_err());
+        }
+    }
 
     #[test]
     fn profiles_directory_expands_only_os_derived_variables() {

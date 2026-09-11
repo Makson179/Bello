@@ -114,22 +114,32 @@ def _helper_environment() -> dict[str, str]:
     return {}
 
 
-def host_preparation(operation: Literal["status", "prepare", "remove"]) -> dict[str, object]:
+def host_preparation(
+    operation: Literal["status", "prepare", "remove"], *, drive: str | None = None,
+) -> dict[str, object]:
     """Run only the helper's fixed host-metadata setup command, never an agent.
 
     Elevation is deliberately external: the user opens an administrator terminal
-    for prepare/remove. No task, shell command, path, SID, or permission mask is
-    accepted by this interface. The native helper independently checks elevation
-    and obtains the two fixed system directories from Windows, not environment.
+    for prepare/remove. Only an optional drive letter such as D: can be selected,
+    never a task, shell command, directory path, SID, or permission mask. The
+    native helper checks elevation and resolves and pins actual Windows targets.
     """
     if operation not in {"status", "prepare", "remove"}:
         raise WindowsSandboxBackendError("unknown Windows sandbox preparation operation")
+    if drive is not None:
+        if (
+            not isinstance(drive, str) or len(drive) != 2
+            or drive[0] not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+            or drive[1] != ":"
+        ):
+            raise WindowsSandboxBackendError("select a drive letter such as D:, not a directory path")
+        drive = drive.upper()
     if platform.system() != "Windows":
         raise WindowsSandboxUnavailableError("Windows sandbox preparation is available only on Windows")
     helper = _helper_path(Path.cwd(), "read-only")
     try:
         completed = subprocess.run(
-            [os.fspath(helper), f"host-{operation}"],
+            [os.fspath(helper), f"host-{operation}", *(["--drive", drive] if drive else [])],
             cwd=helper.parent,
             env=_helper_environment(),
             stdin=subprocess.DEVNULL,
@@ -175,14 +185,15 @@ def host_preparation(operation: Literal["status", "prepare", "remove"]) -> dict[
     ):
         raise WindowsSandboxBackendError("Windows sandbox preparation response has invalid fields")
     targets = value.get("targets")
-    if not isinstance(targets, list) or len(targets) != 2:
-        raise WindowsSandboxBackendError("Windows sandbox preparation must report both fixed targets")
+    expected_kinds = {"additionalDriveRoot"} if drive else {"systemDriveRoot", "userProfiles"}
+    if not isinstance(targets, list) or len(targets) != len(expected_kinds):
+        raise WindowsSandboxBackendError("Windows sandbox preparation must report exactly the selected targets")
     kinds: set[str] = set()
     for target in targets:
         if (
             not isinstance(target, dict)
             or not isinstance(target.get("kind"), str)
-            or target.get("kind") not in {"systemDriveRoot", "userProfiles"}
+            or target.get("kind") not in expected_kinds
             or target["kind"] in kinds
             or not isinstance(target.get("path"), str)
             or type(target.get("prepared")) is not bool
@@ -199,6 +210,7 @@ def host_preparation(operation: Literal["status", "prepare", "remove"]) -> dict[
             or "\x00" in target["path"]
             or (target["kind"] == "systemDriveRoot" and target["path"] != value["systemRoot"])
             or (target["kind"] == "userProfiles" and len(path.parts) < 2)
+            or (target["kind"] == "additionalDriveRoot" and target["path"] != f"{drive}\\")
         ):
             raise WindowsSandboxBackendError("Windows sandbox preparation target is not an expected local directory")
         kinds.add(target["kind"])

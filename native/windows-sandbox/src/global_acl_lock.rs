@@ -200,6 +200,99 @@ mod tests {
     use windows_sys::Win32::System::Threading::{CreateEventW, OpenMutexW};
 
     #[test]
+    fn ci_hold_global_acl_object() {
+        if std::env::var("BELLO_TEST_ACL_HOLDER").as_deref() != Ok("1") {
+            return;
+        }
+        use std::io::{Read, Write};
+        use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+        use windows_sys::Win32::Security::{
+            GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenElevation,
+            TokenIntegrityLevel, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        let mut token = 0;
+        assert_ne!(
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) },
+            0
+        );
+        let token = Handle::new(token, "CI holder process token").unwrap();
+        let mut elevation: TOKEN_ELEVATION = unsafe { mem::zeroed() };
+        let mut bytes = 0;
+        assert_ne!(
+            unsafe {
+                GetTokenInformation(
+                    token.raw(),
+                    TokenElevation,
+                    &mut elevation as *mut _ as *mut c_void,
+                    mem::size_of_val(&elevation) as u32,
+                    &mut bytes,
+                )
+            },
+            0
+        );
+        assert_ne!(
+            elevation.TokenIsElevated, 0,
+            "CI holder must actually be elevated"
+        );
+        unsafe {
+            GetTokenInformation(
+                token.raw(),
+                TokenIntegrityLevel,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes,
+            );
+        }
+        assert_eq!(unsafe { GetLastError() }, ERROR_INSUFFICIENT_BUFFER);
+        assert!((mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32..=16384).contains(&bytes));
+        let mut storage = vec![0_usize; (bytes as usize).div_ceil(mem::size_of::<usize>())];
+        assert_ne!(
+            unsafe {
+                GetTokenInformation(
+                    token.raw(),
+                    TokenIntegrityLevel,
+                    storage.as_mut_ptr() as *mut c_void,
+                    bytes,
+                    &mut bytes,
+                )
+            },
+            0
+        );
+        let sid = unsafe {
+            (*(storage.as_ptr() as *const TOKEN_MANDATORY_LABEL))
+                .Label
+                .Sid
+        };
+        assert_ne!(unsafe { IsValidSid(sid) }, 0);
+        let count = unsafe { *GetSidSubAuthorityCount(sid) };
+        assert_ne!(count, 0);
+        let integrity = unsafe { *GetSidSubAuthority(sid, u32::from(count - 1)) };
+        assert!(integrity >= 0x3000, "CI holder token is not high-integrity");
+        let existing = unsafe { OpenMutexW(ACCESS, 0, wide(NAME).as_ptr()) };
+        let error = unsafe { GetLastError() };
+        assert_eq!(existing, 0, "CI requires a fresh elevated-created mutex");
+        assert_eq!(
+            error, ERROR_FILE_NOT_FOUND,
+            "mutex absence must not be an access error"
+        );
+        // This is the production creator/descriptor. Keep an open handle, never
+        // acquire it: the standard-user smoke must still perform real ACL work.
+        let _present = open_lock().unwrap();
+        println!(
+            "\nBELLO_ACL_HOLDER_READY={}",
+            serde_json::json!({
+                "elevated": true, "integrityRid": integrity,
+                "userSid": acl::current_account_sid_string().unwrap(), "mutexName": NAME
+            })
+        );
+        std::io::stdout().flush().unwrap();
+        // Controller shutdown/EOF releases the handle even if its smoke fails.
+        let mut stop = [0_u8; 1];
+        let _ = std::io::stdin().read(&mut stop).unwrap();
+    }
+
+    #[test]
     fn lock_creator_cannot_rewrite_permissions_and_nested_guards_work() {
         let _outer = GlobalAclLock::acquire().unwrap();
         let _inner = GlobalAclLock::acquire().unwrap();

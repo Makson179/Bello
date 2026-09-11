@@ -126,7 +126,8 @@ def test_failed_postcondition_is_not_reported_as_success(monkeypatch, host, oper
 
 
 @pytest.mark.parametrize(("stdout", "stderr"), [(b"", b""), (b"not json", b""),
-    (b"x" * (backend.MAX_CONTROL_BYTES + 1), b""), (json.dumps(response()).encode(), b"unexpected")])
+    (b"x" * (backend.MAX_CONTROL_BYTES + 1), b""), (json.dumps(response()).encode(), b"unexpected")],
+    ids=["empty", "non-json", "oversized", "unexpected-stderr"])
 def test_invalid_helper_output_is_rejected(monkeypatch, host, stdout, stderr):
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a[0], 0, stdout, stderr))
     with pytest.raises(backend.WindowsSandboxBackendError):
@@ -145,7 +146,7 @@ def test_native_admin_error_is_preserved(monkeypatch, host):
 
 def test_cli_status_does_not_change_permissions(monkeypatch):
     calls = []
-    monkeypatch.setattr(backend, "host_preparation", lambda operation: calls.append(operation) or response(prepared=False))
+    monkeypatch.setattr(backend, "host_preparation", lambda operation, **kw: calls.append(operation) or response(prepared=False))
     result = CliRunner().invoke(cli, ["runtime", "windows-sandbox", "status"])
     assert result.exit_code == 0
     assert calls == ["status"]
@@ -156,7 +157,7 @@ def test_cli_status_does_not_change_permissions(monkeypatch):
 @pytest.mark.parametrize("operation", ["prepare", "remove"])
 def test_cli_declining_confirmation_does_not_change_permissions(monkeypatch, operation):
     calls = []
-    monkeypatch.setattr(backend, "host_preparation", lambda op: calls.append(op) or response(prepared=operation == "remove"))
+    monkeypatch.setattr(backend, "host_preparation", lambda op, **kw: calls.append(op) or response(prepared=operation == "remove"))
     result = CliRunner().invoke(cli, ["runtime", "windows-sandbox", operation], input="n\n")
     assert result.exit_code != 0
     assert calls == ["status"]
@@ -166,7 +167,8 @@ def test_cli_declining_confirmation_does_not_change_permissions(monkeypatch, ope
 def test_cli_approved_change_runs_only_requested_setup(monkeypatch, operation):
     calls = []
 
-    def run(op):
+    def run(op, **kwargs):
+        assert kwargs == {"drive": None}
         calls.append(op)
         return response(op, prepared=(operation == "remove") if op == "status" else operation == "prepare")
 
@@ -180,7 +182,7 @@ def test_cli_approved_change_runs_only_requested_setup(monkeypatch, operation):
 @pytest.mark.parametrize("operation", ["prepare", "remove"])
 def test_cli_already_in_requested_state_never_mutates(monkeypatch, operation):
     calls = []
-    monkeypatch.setattr(backend, "host_preparation", lambda op: calls.append(op) or response(prepared=operation == "prepare"))
+    monkeypatch.setattr(backend, "host_preparation", lambda op, **kw: calls.append(op) or response(prepared=operation == "prepare"))
     result = CliRunner().invoke(cli, ["runtime", "windows-sandbox", operation])
     assert result.exit_code == 0
     assert calls == ["status"]
@@ -190,7 +192,8 @@ def test_cli_already_in_requested_state_never_mutates(monkeypatch, operation):
 def test_cli_mixed_setup_runs_requested_operation(monkeypatch, operation):
     calls = []
 
-    def run(op):
+    def run(op, **kwargs):
+        assert kwargs == {"drive": None}
         calls.append(op)
         if op == "status":
             value = response(prepared=False)
@@ -203,3 +206,76 @@ def test_cli_mixed_setup_runs_requested_operation(monkeypatch, operation):
     assert result.exit_code == 0, result.output
     assert calls == ["status", operation]
     assert "C:\\Users" in result.output
+
+
+def drive_response(operation="status", *, prepared=True, changed=False, drive="D:"):
+    value = response(operation, prepared=prepared, changed=changed)
+    value["targets"] = [{"kind": "additionalDriveRoot", "path": f"{drive}\\",
+                         "prepared": prepared, "changed": changed}]
+    return value
+
+
+@pytest.mark.parametrize("operation", ["status", "prepare", "remove"])
+def test_explicit_drive_only_invokes_selected_fixed_root(monkeypatch, host, operation):
+    value = drive_response(operation, prepared=operation != "remove", changed=operation != "status")
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        assert kwargs["env"] == {} and kwargs["stdin"] == subprocess.DEVNULL
+        assert not kwargs.get("shell")
+        return subprocess.CompletedProcess(command, 0, json.dumps(value).encode(), b"")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert backend.host_preparation(operation, drive="d:") == value
+    assert calls == [[str(host), f"host-{operation}", "--drive", "D:"]]
+
+
+@pytest.mark.parametrize("drive", ["", "D", "D:/", "D:\\", "D:\\private", "D:..", "1:",
+                                    "\\\\host\\share", "D: & whoami", " D:", "D:\x00", [], True])
+def test_invalid_drive_never_starts_helper(monkeypatch, drive):
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: pytest.fail("unexpected process"))
+    with pytest.raises(backend.WindowsSandboxBackendError, match="drive letter"):
+        backend.host_preparation("prepare", drive=drive)
+
+
+@pytest.mark.parametrize("patch", [
+    {"path": "E:\\"}, {"path": "D:\\private"}, {"path": "D:/"},
+    {"kind": "systemDriveRoot"}, {"kind": "userProfiles"}, {"path": "D:\\\\"},
+])
+def test_drive_response_cannot_substitute_another_target(monkeypatch, host, patch):
+    value = drive_response()
+    value["targets"][0].update(patch)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(
+        a[0], 0, json.dumps(value).encode(), b""
+    ))
+    with pytest.raises(backend.WindowsSandboxBackendError):
+        backend.host_preparation("status", drive="D:")
+
+
+@pytest.mark.parametrize("requested_drive", [None, "D:"])
+def test_helper_cannot_swap_default_and_selected_drive_modes(monkeypatch, host, requested_drive):
+    value = response() if requested_drive else drive_response()
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(
+        a[0], 0, json.dumps(value).encode(), b""
+    ))
+    with pytest.raises(backend.WindowsSandboxBackendError):
+        backend.host_preparation("status", drive=requested_drive)
+
+
+@pytest.mark.parametrize("operation", ["status", "prepare", "remove"])
+def test_cli_preserves_drive_selection_for_every_helper_call(monkeypatch, operation):
+    calls = []
+
+    def run(op, *, drive=None):
+        calls.append((op, drive))
+        return drive_response(op, prepared=(operation == "remove") if op == "status" else operation == "prepare")
+
+    monkeypatch.setattr(backend, "host_preparation", run)
+    result = CliRunner().invoke(cli, ["runtime", "windows-sandbox", operation, "--drive", "D:",
+                                      *([] if operation == "status" else ["--yes"])])
+    assert result.exit_code == 0, result.output
+    assert calls == [("status", "D:")] + ([] if operation == "status" else [(operation, "D:")])
+    assert "D:" in result.output
+    if operation == "status":
+        assert "prepare --drive D:" in result.output

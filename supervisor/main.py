@@ -312,11 +312,12 @@ def runtime_windows_sandbox_group() -> None:
 
 
 @runtime_windows_sandbox_group.command("status")
-def runtime_windows_sandbox_status() -> None:
+@click.option("--drive", help="Check only this fixed local drive root, for example D:.")
+def runtime_windows_sandbox_status(drive: str | None) -> None:
     """Check the host permission without changing it or requesting elevation."""
     from supervisor.runtime.windows_sandbox import WindowsSandboxError, host_preparation
     try:
-        result = host_preparation("status")
+        result = host_preparation("status", drive=drive)
     except WindowsSandboxError as exc:
         raise click.ClickException(str(exc)) from exc
     targets = ", ".join(target["path"] for target in result["targets"])
@@ -324,15 +325,16 @@ def runtime_windows_sandbox_status() -> None:
         click.echo(f"Windows sandbox metadata access is prepared for {targets}")
     else:
         click.echo("Windows sandbox metadata access needs one-time administrator setup.")
-        click.echo("In an administrator terminal, run: bello runtime windows-sandbox prepare")
+        suffix = f" --drive {drive.upper()}" if drive else ""
+        click.echo(f"In an administrator terminal, run: bello runtime windows-sandbox prepare{suffix}")
     click.echo("This checks host preparation only, not every workspace or sandbox operation.")
 
 
-def _windows_sandbox_change(operation: str, *, yes: bool) -> None:
+def _windows_sandbox_change(operation: str, *, yes: bool, drive: str | None = None) -> None:
     from supervisor.runtime.windows_sandbox import WindowsSandboxError, host_preparation
     # Perform a read-only check first, including platform/helper validation.
     try:
-        current = host_preparation("status")
+        current = host_preparation("status", drive=drive)
     except WindowsSandboxError as exc:
         raise click.ClickException(str(exc)) from exc
     removing = operation == "remove"
@@ -352,7 +354,7 @@ def _windows_sandbox_change(operation: str, *, yes: bool) -> None:
     if not yes:
         click.confirm(f"{verb} this permission?", abort=True)
     try:
-        result = host_preparation("remove" if removing else "prepare")
+        result = host_preparation("remove" if removing else "prepare", drive=drive)
     except WindowsSandboxError as exc:
         raise click.ClickException(str(exc)) from exc
     if (
@@ -370,16 +372,18 @@ def _windows_sandbox_change(operation: str, *, yes: bool) -> None:
 
 @runtime_windows_sandbox_group.command("prepare")
 @click.option("--yes", is_flag=True, help="Confirm the fixed metadata permission change without prompting.")
-def runtime_windows_sandbox_prepare(yes: bool) -> None:
+@click.option("--drive", help="Prepare only this fixed local drive root, for example D:.")
+def runtime_windows_sandbox_prepare(yes: bool, drive: str | None) -> None:
     """One-time metadata permission setup. Requires an administrator terminal."""
-    _windows_sandbox_change("prepare", yes=yes)
+    _windows_sandbox_change("prepare", yes=yes, drive=drive)
 
 
 @runtime_windows_sandbox_group.command("remove")
 @click.option("--yes", is_flag=True, help="Confirm removal of the fixed metadata permission without prompting.")
-def runtime_windows_sandbox_remove(yes: bool) -> None:
+@click.option("--drive", help="Remove preparation only from this fixed local drive root, for example D:.")
+def runtime_windows_sandbox_remove(yes: bool, drive: str | None) -> None:
     """Remove the setup permission. Stop runs first; requires an administrator terminal."""
-    _windows_sandbox_change("remove", yes=yes)
+    _windows_sandbox_change("remove", yes=yes, drive=drive)
 
 
 @runtime_group.command("models")

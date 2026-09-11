@@ -232,7 +232,14 @@ fn run(
                     continue;
                 }
                 if is_volume_root(path) || fixed.iter().any(|target| path_eq(target, path)) {
-                    return Err(anyhow!("sandbox requires fixed host metadata preparation for {}; run the explicit Administrator host-prepare command (no automatic elevation)", path.display()));
+                    let selector = if is_volume_root(path) {
+                        let plain = path.to_string_lossy();
+                        let plain = plain.strip_prefix(r"\\?\").unwrap_or(&plain);
+                        format!(" --drive {}", &plain[..2])
+                    } else {
+                        String::new()
+                    };
+                    return Err(anyhow!("sandbox requires fixed host metadata preparation for {}; run bello runtime windows-sandbox prepare{selector} from an Administrator terminal (no automatic elevation)", path.display()));
                 }
                 let mutation = crate::host_prepare::metadata_mutation_lock(path, handle)
                     .with_context(|| {

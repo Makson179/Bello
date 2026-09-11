@@ -135,6 +135,15 @@ jobs:
             -Helper $helper -Phase Prepare `
             -SnapshotPath (Join-Path $env:RUNNER_TEMP "bello-host-setup-baseline.json") `
             -Report (Join-Path $env:RUNNER_TEMP "bello-host-setup-prepare.json")
+          $setup = Get-Content (Join-Path $env:RUNNER_TEMP "bello-host-setup-prepare.json") -Raw | ConvertFrom-Json
+          $checkoutRoot = [IO.Path]::GetPathRoot((Get-Item -LiteralPath $env:GITHUB_WORKSPACE).FullName)
+          if ($checkoutRoot -notmatch '^[A-Za-z]:\\$') { throw "checkout is not on a literal local drive" }
+          if ($checkoutRoot -ine $setup.systemRoot) {
+            ./native/windows-sandbox/ci/verify_host_setup.ps1 `
+              -Helper $helper -Phase Prepare -Drive $checkoutRoot.Substring(0, 2) `
+              -SnapshotPath (Join-Path $env:RUNNER_TEMP "bello-checkout-drive-baseline.json") `
+              -Report (Join-Path $env:RUNNER_TEMP "bello-checkout-drive-prepare.json")
+          }
       - name: Run Pi worker tests
         working-directory: supervisor/pi_worker
         run: npm test
@@ -156,6 +165,18 @@ jobs:
       - name: Verify doctor has no legacy executor dependency
         if: runner.os == 'Windows'
         run: python -m pytest -q tests/test_doctor.py::test_doctor_does_not_start_the_removed_codex_executor
+      - name: Restore the Windows checkout-drive setup ACL
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $snapshot = Join-Path $env:RUNNER_TEMP "bello-checkout-drive-baseline.json"
+          if (Test-Path -LiteralPath $snapshot) {
+            $selection = Get-Content -LiteralPath $snapshot -Raw | ConvertFrom-Json
+            $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe"
+            ./native/windows-sandbox/ci/verify_host_setup.ps1 `
+              -Helper $helper -Phase Restore -Drive $selection.selectedDrive -SnapshotPath $snapshot `
+              -Report (Join-Path $env:RUNNER_TEMP "bello-checkout-drive-restore.json")
+          }
       - name: Restore the Windows host setup ACL
         if: always() && runner.os == 'Windows'
         shell: pwsh
@@ -175,4 +196,6 @@ jobs:
           path: |
             ${{ runner.temp }}/bello-host-setup-prepare.json
             ${{ runner.temp }}/bello-host-setup-restore.json
+            ${{ runner.temp }}/bello-checkout-drive-prepare.json
+            ${{ runner.temp }}/bello-checkout-drive-restore.json
           if-no-files-found: ignore

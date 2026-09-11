@@ -63,6 +63,18 @@ the fixed permission. Close that terminal afterwards and run tasks normally,
 without administrator rights. Installation and ordinary runs never silently
 elevate or perform this setup.
 
+If your project or toolchain is on another local fixed drive, prepare just that
+drive's root as well. For example, from the administrator terminal:
+
+```powershell
+bello runtime windows-sandbox status --drive D:
+bello runtime windows-sandbox prepare --drive D:
+```
+
+`--drive D:` selects only `D:\`, not the system directories or other drives.
+It accepts a drive letter, not a directory path. Network and substituted drives
+are not supported. Use `remove --drive D:` to undo that drive's preparation.
+
 This grants only attributes, extended attributes, permission-descriptor reads
 and synchronization on those two directories. It does not grant listing,
 file-content reads, writes, or inherited access to descendants. The permission
@@ -72,13 +84,13 @@ permissions are preserved. The named capability is not an authentication check:
 another process can request the same capability. Its access remains limited to
 this fixed metadata permission, rather than applying to all AppContainers.
 
-Preparation does not grant access to arbitrary drives or protected machine-wide
+Preparation does not grant access to unselected drives or protected machine-wide
 toolchains. Exposed toolchain roots must still allow the invoking account to
 manage their exact permissions; use host-controlled per-user installations.
 Other required parent directories receive temporary metadata-only permissions
 for the individual command, when Windows permits the invoking account to modify
-their permissions. These do not
-allow listing or access to sibling files and are removed during cleanup.
+their permissions. These do not allow listing or access to sibling files and
+are removed during cleanup.
 Unsupported locations are rejected rather than triggering automatic elevation.
 
 ## Sign in and choose models
