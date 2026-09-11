@@ -74,6 +74,28 @@ jobs:
           BELLO_REQUIRE_NATIVE_SANDBOX: "1"
           BELLO_WINDOWS_SANDBOX_TIMING_REPORT: ${{ runner.temp }}\bello-windows-sandbox-timing-pytest.json
         run: python -m pytest -v -o faulthandler_timeout=120 tests/test_runtime_sandbox.py tests/test_runtime_windows_sandbox.py
+      - name: Trace failing native file operations
+        if: always() && (steps.native_unit_tests.outcome == 'failure' || steps.native_integration_tests.outcome == 'failure')
+        continue-on-error: true
+        shell: pwsh
+        env:
+          BELLO_REQUIRE_NATIVE_SANDBOX: "1"
+        run: |
+          ./native/windows-sandbox/ci/trace_file_access.ps1 `
+            -Python (Get-Command python).Source `
+            -OutputDirectory (Join-Path $env:RUNNER_TEMP "bello-file-trace")
+      - name: Upload only filtered file-access diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-file-trace-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/bello-file-trace/summary.json
+            ${{ runner.temp }}/bello-file-trace/cmd-events.jsonl
+            ${{ runner.temp }}/bello-file-trace/node-events.jsonl
+            ${{ runner.temp }}/bello-file-trace/cmd-test.txt
+            ${{ runner.temp }}/bello-file-trace/node-test.txt
+          if-no-files-found: ignore
       - name: Build and inspect release wheel and sdist
         shell: pwsh
         run: |
@@ -130,28 +152,6 @@ jobs:
             -Helper $helper `
             -NodeSource (Get-Command node).Source `
             -Report $report
-      - name: Trace failing native file operations
-        if: always() && (steps.native_unit_tests.outcome == 'failure' || steps.native_integration_tests.outcome == 'failure')
-        continue-on-error: true
-        shell: pwsh
-        env:
-          BELLO_REQUIRE_NATIVE_SANDBOX: "1"
-        run: |
-          ./native/windows-sandbox/ci/trace_file_access.ps1 `
-            -Python (Get-Command python).Source `
-            -OutputDirectory (Join-Path $env:RUNNER_TEMP "bello-file-trace")
-      - name: Upload only filtered file-access diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-file-trace-${{ matrix.os }}
-          path: |
-            ${{ runner.temp }}/bello-file-trace/summary.json
-            ${{ runner.temp }}/bello-file-trace/cmd-events.jsonl
-            ${{ runner.temp }}/bello-file-trace/node-events.jsonl
-            ${{ runner.temp }}/bello-file-trace/cmd-test.txt
-            ${{ runner.temp }}/bello-file-trace/node-test.txt
-          if-no-files-found: ignore
       - name: Upload native packages and timing reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -161,6 +161,8 @@ jobs:
             ${{ runner.temp }}\bello-packages\*
             ${{ runner.temp }}\bello-windows-sandbox-timing-*.json
             ${{ runner.temp }}\bello-standard-user-output\*.json
+            ${{ runner.temp }}/bello-standard-user-output/standard-user-stdout.txt
+            ${{ runner.temp }}/bello-standard-user-output/standard-user-stderr.txt
           if-no-files-found: error
       # Collect independent evidence after a failure, but never report this
       # job as successful without both required test groups passing.
