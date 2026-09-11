@@ -4,6 +4,7 @@ import asyncio
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import shlex
+import shutil
 import subprocess
 import sys
 
@@ -581,6 +582,80 @@ async def test_native_windows_runner_enforces_workspace_and_private_state(
     denied_write = await readonly.run("echo denied>read-only-write.txt", root, 30)
     assert denied_write.exit_code != 0
     assert not (root / "read-only-write.txt").exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="native Windows AppContainer integration")
+@pytest.mark.asyncio
+async def test_native_windows_parallel_cleanup_preserves_other_command_access(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    private = root / ".supervisor"
+    private.mkdir()
+    (private / "secret.txt").write_text("PRIVATE_CONCURRENT_SENTINEL", encoding="utf-8")
+    monkeypatch.setattr(sandbox, "_discover_toolchain", lambda _policy: sandbox._Toolchain())
+    runner = SandboxRunner(SandboxPolicy(root, network_access=False))
+    try:
+        probe = await runner.run("echo NATIVE_READY", root, 30)
+    except SandboxUnavailableError as exc:
+        if os.environ.get("BELLO_REQUIRE_NATIVE_SANDBOX") == "1":
+            raise
+        pytest.skip(str(exc))
+    assert probe.exit_code == 0, probe.output
+
+    node_source = shutil.which("node")
+    assert node_source is not None, "native Windows integration requires the staged Node fixture"
+    toolchain = tmp_path / "toolchain"
+    toolchain.mkdir()
+    node = toolchain / "node.exe"
+    shutil.copyfile(node_source, node)
+    script = root / "concurrent.js"
+    script.write_text(
+        "const fs = require('fs');\n"
+        "const id = process.argv[2];\n"
+        "fs.writeFileSync('ready-' + id, 'ready');\n"
+        "const timeout = setTimeout(() => process.exit(24), 20000);\n"
+        "const poll = setInterval(() => {\n"
+        "  const waitFor = id === 'first' ? 'ready-second' : 'release-second';\n"
+        "  if (!fs.existsSync(waitFor)) return;\n"
+        "  clearInterval(poll); clearTimeout(timeout);\n"
+        "  try { fs.readFileSync('.supervisor/secret.txt'); process.exit(25); }\n"
+        "  catch (error) { if (error.code !== 'EACCES' && error.code !== 'EPERM') throw error; }\n"
+        "  fs.mkdirSync('created-' + id);\n"
+        "  fs.writeFileSync('created-' + id + '/result.txt', id);\n"
+        "  fs.renameSync('created-' + id, 'renamed-' + id);\n"
+        "}, 20);\n",
+        encoding="utf-8",
+    )
+    runner = SandboxRunner(SandboxPolicy(
+        root, readable_roots=(toolchain,), network_access=False,
+    ))
+    first = asyncio.create_task(runner.run(f'"{node}" "{script}" first', root, 45))
+    second = asyncio.create_task(runner.run(f'"{node}" "{script}" second', root, 45))
+    try:
+        finished = await first
+        assert finished.exit_code == 0, finished.output
+        assert not finished.timed_out
+        assert (root / "ready-second").exists(), "commands never overlapped"
+        assert not second.done(), "second command must remain alive through first cleanup"
+        assert (root / "renamed-first" / "result.txt").read_text() == "first"
+        # The first helper has returned, including revocation and profile cleanup.
+        # Only now let the other LPAC process exercise its remaining permissions.
+        (root / "release-second").write_text("release", encoding="utf-8")
+        finished = await second
+        assert finished.exit_code == 0, finished.output
+        assert not finished.timed_out
+        assert (root / "renamed-second" / "result.txt").read_text() == "second"
+    finally:
+        for task in (first, second):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(first, second, return_exceptions=True)
+    assert (private / "secret.txt").read_text() == "PRIVATE_CONCURRENT_SENTINEL"
+    denied = await runner.run('type ".supervisor\\secret.txt"', root, 30)
+    assert denied.exit_code != 0
+    assert "PRIVATE_CONCURRENT_SENTINEL" not in denied.output
 
 
 @pytest.mark.asyncio

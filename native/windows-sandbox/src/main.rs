@@ -5,8 +5,10 @@ use protocol::{Request, TerminalRecord, MAX_REQUEST_BYTES, PROTOCOL_VERSION};
 use std::io::{self, Read, Write};
 
 #[cfg(windows)]
+mod access_check;
+#[cfg(windows)]
 mod acl;
-#[cfg(all(windows, test))]
+#[cfg(windows)]
 mod acl_lock;
 #[cfg(windows)]
 mod identity;

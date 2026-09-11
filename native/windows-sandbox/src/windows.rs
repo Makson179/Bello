@@ -1,29 +1,33 @@
+use crate::access_check::AccessVerifier;
+use crate::acl_lock::AclMutationLock;
 use crate::protocol::{Request, SandboxMode};
 use crate::{acl, identity, journal, process, winutil};
 use anyhow::{anyhow, Context, Result};
 use identity::{create_profile, profile_local_app_data, random_profile_name, CapabilitySids};
 use journal::{create_live_mutex, mutex_name, recover_stale, state_directory, Journal};
-use process::{clean_environment, run_child, start_parent_monitor, Job};
-use std::collections::VecDeque;
+use process::{clean_environment, run_child_verified, start_parent_monitor, Job};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+use windows_sys::Win32::Storage::FileSystem::{
+    DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
+    WRITE_DAC, WRITE_OWNER,
+};
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::UI::Shell::{FOLDERID_Profile, SHGetKnownFolderPath};
 use winutil::{
     canonical_existing, contains, file_identity, is_normalized_local_absolute, is_volume_root,
     open_path, path_eq, require_persistent_acls, validate_final_path, validate_plain_file_object,
-    verbatim_local_absolute, Handle,
+    verbatim_local_absolute, walk_pinned_tree, Handle,
 };
-
-const MAX_AUTHORITY_OBJECTS: usize = 500_000;
 
 pub fn execute(request: Request) -> Result<i32> {
     let state_dir = state_directory()?;
     match request {
         Request::Recover { .. } => {
+            let _lock = AclMutationLock::acquire(&state_dir, &AtomicBool::new(false))?;
             recover_stale(state_dir.path())?;
             Ok(0)
         }
@@ -37,7 +41,7 @@ pub fn execute(request: Request) -> Result<i32> {
             network_access,
             ..
         } => run(
-            state_dir.path(),
+            &state_dir,
             command,
             cwd,
             root,
@@ -51,7 +55,7 @@ pub fn execute(request: Request) -> Result<i32> {
 
 #[allow(clippy::too_many_arguments)]
 fn run(
-    state_dir: &Path,
+    state: &journal::StateDirectory,
     command: String,
     cwd: String,
     root: String,
@@ -60,6 +64,8 @@ fn run(
     private_paths: Vec<String>,
     network_access: bool,
 ) -> Result<i32> {
+    let state_dir = state.path();
+    let cancelled = Arc::new(AtomicBool::new(false));
     if command.trim().is_empty() || command.contains('\0') {
         return Err(anyhow!("command must be non-empty and contain no NUL byte"));
     }
@@ -98,6 +104,7 @@ fn run(
     }
     // Never interpret recovery data until the requested authorities are known
     // not to overlap the fixed, OS-resolved state directory.
+    let mut mutation_lock = Some(AclMutationLock::acquire(state, &cancelled)?);
     recover_stale(state_dir)?;
 
     let authority_paths: Vec<PathBuf> = std::iter::once(root.clone())
@@ -111,8 +118,12 @@ fn run(
     let sid = create_profile(journal.profile_name(), &capabilities)?;
     let profile_local = profile_local_app_data(sid.0)?;
     let job = Job::create()?;
-    let cancelled = Arc::new(AtomicBool::new(false));
     start_parent_monitor(Arc::clone(&job), Arc::clone(&cancelled))?;
+
+    // Pins outlive run_child: grandchildren must be dead before any authority
+    // or private ancestor becomes renameable again.
+    let mut authority_handles: Vec<(PathBuf, Handle)> = Vec::new();
+    let mut private_handles: Vec<(PathBuf, Handle)> = Vec::new();
 
     let operation = (|| -> Result<i32> {
         let private_paths =
@@ -127,29 +138,17 @@ fn run(
             return Err(anyhow!("controller closed stdin during sandbox setup"));
         }
 
-        // Retain only authority/private root handles. The traversal opens each
-        // descendant briefly, so model commands remain free to rename/delete
-        // ordinary descendants after launch.
-        let mut authority_handles: Vec<(PathBuf, Handle)> = Vec::new();
         for authority in &authorities {
             let handle = open_path(authority, true)?;
             validate_final_path(&handle, authority)?;
             require_persistent_acls(&handle, authority)?;
             journal.before_acl_mutation(authority, &handle)?;
-            let authority_mode = if path_eq(authority, &root) {
-                mode
-            } else {
-                SandboxMode::ReadOnly
-            };
-            acl::grant(&handle, sid.0, authority_mode)
-                .with_context(|| format!("could not grant {}", authority.display()))?;
             authority_handles.push(((*authority).clone(), handle));
             if cancelled.load(Ordering::Acquire) {
                 return Err(anyhow!("controller closed stdin during ACL setup"));
             }
         }
 
-        let mut private_handles: Vec<(PathBuf, Handle)> = Vec::new();
         for private in &private_paths {
             for ancestor in private_ancestors(&authorities, private)? {
                 if private_handles
@@ -163,13 +162,26 @@ fn run(
                 validate_plain_file_object(&handle, &ancestor)?;
                 private_handles.push((ancestor, handle));
             }
-            let handle = open_path(private, true)?;
+            let handle = open_path(private, false)?;
             validate_final_path(&handle, private)?;
             validate_plain_file_object(&handle, private)?;
-            journal.before_acl_mutation(private, &handle)?;
-            acl::deny_all(&handle, sid.0)
-                .with_context(|| format!("could not protect {}", private.display()))?;
             private_handles.push((private.clone(), handle));
+        }
+        for authority in &authorities {
+            let authority_mode = if path_eq(authority, &root) {
+                mode
+            } else {
+                SandboxMode::ReadOnly
+            };
+            walk_pinned_tree(authority, true, &cancelled, &mut |path, handle| {
+                if private_paths.iter().any(|private| contains(private, path)) {
+                    return Ok(());
+                }
+                let allow_delete = !path_eq(authority, path)
+                    && !private_paths.iter().any(|private| contains(path, private));
+                acl::grant_object(handle, sid.0, authority_mode, allow_delete)
+                    .with_context(|| format!("could not grant {}", path.display()))
+            })?;
         }
         verify_effective_tree(&authorities, &private_paths, sid.0, mode, &cancelled)?;
         if cancelled.load(Ordering::Acquire) {
@@ -177,7 +189,52 @@ fn run(
         }
 
         let mut environment = clean_environment(&profile_local, &root, &readable_roots)?;
-        run_child(
+        let mut verify_access = |token: &Handle| -> Result<()> {
+            let verifier = AccessVerifier::from_token(token)?;
+            for authority in &authorities {
+                let authority_mode = if path_eq(authority, &root) {
+                    mode
+                } else {
+                    SandboxMode::ReadOnly
+                };
+                walk_pinned_tree(authority, false, &cancelled, &mut |path, handle| {
+                    let granted = verifier.granted_file_access(handle)?;
+                    if private_paths.iter().any(|private| contains(private, path)) {
+                        if granted & FILE_ALL_ACCESS != 0 {
+                            return Err(anyhow!("actual sandbox token can access private object {} (mask {granted:#x})", path.display()));
+                        }
+                        return Ok(());
+                    }
+                    let mut required = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+                    let mut forbidden = WRITE_DAC | WRITE_OWNER | FILE_DELETE_CHILD;
+                    if authority_mode == SandboxMode::WorkspaceWrite {
+                        required |= FILE_GENERIC_WRITE;
+                        if path_eq(authority, path)
+                            || private_paths.iter().any(|private| contains(path, private))
+                        {
+                            forbidden |= DELETE;
+                        } else {
+                            required |= DELETE;
+                        }
+                    } else {
+                        forbidden |= FILE_WRITE_DATA
+                            | FILE_APPEND_DATA
+                            | FILE_WRITE_EA
+                            | FILE_WRITE_ATTRIBUTES
+                            | DELETE;
+                    }
+                    if granted & required != required || granted & forbidden != 0 {
+                        return Err(anyhow!("actual sandbox token does not match access policy for {} (mask {granted:#x})", path.display()));
+                    }
+                    Ok(())
+                })?;
+            }
+            // Grant setup and the actual suspended-token checks form one
+            // cooperative mutation phase. Never lock while commands execute.
+            drop(mutation_lock.take());
+            Ok(())
+        };
+        run_child_verified(
             &command,
             &cwd,
             sid.0,
@@ -185,18 +242,28 @@ fn run(
             &mut environment,
             &job,
             &cancelled,
+            &mut verify_access,
         )
     })();
 
     let requested_exit = operation.as_ref().copied().unwrap_or(125) as u32;
     let _ = job.terminate(requested_exit);
     let empty = job.ensure_empty();
+    drop(mutation_lock.take());
     let mut failures = job.failure_messages();
     if let Err(error) = &empty {
         failures.push(format!("could not prove job empty: {error:#}"));
     }
     let cleanup = if empty.is_ok() {
-        journal.cleanup()
+        drop(private_handles);
+        let cleanup_cancelled = AtomicBool::new(false);
+        match AclMutationLock::acquire(state, &cleanup_cancelled) {
+            Ok(_guard) => journal.cleanup(),
+            Err(error) => {
+                journal.defer_cleanup();
+                Err(error)
+            }
+        }
     } else {
         journal.defer_cleanup();
         Err(anyhow!(
@@ -301,42 +368,10 @@ fn profile_directory() -> Result<PathBuf> {
 }
 
 fn scan_authority(root: &Path, cancelled: &Arc<AtomicBool>) -> Result<()> {
-    let mut pending = VecDeque::from([root.to_owned()]);
-    let mut visited = 0_usize;
-    while let Some(path) = pending.pop_front() {
-        if cancelled.load(Ordering::Acquire) {
-            return Err(anyhow!(
-                "controller closed stdin while validating filesystem"
-            ));
-        }
-        visited += 1;
-        if visited > MAX_AUTHORITY_OBJECTS {
-            return Err(anyhow!(
-                "sandbox authority exceeds the {MAX_AUTHORITY_OBJECTS}-object validation limit"
-            ));
-        }
-        let handle = open_path(&path, false)?;
-        validate_final_path(&handle, &std::fs::canonicalize(&path)?)?;
-        let info = validate_plain_file_object(&handle, &path)?;
-        acl::require_non_null_dacl(&handle)
-            .with_context(|| format!("unsupported DACL on {}", path.display()))?;
-        if info.file_index == 0 {
-            return Err(anyhow!(
-                "filesystem returned no stable file identity for {}",
-                path.display()
-            ));
-        }
-        let raw = winutil::file_info(&handle)?;
-        drop(handle);
-        if raw.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-            for entry in fs::read_dir(&path)
-                .with_context(|| format!("could not enumerate {}", path.display()))?
-            {
-                pending.push_back(entry?.path());
-            }
-        }
-    }
-    Ok(())
+    walk_pinned_tree(root, false, cancelled, &mut |path, handle| {
+        acl::require_non_null_dacl(handle)
+            .with_context(|| format!("unsupported DACL on {}", path.display()))
+    })
 }
 
 fn prepare_private_paths(
@@ -434,16 +469,24 @@ fn materialize_private(root: &Path, target: &Path, journal: &mut Journal) -> Res
         .strip_prefix(root)
         .map_err(|_| anyhow!("private path casing does not match canonical root"))?;
     let mut current = root.to_owned();
+    let mut pins = vec![open_path(root, false)?];
     for component in relative.components() {
         current.push(component);
         if current.exists() {
+            let handle = open_path(&current, false)?;
+            validate_final_path(&handle, &current)?;
+            validate_plain_file_object(&handle, &current)?;
+            pins.push(handle);
             continue;
         }
         fs::create_dir(&current)
             .with_context(|| format!("could not materialize private path {}", current.display()))?;
         let handle = open_path(&current, false)?;
+        validate_final_path(&handle, &current)?;
+        validate_plain_file_object(&handle, &current)?;
         let identity = file_identity(&handle)?;
         journal.record_created(current.clone(), identity)?;
+        pins.push(handle);
     }
     Ok(())
 }

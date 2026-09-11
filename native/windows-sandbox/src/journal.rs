@@ -229,6 +229,13 @@ pub fn state_directory() -> Result<StateDirectory> {
     let bello = local.join("Bello");
     if !bello.exists() {
         fs::create_dir(&bello)
+            .or_else(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            })
             .with_context(|| format!("could not create state parent {}", bello.display()))?;
     }
     let bello_handle = open_path(&bello, false)?;
@@ -238,6 +245,19 @@ pub fn state_directory() -> Result<StateDirectory> {
     let state = bello.join("SandboxState-v1");
     if !state.exists() {
         acl::create_state_directory(&state)
+            .or_else(|error| {
+                // A competing helper may have atomically created this leaf.
+                // Reopen and perform the full no-follow/owner validation below.
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error)
+                    == Some(183)
+                {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            })
             .with_context(|| format!("could not create recovery directory {}", state.display()))?;
     }
     // Open the lexical leaf with OPEN_REPARSE_POINT before canonicalizing it.
@@ -405,25 +425,29 @@ fn cleanup_data(data: &JournalData) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let sid = derive_profile_sid(&data.profile_name)?;
     let mut failures = Vec::new();
-    let mut touched_handles = Vec::new();
-    for record in data.touched_paths.iter().rev() {
-        match reopen_recorded(record, true) {
-            Ok(handle) => {
-                if let Err(error) = acl::revoke(&handle, sid.0) {
-                    failures.push(format!("revoke {}: {error:#}", record.path.display()));
-                }
-                touched_handles.push(handle);
-            }
-            Err(error) => failures.push(format!(
-                "revalidate {} before revoke: {error:#}",
+    // The authority identities are the durable write-ahead anchors. Ordinary
+    // objects may legitimately be new, renamed, or deleted; never reopen their
+    // historical names. Traverse the current pinned tree and remove only this
+    // run's SID, including explicit ACEs on objects created by the child.
+    for record in &data.authorities {
+        if let Err(error) = crate::winutil::walk_pinned_tree(
+            &record.path,
+            true,
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut |path, handle| {
+                acl::revoke(handle, sid.0).with_context(|| format!("revoke {}", path.display()))
+            },
+        ) {
+            failures.push(format!(
+                "revoke authority {}: {error:#}",
                 record.path.display()
-            )),
+            ));
         }
     }
     if !failures.is_empty() {
         return Err(anyhow!(failures.join("; ")));
     }
-    for record in &data.touched_paths {
+    for record in &data.authorities {
         if let Err(error) = acl::verify_absent_tree(&record.path, sid.0) {
             failures.push(format!(
                 "verify AppContainer ACE removal under {}: {error:#}",
@@ -437,10 +461,7 @@ fn cleanup_data(data: &JournalData) -> Result<()> {
     if let Err(error) = delete_profile(&data.profile_name) {
         return Err(anyhow!("delete profile: {error:#}"));
     }
-    // These handles intentionally disallow delete sharing during revocation
-    // and verification. Release them before removing our empty directories;
-    // the authority handles remain pinned for the rest of cleanup.
-    drop(touched_handles);
+    // The per-object traversal pins are now released; authority pins remain.
     for created in data.created_paths.iter().rev() {
         match open_path(&created.path, false).and_then(|handle| file_identity(&handle)) {
             Ok(identity)
@@ -450,7 +471,10 @@ fn cleanup_data(data: &JournalData) -> Result<()> {
                 if let Err(error) = fs::remove_dir(&created.path) {
                     // ERROR_DIR_NOT_EMPTY. Avoid ErrorKind::DirectoryNotEmpty,
                     // which postdates this crate's declared Rust 1.75 MSRV.
-                    if error.raw_os_error() != Some(145) {
+                    // A live peer may pin an otherwise empty private directory.
+                    // It is not ours to force-delete; removing our SID above
+                    // has already been verified across the current tree.
+                    if !matches!(error.raw_os_error(), Some(145 | 32)) {
                         failures.push(format!("remove {}: {error}", created.path.display()));
                     }
                 }
@@ -473,6 +497,79 @@ mod tests {
     use super::*;
     use std::process::{Command, Stdio};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn cleanup_follows_current_tree_after_rename_and_preserves_peer_grants() {
+        use crate::protocol::SandboxMode;
+        use std::sync::atomic::AtomicBool;
+        let base = std::env::temp_dir().join(format!(
+            "bello-cleanup-current-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        fs::create_dir_all(base.join("workspace").join("ordinary")).unwrap();
+        let root = fs::canonicalize(base.join("workspace")).unwrap();
+        fs::write(root.join("ordinary").join("existing.txt"), "existing").unwrap();
+        let profile = crate::identity::random_profile_name().unwrap();
+        let peer_profile = crate::identity::random_profile_name().unwrap();
+        let ours = derive_profile_sid(&profile).unwrap();
+        let peer = derive_profile_sid(&peer_profile).unwrap();
+        let mut journal = Journal::create(
+            &base.join("state"),
+            &profile,
+            &mutex_name(&profile),
+            std::slice::from_ref(&root),
+        )
+        .unwrap();
+        journal
+            .before_acl_mutation(&root, &open_path(&root, true).unwrap())
+            .unwrap();
+        crate::winutil::walk_pinned_tree(
+            &root,
+            true,
+            &AtomicBool::new(false),
+            &mut |path, handle| {
+                acl::grant_object(
+                    handle,
+                    ours.0,
+                    SandboxMode::WorkspaceWrite,
+                    !path_eq(&root, path),
+                )?;
+                acl::grant_object(handle, peer.0, SandboxMode::ReadOnly, false)
+            },
+        )
+        .unwrap();
+        fs::rename(root.join("ordinary"), root.join("renamed")).unwrap();
+        fs::create_dir(root.join("new")).unwrap();
+        fs::write(root.join("new").join("created.txt"), "new").unwrap();
+        journal.cleanup().unwrap();
+        acl::verify_absent_tree(&root, ours.0).unwrap();
+        acl::verify_tree(
+            &root,
+            &[],
+            peer.0,
+            SandboxMode::ReadOnly,
+            &std::sync::Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("renamed").join("existing.txt")).unwrap(),
+            "existing"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("new").join("created.txt")).unwrap(),
+            "new"
+        );
+        crate::winutil::walk_pinned_tree(&root, true, &AtomicBool::new(false), &mut |_, handle| {
+            acl::revoke(handle, peer.0)
+        })
+        .unwrap();
+        acl::verify_absent_tree(&root, peer.0).unwrap();
+        fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn state_leaf_junction_is_rejected_without_touching_target_acl() {

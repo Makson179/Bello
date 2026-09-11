@@ -11,11 +11,13 @@ use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use windows_sys::Win32::Foundation::{
-    GetLastError, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    GetHandleInformation, GetLastError, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
+    INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::{
     EqualSid, GetTokenInformation, TokenAppContainerSid, TokenIsAppContainer,
-    SECURITY_CAPABILITIES, TOKEN_APPCONTAINER_INFORMATION, TOKEN_INFORMATION_CLASS, TOKEN_QUERY,
+    SECURITY_CAPABILITIES, TOKEN_APPCONTAINER_INFORMATION, TOKEN_DUPLICATE,
+    TOKEN_INFORMATION_CLASS, TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -48,6 +50,9 @@ const WAIT_FAILED: u32 = 0xffff_ffff;
 const WAIT_TIMEOUT: u32 = 258;
 const JOB_EMPTY_WAIT_MILLIS: u32 = 5_000;
 const PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT: u32 = 1;
+// stdout is shared across concurrently launched commands and native tests.
+// Hold this only while marking handles and creating the suspended process.
+static HANDLE_INHERIT_LOCK: Mutex<()> = Mutex::new(());
 
 pub struct Job {
     handle: Handle,
@@ -308,18 +313,28 @@ fn set_inheritable(handle: HANDLE, enabled: bool) -> Result<()> {
     Ok(())
 }
 
-struct InheritGuard(HANDLE);
+struct InheritGuard {
+    handle: HANDLE,
+    was_inheritable: bool,
+}
 
 impl InheritGuard {
     fn new(handle: HANDLE) -> Result<Self> {
+        let mut flags = 0;
+        if unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
+            return Err(last_error("GetHandleInformation"));
+        }
         set_inheritable(handle, true)?;
-        Ok(Self(handle))
+        Ok(Self {
+            handle,
+            was_inheritable: flags & HANDLE_FLAG_INHERIT != 0,
+        })
     }
 }
 
 impl Drop for InheritGuard {
     fn drop(&mut self) {
-        let _ = set_inheritable(self.0, false);
+        let _ = set_inheritable(self.handle, self.was_inheritable);
     }
 }
 
@@ -494,9 +509,9 @@ fn token_flag(token: HANDLE, class: TOKEN_INFORMATION_CLASS, label: &str) -> Res
     Ok(value)
 }
 
-fn verify_child_token(process: HANDLE, expected_sid: *mut c_void) -> Result<()> {
+fn verify_child_token(process: HANDLE, expected_sid: *mut c_void) -> Result<Handle> {
     let mut raw_token = 0;
-    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut raw_token) } == 0 {
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &mut raw_token) } == 0 {
         return Err(last_error("OpenProcessToken(sandbox child)"));
     }
     let token = Handle::new(raw_token, "OpenProcessToken(sandbox child)")?;
@@ -547,9 +562,10 @@ fn verify_child_token(process: HANDLE, expected_sid: *mut c_void) -> Result<()> 
     // supported Windows Server versions. LPAC is requested by the checked
     // ALL_APPLICATION_PACKAGES_POLICY attribute; native tests additionally
     // prove that ALL_APPLICATION_PACKAGES alone does not grant file access.
-    Ok(())
+    Ok(token)
 }
 
+#[cfg(test)]
 pub fn run_child(
     command: &str,
     cwd: &Path,
@@ -558,6 +574,30 @@ pub fn run_child(
     environment: &mut [u16],
     job: &Arc<Job>,
     cancelled: &Arc<AtomicBool>,
+) -> Result<i32> {
+    run_child_verified(
+        command,
+        cwd,
+        appcontainer_sid,
+        capabilities,
+        environment,
+        job,
+        cancelled,
+        &mut |_| Ok(()),
+    )
+}
+
+/// Verify the token identity and filesystem policy before any child code runs.
+#[allow(clippy::too_many_arguments)]
+pub fn run_child_verified(
+    command: &str,
+    cwd: &Path,
+    appcontainer_sid: *mut c_void,
+    capabilities: &mut CapabilitySids,
+    environment: &mut [u16],
+    job: &Arc<Job>,
+    cancelled: &Arc<AtomicBool>,
+    verify_access: &mut dyn FnMut(&Handle) -> Result<()>,
 ) -> Result<i32> {
     if cancelled.load(Ordering::Acquire) {
         return Err(anyhow!(
@@ -585,7 +625,10 @@ pub fn run_child(
     if stdout == 0 || stdout == INVALID_HANDLE_VALUE {
         return Err(last_error("GetStdHandle(STD_OUTPUT_HANDLE)"));
     }
-    let _stdin_inherit = InheritGuard::new(stdin.raw())?;
+    let inherit_lock = HANDLE_INHERIT_LOCK
+        .lock()
+        .map_err(|_| anyhow!("sandbox handle inheritance lock was poisoned"))?;
+    let stdin_inherit = InheritGuard::new(stdin.raw())?;
     let stdout_inherit = InheritGuard::new(stdout)?;
 
     let security_capabilities: SECURITY_CAPABILITIES =
@@ -631,6 +674,8 @@ pub fn run_child(
     };
     let create_error = unsafe { GetLastError() };
     drop(stdout_inherit);
+    drop(stdin_inherit);
+    drop(inherit_lock);
     if created == 0 {
         return Err(anyhow!(
             "CreateProcessW(AppContainer) failed with Win32 error {create_error}"
@@ -638,7 +683,12 @@ pub fn run_child(
     }
     let process_handle = Handle(process.hProcess);
     let thread_handle = Handle(process.hThread);
-    if let Err(error) = verify_child_token(process_handle.raw(), appcontainer_sid) {
+    let verification =
+        verify_child_token(process_handle.raw(), appcontainer_sid).and_then(|token| {
+            verify_access(&token)
+                .context("sandbox filesystem access verification failed; command not resumed")
+        });
+    if let Err(error) = verification {
         let _ = job.terminate(125);
         return Err(error);
     }
@@ -674,6 +724,23 @@ pub fn run_child(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inheritance_guard_restores_both_original_flag_states() {
+        let handle = nul_handle().unwrap();
+        for inherited in [false, true] {
+            set_inheritable(handle.raw(), inherited).unwrap();
+            {
+                let _guard = InheritGuard::new(handle.raw()).unwrap();
+                let mut flags = 0;
+                assert_ne!(unsafe { GetHandleInformation(handle.raw(), &mut flags) }, 0);
+                assert_ne!(flags & HANDLE_FLAG_INHERIT, 0);
+            }
+            let mut flags = 0;
+            assert_ne!(unsafe { GetHandleInformation(handle.raw(), &mut flags) }, 0);
+            assert_eq!(flags & HANDLE_FLAG_INHERIT != 0, inherited);
+        }
+    }
 
     #[test]
     fn ordinary_process_token_is_rejected_before_sandbox_resume() {

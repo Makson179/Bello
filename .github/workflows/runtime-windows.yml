@@ -39,12 +39,17 @@ jobs:
         with:
           components: rustfmt, clippy
           targets: x86_64-pc-windows-msvc
-      - name: Audit native formatting, types, lints, and unit tests
+      - name: Audit native formatting, types, and lints
         shell: pwsh
         run: |
           cargo fmt --manifest-path native/windows-sandbox/Cargo.toml --all -- --check
           cargo check --locked --manifest-path native/windows-sandbox/Cargo.toml --target x86_64-pc-windows-msvc
           cargo clippy --locked --manifest-path native/windows-sandbox/Cargo.toml --all-targets -- -D warnings
+      - name: Run native Rust unit tests
+        id: native_unit_tests
+        continue-on-error: true
+        shell: pwsh
+        run: |
           cargo test --locked --manifest-path native/windows-sandbox/Cargo.toml
       - name: Install pinned Pi runtime
         working-directory: supervisor/pi_worker
@@ -133,3 +138,9 @@ jobs:
             ${{ runner.temp }}\bello-windows-sandbox-timing-*.json
             ${{ runner.temp }}\bello-standard-user-output\*.json
           if-no-files-found: error
+      # Collect integration evidence even when a unit test fails, but never
+      # report this job as successful without all native unit tests passing.
+      - name: Require native Rust unit tests to pass
+        if: always() && steps.native_unit_tests.outcome != 'success'
+        shell: pwsh
+        run: throw "Native Rust unit tests failed or did not run. See the unit-test step."

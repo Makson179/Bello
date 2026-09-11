@@ -4,6 +4,7 @@ use std::mem;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::FromRawHandle;
 use std::path::{Component, Path, PathBuf, Prefix};
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Globalization::CompareStringOrdinal;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -156,6 +157,61 @@ pub fn validate_plain_file_object(handle: &Handle, path: &Path) -> Result<FileId
         volume_serial: info.dwVolumeSerialNumber,
         file_index: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
     })
+}
+
+pub fn walk_pinned_tree(
+    root: &Path,
+    write_dac: bool,
+    cancelled: &AtomicBool,
+    visit: &mut dyn FnMut(&Path, &Handle) -> Result<()>,
+) -> Result<()> {
+    // Each stack frame retains a no-delete-sharing parent handle until its
+    // children are finished. Never follow a newly inserted junction, or mutate
+    // a child after its ancestry has been renamed out of the authority.
+    let mut stack: Vec<(Handle, std::fs::ReadDir)> = Vec::new();
+    let mut next = Some(root.to_owned());
+    let mut count = 0_usize;
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(anyhow!("sandbox filesystem traversal cancelled"));
+        }
+        if let Some(path) = next.take() {
+            count += 1;
+            if count > 500_000 {
+                return Err(anyhow!(
+                    "sandbox authority exceeds the 500000-object validation limit"
+                ));
+            }
+            let handle = open_path(&path, write_dac)?;
+            validate_final_path(&handle, &path)?;
+            let identity = validate_plain_file_object(&handle, &path)?;
+            if identity.file_index == 0 {
+                return Err(anyhow!(
+                    "filesystem returned no stable identity for {}",
+                    path.display()
+                ));
+            }
+            visit(&path, &handle)?;
+            if file_info(&handle)?.dwFileAttributes
+                & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY
+                != 0
+            {
+                let entries = std::fs::read_dir(&path)
+                    .with_context(|| format!("could not enumerate {}", path.display()))?;
+                stack.push((handle, entries));
+            }
+        }
+        while let Some((_, entries)) = stack.last_mut() {
+            if let Some(entry) = entries.next() {
+                next = Some(entry?.path());
+                break;
+            }
+            stack.pop();
+        }
+        if next.is_none() {
+            return Ok(());
+        }
+    }
 }
 
 pub fn final_path(handle: &Handle) -> Result<PathBuf> {

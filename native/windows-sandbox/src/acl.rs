@@ -1,13 +1,10 @@
 use crate::protocol::SandboxMode;
-use crate::winutil::{
-    contains, open_path, path_eq, validate_final_path, validate_plain_file_object, wide, Handle,
-};
-use anyhow::{anyhow, Result};
-use std::collections::VecDeque;
+use crate::winutil::{contains, path_eq, walk_pinned_tree, wide, Handle};
+use anyhow::{anyhow, Context, Result};
 use std::ffi::c_void;
 use std::mem;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use windows_sys::Win32::Foundation::{LocalFree, PSID};
 use windows_sys::Win32::Security::Authorization::{
@@ -15,21 +12,24 @@ use windows_sys::Win32::Security::Authorization::{
     SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
-    AclSizeInformation, DeleteAce, EqualSid, GetAce, GetAclInformation, GetTokenInformation,
-    InitializeSecurityDescriptor, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
-    SetSecurityDescriptorOwner, TokenUser, ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL,
-    ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE,
-    OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+    AclSizeInformation, DeleteAce, EqualSid, GetAce, GetAclInformation, GetLengthSid,
+    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetTokenInformation,
+    InitializeSecurityDescriptor, IsValidSid, SetSecurityDescriptorControl,
+    SetSecurityDescriptorDacl, SetSecurityDescriptorOwner, TokenUser, ACCESS_ALLOWED_ACE,
+    ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
+    DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+    SE_DACL_AUTO_INHERITED, SE_DACL_AUTO_INHERIT_REQ, SE_DACL_DEFAULTED, SE_DACL_PROTECTED,
+    TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_DELETE_CHILD,
-    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_WRITE_ATTRIBUTES,
-    FILE_WRITE_DATA, FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
+    CreateDirectoryW, DELETE, FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 const GRANT_ACCESS: i32 = 1;
+#[cfg(test)]
 const DENY_ACCESS: i32 = 3;
 
 struct SecurityDescriptor(*mut c_void);
@@ -94,7 +94,7 @@ fn current_dacl(handle: &Handle) -> Result<(*mut ACL, SecurityDescriptor)> {
 }
 
 pub fn require_non_null_dacl(handle: &Handle) -> Result<()> {
-    let _ = current_dacl(handle)?;
+    let _ = raw_object_dacl(handle)?;
     Ok(())
 }
 
@@ -183,9 +183,7 @@ pub fn create_state_directory(path: &Path) -> Result<()> {
         bInheritHandle: 0,
     };
     if unsafe { CreateDirectoryW(wide(path).as_ptr(), &attributes) } == 0 {
-        return Err(crate::winutil::last_error(
-            "CreateDirectoryW(state directory)",
-        ));
+        return Err(std::io::Error::last_os_error()).context("CreateDirectoryW(state directory)");
     }
     Ok(())
 }
@@ -277,6 +275,7 @@ pub fn protect_state_directory(handle: &Handle) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn set_entries(handle: &Handle, entries: &[EXPLICIT_ACCESS_W]) -> Result<()> {
     let (old_dacl, _descriptor) = current_dacl(handle)?;
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
@@ -309,12 +308,17 @@ fn set_entries(handle: &Handle, entries: &[EXPLICIT_ACCESS_W]) -> Result<()> {
     Ok(())
 }
 
-pub fn grant(handle: &Handle, sid: PSID, mode: SandboxMode) -> Result<()> {
+pub fn grant_object(
+    handle: &Handle,
+    sid: PSID,
+    mode: SandboxMode,
+    allow_delete: bool,
+) -> Result<()> {
     let inheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
     let base_mask = FILE_GENERIC_READ
         | FILE_GENERIC_EXECUTE
         | if mode == SandboxMode::WorkspaceWrite {
-            FILE_GENERIC_WRITE
+            FILE_GENERIC_WRITE | if allow_delete { DELETE } else { 0 }
         } else {
             0
         };
@@ -324,9 +328,9 @@ pub fn grant(handle: &Handle, sid: PSID, mode: SandboxMode) -> Result<()> {
         grfInheritance: inheritance,
         Trustee: trustee(sid),
     }];
-    if mode == SandboxMode::WorkspaceWrite {
+    if mode == SandboxMode::WorkspaceWrite && !allow_delete {
         // DELETE applies to descendants, not the authority root. FILE_DELETE_CHILD
-        // is intentionally absent so direct private-path denies cannot be bypassed.
+        // is intentionally absent so an ungranted private child stays protected.
         entries.push(EXPLICIT_ACCESS_W {
             grfAccessPermissions: DELETE,
             grfAccessMode: GRANT_ACCESS,
@@ -334,9 +338,15 @@ pub fn grant(handle: &Handle, sid: PSID, mode: SandboxMode) -> Result<()> {
             Trustee: trustee(sid),
         });
     }
-    set_entries(handle, &entries)
+    set_object_entries(handle, &entries)
 }
 
+#[cfg(test)]
+pub fn grant(handle: &Handle, sid: PSID, mode: SandboxMode) -> Result<()> {
+    grant_object(handle, sid, mode, false)
+}
+
+#[cfg(test)]
 pub fn deny_all(handle: &Handle, sid: PSID) -> Result<()> {
     set_entries(
         handle,
@@ -349,30 +359,202 @@ pub fn deny_all(handle: &Handle, sid: PSID) -> Result<()> {
     )
 }
 
-pub fn revoke(handle: &Handle, sid: PSID) -> Result<()> {
-    let (old_dacl, _descriptor) = current_dacl(handle)?;
-    let mut buffer = dacl_without_access_sid(old_dacl, sid)?;
-    let code = unsafe {
-        SetSecurityInfo(
+fn raw_object_dacl(handle: &Handle) -> Result<(*mut ACL, Vec<usize>)> {
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQuerySecurityObject(
+            handle: isize,
+            information: u32,
+            descriptor: *mut c_void,
+            length: u32,
+            needed: *mut u32,
+        ) -> i32;
+    }
+    let mut required = 0;
+    let mut status = unsafe {
+        NtQuerySecurityObject(
             handle.raw(),
-            SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            buffer.as_mut_ptr() as *mut ACL,
-            std::ptr::null_mut(),
+            0,
+            &mut required,
         )
     };
-    if code != 0 {
+    for _ in 0..3 {
+        if required == 0 || required > 128 * 1024 {
+            return Err(anyhow!(
+                "NtQuerySecurityObject invalid size {required}, NTSTATUS {:#010x}",
+                status as u32
+            ));
+        }
+        let mut buffer = vec![0_usize; (required as usize).div_ceil(mem::size_of::<usize>())];
+        status = unsafe {
+            NtQuerySecurityObject(
+                handle.raw(),
+                DACL_SECURITY_INFORMATION,
+                buffer.as_mut_ptr() as *mut c_void,
+                (buffer.len() * mem::size_of::<usize>()) as u32,
+                &mut required,
+            )
+        };
+        if status == 0xC0000023_u32 as i32 {
+            continue;
+        }
+        if status < 0 {
+            return Err(anyhow!(
+                "NtQuerySecurityObject failed with NTSTATUS {:#010x}",
+                status as u32
+            ));
+        }
+        let mut dacl = std::ptr::null_mut();
+        let mut present = 0;
+        let mut defaulted = 0;
+        if unsafe {
+            GetSecurityDescriptorDacl(
+                buffer.as_ptr() as *mut c_void,
+                &mut present,
+                &mut dacl,
+                &mut defaulted,
+            )
+        } == 0
+        {
+            return Err(crate::winutil::last_error("GetSecurityDescriptorDacl(raw)"));
+        }
+        if present == 0 || dacl.is_null() {
+            return Err(anyhow!("native sandbox refuses an absent/null DACL"));
+        }
+        return Ok((dacl, buffer));
+    }
+    Err(anyhow!("raw DACL changed size repeatedly during probe"))
+}
+
+fn set_object_dacl(handle: &Handle, dacl: *mut ACL) -> Result<()> {
+    // Native object-local update: never propagate into unvalidated children.
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtSetSecurityObject(handle: isize, information: u32, descriptor: *mut c_void) -> i32;
+    }
+    let (_, raw) = raw_object_dacl(handle)?;
+    let mut control = 0;
+    let mut revision = 0;
+    if unsafe {
+        GetSecurityDescriptorControl(raw.as_ptr() as *mut c_void, &mut control, &mut revision)
+    } == 0
+    {
+        return Err(crate::winutil::last_error(
+            "GetSecurityDescriptorControl(raw)",
+        ));
+    }
+    let mut descriptor: SECURITY_DESCRIPTOR = unsafe { mem::zeroed() };
+    let pointer = &mut descriptor as *mut _ as *mut c_void;
+    let preserved = SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED | SE_DACL_AUTO_INHERIT_REQ;
+    // The native setter needs the request bit to retain an existing
+    // AUTO_INHERITED state. This set-only bit is absent from queried SDs.
+    let requested = (control & preserved)
+        | if control & SE_DACL_AUTO_INHERITED != 0 {
+            SE_DACL_AUTO_INHERIT_REQ
+        } else {
+            0
+        };
+    if unsafe { InitializeSecurityDescriptor(pointer, 1) } == 0
+        || unsafe {
+            SetSecurityDescriptorDacl(
+                pointer,
+                1,
+                dacl,
+                i32::from(control & SE_DACL_DEFAULTED != 0),
+            )
+        } == 0
+        || unsafe { SetSecurityDescriptorControl(pointer, preserved, requested) } == 0
+    {
+        return Err(crate::winutil::last_error("initialize object-local DACL"));
+    }
+    let status = unsafe { NtSetSecurityObject(handle.raw(), DACL_SECURITY_INFORMATION, pointer) };
+    if status < 0 {
         return Err(anyhow!(
-            "SetSecurityInfo(revoke) failed with Win32 error {code}"
+            "NtSetSecurityObject failed with NTSTATUS {:#010x}",
+            status as u32
         ));
     }
     Ok(())
 }
 
+fn set_object_entries(handle: &Handle, entries: &[EXPLICIT_ACCESS_W]) -> Result<()> {
+    let (old_dacl, _descriptor) = raw_object_dacl(handle)?;
+    let mut dacl = std::ptr::null_mut();
+    let result =
+        unsafe { SetEntriesInAclW(entries.len() as u32, entries.as_ptr(), old_dacl, &mut dacl) };
+    if result != 0 {
+        return Err(anyhow!("SetEntriesInAclW(object-local) failed: {result}"));
+    }
+    let dacl = LocalAcl(dacl);
+    set_object_dacl(handle, dacl.0)
+}
+
+pub fn revoke(handle: &Handle, sid: PSID) -> Result<()> {
+    let (dacl, _descriptor) = raw_object_dacl(handle)?;
+    let mut filtered = dacl_without_access_sid(dacl, sid)?;
+    if unsafe { (*dacl).AceCount == (*(filtered.as_ptr() as *const ACL)).AceCount } {
+        return Ok(());
+    }
+    set_object_dacl(handle, filtered.as_mut_ptr() as *mut ACL)
+}
+
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+
+fn ace_has_sid(raw: *mut c_void, sid: PSID) -> Result<bool> {
+    let header = unsafe { &*(raw as *const ACE_HEADER) };
+    let size = usize::from(header.AceSize);
+    let bytes = unsafe { std::slice::from_raw_parts(raw as *const u8, size) };
+    let offset = match header.AceType {
+        0 | 1 | 9 | 10 => 8,
+        5 | 6 | 11 | 12 => {
+            if size < 12 {
+                return Err(anyhow!("truncated object ACE"));
+            }
+            let flags = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+            if flags & !3 != 0 {
+                return Err(anyhow!("unsupported object ACE flags"));
+            }
+            12 + if flags & 1 != 0 { 16 } else { 0 } + if flags & 2 != 0 { 16 } else { 0 }
+        }
+        _ => {
+            // Preserve unknown foreign ACEs, but never claim cleanup succeeded
+            // if an unsupported form embeds the run SID (including zero masks).
+            let sid_bytes =
+                unsafe { std::slice::from_raw_parts(sid as *const u8, GetLengthSid(sid) as usize) };
+            if sid_bytes.is_empty() || bytes.windows(sid_bytes.len()).any(|part| part == sid_bytes)
+            {
+                return Err(anyhow!(
+                    "unsupported DACL ACE may contain the AppContainer SID"
+                ));
+            }
+            return Ok(false);
+        }
+    };
+    if size < offset + 8 || size < offset + 8 + usize::from(bytes[offset + 1]) * 4 {
+        return Err(anyhow!("truncated SID in DACL ACE"));
+    }
+    let candidate = unsafe { (raw as *mut u8).add(offset) } as PSID;
+    if unsafe { IsValidSid(candidate) } == 0 {
+        return Err(anyhow!("invalid SID in DACL ACE"));
+    }
+    Ok(unsafe { EqualSid(candidate, sid) } != 0)
+}
+
+fn dacl_has_sid(dacl: *mut ACL, sid: PSID) -> Result<bool> {
+    for index in 0..u32::from(unsafe { (*dacl).AceCount }) {
+        let mut raw = std::ptr::null_mut();
+        if unsafe { GetAce(dacl, index, &mut raw) } == 0 {
+            return Err(crate::winutil::last_error("GetAce(SID presence)"));
+        }
+        if ace_has_sid(raw, sid)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 fn dacl_without_access_sid(dacl: *mut ACL, sid: PSID) -> Result<Vec<usize>> {
     let mut info: ACL_SIZE_INFORMATION = unsafe { mem::zeroed() };
@@ -404,15 +586,7 @@ fn dacl_without_access_sid(dacl: *mut ACL, sid: PSID) -> Result<Vec<usize>> {
         if unsafe { GetAce(copied, index, &mut raw) } == 0 {
             return Err(crate::winutil::last_error("GetAce(revoke)"));
         }
-        let header = unsafe { &*(raw as *const ACE_HEADER) };
-        if !matches!(
-            header.AceType,
-            ACCESS_ALLOWED_ACE_TYPE | ACCESS_DENIED_ACE_TYPE
-        ) {
-            continue;
-        }
-        let ace_sid = (raw as usize + mem::size_of::<ACE_HEADER>() + mem::size_of::<u32>()) as PSID;
-        if unsafe { EqualSid(ace_sid, sid) } != 0 && unsafe { DeleteAce(copied, index) } == 0 {
+        if ace_has_sid(raw, sid)? && unsafe { DeleteAce(copied, index) } == 0 {
             return Err(crate::winutil::last_error("DeleteAce(revoke)"));
         }
     }
@@ -443,13 +617,11 @@ fn masks_for_sid(dacl: *mut ACL, sid: PSID, include_inherit_only: bool) -> Resul
         if !include_inherit_only && header.AceFlags & INHERIT_ONLY_ACE as u8 != 0 {
             continue;
         }
-        if header.AceType != ACCESS_ALLOWED_ACE_TYPE && header.AceType != ACCESS_DENIED_ACE_TYPE {
+        if !ace_has_sid(raw, sid)? {
             continue;
         }
-        let ace_sid =
-            (raw as usize + mem::size_of::<ACE_HEADER>() + mem::size_of::<u32>()) as *mut c_void;
-        if unsafe { EqualSid(ace_sid, sid) } == 0 {
-            continue;
+        if header.AceType != ACCESS_ALLOWED_ACE_TYPE && header.AceType != ACCESS_DENIED_ACE_TYPE {
+            return Err(anyhow!("unexpected conditional/object AppContainer grant"));
         }
         if header.AceType == ACCESS_ALLOWED_ACE_TYPE {
             allowed |= unsafe { (*(raw as *const ACCESS_ALLOWED_ACE)).Mask };
@@ -467,120 +639,66 @@ pub fn verify_tree(
     mode: SandboxMode,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut pending = VecDeque::from([root.to_owned()]);
-    while let Some(path) = pending.pop_front() {
-        if cancelled.load(Ordering::Acquire) {
+    walk_pinned_tree(root, false, cancelled, &mut |path, handle| {
+        let (dacl, _descriptor) = raw_object_dacl(handle)?;
+        if private_paths.iter().any(|private| contains(private, path)) {
+            if dacl_has_sid(dacl, sid)? {
+                return Err(anyhow!(
+                    "private object has an AppContainer ACE: {}",
+                    path.display()
+                ));
+            }
+            return Ok(());
+        }
+        let (allowed, denied) = masks_for_sid(dacl, sid, false)?;
+        let mut expected = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+        if mode == SandboxMode::WorkspaceWrite {
+            expected |= FILE_GENERIC_WRITE;
+            if !path_eq(root, path) && !private_paths.iter().any(|private| contains(path, private))
+            {
+                expected |= DELETE;
+            }
+        }
+        let (inherited, _) = masks_for_sid(dacl, sid, true)?;
+        let expected_inherited = expected
+            | if mode == SandboxMode::WorkspaceWrite {
+                DELETE
+            } else {
+                0
+            };
+        if allowed != expected || denied != 0 || inherited != expected_inherited {
             return Err(anyhow!(
-                "controller closed stdin while verifying ACL propagation"
+                "AppContainer grant does not match object policy: {}",
+                path.display()
             ));
         }
-        let handle = open_path(&path, false)?;
-        validate_final_path(&handle, &std::fs::canonicalize(&path)?)?;
-        let (dacl, _descriptor) = current_dacl(&handle)?;
-        let (allowed, denied) = masks_for_sid(dacl, sid, false)?;
-        let private = private_paths.iter().any(|entry| contains(entry, &path));
-        if private {
-            let expected = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE;
-            if denied & expected != expected {
-                return Err(anyhow!(
-                    "private-path deny ACE did not propagate to {}",
-                    path.display()
-                ));
-            }
-            if allowed & (WRITE_DAC | WRITE_OWNER | FILE_DELETE_CHILD) != 0 {
-                return Err(anyhow!(
-                    "private-path inherited allow ACE grants administrative rights to {}",
-                    path.display()
-                ));
-            }
-        } else {
-            let mut expected = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
-            if mode == SandboxMode::WorkspaceWrite {
-                expected |= FILE_GENERIC_WRITE;
-                if !path_eq(root, &path) {
-                    expected |= DELETE;
-                }
-            }
-            if allowed != expected || denied != 0 {
-                return Err(anyhow!(
-                    "AppContainer allow ACE did not propagate exactly to {}",
-                    path.display()
-                ));
-            }
-            let acl_admin = WRITE_DAC | WRITE_OWNER | FILE_DELETE_CHILD;
-            if allowed & acl_admin != 0 {
-                return Err(anyhow!(
-                    "AppContainer allow ACE grants ACL or child-deletion authority to {}",
-                    path.display()
-                ));
-            }
-            if path_eq(root, &path) && allowed & DELETE != 0 {
-                return Err(anyhow!(
-                    "AppContainer allow ACE grants deletion of authority root {}",
-                    path.display()
-                ));
-            }
-            if mode == SandboxMode::ReadOnly {
-                let mutation = FILE_WRITE_DATA
-                    | FILE_APPEND_DATA
-                    | FILE_WRITE_EA
-                    | FILE_WRITE_ATTRIBUTES
-                    | FILE_DELETE_CHILD
-                    | DELETE
-                    | WRITE_DAC
-                    | WRITE_OWNER;
-                if allowed & mutation != 0 {
-                    return Err(anyhow!(
-                        "read-only AppContainer ACE grants mutation rights to {}",
-                        path.display()
-                    ));
-                }
-            }
-        }
-        if path.is_dir() {
-            for entry in std::fs::read_dir(&path)? {
-                pending.push_back(entry?.path());
-            }
-        }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 pub fn verify_absent_tree(root: &Path, sid: PSID) -> Result<()> {
-    if !root.exists() {
-        return Ok(());
-    }
-    let mut pending = VecDeque::from([root.to_owned()]);
-    while let Some(path) = pending.pop_front() {
-        let handle = open_path(&path, false)?;
-        validate_final_path(&handle, &std::fs::canonicalize(&path)?)?;
-        validate_plain_file_object(&handle, &path)?;
-        let (dacl, _descriptor) = current_dacl(&handle)?;
-        let (allowed, denied) = masks_for_sid(dacl, sid, true)?;
-        if allowed != 0 || denied != 0 {
+    walk_pinned_tree(root, false, &AtomicBool::new(false), &mut |path, handle| {
+        let (dacl, _descriptor) = raw_object_dacl(handle)?;
+        if dacl_has_sid(dacl, sid)? {
             return Err(anyhow!(
                 "AppContainer SID ACE remains after cleanup on {}",
                 path.display()
             ));
         }
-        if path.is_dir() {
-            for entry in std::fs::read_dir(&path)? {
-                pending.push_back(entry?.path());
-            }
-        }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::winutil::open_path;
     use std::time::{SystemTime, UNIX_EPOCH};
     use windows_sys::Win32::Security::{
-        AddAccessAllowedAceEx, AddAccessDeniedAceEx, GetSecurityDescriptorControl,
-        GetSecurityDescriptorDacl, InitializeAcl, IsValidAcl, ACL_REVISION, INHERITED_ACE,
-        SE_DACL_AUTO_INHERITED, SE_DACL_AUTO_INHERIT_REQ, SE_DACL_DEFAULTED,
+        AddAccessAllowedAceEx, AddAccessDeniedAceEx, GetSecurityDescriptorControl, InitializeAcl,
+        IsValidAcl, ACL_REVISION, INHERITED_ACE,
     };
+    use windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA;
 
     fn ace_bytes(dacl: *mut ACL) -> Vec<Vec<u8>> {
         let count = unsafe { (*dacl).AceCount };
@@ -606,77 +724,6 @@ mod tests {
             ));
         }
         Ok((ace_bytes(dacl), control))
-    }
-
-    fn raw_object_dacl(handle: &Handle) -> Result<(*mut ACL, Vec<usize>)> {
-        #[link(name = "ntdll")]
-        extern "system" {
-            fn NtQuerySecurityObject(
-                handle: isize,
-                information: u32,
-                descriptor: *mut c_void,
-                length: u32,
-                needed: *mut u32,
-            ) -> i32;
-        }
-        let mut required = 0;
-        let mut status = unsafe {
-            NtQuerySecurityObject(
-                handle.raw(),
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                0,
-                &mut required,
-            )
-        };
-        for _ in 0..3 {
-            if required == 0 || required > 128 * 1024 {
-                return Err(anyhow!(
-                    "NtQuerySecurityObject(probe) invalid size {required}, NTSTATUS {:#010x}",
-                    status as u32
-                ));
-            }
-            let mut buffer = vec![0_usize; (required as usize).div_ceil(mem::size_of::<usize>())];
-            status = unsafe {
-                NtQuerySecurityObject(
-                    handle.raw(),
-                    DACL_SECURITY_INFORMATION,
-                    buffer.as_mut_ptr() as *mut c_void,
-                    (buffer.len() * mem::size_of::<usize>()) as u32,
-                    &mut required,
-                )
-            };
-            if status == 0xC0000023_u32 as i32 {
-                continue;
-            }
-            if status < 0 {
-                return Err(anyhow!(
-                    "NtQuerySecurityObject(probe) failed with NTSTATUS {:#010x}",
-                    status as u32
-                ));
-            }
-            let mut dacl = std::ptr::null_mut();
-            let mut present = 0;
-            let mut defaulted = 0;
-            if unsafe {
-                GetSecurityDescriptorDacl(
-                    buffer.as_ptr() as *mut c_void,
-                    &mut present,
-                    &mut dacl,
-                    &mut defaulted,
-                )
-            } == 0
-            {
-                return Err(crate::winutil::last_error(
-                    "GetSecurityDescriptorDacl(raw probe)",
-                ));
-            }
-            if present == 0 || dacl.is_null() {
-                return Err(anyhow!("raw probe refuses an absent/null DACL"));
-            }
-            return Ok((dacl, buffer));
-        }
-        Err(anyhow!("raw DACL changed size repeatedly during probe"))
     }
 
     fn raw_dacl_snapshot(handle: &Handle) -> Result<DaclSnapshot> {
@@ -708,83 +755,14 @@ mod tests {
         Ok((raw, high_level))
     }
 
-    fn set_object_dacl(handle: &Handle, dacl: *mut ACL) -> Result<()> {
-        // Test-only use of Microsoft's documented user-mode native service.
-        // Unlike SetSecurityInfo's tree propagation, this must change only the
-        // already pinned object. The probe verifies that claim before launch.
-        #[link(name = "ntdll")]
-        extern "system" {
-            fn NtSetSecurityObject(handle: isize, information: u32, descriptor: *mut c_void)
-                -> i32;
-        }
-        let (_, control) = raw_dacl_snapshot(handle)?;
-        let mut descriptor: SECURITY_DESCRIPTOR = unsafe { mem::zeroed() };
-        let pointer = &mut descriptor as *mut _ as *mut c_void;
-        let preserved = SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED | SE_DACL_AUTO_INHERIT_REQ;
-        // The native setter needs the request bit to retain an existing
-        // AUTO_INHERITED state. This set-only bit is absent from queried SDs.
-        let requested = (control & preserved)
-            | if control & SE_DACL_AUTO_INHERITED != 0 {
-                SE_DACL_AUTO_INHERIT_REQ
-            } else {
-                0
-            };
-        if unsafe { InitializeSecurityDescriptor(pointer, 1) } == 0
-            || unsafe {
-                SetSecurityDescriptorDacl(
-                    pointer,
-                    1,
-                    dacl,
-                    i32::from(control & SE_DACL_DEFAULTED != 0),
-                )
-            } == 0
-            || unsafe { SetSecurityDescriptorControl(pointer, preserved, requested) } == 0
-        {
-            return Err(crate::winutil::last_error(
-                "initialize object-only DACL probe",
-            ));
-        }
-        let status =
-            unsafe { NtSetSecurityObject(handle.raw(), DACL_SECURITY_INFORMATION, pointer) };
-        if status < 0 {
-            return Err(anyhow!(
-                "NtSetSecurityObject(probe) failed with NTSTATUS {:#010x}",
-                status as u32
-            ));
-        }
-        Ok(())
-    }
-
-    fn set_object_entries(handle: &Handle, entries: &[EXPLICIT_ACCESS_W]) -> Result<()> {
-        let (old_dacl, _descriptor) = raw_object_dacl(handle)?;
-        let mut dacl = std::ptr::null_mut();
-        let result = unsafe {
-            SetEntriesInAclW(entries.len() as u32, entries.as_ptr(), old_dacl, &mut dacl)
-        };
-        if result != 0 {
-            return Err(anyhow!("SetEntriesInAclW(object probe) failed: {result}"));
-        }
-        let dacl = LocalAcl(dacl);
-        set_object_dacl(handle, dacl.0)
-    }
-
-    fn revoke_object_sid(handle: &Handle, sid: PSID) -> Result<()> {
-        let (dacl, _descriptor) = raw_object_dacl(handle)?;
-        let mut filtered = dacl_without_access_sid(dacl, sid)?;
-        if ace_bytes(dacl) == ace_bytes(filtered.as_mut_ptr() as *mut ACL) {
-            return Ok(());
-        }
-        set_object_dacl(handle, filtered.as_mut_ptr() as *mut ACL)
-    }
-
     #[test]
     fn native_delete_probe_child() {
         use std::io::Write;
         use windows_sys::Win32::Storage::FileSystem::{
             CreateFileW, DeleteFileW, FindClose, FindFirstFileW, GetFileAttributesW,
-            GetFinalPathNameByHandleW, GetFullPathNameW, GetVolumeInformationW,
-            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            OPEN_EXISTING, VOLUME_NAME_DOS, VOLUME_NAME_NT, WIN32_FIND_DATAW,
+            GetFinalPathNameByHandleW, GetFullPathNameW, GetVolumeInformationByHandleW,
+            GetVolumeInformationW, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING, VOLUME_NAME_DOS, VOLUME_NAME_NT, WIN32_FIND_DATAW,
         };
         #[link(name = "kernel32")]
         extern "system" {
@@ -902,6 +880,24 @@ mod tests {
         )
         .unwrap();
         if let Ok(handle) = &opened {
+            let result = unsafe {
+                GetVolumeInformationByHandleW(
+                    handle.raw(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            let error = (result == 0).then(std::io::Error::last_os_error);
+            writeln!(
+                std::io::stderr(),
+                "native volume query by allowed handle: result={result}, error={error:?}"
+            )
+            .unwrap();
             for (label, flags) in [("DOS", VOLUME_NAME_DOS), ("NT", VOLUME_NAME_NT)] {
                 let mut buffer = vec![0_u16; 32768];
                 let count = unsafe {
@@ -1012,7 +1008,7 @@ mod tests {
                 "object-only update propagated to existing child"
             );
             assert_eq!(raw_dacl_snapshot(&child).unwrap(), raw_child_before);
-            revoke_object_sid(&parent, ours.0).unwrap();
+            revoke(&parent, ours.0).unwrap();
             assert_eq!(object_dacl_snapshot(&parent).unwrap(), before);
             assert_eq!(object_dacl_snapshot(&child).unwrap(), child_before);
             assert_eq!(raw_dacl_snapshot(&parent).unwrap(), raw_before);
@@ -1281,6 +1277,16 @@ mod tests {
                 let _ = command(&format!(
                     "set SystemRoot={windows}&& set WINDIR={windows}&& dir /b root.txt"
                 ))?;
+                let _ = command(&format!(
+                    "\"{windows}\\System32\\cmd.exe\" /d /e:off /f:off /c dir /b root.txt"
+                ))?;
+                ensure!(
+                    command("echo PROBE>extensions-probe.txt")? == 0,
+                    "could not create extensions probe"
+                );
+                let _ = command(&format!(
+                    "\"{windows}\\System32\\cmd.exe\" /d /e:off /f:off /c del extensions-probe.txt"
+                ))?;
                 fs::copy(
                     std::env::current_exe()?,
                     root.join("bello-delete-probe.exe"),
@@ -1329,7 +1335,7 @@ mod tests {
                     "commands changed actual private DACL bytes or control flags"
                 );
             }
-            revoke_object_sid(&handle, sid.0)?;
+            revoke(&handle, sid.0)?;
             let root_only_cleanup = verify_absent_tree(&root, sid.0);
             writeln!(
                 std::io::stderr(),
@@ -1363,7 +1369,7 @@ mod tests {
                     masks.0,
                     masks.1
                 )?;
-                revoke_object_sid(&handle, sid.0)?;
+                revoke(&handle, sid.0)?;
             }
             verify_absent_tree(&root, sid.0)?;
             let current_objects = paths
@@ -1469,6 +1475,58 @@ mod tests {
         let empty_dacl = empty.as_mut_ptr() as *mut ACL;
         assert_ne!(unsafe { IsValidAcl(empty_dacl) }, 0);
         assert!(ace_bytes(empty_dacl).is_empty());
+    }
+
+    #[test]
+    fn revoke_removes_zero_mask_callback_and_object_entries_and_rejects_unknown_owned_aces() {
+        use windows_sys::Win32::Security::AddAccessAllowedObjectAce;
+        let ours =
+            crate::identity::derive_profile_sid(&crate::identity::random_profile_name().unwrap())
+                .unwrap();
+        let peer =
+            crate::identity::derive_profile_sid(&crate::identity::random_profile_name().unwrap())
+                .unwrap();
+        let mut buffer = vec![0_usize; 128];
+        let dacl = buffer.as_mut_ptr() as *mut ACL;
+        assert_ne!(
+            unsafe { InitializeAcl(dacl, mem::size_of_val(buffer.as_slice()) as u32, 4) },
+            0
+        );
+        assert_ne!(
+            unsafe { AddAccessAllowedAceEx(dacl, 4, 0, FILE_GENERIC_READ, peer.0) },
+            0
+        );
+        let peer_before = ace_bytes(dacl);
+        assert_ne!(unsafe { AddAccessAllowedAceEx(dacl, 4, 0, 0, ours.0) }, 0);
+        let mut raw = std::ptr::null_mut();
+        assert_ne!(unsafe { GetAce(dacl, 1, &mut raw) }, 0);
+        unsafe {
+            (*(raw as *mut ACE_HEADER)).AceType = 9;
+        }
+        assert_ne!(
+            unsafe {
+                AddAccessAllowedObjectAce(
+                    dacl,
+                    4,
+                    0,
+                    FILE_GENERIC_READ,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    ours.0,
+                )
+            },
+            0
+        );
+        assert!(dacl_has_sid(dacl, ours.0).unwrap());
+        let mut filtered = dacl_without_access_sid(dacl, ours.0).unwrap();
+        let cleaned = filtered.as_mut_ptr() as *mut ACL;
+        assert_eq!(ace_bytes(cleaned), peer_before);
+        assert!(!dacl_has_sid(cleaned, ours.0).unwrap());
+        unsafe {
+            (*(raw as *mut ACE_HEADER)).AceType = 254;
+        }
+        assert!(dacl_without_access_sid(dacl, ours.0).is_err());
+        assert!(dacl_has_sid(dacl, ours.0).is_err());
     }
 
     #[test]
