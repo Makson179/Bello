@@ -70,11 +70,18 @@ catch {
     exit 1
 }
 "@
-    $encodedLauncher = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($launcher))
+    # CreateProcessWithLogonW permits only 1024 command-line characters. Keep
+    # the trusted fixture in a local file rather than expanding it to base64.
+    $launcherPath = Join-Path $reportDirectory "standard-user-launcher.ps1"
+    $launcher | Set-Content -LiteralPath $launcherPath -Encoding utf8BOM
     $powershell = Join-Path $env:SystemRoot "System32/WindowsPowerShell/v1.0/powershell.exe"
+    $launcherArguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$launcherPath`""
+    if ($powershell.Length + $launcherArguments.Length + 3 -ge 1024) {
+        throw "standard-user launcher path exceeds the Windows logon command-line limit"
+    }
     $credential = [Management.Automation.PSCredential]::new("${env:COMPUTERNAME}\$userName", $password)
     $smokeProcess = Start-Process -FilePath $powershell `
-        -ArgumentList "-NoLogo -NoProfile -NonInteractive -EncodedCommand $encodedLauncher" `
+        -ArgumentList $launcherArguments `
         -WorkingDirectory $reportDirectory -Credential $credential -LoadUserProfile -PassThru
     # Keep the process handle alive even if the smoke fails before our first wait.
     $null = $smokeProcess.Handle
