@@ -11,6 +11,8 @@ mod acl;
 #[cfg(windows)]
 mod acl_lock;
 #[cfg(windows)]
+mod global_acl_lock;
+#[cfg(windows)]
 mod host_prepare;
 #[cfg(windows)]
 mod identity;

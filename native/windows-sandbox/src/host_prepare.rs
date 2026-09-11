@@ -9,7 +9,7 @@
 use crate::acl::{self, SYSTEM_ROOT_METADATA_MASK};
 use crate::identity::{sid_string, CapabilitySids, SYSTEM_ROOT_METADATA_CAPABILITY};
 use crate::winutil::{self, wide, Handle};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::ffi::c_void;
 use std::mem;
@@ -308,23 +308,33 @@ pub fn fixed_targets() -> Result<Vec<FixedTarget>> {
 
 pub struct SetupLock(Handle);
 
-/// The normal helper may change exact metadata on its own directories under its
-/// existing account lock. Administrators-owned ancestors additionally require an
-/// already elevated caller and this same cross-account lock. Never elevate here.
-pub fn metadata_mutation_lock(handle: &Handle) -> Result<Option<SetupLock>> {
-    if acl::owned_by_current_account(handle)? {
-        return Ok(None);
+pub struct MetadataMutation {
+    _lock: crate::global_acl_lock::GlobalAclLock,
+    pub writable: Handle,
+}
+
+/// The caller supplies a validated proper ancestor outside all authorities,
+/// retaining its lexical-chain pins. Windows, not directory ownership, decides
+/// whether this helper may write its DACL. All ACL paths share the same lock,
+/// including authority grants and recovery; no model command holds it.
+pub fn metadata_mutation_lock(path: &Path, handle: &Handle) -> Result<MetadataMutation> {
+    let lock = crate::global_acl_lock::GlobalAclLock::acquire()?;
+    winutil::validate_final_path(handle, path)?;
+    let caller = acl::current_account_sid_string()?;
+    let owner = acl::owner_sid_string(handle)?;
+    let writable = winutil::open_path(path, true).with_context(|| format!("metadata WRITE_DAC unavailable; ownerSid={owner}, callerSid={caller}, requiredAccess=0x60000"))?;
+    winutil::validate_final_path(&writable, path)?;
+    let expected = winutil::file_identity(handle)?;
+    let actual = winutil::file_identity(&writable)?;
+    if expected.volume_serial != actual.volume_serial || expected.file_index != actual.file_index {
+        return Err(anyhow!(
+            "metadata ancestor identity changed before WRITE_DAC"
+        ));
     }
-    let admin = known_sid(WinBuiltinAdministratorsSid)?;
-    if !acl::owner_matches(handle, admin.as_ptr() as PSID)? {
-        return Err(anyhow!("metadata ancestor is not owned by this account or Administrators; no permissions changed"));
-    }
-    require_elevated_admin()?;
-    let lock = SetupLock::acquire()?;
-    if !acl::owner_matches(handle, admin.as_ptr() as PSID)? {
-        return Err(anyhow!("metadata ancestor owner changed during setup"));
-    }
-    Ok(Some(lock))
+    Ok(MetadataMutation {
+        _lock: lock,
+        writable,
+    })
 }
 
 impl SetupLock {

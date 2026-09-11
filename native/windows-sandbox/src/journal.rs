@@ -626,10 +626,9 @@ fn cleanup_data(data: &JournalData) -> Result<()> {
                 .last()
                 .ok_or_else(|| anyhow!("empty metadata ancestry"))?
                 .1;
-            let _admin_lock = crate::host_prepare::metadata_mutation_lock(pinned)?;
-            let writable = reopen_recorded(record, true)?;
-            acl::revoke(&writable, sid.0)?;
-            acl::verify_absent_object(&writable, sid.0)
+            let mutation = crate::host_prepare::metadata_mutation_lock(&record.path, pinned)?;
+            acl::revoke(&mutation.writable, sid.0)?;
+            acl::verify_absent_object(&mutation.writable, sid.0)
         })();
         if let Err(error) = result {
             failures.push(format!(

@@ -37,12 +37,20 @@ real CMD/Node operation and private-file denial after preparation.
 
 For other strict ancestors of allowed roots, the helper checks the actual child
 token and temporarily adds only missing metadata access for the unique per-run
-SID. The directories and their ancestry are pinned before mutation. An ancestor
-must be owned by the invoking account, or by Administrators with an already
-elevated caller. The latter path uses the same cross-account setup lock during
-mutation and cleanup, never during command execution. SYSTEM-owned ancestors
-are not a fallback. Permissions never inherit or permit listing or sibling
-content access.
+SID. The directories and their ancestry are pinned before mutation. Windows
+must allow the invoking account to open each exact object with `WRITE_DAC`;
+the helper never takes ownership or elevates itself. The owner's SID alone is
+not an access check: a user can legitimately control permissions on a directory
+owned by an administrator or the system. Permissions never inherit or permit
+listing or sibling content access.
+
+All file-ACL read/modify/write/readback operations, including authority grants,
+ancestor metadata and revocation, use one cross-session synchronization mutex.
+Commands execute outside that lock. Authenticated users can synchronize on the
+mutex and inspect its fixed descriptor, but this grants no file permissions.
+Another local process can cause a bounded timeout by holding it; the helper then
+fails closed. This cooperative lock cannot serialize unrelated ACL-management
+tools that do not participate in the protocol.
 
 Journal v4 stores these ancestor grants separately from recursive authorities.
 Recovery validates their identities and revokes the exact per-run entry without

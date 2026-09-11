@@ -234,25 +234,14 @@ fn run(
                 if is_volume_root(path) || fixed.iter().any(|target| path_eq(target, path)) {
                     return Err(anyhow!("sandbox requires fixed host metadata preparation for {}; run the explicit Administrator host-prepare command (no automatic elevation)", path.display()));
                 }
-                let _admin_lock = crate::host_prepare::metadata_mutation_lock(handle)
+                let mutation = crate::host_prepare::metadata_mutation_lock(path, handle)
                     .with_context(|| {
                         format!("cannot prepare exact metadata ancestor {}", path.display())
                     })?;
-                let writable = open_path(path, true)?;
-                validate_final_path(&writable, path)?;
-                let actual = file_identity(&writable)?;
-                let pinned = file_identity(handle)?;
-                if actual.volume_serial != pinned.volume_serial
-                    || actual.file_index != pinned.file_index
-                {
-                    return Err(anyhow!(
-                        "metadata ancestor identity changed: {}",
-                        path.display()
-                    ));
-                }
-                journal.before_metadata_mutation(path, &writable)?;
-                acl::set_system_root_metadata(&writable, sid.0, true)?;
-                if verifier.granted_file_access(&writable)? & acl::SYSTEM_ROOT_METADATA_MASK
+                journal.before_metadata_mutation(path, &mutation.writable)?;
+                acl::set_system_root_metadata(&mutation.writable, sid.0, true)?;
+                if verifier.granted_file_access(&mutation.writable)?
+                    & acl::SYSTEM_ROOT_METADATA_MASK
                     != acl::SYSTEM_ROOT_METADATA_MASK
                 {
                     return Err(anyhow!(

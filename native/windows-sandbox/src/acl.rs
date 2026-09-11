@@ -140,7 +140,13 @@ fn current_user_sid_buffer() -> Result<Vec<usize>> {
     Ok(buffer)
 }
 
-pub fn owner_matches(handle: &Handle, expected: PSID) -> Result<bool> {
+pub fn current_account_sid_string() -> Result<String> {
+    let buffer = current_user_sid_buffer()?;
+    let sid = unsafe { (*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid };
+    crate::identity::sid_string(sid)
+}
+
+pub fn owner_sid_string(handle: &Handle) -> Result<String> {
     let mut owner = std::ptr::null_mut();
     let mut descriptor = std::ptr::null_mut();
     let code = unsafe {
@@ -164,13 +170,7 @@ pub fn owner_matches(handle: &Handle, expected: PSID) -> Result<bool> {
     if owner.is_null() {
         return Err(anyhow!("metadata directory has no owner"));
     }
-    Ok(unsafe { EqualSid(owner, expected) } != 0)
-}
-
-pub fn owned_by_current_account(handle: &Handle) -> Result<bool> {
-    let buffer = current_user_sid_buffer()?;
-    let sid = unsafe { (*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid };
-    owner_matches(handle, sid)
+    crate::identity::sid_string(owner)
 }
 
 fn state_directory_dacl(user_sid: PSID) -> Result<LocalAcl> {
@@ -191,6 +191,7 @@ fn state_directory_dacl(user_sid: PSID) -> Result<LocalAcl> {
 }
 
 pub fn create_state_directory(path: &Path) -> Result<()> {
+    let _lock = crate::global_acl_lock::GlobalAclLock::acquire()?;
     // Elevated accounts may default new objects to an Administrators owner.
     // Set the intended account owner and protected DACL atomically at creation;
     // never take ownership of or relax validation for an existing directory.
@@ -222,6 +223,7 @@ pub fn create_state_directory(path: &Path) -> Result<()> {
 }
 
 pub fn protect_state_directory(handle: &Handle) -> Result<()> {
+    let _lock = crate::global_acl_lock::GlobalAclLock::acquire()?;
     let buffer = current_user_sid_buffer()?;
     let user_sid = unsafe { (*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid };
 
@@ -310,6 +312,7 @@ pub fn protect_state_directory(handle: &Handle) -> Result<()> {
 
 #[cfg(test)]
 fn set_entries(handle: &Handle, entries: &[EXPLICIT_ACCESS_W]) -> Result<()> {
+    let _lock = crate::global_acl_lock::GlobalAclLock::acquire()?;
     let (old_dacl, _descriptor) = current_dacl(handle)?;
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
     let code = unsafe {
@@ -462,6 +465,7 @@ fn raw_object_dacl(handle: &Handle) -> Result<(*mut ACL, Vec<usize>)> {
 }
 
 fn set_object_dacl(handle: &Handle, dacl: *mut ACL) -> Result<()> {
+    let _lock = crate::global_acl_lock::GlobalAclLock::acquire()?;
     // Native object-local update: never propagate into unvalidated children.
     #[link(name = "ntdll")]
     extern "system" {
@@ -513,6 +517,7 @@ fn set_object_dacl(handle: &Handle, dacl: *mut ACL) -> Result<()> {
 }
 
 fn set_object_entries(handle: &Handle, entries: &[EXPLICIT_ACCESS_W]) -> Result<()> {
+    let _lock = crate::global_acl_lock::GlobalAclLock::acquire()?;
     let (old_dacl, _descriptor) = raw_object_dacl(handle)?;
     let mut dacl = std::ptr::null_mut();
     let result =
@@ -525,6 +530,7 @@ fn set_object_entries(handle: &Handle, entries: &[EXPLICIT_ACCESS_W]) -> Result<
 }
 
 pub fn revoke(handle: &Handle, sid: PSID) -> Result<()> {
+    let _lock = crate::global_acl_lock::GlobalAclLock::acquire()?;
     let (dacl, _descriptor) = raw_object_dacl(handle)?;
     let mut filtered = dacl_without_access_sid(dacl, sid)?;
     if unsafe { (*dacl).AceCount == (*(filtered.as_ptr() as *const ACL)).AceCount } {
@@ -569,9 +575,10 @@ pub fn system_root_metadata_prepared(handle: &Handle, sid: PSID) -> Result<bool>
     metadata_entry_present(dacl, sid)
 }
 
-/// The host-preparation caller pins the fixed OS root and holds its admin-only
-/// mutation lock. Never use GRANT_ACCESS merging or recursively propagate here.
+/// The caller pins the exact object. Fixed host targets additionally require
+/// explicit admin setup. Never merge rights or recursively propagate here.
 pub fn set_system_root_metadata(handle: &Handle, sid: PSID, prepared: bool) -> Result<bool> {
+    let _lock = crate::global_acl_lock::GlobalAclLock::acquire()?;
     let (dacl, _descriptor) = raw_object_dacl(handle)?;
     let present = metadata_entry_present(dacl, sid)?;
     if present == prepared {

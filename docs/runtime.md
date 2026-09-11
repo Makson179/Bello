@@ -76,10 +76,10 @@ Preparation does not grant access to arbitrary drives or protected machine-wide
 toolchains. Exposed toolchain roots must still allow the invoking account to
 manage their exact permissions; use host-controlled per-user installations.
 Other required parent directories receive temporary metadata-only permissions
-for the individual command, when the invoking account owns them. These do not
+for the individual command, when Windows permits the invoking account to modify
+their permissions. These do not
 allow listing or access to sibling files and are removed during cleanup.
-Administrators-owned parents require an already elevated caller; unsupported
-locations are rejected rather than triggering automatic elevation.
+Unsupported locations are rejected rather than triggering automatic elevation.
 
 ## Sign in and choose models
 
