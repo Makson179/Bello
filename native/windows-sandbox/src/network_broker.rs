@@ -1492,6 +1492,9 @@ mod tests {
             identity::random_profile_name().unwrap()
         ));
         fs::create_dir_all(base.join("workspace")).unwrap();
+        // Windows TEMP may use an 8.3 alias. Recovery intentionally validates
+        // the canonical identity of every persisted path, including state.
+        let base = fs::canonicalize(base).unwrap();
         let root = fs::canonicalize(base.join("workspace")).unwrap();
         let state = base.join("state");
         // Deliberately omit the helper marker: exercise the exact old race in

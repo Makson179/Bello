@@ -34,6 +34,7 @@ const CONFIG: &str = "bello-local-dns-fixture.json";
 const REPORT: &str = "bello-local-dns-result.json";
 const CLIENT_TEST: &str = "network_dns_tests::ci_dns_client";
 const CHILD_BOUND: Duration = Duration::from_secs(30);
+const LOCAL_DNS_PORT: u16 = 53;
 
 #[derive(Deserialize, Serialize)]
 struct QueryConfig {
@@ -47,7 +48,7 @@ impl QueryConfig {
         ensure!(
             self.nonce.len() == 32
                 && self.nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
-                && self.port != 0,
+                && self.port == LOCAL_DNS_PORT,
             "invalid local DNS fixture"
         );
         Ok(format!("bello-{}.invalid.", self.nonce))
@@ -61,7 +62,7 @@ struct QueryResult {
     records: bool,
 }
 
-fn local_dns_servers(port: u16) -> DNS_ADDR_ARRAY {
+fn local_dns_servers() -> DNS_ADDR_ARRAY {
     let mut servers: DNS_ADDR_ARRAY = unsafe { mem::zeroed() };
     // Win32's DNS_ADDR_ARRAY specifies MaxCount in BYTES, not entries.
     // AddrCount holds the entry count; all reserved fields remain zero.
@@ -70,16 +71,24 @@ fn local_dns_servers(port: u16) -> DNS_ADDR_ARRAY {
     servers.AddrCount = 1;
     servers.Family = AF_INET;
     // DNS_ADDR starts with sockaddr_in. Use bytes to avoid unaligned references
-    // to this SDK's packed array. The host control verifies custom-port support.
+    // to this SDK's packed array. Port zero selects the standard DNS port (53),
+    // rather than relying on undocumented custom-port support in DnsQueryEx v1.
     servers.AddrArray[0].MaxSa[..2].copy_from_slice(&AF_INET.to_ne_bytes());
-    servers.AddrArray[0].MaxSa[2..4].copy_from_slice(&port.to_be_bytes());
     servers.AddrArray[0].MaxSa[4..8].copy_from_slice(&Ipv4Addr::LOCALHOST.octets());
     servers
 }
 
 #[test]
 fn local_dns_server_array_matches_win32_layout() {
-    let servers = local_dns_servers(32123);
+    for port in [0, 32123] {
+        assert!(QueryConfig {
+            nonce: "a".repeat(32),
+            port
+        }
+        .name()
+        .is_err());
+    }
+    let servers = local_dns_servers();
     assert_eq!(
         { servers.MaxCount },
         mem::size_of::<DNS_ADDR_ARRAY>() as u32
@@ -87,7 +96,7 @@ fn local_dns_server_array_matches_win32_layout() {
     assert_eq!({ servers.AddrCount }, 1);
     assert_eq!({ servers.Family }, AF_INET);
     assert_eq!(&servers.AddrArray[0].MaxSa[..2], &AF_INET.to_ne_bytes());
-    assert_eq!(&servers.AddrArray[0].MaxSa[2..4], &32123_u16.to_be_bytes());
+    assert_eq!(&servers.AddrArray[0].MaxSa[2..4], &[0, 0]);
     assert_eq!(&servers.AddrArray[0].MaxSa[4..8], &[127, 0, 0, 1]);
     assert!(servers.AddrArray[0].MaxSa[8..]
         .iter()
@@ -111,7 +120,7 @@ fn ci_dns_client() -> Result<()> {
     ensure!(input.len() <= 256, "oversized DNS fixture config");
     let config: QueryConfig = serde_json::from_slice(&input)?;
     let name: Vec<u16> = config.name()?.encode_utf16().chain(Some(0)).collect();
-    let mut servers = local_dns_servers(config.port);
+    let mut servers = local_dns_servers();
     let mut request: DNS_QUERY_REQUEST = unsafe { mem::zeroed() };
     request.Version = DNS_QUERY_REQUEST_VERSION1;
     request.QueryName = name.as_ptr();
@@ -191,7 +200,10 @@ struct Responder {
 
 impl Responder {
     fn start(allowed: BTreeSet<String>) -> Result<Self> {
-        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        // Never replace an existing resolver or modify adapters. An occupied
+        // local standard port makes this fixture explicitly inconclusive.
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, LOCAL_DNS_PORT))
+            .context("INCONCLUSIVE: cannot bind the fixture's 127.0.0.1:53 DNS endpoint")?;
         socket.set_read_timeout(Some(Duration::from_millis(100)))?;
         let port = socket.local_addr()?.port();
         let observed = Arc::new(Mutex::new(BTreeSet::new()));
@@ -399,7 +411,7 @@ fn actual_lpac_dns_does_not_gain_brokered_egress_from_network_capabilities() -> 
             .map(|_| {
                 Ok(QueryConfig {
                     nonce: offline_network::new_id()?.replace('-', ""),
-                    port: 1,
+                    port: LOCAL_DNS_PORT,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -421,8 +433,13 @@ fn actual_lpac_dns_does_not_gain_brokered_egress_from_network_capabilities() -> 
             launch(&root, child.then_some(sid.0), network, &safe_cleanup)
         };
         let host = run(0, false, false)?;
-        ensure!(host.returned == 0 && host.status == 0 && host.records && peer.saw(&configs[0].name()?)?,
-            "INCONCLUSIVE: explicit local DnsQueryEx host control failed (including custom-port support): {host:?}");
+        ensure!(
+            host.returned == 0
+                && host.status == 0
+                && host.records
+                && peer.saw(&configs[0].name()?)?,
+            "INCONCLUSIVE: standard-port local DnsQueryEx host control failed: {host:?}"
+        );
         let old = run(1, true, false).context("original no-network-cap LPAC DNS query")?;
         let online = run(2, true, true).context("network-cap LPAC DNS control without WFP")?;
         let record = LeaseRecord {
