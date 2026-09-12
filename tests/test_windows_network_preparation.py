@@ -16,7 +16,7 @@ def response(operation="status", *, installed=True, changed=False):
         "operation": operation, "serviceName": "BelloOfflineNetwork",
         "installPath": r"C:\Program Files\BelloOfflineNetwork\bello-windows-sandbox.exe",
         "installed": installed, "running": installed, "prepared": installed,
-        "binaryMatches": installed, "changed": changed,
+        "binaryMatches": installed, "changed": changed, "quiesced": False,
         "servicePid": 400 if installed else 0, "activeLeases": 0, "retainedLeases": 0,
     }
 
@@ -56,7 +56,7 @@ def test_conflicting_network_selector_never_starts_process(monkeypatch, kwargs):
     {"serviceName": "OtherService"}, {"operation": "prepare"}, {"changed": True},
     {"installed": False}, {"running": False}, {"prepared": False},
     {"servicePid": True}, {"servicePid": 0}, {"activeLeases": -1}, {"retainedLeases": "0"},
-    {"binaryMatches": 1}, {"arbitraryCommand": "anything"},
+    {"binaryMatches": 1}, {"quiesced": 1}, {"quiesced": True}, {"arbitraryCommand": "anything"},
     {"installPath": r"\\host\share\BelloOfflineNetwork\bello-windows-sandbox.exe"},
     {"installPath": r"C:\Program Files\..\BelloOfflineNetwork\bello-windows-sandbox.exe"},
     {"installPath": r"C:\Program Files\OtherService\bello-windows-sandbox.exe"},
@@ -72,6 +72,31 @@ def test_network_status_missing_service_and_stale_binary_are_valid():
     assert not backend._validate_network_preparation(stale, "status")["prepared"]
     with pytest.raises(backend.WindowsSandboxBackendError):
         backend._validate_network_preparation(stale | {"operation": "prepare"}, "prepare")
+
+
+def test_quiesced_service_is_not_ready_and_must_have_no_leases():
+    value = response() | {"quiesced": True, "prepared": False}
+    assert not backend._validate_network_preparation(value, "status")["prepared"]
+    for patch in ({"activeLeases": 1}, {"retainedLeases": 1}, {"running": False, "servicePid": 0}):
+        with pytest.raises(backend.WindowsSandboxBackendError, match="inconsistent"):
+            backend._validate_network_preparation(value | patch, "status")
+    with pytest.raises(backend.WindowsSandboxBackendError, match="inconsistent"):
+        backend._validate_network_preparation(value | {"operation": "prepare"}, "prepare")
+
+
+def test_network_prepare_recovers_quiesced_service_instead_of_returning_ready(monkeypatch):
+    seen = []
+
+    def prepare(operation, **kwargs):
+        seen.append(operation)
+        if operation == "status":
+            return response() | {"quiesced": True, "prepared": False}
+        return response("prepare", changed=True)
+
+    monkeypatch.setattr(backend, "host_preparation", prepare)
+    result = CliRunner().invoke(cli, ["runtime", "windows-sandbox", "prepare", "--network", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert seen == ["status", "prepare"]
 
 
 def test_network_cli_status_is_read_only(monkeypatch):

@@ -267,12 +267,12 @@ def _validate_null_preparation(value: object, operation: str) -> dict[str, objec
 def _validate_network_preparation(value: object, operation: str) -> dict[str, object]:
     expected = {"protocolVersion", "kind", "operation", "serviceName", "installPath",
                 "installed", "running", "prepared", "changed", "servicePid",
-                "activeLeases", "retainedLeases", "policyVersion", "binaryMatches"}
+                "activeLeases", "retainedLeases", "policyVersion", "binaryMatches", "quiesced"}
     if not isinstance(value, dict) or set(value) != expected:
         raise WindowsSandboxBackendError("Windows offline network response has invalid fields")
     if (
         any(type(value[key]) is not bool for key in
-            ("installed", "running", "prepared", "changed", "binaryMatches"))
+            ("installed", "running", "prepared", "changed", "binaryMatches", "quiesced"))
         or any(type(value[key]) is not int or value[key] < 0 for key in
                ("protocolVersion", "policyVersion", "servicePid", "activeLeases", "retainedLeases"))
         or value["protocolVersion"] != PROTOCOL_VERSION or value["policyVersion"] != 1
@@ -289,9 +289,10 @@ def _validate_network_preparation(value: object, operation: str) -> dict[str, ob
         raise WindowsSandboxBackendError("Windows offline network response has an invalid install path")
     if (
         (not value["installed"] and any(value[k] for k in
-         ("running", "prepared", "binaryMatches", "servicePid", "activeLeases", "retainedLeases")))
+         ("running", "prepared", "binaryMatches", "quiesced", "servicePid", "activeLeases", "retainedLeases")))
         or value["running"] != (value["servicePid"] > 0)
-        or value["prepared"] != (value["running"] and value["binaryMatches"])
+        or value["prepared"] != (value["running"] and value["binaryMatches"] and not value["quiesced"])
+        or (value["quiesced"] and (not value["running"] or value["activeLeases"] or value["retainedLeases"]))
         or (not value["running"] and (value["activeLeases"] or value["retainedLeases"]))
         or (operation == "status" and value["changed"])
         or (operation == "prepare" and not value["prepared"])

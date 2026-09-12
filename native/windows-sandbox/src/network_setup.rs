@@ -357,7 +357,7 @@ fn open_service(manager: &Service, write: bool) -> Result<Option<Service>> {
         | SERVICE_QUERY_STATUS
         | READ_CONTROL
         | if write {
-            SERVICE_START | SERVICE_STOP | DELETE | WRITE_DAC
+            SERVICE_START | SERVICE_STOP | SERVICE_USER_DEFINED_CONTROL | DELETE | WRITE_DAC
         } else {
             0
         };
@@ -476,9 +476,31 @@ fn stop_empty(service: &Service) -> Result<()> {
         return Ok(());
     }
     require_empty()?;
+    let before = service_state(service)?;
+    if before.dwCurrentState != SERVICE_RUNNING || before.dwProcessId == 0 {
+        bail!("network service is not running and cannot enter safe stop preparation");
+    }
     let mut status = unsafe { mem::zeroed() };
-    // The service repeats the emptiness check atomically while refusing new
-    // leases, so a run starting after the status query cannot be killed here.
+    // A STOP callback cannot veto a delivered STOP. First request the fixed
+    // administrative control that closes admission only while all leases are
+    // empty, then verify SCM's actual status before sending the real STOP.
+    if unsafe {
+        ControlService(
+            service.0,
+            crate::network_broker::PREPARE_STOP_CONTROL,
+            &mut status,
+        )
+    } == 0
+    {
+        return Err(winutil::last_error("prepare inactive network service stop"));
+    }
+    let prepared = service_state(service)?;
+    if prepared.dwCurrentState != SERVICE_RUNNING
+        || prepared.dwProcessId != before.dwProcessId
+        || prepared.dwControlsAccepted & SERVICE_ACCEPT_STOP == 0
+    {
+        bail!("network service could not quiesce: active/retained leases or a concurrent operation prevent stopping; nothing was stopped");
+    }
     if unsafe { ControlService(service.0, SERVICE_CONTROL_STOP, &mut status) } == 0 {
         return Err(winutil::last_error("stop inactive network service"));
     }
@@ -659,6 +681,7 @@ pub struct NetworkPreparationReport {
     install_path: PathBuf,
     installed: bool,
     running: bool,
+    quiesced: bool,
     prepared: bool,
     changed: bool,
     service_pid: u32,
@@ -721,12 +744,18 @@ pub fn execute(operation: &str) -> Result<NetworkPreparationReport> {
         }
         let _directory = validate_object(directory, true)?;
         if let Some(ref existing) = service {
-            if !binary_matches(&path, source.as_mut().unwrap())? {
+            let matches = binary_matches(&path, source.as_mut().unwrap())?;
+            let state = service_state(existing)?;
+            let quiesced = state.dwCurrentState == SERVICE_RUNNING
+                && state.dwControlsAccepted & SERVICE_ACCEPT_STOP != 0;
+            if !matches || quiesced {
                 stop_empty(existing)?;
                 if !crate::offline_network::leases()?.is_empty() {
                     bail!("retained offline leases prevent a service binary update");
                 }
-                copy_binary(&path, source.as_mut().unwrap())?;
+                if !matches {
+                    copy_binary(&path, source.as_mut().unwrap())?;
+                }
                 changed = true;
             }
         } else {
@@ -822,6 +851,10 @@ pub fn execute(operation: &str) -> Result<NetworkPreparationReport> {
     let running = state
         .as_ref()
         .is_some_and(|s| s.dwCurrentState == SERVICE_RUNNING);
+    let quiesced = running
+        && state
+            .as_ref()
+            .is_some_and(|s| s.dwControlsAccepted & SERVICE_ACCEPT_STOP != 0);
     let matches = installed
         && binary_matches(
             &path,
@@ -852,7 +885,8 @@ pub fn execute(operation: &str) -> Result<NetworkPreparationReport> {
         install_path: path,
         installed,
         running,
-        prepared: running && matches,
+        quiesced,
+        prepared: running && matches && !quiesced,
         changed,
         service_pid: state.map(|s| s.dwProcessId).unwrap_or(0),
         active_leases: active,

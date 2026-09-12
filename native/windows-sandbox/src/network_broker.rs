@@ -77,16 +77,31 @@ const CLIENT_PIPE_ACCESS: u32 = 0x0012_019b;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_LIVE_LEASES: usize = 256;
 const JOB_QUERY_TERMINATE: u32 = 0x000c;
+// SCM authenticates this fixed administrative control using the service DACL.
+// Ordinary users have QUERY_CONFIG/QUERY_STATUS, not USER_DEFINED_CONTROL.
+pub(crate) const PREPARE_STOP_CONTROL: u32 = 128;
 static STOP: AtomicBool = AtomicBool::new(false);
 static SERVICE_HANDLE: AtomicIsize = AtomicIsize::new(0);
 struct Admission {
     accepting: bool,
     leases: usize,
+    stop_armed: bool,
+}
+impl Admission {
+    fn quiesce_if_empty(&mut self) -> bool {
+        if self.leases != 0 {
+            return false;
+        }
+        self.accepting = false;
+        self.stop_armed = true;
+        true
+    }
 }
 // Serializes only lease changes and SCM admission, never sandbox execution.
 static ADMISSION: Mutex<Admission> = Mutex::new(Admission {
     accepting: true,
     leases: 0,
+    stop_armed: false,
 });
 
 fn token_data(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> Result<Vec<usize>> {
@@ -1081,15 +1096,18 @@ fn serve_connection(pipe: HANDLE, state: &mut BrokerState) -> Result<()> {
     Ok(())
 }
 
-fn report_service(state: u32, error: u32) -> Result<()> {
+fn accepted_controls(state: u32, stop_armed: bool) -> u32 {
+    if state != SERVICE_RUNNING {
+        return 0;
+    }
+    SERVICE_ACCEPT_SHUTDOWN | if stop_armed { SERVICE_ACCEPT_STOP } else { 0 }
+}
+
+fn report_service(state: u32, error: u32, stop_armed: bool) -> Result<()> {
     let status = SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: state,
-        dwControlsAccepted: if state == SERVICE_RUNNING {
-            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
-        } else {
-            0
-        },
+        dwControlsAccepted: accepted_controls(state, stop_armed),
         dwWin32ExitCode: error,
         dwServiceSpecificExitCode: 0,
         dwCheckPoint: if matches!(state, SERVICE_START_PENDING | SERVICE_STOP_PENDING) {
@@ -1111,16 +1129,39 @@ fn report_service(state: u32, error: u32) -> Result<()> {
 
 unsafe extern "system" fn control(control: u32, _: u32, _: *mut c_void, _: *mut c_void) -> u32 {
     match control {
+        PREPARE_STOP_CONTROL => {
+            // Never block SCM behind WFP or client operations. A busy/active
+            // request leaves admission unchanged; the installer checks the
+            // actual status/STOP bit, not the callback's return value.
+            let Ok(mut admission) = ADMISSION.try_lock() else {
+                return 0;
+            };
+            if STOP.load(Ordering::Acquire) || !admission.quiesce_if_empty() {
+                return 0;
+            }
+            // Close admission BEFORE advertising STOP. Therefore even a STOP
+            // queued by SCM cannot race with a newly registered sandbox Job.
+            if let Err(error) = report_service(SERVICE_RUNNING, 0, true) {
+                log_service_error(&format!("publish quiesced service status: {error:#}"));
+                // No leases can exist after quiescence. Stop this idle service
+                // instead of stranding a RUNNING-but-unusable installation.
+                STOP.store(true, Ordering::Release);
+            }
+            0
+        }
         SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
             let Ok(mut admission) = ADMISSION.lock() else {
                 return 1061;
             };
-            if control == SERVICE_CONTROL_STOP && admission.leases != 0 {
-                return 170;
+            if control == SERVICE_CONTROL_STOP && (!admission.stop_armed || admission.leases != 0) {
+                // SCM should not deliver STOP before it was advertised. Do not
+                // kill active Jobs even if an unexpected control reaches us.
+                log_service_error("unexpected STOP before empty-service quiescence; sandbox Jobs and filters retained");
+                return 0;
             }
             admission.accepting = false;
             STOP.store(true, Ordering::Release);
-            let _ = report_service(SERVICE_STOP_PENDING, 0);
+            let _ = report_service(SERVICE_STOP_PENDING, 0, false);
             0
         }
         SERVICE_CONTROL_INTERROGATE => 0,
@@ -1140,9 +1181,10 @@ fn service_loop() -> Result<()> {
             .map_err(|_| anyhow!("broker admission lock poisoned"))?;
         admission.leases = state.retained.len();
         admission.accepting = false;
+        admission.stop_armed = false;
     }
     let pipe = create_pipe()?;
-    report_service(SERVICE_RUNNING, 0)?;
+    report_service(SERVICE_RUNNING, 0, false)?;
     // SCM exposes a valid running PID only after SERVICE_RUNNING. No request
     // is read or ACKed yet: verify our own image using the self pseudo-handle,
     // then atomically enable admission unless a concurrent STOP won first.
@@ -1151,7 +1193,7 @@ fn service_loop() -> Result<()> {
         let mut admission = ADMISSION
             .lock()
             .map_err(|_| anyhow!("broker admission lock poisoned"))?;
-        if !STOP.load(Ordering::Acquire) {
+        if !STOP.load(Ordering::Acquire) && !admission.stop_armed {
             admission.accepting = true;
         }
     }
@@ -1189,7 +1231,7 @@ unsafe extern "system" fn service_entry(_: u32, _: *mut *mut u16) {
         return;
     }
     SERVICE_HANDLE.store(handle, Ordering::Release);
-    let _ = report_service(SERVICE_START_PENDING, 0);
+    let _ = report_service(SERVICE_START_PENDING, 0, false);
     let result = std::panic::catch_unwind(service_loop);
     let code = match result {
         Ok(Ok(())) => 0,
@@ -1202,7 +1244,7 @@ unsafe extern "system" fn service_entry(_: u32, _: *mut *mut u16) {
             1066
         }
     };
-    let _ = report_service(SERVICE_STOPPED, code);
+    let _ = report_service(SERVICE_STOPPED, code, false);
 }
 
 fn log_service_error(message: &str) {
@@ -1294,6 +1336,37 @@ mod tests {
                 !client_body.contains(forbidden),
                 "ordinary client reintroduced {forbidden}"
             );
+        }
+    }
+
+    #[test]
+    fn stop_is_advertised_only_after_empty_admission_is_closed() {
+        let mut admission = Admission {
+            accepting: true,
+            leases: 1,
+            stop_armed: false,
+        };
+        assert!(!admission.quiesce_if_empty());
+        assert!(admission.accepting);
+        assert!(!admission.stop_armed);
+        assert_eq!(
+            accepted_controls(SERVICE_RUNNING, admission.stop_armed) & SERVICE_ACCEPT_STOP,
+            0
+        );
+        admission.leases = 0;
+        assert!(admission.quiesce_if_empty());
+        assert!(!admission.accepting);
+        assert!(admission.stop_armed);
+        assert_ne!(
+            accepted_controls(SERVICE_RUNNING, admission.stop_armed) & SERVICE_ACCEPT_STOP,
+            0
+        );
+        assert!(
+            admission.quiesce_if_empty(),
+            "quiesced retries are idempotent"
+        );
+        for state in [SERVICE_START_PENDING, SERVICE_STOP_PENDING, SERVICE_STOPPED] {
+            assert_eq!(accepted_controls(state, true), 0);
         }
     }
 
@@ -1539,33 +1612,187 @@ mod tests {
     #[ignore = "SCM stop assertion must run serially after ordinary integration tests"]
     fn real_active_lease_refuses_service_stop() {
         use windows_sys::Win32::System::Services::{
-            CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
-            SERVICE_STOP,
+            CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx,
+            SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS,
+            SERVICE_STATUS_PROCESS, SERVICE_STOP, SERVICE_USER_DEFINED_CONTROL,
         };
-        let _fixture = TestLease::new();
+        struct ScHandle(isize);
+        impl Drop for ScHandle {
+            fn drop(&mut self) {
+                unsafe { CloseServiceHandle(self.0) };
+            }
+        }
+        let mut fixture = TestLease::new();
+        let original_lease = offline_network::leases()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.record.profile_name == fixture.child.profile)
+            .unwrap();
+        let child = Handle::new(
+            unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, fixture.child.pid) },
+            "test active sandbox process",
+        )
+        .unwrap();
         let scm = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
         assert_ne!(scm, 0);
-        let service = unsafe { OpenServiceW(scm, wide(SERVICE_NAME).as_ptr(), SERVICE_STOP) };
-        if service == 0 {
-            let error = last_error("test OpenServiceW(STOP)");
-            unsafe { CloseServiceHandle(scm) };
-            panic!("{error:#}");
-        }
+        let scm = ScHandle(scm);
+        let service = unsafe {
+            OpenServiceW(
+                scm.0,
+                wide(SERVICE_NAME).as_ptr(),
+                SERVICE_STOP | SERVICE_USER_DEFINED_CONTROL | SERVICE_QUERY_STATUS,
+            )
+        };
+        assert_ne!(service, 0, "{}", last_error("test OpenServiceW(STOP)"));
+        let service = ScHandle(service);
+        let query = || {
+            let mut state: SERVICE_STATUS_PROCESS = unsafe { mem::zeroed() };
+            let mut bytes = 0;
+            assert_ne!(
+                unsafe {
+                    QueryServiceStatusEx(
+                        service.0,
+                        SC_STATUS_PROCESS_INFO,
+                        &mut state as *mut _ as *mut u8,
+                        mem::size_of_val(&state) as u32,
+                        &mut bytes,
+                    )
+                },
+                0,
+                "{}",
+                last_error("test QueryServiceStatusEx")
+            );
+            state
+        };
+        let before = query();
+        assert_eq!(before.dwCurrentState, SERVICE_RUNNING);
+        assert_eq!(before.dwControlsAccepted & SERVICE_ACCEPT_STOP, 0);
         let mut service_status: SERVICE_STATUS = unsafe { mem::zeroed() };
-        let stopped = unsafe { ControlService(service, SERVICE_CONTROL_STOP, &mut service_status) };
+        let stopped =
+            unsafe { ControlService(service.0, SERVICE_CONTROL_STOP, &mut service_status) };
         let error = unsafe { GetLastError() };
-        unsafe {
-            CloseServiceHandle(service);
-            CloseServiceHandle(scm);
-        }
         assert_eq!(
             stopped, 0,
-            "service accepted STOP while a real sandbox job was active"
+            "SCM delivered unadvertised STOP while a real sandbox job was active"
         );
-        assert!(matches!(error, 170 | 1061), "unexpected STOP error {error}");
+        assert!(
+            matches!(error, 1052 | 1061),
+            "unexpected STOP error {error}"
+        );
+        // A delivered preparation request is not evidence of quiescence.
+        // Inspect SCM, the live child and exact persistent lease after both
+        // controls, rather than trusting the HandlerEx return value.
+        assert_ne!(
+            unsafe { ControlService(service.0, PREPARE_STOP_CONTROL, &mut service_status) },
+            0,
+            "{}",
+            last_error("test prepare-stop control delivery")
+        );
+        let after = query();
+        assert_eq!(after.dwCurrentState, SERVICE_RUNNING);
+        assert_eq!(after.dwProcessId, before.dwProcessId);
+        assert_eq!(after.dwControlsAccepted & SERVICE_ACCEPT_STOP, 0);
+        assert_eq!(unsafe { WaitForSingleObject(child.raw(), 0) }, WAIT_TIMEOUT);
+        let active = fixture.child.job.ensure_empty().unwrap_err();
+        assert!(
+            active.to_string().contains("active process(es)"),
+            "{active:#}"
+        );
+        let retained = offline_network::leases()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.record.profile_name == fixture.child.profile)
+            .unwrap();
+        assert_eq!(retained.record, original_lease.record);
+        assert_eq!(retained.filter_ids, original_lease.filter_ids);
         assert!(
             matches!(status().unwrap().result, BrokerResult::Status { active_leases, .. } if active_leases > 0)
         );
+        // The refused administrative request must not strand admission either.
+        let mut later = TestLease::new();
+        later.child.job.terminate(125).unwrap();
+        later.lease.release().unwrap();
+        fixture.child.job.terminate(125).unwrap();
+        fixture.lease.release().unwrap();
+        assert!(!offline_network::leases().unwrap().iter().any(|entry| {
+            entry.record.profile_name == fixture.child.profile
+                || entry.record.profile_name == later.child.profile
+        }));
+        assert_eq!(query().dwProcessId, before.dwProcessId);
+
+        // Simulate an administrator disappearing between prepare-stop and
+        // STOP. The ordinary preparation command must recognize and recover
+        // this state even when the installed binary already matches exactly.
+        assert!(matches!(
+            status().unwrap().result,
+            BrokerResult::Status {
+                active_leases: 0,
+                retained_leases: 0,
+            }
+        ));
+        let (_, installed_image) = crate::network_setup::running_service_identity().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert_ne!(
+                unsafe { ControlService(service.0, PREPARE_STOP_CONTROL, &mut service_status) },
+                0
+            );
+            if query().dwControlsAccepted & SERVICE_ACCEPT_STOP != 0 {
+                break;
+            }
+            // Only the brief idle reap/status lock may postpone quiescence;
+            // this test does not retry or alter any active lease operation.
+            assert!(Instant::now() < deadline, "idle service never quiesced");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let rejected_child = crate::process::tests::suspended_broker_child(true);
+        let error = register(
+            &rejected_child.profile,
+            rejected_child.pid,
+            &rejected_child.job,
+        )
+        .err()
+        .expect("quiesced service admitted a new sandbox");
+        assert!(error.to_string().contains("stopping"), "{error:#}");
+        assert!(!offline_network::leases()
+            .unwrap()
+            .iter()
+            .any(|entry| { entry.record.profile_name == rejected_child.profile }));
+        drop(rejected_child);
+        let invoke = |operation: &str| {
+            let mut command = Command::new(&installed_image)
+                .args([operation, "--network"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(45);
+            while command.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    let _ = command.kill();
+                    let output = command.wait_with_output().unwrap();
+                    panic!("fixed host operation timed out: {output:?}");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let output = command.wait_with_output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+        };
+        let quiesced = invoke("host-status");
+        assert_eq!(quiesced["quiesced"], true);
+        assert_eq!(quiesced["prepared"], false);
+        assert_eq!(quiesced["binaryMatches"], true);
+        let restarted = invoke("host-prepare");
+        assert_eq!(restarted["quiesced"], false);
+        assert_eq!(restarted["prepared"], true);
+        assert_eq!(restarted["changed"], true);
+        assert_eq!(query().dwCurrentState, SERVICE_RUNNING);
+        assert_eq!(query().dwControlsAccepted & SERVICE_ACCEPT_STOP, 0);
+        let mut resumed = TestLease::new();
+        resumed.child.job.terminate(125).unwrap();
+        resumed.lease.release().unwrap();
     }
 
     #[test]

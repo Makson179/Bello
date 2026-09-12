@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+from ctypes import wintypes
 import json
 from pathlib import Path
 import platform
@@ -32,6 +34,37 @@ def sddl(path: Path) -> str:
 
 
 HOST_ENV_SECRET = "bello-native-parent-env-must-not-leak"
+
+
+def assert_network_service_control_denied() -> None:
+    """A limited user must not acquire administrative broker control rights."""
+    services = ctypes.WinDLL("advapi32", use_last_error=True)
+    services.OpenSCManagerW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+    services.OpenSCManagerW.restype = wintypes.HANDLE
+    services.OpenServiceW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR, wintypes.DWORD]
+    services.OpenServiceW.restype = wintypes.HANDLE
+    services.CloseServiceHandle.argtypes = [wintypes.HANDLE]
+    services.CloseServiceHandle.restype = wintypes.BOOL
+    manager = services.OpenSCManagerW(None, None, 0x0001)  # SC_MANAGER_CONNECT
+    if not manager:
+        raise ctypes.WinError(ctypes.get_last_error())
+    service = None
+    try:
+        # Only request a handle; never send a control or modify service state.
+        service = services.OpenServiceW(manager, "BelloOfflineNetwork", 0x0100)
+        error = ctypes.get_last_error()
+        if service or error != 5:  # SERVICE_USER_DEFINED_CONTROL / ERROR_ACCESS_DENIED
+            raise AssertionError(
+                "non-admin broker control access must be denied: "
+                f"opened={bool(service)}, winerror={error}"
+            )
+    finally:
+        try:
+            if service and not services.CloseServiceHandle(service):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            if not services.CloseServiceHandle(manager):
+                raise ctypes.WinError(ctypes.get_last_error())
 
 
 def request(
@@ -158,6 +191,7 @@ def main() -> int:
     )
     if unauthorized_prepare.returncode == 0:
         raise AssertionError("host preparation unexpectedly accepted a non-admin caller")
+    assert_network_service_control_denied()
     base = Path(tempfile.mkdtemp(prefix="bello-native-standard-user-")).resolve()
     root = base / "workspace"
     root.mkdir()
