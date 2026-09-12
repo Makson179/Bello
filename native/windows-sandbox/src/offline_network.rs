@@ -533,13 +533,18 @@ fn validate_filter_shape(filter: &FWPM_FILTER0, index: usize) -> Result<()> {
     // A returned FWPM_FILTER0 has both submitted and BFE-assigned members.
     // Report exactly which bounded scalar differs; do not dump providerData,
     // display strings, pointers, or account/package identities into logs. This
-    // intentionally keeps all existing shape requirements unchanged until a
-    // real native readback establishes any required BFE normalization.
+    // permits only the INDEXED optimization observed in native BFE readback.
+    // INDEXED changes lookup performance, not the action or matching scope:
+    // https://learn.microsoft.com/windows/win32/api/fwpmtypes/ns-fwpmtypes-fwpm_filter0
     let mut mismatches = Vec::new();
-    if filter.flags != FWPM_FILTER_FLAG_PERSISTENT {
+    if filter.flags != FWPM_FILTER_FLAG_PERSISTENT
+        && filter.flags != FWPM_FILTER_FLAG_PERSISTENT | FWPM_FILTER_FLAG_INDEXED
+    {
         mismatches.push(format!(
-            "flags=0x{:08x}, expected=0x{:08x}",
-            filter.flags, FWPM_FILTER_FLAG_PERSISTENT
+            "flags=0x{:08x}, expected=0x{:08x} or 0x{:08x}",
+            filter.flags,
+            FWPM_FILTER_FLAG_PERSISTENT,
+            FWPM_FILTER_FLAG_PERSISTENT | FWPM_FILTER_FLAG_INDEXED
         ));
     }
     if filter.providerKey.is_null() || !unsafe { eq_guid(&*filter.providerKey, &PROVIDER_KEY) } {
@@ -928,6 +933,22 @@ mod tests {
         let mut bad = filter;
         bad.flags = 0;
         assert!(filter_record(&bad).is_err());
+        let mut indexed = filter;
+        indexed.flags |= FWPM_FILTER_FLAG_INDEXED;
+        assert_eq!(filter_record(&indexed).unwrap().0, record);
+        for flags in [
+            FWPM_FILTER_FLAG_INDEXED,
+            FWPM_FILTER_FLAG_PERSISTENT | FWPM_FILTER_FLAG_INDEXED | FWPM_FILTER_FLAG_DISABLED,
+            FWPM_FILTER_FLAG_PERSISTENT | FWPM_FILTER_FLAG_INDEXED | 0x8000_0000,
+            FWPM_FILTER_FLAG_PERSISTENT | FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
+        ] {
+            let mut bad = filter;
+            bad.flags = flags;
+            assert!(filter_record(&bad)
+                .unwrap_err()
+                .to_string()
+                .contains("flags=0x"));
+        }
         let mut bad = filter;
         bad.numFilterConditions = 0;
         assert!(filter_record(&bad).is_err());
@@ -971,7 +992,7 @@ mod tests {
             .to_string()
             .contains("weight: type="));
         let mut bad = filter;
-        bad.flags |= FWPM_FILTER_FLAG_INDEXED;
+        bad.flags |= FWPM_FILTER_FLAG_INDEXED | FWPM_FILTER_FLAG_DISABLED;
         bad.effectiveWeight.r#type = FWP_EMPTY;
         let error = filter_record(&bad).unwrap_err().to_string();
         assert!(error.contains("flags=0x") && error.contains("effectiveWeight:"));

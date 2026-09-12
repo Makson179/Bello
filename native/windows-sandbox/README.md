@@ -120,11 +120,11 @@ rather than handled with a weaker fallback.
 
 Unwinding or dropping a journal never changes ACLs: an exceptional path leaves
 the durable record and unique profile in place. The controller issues an
-explicit recovery request only after the failed helper has exited (and its Job
-handles have therefore closed), while every normal path proves the Job is empty
-before revocation. This intentionally prefers a temporary access residue for a
-dead, unguessable AppContainer SID over revoking permissions while a descendant
-could still be alive.
+explicit recovery request only after the failed helper has exited. For an
+offline run, the broker can still hold the Job, so recovery also requires its
+confirmation that the original Job is empty. Every normal path likewise proves
+the Job is empty before revocation. If that cannot be proved, the journal,
+permissions and blocking rules remain for later recovery.
 
 The helper must be built and exercised on native Windows. A non-Windows Cargo
 build validates only the protocol layer; it is not evidence that the Win32

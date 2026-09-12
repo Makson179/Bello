@@ -61,6 +61,47 @@ struct QueryResult {
     records: bool,
 }
 
+fn local_dns_servers(port: u16) -> DNS_ADDR_ARRAY {
+    let mut servers: DNS_ADDR_ARRAY = unsafe { mem::zeroed() };
+    // Win32's DNS_ADDR_ARRAY specifies MaxCount in BYTES, not entries.
+    // AddrCount holds the entry count; all reserved fields remain zero.
+    // https://learn.microsoft.com/en-us/windows/win32/api/windnsdef/ns-windnsdef-dns_addr_array
+    servers.MaxCount = mem::size_of::<DNS_ADDR_ARRAY>() as u32;
+    servers.AddrCount = 1;
+    servers.Family = AF_INET;
+    // DNS_ADDR starts with sockaddr_in. Use bytes to avoid unaligned references
+    // to this SDK's packed array. The host control verifies custom-port support.
+    servers.AddrArray[0].MaxSa[..2].copy_from_slice(&AF_INET.to_ne_bytes());
+    servers.AddrArray[0].MaxSa[2..4].copy_from_slice(&port.to_be_bytes());
+    servers.AddrArray[0].MaxSa[4..8].copy_from_slice(&Ipv4Addr::LOCALHOST.octets());
+    servers
+}
+
+#[test]
+fn local_dns_server_array_matches_win32_layout() {
+    let servers = local_dns_servers(32123);
+    assert_eq!(
+        { servers.MaxCount },
+        mem::size_of::<DNS_ADDR_ARRAY>() as u32
+    );
+    assert_eq!({ servers.AddrCount }, 1);
+    assert_eq!({ servers.Family }, AF_INET);
+    assert_eq!(&servers.AddrArray[0].MaxSa[..2], &AF_INET.to_ne_bytes());
+    assert_eq!(&servers.AddrArray[0].MaxSa[2..4], &32123_u16.to_be_bytes());
+    assert_eq!(&servers.AddrArray[0].MaxSa[4..8], &[127, 0, 0, 1]);
+    assert!(servers.AddrArray[0].MaxSa[8..]
+        .iter()
+        .all(|byte| *byte == 0));
+    let reserved = unsafe { servers.AddrArray[0].Data.DnsAddrUserDword };
+    assert_eq!(reserved, [0; 8]);
+    assert_eq!({ servers.Tag }, 0);
+    assert_eq!({ servers.WordReserved }, 0);
+    assert_eq!({ servers.Flags }, 0);
+    assert_eq!({ servers.MatchFlag }, 0);
+    assert_eq!({ servers.Reserved1 }, 0);
+    assert_eq!({ servers.Reserved2 }, 0);
+}
+
 #[test]
 fn ci_dns_client() -> Result<()> {
     if !Path::new(CONFIG).exists() {
@@ -70,15 +111,7 @@ fn ci_dns_client() -> Result<()> {
     ensure!(input.len() <= 256, "oversized DNS fixture config");
     let config: QueryConfig = serde_json::from_slice(&input)?;
     let name: Vec<u16> = config.name()?.encode_utf16().chain(Some(0)).collect();
-    let mut servers: DNS_ADDR_ARRAY = unsafe { mem::zeroed() };
-    servers.MaxCount = 1;
-    servers.AddrCount = 1;
-    // DNS_ADDR starts with a sockaddr. Use bytes to avoid an unaligned struct
-    // reference: the SDK's DNS_ADDR_ARRAY is packed. A nonzero explicit port
-    // is checked by the host positive control; never fall back to system DNS.
-    servers.AddrArray[0].MaxSa[..2].copy_from_slice(&AF_INET.to_ne_bytes());
-    servers.AddrArray[0].MaxSa[2..4].copy_from_slice(&config.port.to_be_bytes());
-    servers.AddrArray[0].MaxSa[4..8].copy_from_slice(&Ipv4Addr::LOCALHOST.octets());
+    let mut servers = local_dns_servers(config.port);
     let mut request: DNS_QUERY_REQUEST = unsafe { mem::zeroed() };
     request.Version = DNS_QUERY_REQUEST_VERSION1;
     request.QueryName = name.as_ptr();
