@@ -69,9 +69,18 @@ An offline command is created suspended. Before it resumes, the service checks
 the real local caller, the child's AppContainer identity and its Job Object,
 then installs four Windows Filtering Platform BLOCK rules for that exact
 package SID: IPv4/IPv6 connect and receive/accept. The token can create a socket
-(needed even by Python imports), but the rules block traffic. If service setup
-or rule verification fails, the command does not run. Online commands do not
-use these blocking leases.
+(needed even by Python imports), but the rules block direct TCP/UDP traffic.
+If service setup or rule verification fails, the command does not run. Online
+commands do not use these blocking leases.
+
+System DNS resolution through the Windows DNS Client (`Dnscache`) service is
+not fenced by these per-package rules. Native Server 2025 tests confirm that
+the service can send a query on an offline LPAC process's behalf. Query names
+can disclose domains or carry encoded data that the command is allowed to read.
+This is an explicitly accepted Windows 0.6.0 limitation, not a fixed issue:
+offline mode blocks direct connections but does not guarantee complete network
+isolation or prevent DNS-based data exfiltration. Tests retain direct-traffic
+denial checks and positive controls while characterizing this DNS behavior.
 
 Rules persist if the service crashes. Normal release requires the process Job
 to be empty; uncertain same-boot leases remain blocked. A verified new boot

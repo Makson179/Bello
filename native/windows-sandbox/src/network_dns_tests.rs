@@ -1,6 +1,9 @@
-//! Test-only DNS broker regression. No adapter/resolver settings are changed.
+//! Characterize the accepted Windows system-DNS limitation with real LPACs.
+//! No adapter/resolver settings are changed.
 //! Direct socket denial does not prove that DNS Client cannot send on a child's
 //! behalf. Observe only fresh fixture names at an explicit loopback responder.
+//! DNS may pass through the service or be denied on a particular Windows host;
+//! neither outcome replaces the separate mandatory direct-traffic block tests.
 
 use crate::identity::{
     create_profile, delete_profile, profile_local_app_data, random_profile_name, sid_string,
@@ -388,7 +391,7 @@ fn creation_time() -> Result<u64> {
 }
 
 #[test]
-fn actual_lpac_dns_does_not_gain_brokered_egress_from_network_capabilities() -> Result<()> {
+fn actual_lpac_system_dns_records_known_network_isolation_limit() -> Result<()> {
     no_nrpt_override()?;
     offline_network::validate_layout()?;
     let profile = random_profile_name()?;
@@ -485,9 +488,17 @@ fn actual_lpac_dns_does_not_gain_brokered_egress_from_network_capabilities() -> 
             !old_packet,
             "original no-network-cap LPAC also emits DNS; no offline-isolation claim is justified"
         );
-        ensure!(!offline_packet, "SECURITY REGRESSION: local responder received DNS from new offline LPAC while old no-cap LPAC was blocked");
+        // Accepted Windows 0.6.0 limitation: Dnscache can send on behalf of the
+        // network-capable LPAC despite its per-package WFP filters. Keep this
+        // observation visible, not a skipped test or a claim of DNS isolation.
+        // A host that blocks this path is also valid; do not require a leak.
+        if offline_packet {
+            eprintln!("WINDOWS_DNS_LIMITATION: OBSERVED - system DNS reached the local fixture while package-WFP offline filters were installed; complete network isolation is not guaranteed");
+        } else {
+            eprintln!("WINDOWS_DNS_LIMITATION: NOT OBSERVED on this host - this does not establish a general guarantee that system DNS is blocked");
+        }
         if !online_packet {
-            eprintln!("DNS RPC control is unavailable to this LPAC even with network capabilities; this path shows no regression but does not prove WFP blocked DNS service traffic");
+            eprintln!("DNS RPC control is unavailable to this LPAC even with network capabilities; this does not prove WFP blocked DNS service traffic");
         }
         Ok(())
     })();

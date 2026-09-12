@@ -111,7 +111,9 @@ jobs:
         shell: pwsh
         run: |
           $nativeTestLog = Join-Path $env:RUNNER_TEMP "bello-native-rust-tests.log"
-          & cargo test --locked --manifest-path native/windows-sandbox/Cargo.toml 2>&1 |
+          # Preserve successful-test diagnostics too, including the observed
+          # system-DNS limitation; passing does not imply complete DNS isolation.
+          & cargo test --locked --manifest-path native/windows-sandbox/Cargo.toml -- --show-output 2>&1 |
             Tee-Object -FilePath $nativeTestLog
           $testExit = $LASTEXITCODE
           if ($testExit -ne 0) { throw "Native Rust unit tests failed with exit $testExit" }

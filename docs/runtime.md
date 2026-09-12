@@ -49,6 +49,16 @@ Windows process isolation with restricted filesystem and network permissions.
 Native Windows verification is tracked separately; passing non-Windows tests
 does not certify the Windows boundary.
 
+**Known Windows 0.6.0 limitation:** offline commands are blocked from direct
+TCP/UDP connections over IPv4 and IPv6, but system DNS resolution through the
+Windows DNS Client (`Dnscache`) service is not fenced. Actual Server 2025 tests
+confirm that it can send a query on an offline process's behalf. Queries can
+disclose domain names, and a command can encode data it is allowed to read into
+those names to transmit it outside the sandbox. This limitation is accepted for
+0.6.0, not fixed; offline mode must not be treated as complete network isolation
+or a guarantee against data exfiltration. See the implementation record for
+verification status.
+
 Windows tools such as Node and CMD also need metadata access to the system-drive
 root and Windows' user-profiles directory (usually `C:\` and `C:\Users`).
 Check the one-time preparation without changing permissions:
@@ -186,9 +196,11 @@ daemonized process has exited.
 ## Front ends
 
 Codex and Claude Code plugins invoke the same installed Bello binary; the front
-end does not determine which provider must perform the task. Delegation package
-sources are in [plugins/bello](../plugins/bello). Configuration-advisor migration
-is a separate follow-up, not an automatically replaced skill in this branch.
+end does not determine which provider must perform the task. Delegation and
+configuration-advisor sources are in [plugins/bello](../plugins/bello). The
+advisor is migrated: it reads Bello's available provider/model/effort catalog
+and recommends one concrete setup. Marketplace publication and installation of
+the updated plugin remain separate release steps.
 
 Pi's MIT notice ships with its bridge in `supervisor/pi_worker`. The official
 Claude SDK and its CLI remain separate dependencies under their own terms.
