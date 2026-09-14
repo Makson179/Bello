@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
@@ -56,7 +57,9 @@ def test_cli_runtime_and_distiller_boolean_pairs(monkeypatch, tmp_path, enabled)
     ])
     assert result.exit_code == 0, result.output
     assert captured[0].runtime_enabled is enabled
-    assert captured[0].log_distiller == LogDistillerConfig(enabled=enabled, model_path="models/local-selector")
+    assert captured[0].log_distiller == LogDistillerConfig(
+        enabled=enabled, model_path=str(Path("models/local-selector")),
+    )
     assert captured[0].adversary and not captured[0].completion_review
 
 

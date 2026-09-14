@@ -203,10 +203,10 @@ async def test_fast_priority_translates_to_native_fast(tmp_path):
 async def test_native_launcher_target_is_readable_but_install_parent_is_not(tmp_path):
     install = tmp_path / "private-install"
     install.mkdir()
-    executable = install / "codex-native"
+    executable = install / ("codex-native.exe" if os.name == "nt" else "codex-native")
     executable.write_bytes(b"fixture-not-executed")
     executable.chmod(0o700)
-    launcher = tmp_path / "codex-launcher"
+    launcher = tmp_path / ("codex-launcher.exe" if os.name == "nt" else "codex-launcher")
     launcher.symlink_to(executable)
     workspace = tmp_path / "workspace"
     backend, _, clients = make_backend(tmp_path, command=[str(launcher), "app-server"])

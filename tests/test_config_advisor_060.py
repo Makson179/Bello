@@ -154,7 +154,7 @@ class AdvisorValidationTests(unittest.TestCase):
             candidate.update(runtime_enabled=runtime, completion_review=completion, adversary=adversary,
                              max_completion_returns_before_adversary=int(completion),
                              max_completion_returns_after_adversary=0, max_adversary_runs=int(adversary),
-                             log_distiller={"enabled": distiller, "model_path": "/supplied/bundle"})
+                             log_distiller={"enabled": distiller, "model_path": str(Path("supplied/bundle").absolute())})
             with self.subTest(runtime=runtime, completion=completion, adversary=adversary, distiller=distiller):
                 with mock.patch("supervisor.runtime.distiller_bundle.validate_bundle", return_value={}) as check:
                     self.assertEqual(validate(candidate), [])
@@ -256,7 +256,7 @@ class AdvisorValidationTests(unittest.TestCase):
 
     def test_enabled_distiller_requires_bello_python_but_disabled_path_is_dormant(self):
         candidate = config()
-        candidate["log_distiller"]["model_path"] = "/unavailable/bundle"
+        candidate["log_distiller"]["model_path"] = str(Path("unavailable/bundle").absolute())
         with mock.patch.dict(sys.modules, {"supervisor.runtime.distiller_bundle": None}):
             self.assertEqual(validate(candidate), [])
             candidate["log_distiller"]["enabled"] = True
