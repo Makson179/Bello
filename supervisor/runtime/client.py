@@ -1,7 +1,8 @@
 """Provider-neutral controller boundary with Bello-owned session/tool scope.
 
 The thread/turn/item names are an internal compatibility contract for Bello's
-existing safety logic. This client never starts Codex app-server.
+existing safety logic. Subscription Codex uses its native app-server; Claude
+Code uses its SDK and other providers retain Pi.
 """
 
 from __future__ import annotations
@@ -20,12 +21,12 @@ from supervisor.approvals import ApprovalManager, normalize_approval_request
 from supervisor.runtime.cleanup import finish_cleanup
 from supervisor.runtime.journal import RuntimeJournal
 from supervisor.runtime.models import parse_model_selection
-from supervisor.runtime.tools import TOOL_DEFINITIONS, ToolHost, ToolScope, tool_result
+from supervisor.runtime.tools import ToolHost, ToolScope, tool_result, tool_definitions
 from supervisor.runtime.transport import WorkerTransport
 
 
 class RuntimeClient(AppServerClient):
-    """Reuse the established typed convenience methods, not the old executor."""
+    """Route the established controller contract to an explicit provider engine."""
 
     def __init__(self, *, cwd: Path, notification_handler=None, server_request_handler=None,
                  transport_error_handler=None, state_dir: Path | None = None, backends: dict | None = None,
@@ -47,10 +48,61 @@ class RuntimeClient(AppServerClient):
         self.required_models = required_models
         self._engine_lock = asyncio.Lock()
         self._stop_task: asyncio.Task | None = None
+        self.runtime_enabled = True
+        self._distiller = None
+        self._distiller_path: Path | None = None
+        self._distiller_auto = False
+
+    def configure_run(self, *, runtime_enabled: bool = True, log_distiller=None) -> None:
+        """Controller-owned policy. Never configurable by a provider tool call."""
+        if not isinstance(runtime_enabled, bool):
+            raise ValueError("runtime_enabled must be a boolean")
+        config = log_distiller.to_json_data() if hasattr(log_distiller, "to_json_data") else (log_distiller or {})
+        enabled = config.get("enabled", False)
+        path = None
+        automatic = enabled and not config.get("model_path")
+        if enabled:
+            value = config.get("model_path")
+            if automatic:
+                from supervisor.runtime.distiller import require_dependencies
+                from supervisor.runtime.distiller_download import default_bundle_path
+                require_dependencies()
+                path = default_bundle_path().resolve()
+            else:
+                path = Path(value).expanduser()
+                path = (self.cwd / path).resolve() if not path.is_absolute() else path.resolve()
+        if self._started and (runtime_enabled != self.runtime_enabled or path != self._distiller_path):
+            raise AppServerError("run policy changes require stopping the runtime first")
+        if path is not None and (path != self._distiller_path or self._distiller is None):
+            from supervisor.runtime.distiller import LogDistiller, require_dependencies, validate_bundle
+            try:
+                if not automatic:
+                    validate_bundle(path)
+            except (OSError, ValueError) as exc:
+                raise AppServerError(f"Cannot use log-distiller bundle {path}: {exc}") from exc
+            require_dependencies()
+            self._distiller = LogDistiller(path)
+        elif path is None:
+            self._distiller = None
+        self.runtime_enabled, self._distiller_path = runtime_enabled, path
+        self._distiller_auto = automatic
 
     async def start(self, **_kwargs) -> None:
         if self._started:
             return
+        if self._distiller_auto:
+            from supervisor.runtime.distiller_download import ensure_default_bundle
+            try:
+                await asyncio.to_thread(ensure_default_bundle)
+            except Exception as exc:
+                raise AppServerError(
+                    "Cannot prepare the published log-distiller model. Check the network/cache "
+                    "or supply a local bundle with --distiller-model. " + str(exc)
+                ) from exc
+        if self._distiller_path is not None and self._distiller is None:
+            self.configure_run(runtime_enabled=self.runtime_enabled,
+                               log_distiller={"enabled": True, "model_path": (
+                                   None if self._distiller_auto else str(self._distiller_path))})
         self._closing = False
         self._stop_task = None
         self._journal = RuntimeJournal(self.state_dir)
@@ -60,13 +112,14 @@ class RuntimeClient(AppServerClient):
                 record["interruptedTurnId"] = record.pop("activeTurnId")
         for thread_id in self._threads:
             self._save(thread_id)
-        self._host = ToolHost(self._journal, self._scope_for, self._approve, self._emit, self._delegate)
+        self._host = ToolHost(self._journal, self._scope_for, self._approve, self._emit, self._delegate,
+                              distill=self._distiller.distill if self._distiller else None)
         self._started = True
 
     async def initialize(self, *, timeout: float = 30) -> dict[str, Any]:
         if not self._started:
             await self.start()
-        return {"runtime": "bello", "protocolVersion": 1, "engines": ["pi", "claude-code"]}
+        return {"runtime": "bello", "protocolVersion": 1, "engines": ["codex", "pi", "claude-code"]}
 
     async def _engine(self, name: str):
         async with self._engine_lock:
@@ -87,6 +140,14 @@ class RuntimeClient(AppServerClient):
             except BaseException:
                 await backend.stop()
                 raise
+        elif name == "codex":
+            from supervisor.runtime.codex import CodexBackend
+            backend = CodexBackend(state_dir=self.state_dir / "codex",
+                                   emit=lambda raw: self._emit(raw, engine="codex"),
+                                   tool_handler=self._call_tool,
+                                   on_error=lambda error: self._engine_failed("codex", error),
+                                   distiller=self._distiller)
+            await backend.request("initialize", {})
         elif name == "claude-code":
             from supervisor.runtime.claude import ClaudeBackend
             backend = ClaudeBackend(state_dir=self.state_dir / "claude",
@@ -138,12 +199,20 @@ class RuntimeClient(AppServerClient):
             raise AppServerError("tool request belongs to an inactive or stale turn")
         return ToolScope(root=Path(record["cwd"]), mode=record["sandbox"],
                          readable_roots=tuple(Path(p) for p in record.get("runtimeWorkspaceRoots", [])),
-                         approval_policy=record.get("approvalPolicy", "on-request"), network_access=False)
+                         approval_policy=record.get("approvalPolicy", "on-request"),
+                         network_access=record.get("networkAccess", False),
+                         distiller_enabled=record.get("distillerEnabled", False),
+                         runtime_enabled=self.runtime_enabled,
+                         task_path=Path(record["runtimeTaskPath"]) if record.get("runtimeTaskPath") else None)
 
     async def request(self, method: str, params: dict[str, Any] | None = None, *, timeout: float = 30) -> dict[str, Any]:
         if not self._started:
             await self.start()
         params = deepcopy(params or {})
+        # Sandbox networking is a run-level host policy, independent of the
+        # provider's legacy offline defaults. Filesystem roots stay unchanged.
+        if "sandboxPolicy" in params and not self.runtime_enabled:
+            params["sandboxPolicy"]["networkAccess"] = True
         if method == "initialize":
             return await self.initialize(timeout=timeout)
         if method == "model/validate":
@@ -155,16 +224,23 @@ class RuntimeClient(AppServerClient):
             requested_engines = params.pop("engines", None)
             optional = params.pop("optionalEngines", False)
             if requested_engines is not None and (not isinstance(requested_engines, list)
-                    or not requested_engines or any(name not in {"pi", "claude-code"} for name in requested_engines)):
-                raise AppServerError("engines must contain pi and/or claude-code")
+                    or not requested_engines or any(name not in {"codex", "pi", "claude-code"} for name in requested_engines)):
+                raise AppServerError("engines must contain codex, pi and/or claude-code")
             engines = set(requested_engines) if requested_engines else {
-                parse_model_selection(model).engine for model in self.required_models} or {"pi"}
+                parse_model_selection(model).engine for model in self.required_models} or {"codex"}
             responses = []
             unavailable = {}
             for name in sorted(engines):
                 try:
                     backend = await self._engine(name)
-                    responses.append(await backend.request(method, params, timeout=timeout))
+                    response = await backend.request(method, params, timeout=timeout)
+                    if name == "pi" and method == "model/list":
+                        # Pi can advertise its own Codex OAuth provider, but that
+                        # route is no longer executable through Bello's Pi engine.
+                        response["data"] = [item for item in response.get("data", [])
+                            if item.get("provider") != "openai-codex"
+                            and not str(item.get("qualifiedId", item.get("id", ""))).startswith("openai-codex/")]
+                    responses.append(response)
                 except Exception as exc:
                     if not optional:
                         raise
@@ -177,8 +253,12 @@ class RuntimeClient(AppServerClient):
                 return {"data": data, **({"unavailableEngines": unavailable} if unavailable else {})}
             return {"accounts": responses, **({"unavailableEngines": unavailable} if unavailable else {})}
         if method == "account/rateLimits/read":
+            if "codex" in self._engines or any(parse_model_selection(model).engine == "codex" for model in self.required_models):
+                return await (await self._engine("codex")).request(method, params, timeout=timeout)
             return {"available": False, "reason": "Provider-specific quota data is not exposed by this runtime"}
         if method == "configRequirements/read":
+            if "codex" in self._engines or any(parse_model_selection(model).engine == "codex" for model in self.required_models):
+                return await (await self._engine("codex")).request(method, params, timeout=timeout)
             return {"requirements": {"managedTools": True, "protocolVersion": 1}}
         if method == "thread/list":
             return {"data": [self._public_thread(key) for key, value in self._threads.items() if not value.get("closed")]}
@@ -186,6 +266,21 @@ class RuntimeClient(AppServerClient):
             return await self._start_thread(params, timeout)
         thread_id = params.get("threadId")
         record = self._record(thread_id)
+        if method in {"thread/resume", "turn/start"}:
+            if parse_model_selection(record["qualifiedModel"]).engine != record["engine"]:
+                raise AppServerError("Saved thread used the previous Pi subscription route; start a fresh run. "
+                                     "Bello cannot migrate its conversation into native Codex silently.")
+            role = record.get("belloRole", record.get("config", {}).get("agents", {}).get("role"))
+            expected_distiller = self._distiller is not None and role == "coder"
+            if (record.get("networkAccess", False) != (not self.runtime_enabled)
+                    or record.get("distillerEnabled", False) != expected_distiller
+                    or (params.get("belloRole") is not None and params["belloRole"] != role)):
+                raise AppServerError(
+                    "Saved thread uses a different runtime/distiller tool policy; start a fresh run "
+                    "instead of resuming it with changed switches."
+                )
+        if not self.runtime_enabled:
+            params["approvalPolicy"] = "never"
         engine = await self._engine(record["engine"])
         if method == "turn/start":
             if record.get("closed") or record.get("activeTurnId"):
@@ -264,10 +359,15 @@ class RuntimeClient(AppServerClient):
             self._validate_scope_overrides(record, params)
             if record.get("activeTurnId"):
                 raise AppServerError("cannot resume a thread while its turn is active")
-            params.update({"tools": record["tools"], "provider": record["provider"], "model": record["model"]})
+            params.update({"tools": record["tools"], "provider": record["provider"], "model": record["model"],
+                           "developerInstructions": record.get("developerInstructions", "")})
         response = await engine.request(method, params, timeout=timeout)
         if method == "thread/resume":
             record["closed"] = False
+            # Older saved threads predate the host-only task exclusion metadata.
+            # Adopting the pinned task does not grant new filesystem authority.
+            if not record.get("runtimeTaskPath") and params.get("runtimeTaskPath"):
+                record["runtimeTaskPath"] = str(Path(params["runtimeTaskPath"]).resolve())
             self._save(thread_id)
         if method in {"thread/read", "thread/resume"} and isinstance(response.get("thread"), dict):
             response["thread"].update(self._public_thread(thread_id))
@@ -288,7 +388,25 @@ class RuntimeClient(AppServerClient):
             raise AppServerError("duplicate thread id")
         agents = params.get("config", {}).get("agents", {})
         enabled = bool(agents.get("enabled", False))
-        tools = [entry for entry in TOOL_DEFINITIONS if enabled or entry["name"] not in
+        coder = params.get("belloRole", agents.get("role")) == "coder"
+        distill = self._distiller is not None and coder
+        params["networkAccess"] = not self.runtime_enabled
+        params["distillerEnabled"] = distill
+        if not self.runtime_enabled:
+            params["approvalPolicy"] = "never"
+        if distill:
+            from supervisor.runtime.codex_distiller import FOCUS_GUIDANCE
+            if selection.engine == "codex":
+                focus_instruction = FOCUS_GUIDANCE
+            else:
+                focus_instruction = "Add a very short focus to each text tool call."
+            previous = params.get("developerInstructions") or ""
+            # A cross-provider child inherits the parent instructions. Replace
+            # only our exact generated focus line, never stack both variants.
+            previous = "\n".join(line for line in previous.splitlines()
+                                 if line not in {FOCUS_GUIDANCE, "Add a very short focus to each text tool call."})
+            params["developerInstructions"] = (previous + "\n" + focus_instruction).strip()
+        tools = [entry for entry in tool_definitions(distiller=distill, runtime_enabled=self.runtime_enabled) if enabled or entry["name"] not in
                  {"spawn_agent", "send_message", "wait_agent", "close_agent"}]
         record = {**params, "cwd": str(root), "sandbox": mode, "engine": selection.engine,
                   "qualifiedModel": selection.qualified, "provider": selection.provider,
@@ -308,8 +426,8 @@ class RuntimeClient(AppServerClient):
                 record["effort"] = resolved_effort
                 self._save(thread_id)
             response["thread"].update(self._public_thread(thread_id))
-            sandbox = ({"type": "workspaceWrite", "networkAccess": False, "writableRoots": [str(root)]}
-                       if mode == "workspace-write" else {"type": "readOnly", "networkAccess": False}
+            sandbox = ({"type": "workspaceWrite", "networkAccess": record["networkAccess"], "writableRoots": [str(root)]}
+                       if mode == "workspace-write" else {"type": "readOnly", "networkAccess": record["networkAccess"]}
                        if mode == "read-only" else {"type": "dangerFullAccess"})
             await self._emit({"method": "thread/started", "params": {"threadId": thread_id, "thread": self._public_thread(thread_id)}})
             return {**response, "approvalPolicy": record.get("approvalPolicy", "on-request"), "sandbox": sandbox}
@@ -332,8 +450,13 @@ class RuntimeClient(AppServerClient):
             raise AppServerError("a resumed thread cannot change its sandbox")
         policy = params.get("sandboxPolicy", {})
         modes = {"readOnly": "read-only", "workspaceWrite": "workspace-write", "dangerFullAccess": "danger-full-access"}
-        if policy and (modes.get(policy.get("type")) != record["sandbox"] or policy.get("networkAccess", False)):
+        if policy and (modes.get(policy.get("type")) != record["sandbox"]
+                       or policy.get("networkAccess", False) != record.get("networkAccess", False)):
             raise AppServerError("a turn cannot weaken the thread's sandbox policy")
+        if "networkAccess" in params and params["networkAccess"] != record.get("networkAccess", False):
+            raise AppServerError("a resumed thread cannot change network authority")
+        if "belloRole" in params and params["belloRole"] != record.get("belloRole"):
+            raise AppServerError("a resumed thread cannot change its role")
         if policy.get("writableRoots") is not None and {str(Path(p).resolve()) for p in policy["writableRoots"]} != {record["cwd"]}:
             raise AppServerError("a turn cannot add writable roots")
         roots = params.get("runtimeWorkspaceRoots")
@@ -417,6 +540,10 @@ class RuntimeClient(AppServerClient):
         future = self._approval_waiters.get(request_id)
         if future and not future.done():
             future.set_result(result if error is None and isinstance(result, dict) else {"decision": "decline"})
+            return
+        native = self._engines.get("codex")
+        if native is not None and isinstance(request_id, str) and request_id.startswith("codex:"):
+            await native.respond(request_id, result, error=error, timeout=timeout)
 
     async def _delegate(self, name: str, args: dict[str, Any], parent: str, turn_id: str) -> dict[str, Any]:
         self._scope_for(parent, turn_id)
@@ -445,7 +572,7 @@ class RuntimeClient(AppServerClient):
                 if len(children) >= agents.get("max_concurrent_threads_per_session", 1):
                     raise AppServerError("subagent concurrency limit reached; wait for an active child first")
                 child_params = {key: deepcopy(record[key]) for key in (
-                    "cwd", "sandbox", "approvalPolicy", "runtimeWorkspaceRoots", "serviceTier"
+                    "cwd", "sandbox", "approvalPolicy", "runtimeWorkspaceRoots", "runtimeTaskPath", "serviceTier", "belloRole"
                 ) if key in record}
                 child_params.update(model=selected.qualified, effort=args["effort"], parentThreadId=parent,
                                     rootThreadId=family, depth=depth + 1,
@@ -531,7 +658,11 @@ class RuntimeClient(AppServerClient):
         if self._host:
             engines.append("tool host")
             cleanup.append(self._host.close())
+        if self._distiller:
+            engines.append("log distiller")
+            cleanup.append(self._distiller.close())
         results = await asyncio.gather(*cleanup, return_exceptions=True)
+        self._distiller = None
         self._engines.clear()
         if self._journal:
             self._journal.close()

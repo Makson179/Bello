@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import platform
 import shutil
 import struct
@@ -106,13 +107,18 @@ def _runtime_dependency_results() -> list[DoctorResult]:
     from supervisor.runtime.install import node_executable, worker_command
 
     results: list[DoctorResult] = []
+    codex = _doctor_executable(os.environ.get("BELLO_CODEX_BINARY", "codex"))
+    results.append(DoctorResult("ok", f"Native Codex app-server executable found: {codex}") if codex else
+                   DoctorResult("warn", "Native Codex executable not found",
+                                "Required only for openai-codex subscription roles. Install Codex and run `bello runtime login openai-codex`."))
     try:
         node = node_executable()
         results.append(DoctorResult("ok", f"Node.js supported: {node}"))
         worker_command()
         results.append(DoctorResult("ok", "Pinned Pi runtime installed"))
     except Exception as exc:
-        results.append(DoctorResult("fail", "Pi runtime dependency check failed", str(exc)))
+        results.append(DoctorResult("warn", "Pi runtime dependency check failed",
+                                    f"{exc}. Required only for Pi providers; native Codex does not need Pi."))
     results.append(_sandbox_dependency_result())
     try:
         claude = ClaudeBackend._bundled_cli_path()

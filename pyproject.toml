@@ -37,6 +37,12 @@ Repository = "https://github.com/Makson179/Bello"
 Issues = "https://github.com/Makson179/Bello/issues"
 
 [project.optional-dependencies]
+log-distiller = [
+  "torch>=2.6,<3",
+  "transformers>=4.49,<5",
+  "safetensors>=0.5,<1",
+  "huggingface-hub>=0.28,<1",
+]
 claude = [
   "claude-agent-sdk==0.2.152",
 ]

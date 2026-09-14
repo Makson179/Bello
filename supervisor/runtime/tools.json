@@ -17,6 +17,7 @@
           "maximum": 3600
         },
         "yield_time_ms": {"type": "integer", "minimum": 0, "maximum": 30000},
+        "max_output_tokens": {"type": "integer", "minimum": 0, "description": "Approximate returned-text budget; default and host ceiling 10000 tokens. Keeps beginning and end when truncated."},
         "sandbox_permissions": {
           "type": "string",
           "enum": ["use_default", "require_escalated"]
@@ -38,7 +39,8 @@
       "type": "object",
       "properties": {
         "session_id": {"type": "string"},
-        "yield_time_ms": {"type": "integer", "minimum": 0, "maximum": 30000}
+        "yield_time_ms": {"type": "integer", "minimum": 0, "maximum": 30000},
+        "max_output_tokens": {"type": "integer", "minimum": 0, "description": "Approximate returned-text budget; default and host ceiling 10000 tokens."}
       },
       "required": ["session_id"],
       "additionalProperties": false

@@ -1,0 +1,885 @@
+Bello native command-output selection for OpenAI Codex rust-v0.153.4.
+
+Modifications: optional short focus, local output selection after native execution,
+315-second selection transport, direct and code-mode output integration, and tests.
+Upstream: https://github.com/openai/codex/tree/rust-v0.153.4
+OpenAI Codex, Copyright 2025 OpenAI.
+This patch contains Apache-2.0-licensed Codex context and modifications.
+Retain upstream LICENSE and NOTICE when distributing patched Codex.
+The rest of Bello retains its own license.
+
+Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+1.  Definitions.
+
+    "License" shall mean the terms and conditions for use, reproduction,
+    and distribution as defined by Sections 1 through 9 of this document.
+
+    "Licensor" shall mean the copyright owner or entity authorized by
+    the copyright owner that is granting the License.
+
+    "Legal Entity" shall mean the union of the acting entity and all
+    other entities that control, are controlled by, or are under common
+    control with that entity. For the purposes of this definition,
+    "control" means (i) the power, direct or indirect, to cause the
+    direction or management of such entity, whether by contract or
+    otherwise, or (ii) ownership of fifty percent (50%) or more of the
+    outstanding shares, or (iii) beneficial ownership of such entity.
+
+    "You" (or "Your") shall mean an individual or Legal Entity
+    exercising permissions granted by this License.
+
+    "Source" form shall mean the preferred form for making modifications,
+    including but not limited to software source code, documentation
+    source, and configuration files.
+
+    "Object" form shall mean any form resulting from mechanical
+    transformation or translation of a Source form, including but
+    not limited to compiled object code, generated documentation,
+    and conversions to other media types.
+
+    "Work" shall mean the work of authorship, whether in Source or
+    Object form, made available under the License, as indicated by a
+    copyright notice that is included in or attached to the work
+    (an example is provided in the Appendix below).
+
+    "Derivative Works" shall mean any work, whether in Source or Object
+    form, that is based on (or derived from) the Work and for which the
+    editorial revisions, annotations, elaborations, or other modifications
+    represent, as a whole, an original work of authorship. For the purposes
+    of this License, Derivative Works shall not include works that remain
+    separable from, or merely link (or bind by name) to the interfaces of,
+    the Work and Derivative Works thereof.
+
+    "Contribution" shall mean any work of authorship, including
+    the original version of the Work and any modifications or additions
+    to that Work or Derivative Works thereof, that is intentionally
+    submitted to Licensor for inclusion in the Work by the copyright owner
+    or by an individual or Legal Entity authorized to submit on behalf of
+    the copyright owner. For the purposes of this definition, "submitted"
+    means any form of electronic, verbal, or written communication sent
+    to the Licensor or its representatives, including but not limited to
+    communication on electronic mailing lists, source code control systems,
+    and issue tracking systems that are managed by, or on behalf of, the
+    Licensor for the purpose of discussing and improving the Work, but
+    excluding communication that is conspicuously marked or otherwise
+    designated in writing by the copyright owner as "Not a Contribution."
+
+    "Contributor" shall mean Licensor and any individual or Legal Entity
+    on behalf of whom a Contribution has been received by Licensor and
+    subsequently incorporated within the Work.
+
+2.  Grant of Copyright License. Subject to the terms and conditions of
+    this License, each Contributor hereby grants to You a perpetual,
+    worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+    copyright license to reproduce, prepare Derivative Works of,
+    publicly display, publicly perform, sublicense, and distribute the
+    Work and such Derivative Works in Source or Object form.
+
+3.  Grant of Patent License. Subject to the terms and conditions of
+    this License, each Contributor hereby grants to You a perpetual,
+    worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+    (except as stated in this section) patent license to make, have made,
+    use, offer to sell, sell, import, and otherwise transfer the Work,
+    where such license applies only to those patent claims licensable
+    by such Contributor that are necessarily infringed by their
+    Contribution(s) alone or by combination of their Contribution(s)
+    with the Work to which such Contribution(s) was submitted. If You
+    institute patent litigation against any entity (including a
+    cross-claim or counterclaim in a lawsuit) alleging that the Work
+    or a Contribution incorporated within the Work constitutes direct
+    or contributory patent infringement, then any patent licenses
+    granted to You under this License for that Work shall terminate
+    as of the date such litigation is filed.
+
+4.  Redistribution. You may reproduce and distribute copies of the
+    Work or Derivative Works thereof in any medium, with or without
+    modifications, and in Source or Object form, provided that You
+    meet the following conditions:
+
+    (a) You must give any other recipients of the Work or
+    Derivative Works a copy of this License; and
+
+    (b) You must cause any modified files to carry prominent notices
+    stating that You changed the files; and
+
+    (c) You must retain, in the Source form of any Derivative Works
+    that You distribute, all copyright, patent, trademark, and
+    attribution notices from the Source form of the Work,
+    excluding those notices that do not pertain to any part of
+    the Derivative Works; and
+
+    (d) If the Work includes a "NOTICE" text file as part of its
+    distribution, then any Derivative Works that You distribute must
+    include a readable copy of the attribution notices contained
+    within such NOTICE file, excluding those notices that do not
+    pertain to any part of the Derivative Works, in at least one
+    of the following places: within a NOTICE text file distributed
+    as part of the Derivative Works; within the Source form or
+    documentation, if provided along with the Derivative Works; or,
+    within a display generated by the Derivative Works, if and
+    wherever such third-party notices normally appear. The contents
+    of the NOTICE file are for informational purposes only and
+    do not modify the License. You may add Your own attribution
+    notices within Derivative Works that You distribute, alongside
+    or as an addendum to the NOTICE text from the Work, provided
+    that such additional attribution notices cannot be construed
+    as modifying the License.
+
+    You may add Your own copyright statement to Your modifications and
+    may provide additional or different license terms and conditions
+    for use, reproduction, or distribution of Your modifications, or
+    for any such Derivative Works as a whole, provided Your use,
+    reproduction, and distribution of the Work otherwise complies with
+    the conditions stated in this License.
+
+5.  Submission of Contributions. Unless You explicitly state otherwise,
+    any Contribution intentionally submitted for inclusion in the Work
+    by You to the Licensor shall be under the terms and conditions of
+    this License, without any additional terms or conditions.
+    Notwithstanding the above, nothing herein shall supersede or modify
+    the terms of any separate license agreement you may have executed
+    with Licensor regarding such Contributions.
+
+6.  Trademarks. This License does not grant permission to use the trade
+    names, trademarks, service marks, or product names of the Licensor,
+    except as required for reasonable and customary use in describing the
+    origin of the Work and reproducing the content of the NOTICE file.
+
+7.  Disclaimer of Warranty. Unless required by applicable law or
+    agreed to in writing, Licensor provides the Work (and each
+    Contributor provides its Contributions) on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+    implied, including, without limitation, any warranties or conditions
+    of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+    PARTICULAR PURPOSE. You are solely responsible for determining the
+    appropriateness of using or redistributing the Work and assume any
+    risks associated with Your exercise of permissions under this License.
+
+8.  Limitation of Liability. In no event and under no legal theory,
+    whether in tort (including negligence), contract, or otherwise,
+    unless required by applicable law (such as deliberate and grossly
+    negligent acts) or agreed to in writing, shall any Contributor be
+    liable to You for damages, including any direct, indirect, special,
+    incidental, or consequential damages of any character arising as a
+    result of this License or out of the use or inability to use the
+    Work (including but not limited to damages for loss of goodwill,
+    work stoppage, computer failure or malfunction, or any and all
+    other commercial damages or losses), even if such Contributor
+    has been advised of the possibility of such damages.
+
+9.  Accepting Warranty or Additional Liability. While redistributing
+    the Work or Derivative Works thereof, You may choose to offer,
+    and charge a fee for, acceptance of support, warranty, indemnity,
+    or other liability obligations and/or rights consistent with this
+    License. However, in accepting such obligations, You may act only
+    on Your own behalf and on Your sole responsibility, not on behalf
+    of any other Contributor, and only if You agree to indemnify,
+    defend, and hold each Contributor harmless for any liability
+    incurred by, or claims asserted against, such Contributor by reason
+    of your accepting any such warranty or additional liability.
+
+END OF TERMS AND CONDITIONS
+
+APPENDIX: How to apply the Apache License to your work.
+
+      To apply the Apache License to your work, attach the following
+      boilerplate notice, with the fields enclosed by brackets "[]"
+      replaced with your own identifying information. (Don't include
+      the brackets!)  The text should be enclosed in the appropriate
+      comment syntax for the file format. We also recommend that a
+      file or class name and description of purpose be included on the
+      same "printed page" as the copyright notice for easier
+      identification within third-party archives.
+
+Copyright 2025 OpenAI
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+diff --git a/codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs b/codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs
+index 8b97ff0..bc2a433 100644
+--- a/codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs
++++ b/codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs
+@@ -63,6 +63,7 @@ pub(crate) struct ExecCommandHandlerOptions {
+     pub(crate) include_environment_id: bool,
+     pub(crate) include_shell_parameter: bool,
+     pub(crate) include_windows_shell_guidance: bool,
++    pub(crate) bello_native_selection: bool,
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -86,6 +87,7 @@ impl Default for ExecCommandHandler {
+                 include_environment_id: false,
+                 include_shell_parameter: true,
+                 include_windows_shell_guidance: cfg!(windows),
++                bello_native_selection: false,
+             },
+         }
+     }
+@@ -122,6 +124,7 @@ impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
+             self.options.include_shell_parameter,
+             self.options.include_windows_shell_guidance,
+         );
++        let spec = crate::tools::native_selection::focused_spec(spec, self.options.bello_native_selection);
+         match self.lifetime {
+             ExecCommandLifetime::Interactive => spec,
+             ExecCommandLifetime::OneShot => one_shot_exec_command_spec(spec),
+diff --git a/codex-rs/core/src/tools/handlers/unified_exec/write_stdin.rs b/codex-rs/core/src/tools/handlers/unified_exec/write_stdin.rs
+index 657da46..6bbfd8a 100644
+--- a/codex-rs/core/src/tools/handlers/unified_exec/write_stdin.rs
++++ b/codex-rs/core/src/tools/handlers/unified_exec/write_stdin.rs
+@@ -31,7 +31,10 @@ struct WriteStdinArgs {
+     max_output_tokens: Option<usize>,
+ }
+ 
+-pub struct WriteStdinHandler;
++#[derive(Default)]
++pub struct WriteStdinHandler {
++    pub(crate) bello_native_selection: bool,
++}
+ 
+ impl ToolExecutor<ToolInvocation> for WriteStdinHandler {
+     fn tool_name(&self) -> ToolName {
+@@ -39,7 +42,7 @@ impl ToolExecutor<ToolInvocation> for WriteStdinHandler {
+     }
+ 
+     fn spec(&self) -> ToolSpec {
+-        create_write_stdin_tool()
++        crate::tools::native_selection::focused_spec(create_write_stdin_tool(), self.bello_native_selection)
+     }
+ 
+     fn supports_parallel_tool_calls(&self) -> bool {
+diff --git a/codex-rs/core/src/tools/handlers/unified_exec_tests.rs b/codex-rs/core/src/tools/handlers/unified_exec_tests.rs
+index f75b57d..ed1a143 100644
+--- a/codex-rs/core/src/tools/handlers/unified_exec_tests.rs
++++ b/codex-rs/core/src/tools/handlers/unified_exec_tests.rs
+@@ -408,7 +408,7 @@ async fn exec_command_pre_tool_use_payload_skips_write_stdin() {
+     };
+     let (session, turn) = make_session_and_context().await;
+     let turn = Arc::new(turn);
+-    let handler = WriteStdinHandler;
++    let handler = WriteStdinHandler::default();
+ 
+     assert_eq!(
+         handler.pre_tool_use_payload(&ToolInvocation {
+@@ -535,7 +535,7 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
+         hook_command: Some("sleep 1; echo finished".to_string()),
+     };
+     let invocation = invocation_for_payload("write_stdin", "write-stdin-call", payload).await;
+-    let handler = WriteStdinHandler;
++    let handler = WriteStdinHandler::default();
+ 
+     assert_eq!(
+         handler.post_tool_use_payload(&invocation, &output),
+@@ -581,7 +581,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
+     };
+     let invocation_b = invocation_for_payload("write_stdin", "write-call-b", payload.clone()).await;
+     let invocation_a = invocation_for_payload("write_stdin", "write-call-a", payload).await;
+-    let handler = WriteStdinHandler;
++    let handler = WriteStdinHandler::default();
+ 
+     let payloads = [
+         handler.post_tool_use_payload(&invocation_b, &output_b),
+diff --git a/codex-rs/core/src/tools/mod.rs b/codex-rs/core/src/tools/mod.rs
+index ff1b6d0..81b3785 100644
+--- a/codex-rs/core/src/tools/mod.rs
++++ b/codex-rs/core/src/tools/mod.rs
+@@ -5,6 +5,7 @@ mod control_tool_analytics;
+ pub(crate) mod events;
+ mod executed_tool_calls;
+ pub(crate) mod handlers;
++mod native_selection;
+ pub(crate) mod hook_names;
+ pub(crate) mod hosted_spec;
+ pub(crate) mod lifecycle;
+diff --git a/codex-rs/core/src/tools/native_selection.rs b/codex-rs/core/src/tools/native_selection.rs
+new file mode 100644
+index 0000000..2582a8d
+--- /dev/null
++++ b/codex-rs/core/src/tools/native_selection.rs
+@@ -0,0 +1,219 @@
++//! Experimental local output selection after native execution and policy hooks.
++//! No command execution, approval decisions, history rewriting, or model tools.
++
++use std::path::Path;
++use std::time::Duration;
++
++use codex_protocol::models::FunctionCallOutputBody;
++use codex_protocol::models::FunctionCallOutputContentItem;
++use codex_protocol::models::ResponseInputItem;
++use serde_json::Value;
++use serde_json::json;
++
++use super::context::ToolInvocation;
++use super::context::ToolOutput;
++use super::context::ToolPayload;
++
++pub(crate) fn focused_spec(mut spec: codex_tools::ToolSpec, enabled: bool) -> codex_tools::ToolSpec {
++    if enabled
++        && let codex_tools::ToolSpec::Function(tool) = &mut spec
++        && let Some(properties) = &mut tool.parameters.properties
++    {
++        properties.insert(
++            "focus".to_string(),
++            codex_tools::JsonSchema::string(Some(
++                "Very short purpose of this command or poll; at most 120 characters.".to_string(),
++            )),
++        );
++    }
++    spec
++}
++
++pub(crate) fn enabled(turn: &crate::session::turn_context::TurnContext) -> bool {
++    cfg!(unix)
++        && turn
++            .config
++            .features
++            .enabled(codex_features::Feature::BelloNativeSelection)
++        && !crate::guardian::is_basic_session_source(&turn.session_source)
++}
++
++pub(crate) async fn filter(
++    invocation: &ToolInvocation,
++    original: Box<dyn ToolOutput>,
++) -> Box<dyn ToolOutput> {
++    if !enabled(&invocation.turn) {
++        return original;
++    }
++    let Some(socket) = std::env::var_os("BELLO_SELECTOR_SOCKET") else {
++        return original;
++    };
++    filter_at_socket(
++        &invocation.tool_name,
++        &invocation.payload,
++        original,
++        Path::new(&socket),
++    )
++    .await
++}
++
++async fn filter_at_socket(
++    tool_name: &codex_tools::ToolName,
++    payload: &ToolPayload,
++    original: Box<dyn ToolOutput>,
++    socket: &Path,
++) -> Box<dyn ToolOutput> {
++    if !socket.is_absolute()
++        || !tool_name.is_default_namespace()
++        || !matches!(tool_name.name.as_str(), "exec_command" | "write_stdin")
++    {
++        return original;
++    }
++    let ToolPayload::Function { arguments } = payload else {
++        return original;
++    };
++    let Ok(arguments) = serde_json::from_str::<Value>(arguments) else {
++        return original;
++    };
++    let Some(focus) = arguments
++        .get("focus")
++        .and_then(Value::as_str)
++        .filter(|focus| !focus.trim().is_empty() && focus.chars().count() <= 120)
++    else {
++        return original;
++    };
++    // write_stdin outputs retain the real original command here, including polls
++    // whose process is still running.
++    // Missing association is a pass-through, never an invented empty command.
++    let Some(input) = original.post_tool_use_input(payload) else {
++        return original;
++    };
++    let Some(command) = input.get("command").and_then(Value::as_str) else {
++        return original;
++    };
++    let mut native = original.code_mode_result(payload);
++    let Some(raw) = native.get("output").and_then(Value::as_str) else {
++        return original;
++    };
++    if raw.is_empty() {
++        return original;
++    }
++    let request = json!({"focus": focus, "command": command, "log": raw});
++    let max_response_bytes = raw.len().saturating_mul(6).saturating_add(1024);
++    let Ok(Some(selected)) = tokio::time::timeout(
++        Duration::from_secs(315),
++        exchange(socket, request, max_response_bytes),
++    )
++    .await
++    else {
++        return original;
++    };
++    if selected.len() >= raw.len() {
++        return original;
++    }
++    native["output"] = Value::String(selected.clone());
++    Box::new(SelectedOutput {
++        original,
++        native,
++        selected,
++    })
++}
++
++#[cfg(unix)]
++async fn exchange(socket: &Path, request: Value, max_bytes: usize) -> Option<String> {
++    use tokio::io::AsyncReadExt;
++    use tokio::io::AsyncWriteExt;
++    let mut stream = tokio::net::UnixStream::connect(socket).await.ok()?;
++    let mut encoded = serde_json::to_vec(&request).ok()?;
++    encoded.push(b'\n');
++    stream.write_all(&encoded).await.ok()?;
++    let mut received = Vec::new();
++    let mut buffer = [0_u8; 8192];
++    loop {
++        let count = stream.read(&mut buffer).await.ok()?;
++        if count == 0 || received.len().saturating_add(count) > max_bytes {
++            return None;
++        }
++        received.extend_from_slice(&buffer[..count]);
++        if let Some(end) = received.iter().position(|byte| *byte == b'\n') {
++            if !received[end + 1..].iter().all(u8::is_ascii_whitespace) {
++                return None;
++            }
++            let response: Value = serde_json::from_slice(&received[..end]).ok()?;
++            return response
++                .get("text")
++                .and_then(Value::as_str)
++                .map(str::to_string);
++        }
++    }
++}
++
++#[cfg(not(unix))]
++async fn exchange(_socket: &Path, _request: Value, _max_bytes: usize) -> Option<String> {
++    None
++}
++
++struct SelectedOutput {
++    original: Box<dyn ToolOutput>,
++    native: Value,
++    selected: String,
++}
++
++impl ToolOutput for SelectedOutput {
++    fn log_output(&self) -> String {
++        self.original.log_output()
++    }
++    fn success_for_logging(&self) -> bool {
++        self.original.success_for_logging()
++    }
++    fn fallback_token_limit_override(&self) -> Option<usize> {
++        self.original.fallback_token_limit_override()
++    }
++    fn tool_result_sources(&self) -> Option<codex_protocol::models::ToolResultSources> {
++        self.original.tool_result_sources()
++    }
++    fn contains_external_context(&self) -> bool {
++        self.original.contains_external_context()
++    }
++    fn post_tool_use_id(&self, call_id: &str) -> String {
++        self.original.post_tool_use_id(call_id)
++    }
++    fn post_tool_use_input(&self, payload: &ToolPayload) -> Option<Value> {
++        self.original.post_tool_use_input(payload)
++    }
++    fn post_tool_use_response(&self, call_id: &str, payload: &ToolPayload) -> Option<Value> {
++        self.original.post_tool_use_response(call_id, payload)
++    }
++    fn code_mode_result(&self, _payload: &ToolPayload) -> Value {
++        self.native.clone()
++    }
++    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
++        let mut response = self.original.to_response_item(call_id, payload);
++        let replace = |text: &mut String| {
++            // Native unified-exec formatting owns this separator. Preserve its
++            // metadata prefix byte-for-byte and never enlarge its direct cap.
++            if let Some((prefix, output)) = text.split_once("\nOutput:\n")
++                && self.selected.len() < output.len()
++            {
++                *text = format!("{prefix}\nOutput:\n{}", self.selected);
++            }
++        };
++        if let ResponseInputItem::FunctionCallOutput { output, .. } = &mut response {
++            match &mut output.body {
++                FunctionCallOutputBody::Text(text) => replace(text),
++                FunctionCallOutputBody::ContentItems(items) => {
++                    for item in items {
++                        if let FunctionCallOutputContentItem::InputText { text } = item {
++                            replace(text);
++                        }
++                    }
++                }
++            }
++        }
++        response
++    }
++}
++
++#[cfg(test)]
++#[path = "native_selection_tests.rs"]
++mod tests;
+diff --git a/codex-rs/core/src/tools/native_selection_tests.rs b/codex-rs/core/src/tools/native_selection_tests.rs
+new file mode 100644
+index 0000000..0114865
+--- /dev/null
++++ b/codex-rs/core/src/tools/native_selection_tests.rs
+@@ -0,0 +1,197 @@
++use super::*;
++use crate::tools::context::ExecCommandToolOutput;
++use codex_tools::ToolName;
++use codex_utils_output_truncation::TruncationPolicy;
++use pretty_assertions::assert_eq;
++
++#[test]
++fn native_selection_focus_only_changes_optional_input_property() {
++    use crate::tools::handlers::shell_spec::CommandToolOptions;
++    use crate::tools::handlers::shell_spec::create_exec_command_tool;
++    use crate::tools::handlers::shell_spec::create_write_stdin_tool;
++    for original in [
++        create_exec_command_tool(CommandToolOptions {
++            allow_login_shell: true,
++            exec_permission_approvals_enabled: true,
++        }),
++        create_write_stdin_tool(),
++    ] {
++        assert_eq!(focused_spec(original.clone(), false), original);
++        let mut selected = focused_spec(original.clone(), true);
++        let codex_tools::ToolSpec::Function(function) = &mut selected else {
++            panic!("expected native command function");
++        };
++        let focus = function.parameters.properties.as_mut().unwrap().remove("focus");
++        assert!(focus.is_some());
++        assert_eq!(selected, original);
++    }
++}
++
++fn output(process_id: Option<i32>) -> Box<dyn ToolOutput> {
++    Box::new(ExecCommandToolOutput {
++        event_call_id: "native-call".to_string(),
++        chunk_id: "chunk-123".to_string(),
++        wall_time: Duration::from_millis(250),
++        raw_output: b"noise noise noise\nERROR retained\n".to_vec(),
++        truncation_policy: TruncationPolicy::Tokens(10000),
++        max_output_tokens: Some(10000),
++        process_id,
++        exit_code: process_id.is_none().then_some(7),
++        original_token_count: Some(9),
++        output_omitted_bytes: None,
++        hook_command: Some("actual original command".to_string()),
++    })
++}
++
++#[tokio::test]
++#[cfg(unix)]
++async fn native_selection_preserves_metadata_and_poll_command() {
++    use tokio::io::AsyncBufReadExt;
++    use tokio::io::AsyncWriteExt;
++    for (name, process_id) in [
++        ("exec_command", None),
++        ("write_stdin", None),
++        ("exec_command", Some(123)),
++        ("write_stdin", Some(123)),
++    ] {
++        let directory = tempfile::tempdir().unwrap();
++        let socket = directory.path().join("selector.sock");
++        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
++        let peer = tokio::spawn(async move {
++            let (mut connection, _) = listener.accept().await.unwrap();
++            let mut request = String::new();
++            tokio::io::BufReader::new(&mut connection)
++                .read_line(&mut request)
++                .await
++                .unwrap();
++            assert_eq!(
++                serde_json::from_str::<Value>(&request).unwrap(),
++                json!({
++                "focus": "inspect test failure", "command": "actual original command",
++                "log": "noise noise noise\nERROR retained\n"})
++            );
++            connection
++                .write_all(b"{\"text\":\"ERROR retained\\n\"}\n")
++                .await
++                .unwrap();
++        });
++        let payload = ToolPayload::Function {
++            arguments: json!({"focus":"inspect test failure"}).to_string(),
++        };
++        let original = output(process_id);
++        let mut expected = original.code_mode_result(&payload);
++        expected["output"] = json!("ERROR retained\n");
++        let selected = filter_at_socket(&ToolName::plain(name), &payload, original, &socket).await;
++        assert_eq!(selected.code_mode_result(&payload), expected);
++        let native = output(process_id).to_response_item("call", &payload);
++        let mut expected_direct = native.clone();
++        if let ResponseInputItem::FunctionCallOutput { output, .. } = &mut expected_direct
++            && let FunctionCallOutputBody::Text(text) = &mut output.body
++        {
++            *text = text.replace("noise noise noise\nERROR retained\n", "ERROR retained\n");
++        } else {
++            panic!("native single-text output must use a text body");
++        }
++        assert_eq!(selected.to_response_item("call", &payload), expected_direct);
++        peer.await.unwrap();
++    }
++}
++
++#[tokio::test]
++async fn absent_backend_and_missing_focus_preserve_original() {
++    for (focus, process_id) in [
++        (Some("inspect output"), Some(123)),
++        (None, None),
++        (Some("inspect output"), None),
++    ] {
++        let payload = ToolPayload::Function {
++            arguments: json!({"focus": focus}).to_string(),
++        };
++        let original = output(process_id);
++        let expected = original.code_mode_result(&payload);
++        let selected = filter_at_socket(
++            &ToolName::plain("exec_command"),
++            &payload,
++            original,
++            Path::new("/nonexistent/bello-selector.sock"),
++        )
++        .await;
++        assert_eq!(selected.code_mode_result(&payload), expected);
++    }
++}
++
++#[tokio::test]
++#[cfg(unix)]
++async fn malformed_backend_reply_preserves_original() {
++    use tokio::io::AsyncBufReadExt;
++    use tokio::io::AsyncWriteExt;
++    let directory = tempfile::tempdir().unwrap();
++    let socket = directory.path().join("selector.sock");
++    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
++    let peer = tokio::spawn(async move {
++        let (mut connection, _) = listener.accept().await.unwrap();
++        let mut request = String::new();
++        tokio::io::BufReader::new(&mut connection)
++            .read_line(&mut request)
++            .await
++            .unwrap();
++        connection.write_all(b"{\"text\":42}\n").await.unwrap();
++    });
++    let payload = ToolPayload::Function {
++        arguments: json!({"focus":"inspect output"}).to_string(),
++    };
++    let original = output(/*process_id*/ None);
++    let expected = original.code_mode_result(&payload);
++    let selected = filter_at_socket(
++        &ToolName::plain("exec_command"),
++        &payload,
++        original,
++        &socket,
++    )
++    .await;
++    assert_eq!(selected.code_mode_result(&payload), expected);
++    peer.await.unwrap();
++}
++
++#[tokio::test]
++#[cfg(unix)]
++async fn native_selection_accepts_response_after_three_hundred_seconds() {
++    use tokio::io::AsyncBufReadExt;
++    use tokio::io::AsyncWriteExt;
++    let directory = tempfile::tempdir().unwrap();
++    let socket = directory.path().join("selector.sock");
++    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
++    let peer = tokio::spawn(async move {
++        let (mut connection, _) = listener.accept().await.unwrap();
++        let mut request = String::new();
++        tokio::io::BufReader::new(&mut connection)
++            .read_line(&mut request)
++            .await
++            .unwrap();
++        // The request has reached the peer, so the native transport timer is
++        // active. Advance only this test runtime, without a real five-minute wait.
++        tokio::time::pause();
++        tokio::time::advance(Duration::from_secs(301)).await;
++        tokio::task::yield_now().await;
++        tokio::time::resume();
++        connection
++            .write_all(b"{\"text\":\"ERROR retained\\n\"}\n")
++            .await
++            .unwrap();
++    });
++    let payload = ToolPayload::Function {
++        arguments: json!({"focus":"inspect output"}).to_string(),
++    };
++    let original = output(/*process_id*/ None);
++    let mut expected = original.code_mode_result(&payload);
++    expected["output"] = json!("ERROR retained\n");
++    let selected = filter_at_socket(
++        &ToolName::plain("exec_command"),
++        &payload,
++        original,
++        &socket,
++    )
++    .await;
++    assert_eq!(selected.code_mode_result(&payload), expected);
++    peer.await.unwrap();
++}
+diff --git a/codex-rs/core/src/tools/registry.rs b/codex-rs/core/src/tools/registry.rs
+index e73711f..3e97709 100644
+--- a/codex-rs/core/src/tools/registry.rs
++++ b/codex-rs/core/src/tools/registry.rs
+@@ -720,6 +720,7 @@ impl ToolRegistry {
+ 
+         match result {
+             Ok(mut result) => {
++                let mut hook_replaced_output = false;
+                 if let Some(outcome) = post_tool_use_outcome {
+                     if outcome.should_block {
+                         let message = outcome.feedback_message.unwrap_or_else(|| {
+@@ -730,6 +731,7 @@ impl ToolRegistry {
+                         return Err(err);
+                     }
+                     if let Some(feedback_message) = outcome.feedback_message {
++                        hook_replaced_output = true;
+                         result.result = Box::new(PostToolUseFeedbackOutput {
+                             original: result.result,
+                             model_visible: FunctionToolOutput::from_text(
+@@ -739,6 +741,9 @@ impl ToolRegistry {
+                         });
+                     }
+                 }
++                if !hook_replaced_output {
++                    result.result = super::native_selection::filter(&invocation, result.result).await;
++                }
+                 tool.on_tool_result_accepted(&invocation, result.result.as_ref());
+                 dispatch_trace.record_completed(
+                     &invocation,
+diff --git a/codex-rs/core/src/tools/registry_tests.rs b/codex-rs/core/src/tools/registry_tests.rs
+index 9808432..fbee8d0 100644
+--- a/codex-rs/core/src/tools/registry_tests.rs
++++ b/codex-rs/core/src/tools/registry_tests.rs
+@@ -578,7 +578,7 @@ async fn code_mode_wait_does_not_expose_default_hook_payloads() {
+ async fn write_stdin_does_not_expose_default_pre_tool_use_payload() {
+     let (session, turn) = crate::session::tests::make_session_and_context().await;
+ 
+-    let write_stdin = crate::tools::handlers::WriteStdinHandler;
++    let write_stdin = crate::tools::handlers::WriteStdinHandler::default();
+     let invocation = test_invocation(
+         Arc::new(session),
+         Arc::new(turn),
+diff --git a/codex-rs/core/src/tools/spec_plan.rs b/codex-rs/core/src/tools/spec_plan.rs
+index 908bb14..ace7cd0 100644
+--- a/codex-rs/core/src/tools/spec_plan.rs
++++ b/codex-rs/core/src/tools/spec_plan.rs
+@@ -1005,8 +1005,11 @@ fn add_core_tool_sources(context: &CoreToolPlanContext<'_>, registry: &mut ToolR
+                     include_windows_shell_guidance: should_include_windows_shell_guidance(
+                         context.environments,
+                     ),
++                    bello_native_selection: super::native_selection::enabled(turn_context),
+                 }));
+-                registry.add(WriteStdinHandler);
++                registry.add(WriteStdinHandler {
++                    bello_native_selection: super::native_selection::enabled(turn_context),
++                });
+             }
+             if turn_context.config.features.enabled(Feature::ViewImage) {
+                 registry.add(ViewImageHandler::new(ViewImageToolOptions {
+@@ -1094,10 +1097,13 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
+             context.environments,
+         ),
+         include_windows_shell_guidance: should_include_windows_shell_guidance(context.environments),
++        bello_native_selection: super::native_selection::enabled(turn_context),
+     };
+     if features.enabled(Feature::UnifiedExec) {
+         registry.add(ExecCommandHandler::new(options));
+-        registry.add(WriteStdinHandler);
++        registry.add(WriteStdinHandler {
++            bello_native_selection: super::native_selection::enabled(turn_context),
++        });
+     } else {
+         // Managed requirements are the only configuration path that can keep
+         // unified exec disabled. Preserve command execution without exposing a
+diff --git a/codex-rs/core/src/tools/spec_plan_tests.rs b/codex-rs/core/src/tools/spec_plan_tests.rs
+index c77936f..a7fe323 100644
+--- a/codex-rs/core/src/tools/spec_plan_tests.rs
++++ b/codex-rs/core/src/tools/spec_plan_tests.rs
+@@ -893,6 +893,43 @@ async fn request_user_input_stays_direct_in_code_mode_only() {
+     assert!(!exec.description.contains("request_user_input"));
+ }
+ 
++#[tokio::test]
++#[cfg(unix)]
++async fn bello_native_selection_is_scoped_to_each_thread_spec() {
++    let configure = |turn: &mut TurnContext| {
++        set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);
++        set_feature(turn, Feature::ShellZshFork, /*enabled*/ false);
++        set_feature(turn, Feature::CodeMode, /*enabled*/ false);
++        set_feature(turn, Feature::CodeModeOnly, /*enabled*/ false);
++        update_turn_settings_for_test(turn, |settings| {
++            Arc::make_mut(&mut settings.model_info).shell_type = ConfigShellToolType::UnifiedExec;
++        });
++    };
++    let baseline = probe(configure).await;
++    let coder = probe(|turn| {
++        configure(turn);
++        set_feature(turn, Feature::BelloNativeSelection, /*enabled*/ true);
++    })
++    .await;
++    let other_thread = probe(configure).await;
++    for name in ["exec_command", "write_stdin"] {
++        assert!(!has_parameter(baseline.visible_spec(name), "focus"));
++        assert!(has_parameter(coder.visible_spec(name), "focus"));
++        assert_eq!(baseline.visible_spec(name), other_thread.visible_spec(name));
++        let mut stripped = coder.visible_spec(name).clone();
++        let ToolSpec::Function(function) = &mut stripped else {
++            panic!("expected function tool");
++        };
++        function
++            .parameters
++            .properties
++            .as_mut()
++            .unwrap()
++            .remove("focus");
++        assert_eq!(&stripped, baseline.visible_spec(name));
++    }
++}
++
+ #[tokio::test]
+ async fn shell_family_registers_only_unified_exec_tools() {
+     let plan = probe(|turn| {
+diff --git a/codex-rs/features/src/lib.rs b/codex-rs/features/src/lib.rs
+index fdeae5c..9eafef4 100644
+--- a/codex-rs/features/src/lib.rs
++++ b/codex-rs/features/src/lib.rs
+@@ -106,6 +106,8 @@ pub enum Feature {
+     SecretAuthStorage,
+ 
+     // Experimental
++    /// Apply the host-owned local selector to native command output.
++    BelloNativeSelection,
+     /// Send per-content-entry classifications in internal Responses metadata.
+     ContentItemKinds,
+     /// Record model-attempted tool calls in internal Responses metadata.
+@@ -985,6 +987,12 @@ pub const FEATURES: &[FeatureSpec] = &[
+         stage: Stage::UnderDevelopment,
+         default_enabled: false,
+     },
++    FeatureSpec {
++        id: Feature::BelloNativeSelection,
++        key: "bello_native_selection",
++        stage: Stage::UnderDevelopment,
++        default_enabled: false,
++    },
+     FeatureSpec {
+         id: Feature::CodeMode,
+         key: "code_mode",

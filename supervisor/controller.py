@@ -48,7 +48,7 @@ from supervisor.health import (
 )
 from supervisor.filesystem_safety import is_link_or_reparse, is_windows_platform
 from supervisor.executables import ExecutableResolutionError, require_trusted_executable
-from supervisor.project_config import DEFAULT_MODEL, MultiAgentConfig, ProjectConfig
+from supervisor.project_config import DEFAULT_MODEL, LogDistillerConfig, MultiAgentConfig, ProjectConfig
 from supervisor.policy import (
     _executable_basename,
     command_is_windows_shell_wrapper,
@@ -97,7 +97,7 @@ from supervisor.schemas import (
     ValidationRun,
 )
 from supervisor.schemas.models import ensure_relative_to
-from supervisor.state import DECISIONS, HANDOFF, PROGRESS, StateStore
+from supervisor.state import CONFIG, DECISIONS, HANDOFF, PROGRESS, StateStore
 from supervisor.supervisor_agent import StatelessSupervisorAgent, SupervisorAgentError
 from supervisor.task_select import resolve_plan, resolve_task
 from supervisor.tui import TerminalTUI, UserCommand
@@ -353,6 +353,8 @@ class BelloController:
         adversary_enabled: bool | None = None,
         adversary_runs: int | None = None,
         completion_review: bool | None = None,
+        runtime_enabled: bool | None = None,
+        log_distiller: LogDistillerConfig | None = None,
         declared_grading_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
         project_config: ProjectConfig | None = None,
     ):
@@ -410,6 +412,8 @@ class BelloController:
         # CLI override for the completion-review toggle; stays runtime-scoped and never
         # rewrites the persisted project config, matching the other run settings.
         self.completion_review = completion_review
+        self.runtime_enabled = runtime_enabled
+        self.log_distiller = log_distiller
         self.project_config = project_config
         self.event_queue: asyncio.Queue[ControllerEvent] = asyncio.Queue()
         self.client = client or RuntimeClient(
@@ -510,6 +514,12 @@ class BelloController:
         self.initialize_state()
         self._write_run_checkpoint("startup", state="active")
         try:
+            configure_run = getattr(self.client, "configure_run", None)
+            if callable(configure_run):
+                configure_run(
+                    runtime_enabled=self._runtime_enabled(),
+                    log_distiller=self._log_distiller_config(),
+                )
             await self.client.start()
             await self.client.initialize()
             await self.tui.start()
@@ -517,11 +527,6 @@ class BelloController:
             self.tui.render("SYSTEM", self._runtime_settings_summary())
             self._prepare_coder_workspace()
             self._write_run_checkpoint("coder_workspace", state="stable")
-            if self._adversary_enabled_for_config() and not self._effective_completion_review():
-                self.tui.render(
-                    "SYSTEM",
-                    "adversary requires completion review; disabled for this run",
-                )
             await self.preflight()
             if not self.running:
                 return
@@ -538,7 +543,7 @@ class BelloController:
                     thread_id,
                     role="runtime",
                 ),
-            )
+            ) if self._runtime_enabled() else None
             self.completion_supervisor = StatelessSupervisorAgent(
                 self.client,
                 self.store,
@@ -556,25 +561,25 @@ class BelloController:
                     thread_id,
                     role="completion_review",
                 ),
-            )
+            ) if self._effective_completion_review() else None
             self.adv_report_controller = StatelessSupervisorAgent(
                 self.client,
                 self.store,
                 self.task_path,
                 workspace_root=self._active_workspace_root(),
                 task_contents=self._canonical_task_contents,
-                model=self._completion_model(),
+                model=self._completion_model() if self._effective_completion_review() else self._adversary_model(),
                 fast=self._fast_mode(),
-                intelligence=self._completion_intelligence(),
+                intelligence=self._completion_intelligence() if self._effective_completion_review() else self._adversary_intelligence(),
                 completion_source_snapshot=getattr(self, "_coder_snapshot", None),
                 on_thread_start=lambda thread_id: self._register_reviewer_thread(
                     thread_id,
                     role="adv_report_controller",
                 ),
-            )
+            ) if self._adversary_model_required_for_preflight() else None
             self.approvals = ApprovalManager(
                 self._active_workspace_root(),
-                supervisor=self,
+                supervisor=self if self._runtime_enabled() else None,
                 declared_grading_roots=self.declared_grading_roots,
                 immutable_paths=self._immutable_approval_paths(),
             )
@@ -588,6 +593,7 @@ class BelloController:
                 intelligence=self._active_coder_intelligence(),
                 multi_agent=self._multi_agent_config(),
                 plan_path=self._active_coder_plan_path(),
+                readonly_roots=self._active_dependency_roots(),
             )
             await self.coder.start_thread()
             self._coder_started = True
@@ -654,7 +660,9 @@ class BelloController:
             max_completion_returns_before_adversary=project_config.completion_returns_before_adversary,
             max_completion_returns_after_adversary=project_config.completion_returns_after_adversary,
             completion_review_enabled=project_config.completion_review,
-            cheap_runtime=project_config.cheap_runtime,
+            cheap_runtime=self._runtime_enabled() and project_config.cheap_runtime,
+            runtime_enabled=self._runtime_enabled(),
+            log_distiller=self._log_distiller_config().to_json_data(),
             multi_agent=project_config.multi_agent.to_json_data(),
             completion_multi_agent=project_config.completion_multi_agent.to_json_data(),
             adversary_multi_agent=project_config.adversary_multi_agent.to_json_data(),
@@ -760,7 +768,9 @@ class BelloController:
                     "max_completion_returns_before_adversary": project_config.completion_returns_before_adversary,
                     "max_completion_returns_after_adversary": project_config.completion_returns_after_adversary,
                     "completion_review_enabled": project_config.completion_review,
-                    "cheap_runtime": project_config.cheap_runtime,
+                    "cheap_runtime": self._runtime_enabled() and project_config.cheap_runtime,
+                    "runtime_enabled": self._runtime_enabled(),
+                    "log_distiller": self._log_distiller_config().to_json_data(),
                     "multi_agent": project_config.multi_agent.to_json_data(),
                     "completion_multi_agent": project_config.completion_multi_agent.to_json_data(),
                     "adversary_multi_agent": project_config.adversary_multi_agent.to_json_data(),
@@ -770,6 +780,10 @@ class BelloController:
 
     def _active_workspace_root(self) -> Path:
         return Path(getattr(self, "workspace_root", self.project_root)).resolve()
+
+    def _active_dependency_roots(self) -> tuple[Path, ...]:
+        snapshot = getattr(self, "_coder_snapshot", None)
+        return getattr(snapshot, "readonly_dependency_roots", ())
 
     def _active_task_path(self) -> Path:
         return Path(getattr(self, "workspace_task_path", self.task_path)).resolve()
@@ -1214,18 +1228,47 @@ class BelloController:
         return bool(getattr(self, "fast", False))
 
     def _cheap_runtime_enabled(self) -> bool:
+        if not self._runtime_enabled():
+            return False
         try:
             return bool(self.store.get_bello_config().cheap_runtime)
         except Exception:
             project_config = getattr(self, "project_config", None)
             return bool(project_config.cheap_runtime) if project_config is not None else True
 
+    def _runtime_enabled(self) -> bool:
+        override = getattr(self, "runtime_enabled", None)
+        if override is not None:
+            return bool(override)
+        config = getattr(self, "project_config", None)
+        if config is not None:
+            return bool(getattr(config, "runtime_enabled", True))
+        try:
+            return bool(self.store.get_bello_config().runtime_enabled)
+        except Exception:
+            return True
+
+    def _post_coder_review_enabled(self) -> bool:
+        return self._effective_completion_review() or self._adversary_model_required_for_preflight()
+
+    def _log_distiller_config(self) -> LogDistillerConfig:
+        override = getattr(self, "log_distiller", None)
+        if override is not None:
+            return override
+        config = getattr(self, "project_config", None)
+        if config is not None:
+            return config.log_distiller
+        try:
+            saved = self.store.read_json(CONFIG, {})
+            return LogDistillerConfig(**saved.get("log_distiller", {}))
+        except (AttributeError, FileNotFoundError):
+            return LogDistillerConfig()
+
     def _effective_completion_review(self) -> bool:
         """Whether the completion review gate is active for this run.
 
         CLI override wins; otherwise the persisted project-config mirror. With the gate
-        off, the coder's readiness marker finalizes the run directly and the adversary
-        (which runs inside the review-accept path) is inactive.
+        off, the independently configured adversary can still review coder readiness.
         """
         override = getattr(self, "completion_review", None)
         if override is not None:
@@ -1265,6 +1308,8 @@ class BelloController:
             completion_intelligence=self._completion_intelligence() or DEFAULT_INTELLIGENCE,
             adversary_intelligence=self._adversary_intelligence() or DEFAULT_INTELLIGENCE,
             speed="fast" if self._fast_mode() else "usual",
+            runtime_enabled=self._runtime_enabled(),
+            log_distiller=self._log_distiller_config(),
             start_over=self.overwrite_state,
             adversary=self._adversary_enabled_for_config(),
             clean=self.clean_workspace,
@@ -1303,6 +1348,8 @@ class BelloController:
             f"completion-intelligence={self._completion_intelligence()} "
             f"adversary-intelligence={self._adversary_intelligence()} "
             f"speed={speed} "
+            f"runtime={_format_bool(self._runtime_enabled())} "
+            f"log-distiller={_format_bool(self._log_distiller_config().enabled)} "
             f"cheap-runtime={_format_bool(self._cheap_runtime_enabled())} "
             f"multi-agent={multi_agent_summary} "
             f"completion-multi-agent={completion_multi_agent_summary} "
@@ -1310,7 +1357,7 @@ class BelloController:
             f"start-over={_format_bool(self.overwrite_state)} "
             f"clean={_format_bool(self.clean_workspace)} "
             f"completion-review={_format_bool(self._effective_completion_review())} "
-            f"adversary={_format_bool(self._adversary_enabled_for_config() and self._effective_completion_review())} "
+            f"adversary={_format_bool(self._effective_max_adversary_runs() > 0)} "
             f"protected-path={protected_paths}"
         )
 
@@ -1405,6 +1452,11 @@ class BelloController:
     def _completion_supervisor_agent(self) -> StatelessSupervisorAgent | None:
         return getattr(self, "completion_supervisor", None) or getattr(self, "supervisor", None)
 
+    def _post_coder_review_agent(self) -> StatelessSupervisorAgent | None:
+        if self._effective_completion_review():
+            return self._completion_supervisor_agent()
+        return self._adv_report_controller_agent()
+
     def _adv_report_controller_agent(self) -> StatelessSupervisorAgent | None:
         return getattr(self, "adv_report_controller", None)
 
@@ -1447,15 +1499,18 @@ class BelloController:
         await self._ensure_selected_models_available(models_response)
         if self.store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE:
             return
-        self.tui.status("checking supervisor structured output")
-        await self._structured_output_self_test()
-        await self._configure_runtime_triage()
+        if self._runtime_enabled():
+            self.tui.status("checking supervisor structured output")
+            await self._structured_output_self_test()
+            await self._configure_runtime_triage()
         self.tui.status("checking config requirements")
         await self.client.config_requirements_read()
         self.tui.status("checking coder sandbox and approval settings")
         thread = await self.client.thread_start(
             coder_thread_params(
                 self._active_workspace_root(),
+                task_path=self._active_task_path(),
+                readonly_roots=self._active_dependency_roots(),
                 model=self._coder_model(),
                 intelligence=self._coder_intelligence(),
                 fast=self._fast_mode(),
@@ -1478,56 +1533,77 @@ class BelloController:
             await self._cleanup_preflight_probe_thread(thread_id)
 
     async def _runtime_preflight(self) -> None:
+        from supervisor.runtime.models import parse_model_selection
         from supervisor.runtime.sandbox import SandboxPolicy, SandboxRunner
         self.tui.status("checking Bello execution engines and configured models")
-        selected = [self._coder_model(), self._runtime_model()]
+        selected = [self._coder_model()]
+        if self._runtime_enabled():
+            selected.append(self._runtime_model())
         if self._effective_completion_review():
             selected.append(self._completion_model())
-            if self._revision_coder_enabled():
-                selected.append(self._revision_coder_model())
+        if self._post_coder_review_enabled() and self._revision_coder_enabled():
+            selected.append(self._revision_coder_model())
         if self._adversary_model_required_for_preflight():
             selected.append(self._adversary_model())
         selected.extend(self._enabled_subagent_models_for_preflight())
         self.client.required_models = tuple(dict.fromkeys(selected))
         models = await self.client.model_list()
         self.store.update_bello_config(lambda cfg: cfg.model_copy(update={
-            "runtime_name": "bello-pi/claude-code", "runtime_protocol_version": 1,
+            "runtime_name": "bello-codex/pi/claude-code", "runtime_protocol_version": 1,
         }))
         self._persist_model_config()
         await self._ensure_selected_models_available(models)
         if self.store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE:
             return
-        profiles = [(self._coder_model(), self._coder_intelligence()),
-                    (self._runtime_model(), self._runtime_intelligence())]
+        profiles = [(self._coder_model(), self._coder_intelligence())]
+        if self._runtime_enabled():
+            profiles.append((self._runtime_model(), self._runtime_intelligence()))
         policies = [self._multi_agent_config()]
         if self._effective_completion_review():
             profiles.append((self._completion_model(), self._completion_intelligence()))
             policies.append(self._completion_multi_agent_config())
-            if self._revision_coder_enabled():
-                profiles.append((self._revision_coder_model(), self._revision_coder_intelligence()))
+        if self._post_coder_review_enabled() and self._revision_coder_enabled():
+            profiles.append((self._revision_coder_model(), self._revision_coder_intelligence()))
         if self._adversary_model_required_for_preflight():
             profiles.append((self._adversary_model(), self._adversary_intelligence()))
             policies.append(self._adversary_multi_agent_config())
         for policy in policies:
             if policy.enabled:
                 profiles.extend((model, effort) for model, efforts in policy.allowed.items() for effort in efforts)
+        distilled_models = set()
+        if self._log_distiller_config().enabled:
+            distilled_models.add(parse_model_selection(self._coder_model()).qualified)
+            if self._post_coder_review_enabled() and self._revision_coder_enabled():
+                distilled_models.add(parse_model_selection(self._revision_coder_model()).qualified)
+            coder_agents = self._multi_agent_config()
+            if coder_agents.enabled:
+                distilled_models.update(parse_model_selection(model).qualified for model in coder_agents.allowed)
         for model, effort in dict.fromkeys(profiles):
-            validation = await self.client.request("model/validate", {
+            selection = parse_model_selection(model)
+            request = {
                 "model": model, "effort": effort,
                 "serviceTier": "priority" if self._fast_mode() else None,
-            })
+            }
+            if selection.engine == "codex" and selection.qualified in distilled_models:
+                # Check native D capability before runtime's paid startup probe,
+                # but do not require a patched binary for Codex reviewers alone.
+                request["distillerEnabled"] = True
+            validation = await self.client.request("model/validate", request)
             if validation.get("valid") is not True:
                 raise RuntimeError(f"execution engine could not validate the exact model profile: {model} / {effort}")
         self.tui.status("checking the operating-system sandbox")
         root = self._active_workspace_root()
-        probe = await SandboxRunner(SandboxPolicy(root=root, mode=coder_sandbox_mode())).run(
+        probe = await SandboxRunner(SandboxPolicy(
+            root=root, mode=coder_sandbox_mode(), readable_roots=self._active_dependency_roots(),
+        )).run(
             "echo bello-sandbox-probe", root, 10
         )
         if probe.exit_code != 0 or "bello-sandbox-probe" not in probe.output:
             raise RuntimeError("Bello could not start its required OS sandbox; no model run was started")
-        self.tui.status("checking supervisor structured output")
-        await self._structured_output_self_test()
-        await self._configure_runtime_triage()
+        if self._runtime_enabled():
+            self.tui.status("checking supervisor structured output")
+            await self._structured_output_self_test()
+            await self._configure_runtime_triage()
 
     async def _ensure_selected_models_available(self, models_response: dict[str, Any]) -> None:
         result = _selected_model_availability(
@@ -1535,10 +1611,10 @@ class BelloController:
             coder_model=self._coder_model(),
             revision_coder_model=(
                 self._revision_coder_model()
-                if self._revision_coder_enabled() and self._effective_completion_review()
+                if self._revision_coder_enabled() and self._post_coder_review_enabled()
                 else None
             ),
-            runtime_model=self._runtime_model(),
+            runtime_model=self._runtime_model() if self._runtime_enabled() else None,
             completion_model=self._completion_model() if self._effective_completion_review() else None,
             adversary_model=self._adversary_model() if self._adversary_model_required_for_preflight() else None,
             subagent_models=self._enabled_subagent_models_for_preflight(),
@@ -1572,8 +1648,6 @@ class BelloController:
         return tuple(models)
 
     def _adversary_model_required_for_preflight(self) -> bool:
-        if not self._effective_completion_review():
-            return False
         enabled = getattr(self, "adversary_enabled", None)
         if enabled is False:
             return False
@@ -1933,6 +2007,7 @@ class BelloController:
             intelligence=self._active_coder_intelligence(),
             multi_agent=self._multi_agent_config(),
             plan_path=self._active_coder_plan_path(),
+            readonly_roots=previous.readonly_roots,
         )
         self.coder = replacement
         new_thread_id = await replacement.start_thread()
@@ -1994,6 +2069,9 @@ class BelloController:
             health = self.store.get_health()
             self.tui.render("SYSTEM", f"task={Path(cfg.task_path).name} generation={cfg.generation} active_turn={cfg.active_coder_turn_id} pending_approvals={len(self.pending_approvals)} restarts={health.restart_count}")
             return
+        if not self._runtime_enabled():
+            await self._deliver_coder_message(command.text)
+            return
         self._schedule_supervisor_check(
             f"Human message to supervisor: {text}",
             human_message=HumanMessage(text=command.text, sequence=self._sequence),
@@ -2024,7 +2102,15 @@ class BelloController:
             reason=context.command or context.grant_root or context.request_type.value,
         )
         is_adversary_request = self._is_adversary_approval_context(context)
-        if is_adversary_request:
+        if not self._runtime_enabled():
+            # The runtime grants network inside each assigned filesystem sandbox.
+            # An explicit sandbox escape needs separate user authority, which this
+            # unattended approval protocol does not provide. Do not call any model
+            # or auto-approve a host-wide command as a substitute.
+            manager = ApprovalManager(self._active_workspace_root())
+            resolution = manager._deny(context, "outside-sandbox approval is unavailable while runtime supervision is disabled")
+            response = manager.response_payload(context, resolution)
+        elif is_adversary_request:
             adversary_workspace_root = getattr(self, "_active_adversary_workspace_root", None)
             fallback_manager = ApprovalManager(
                 adversary_workspace_root or self._active_workspace_root(),
@@ -2069,7 +2155,7 @@ class BelloController:
                     PROGRESS,
                     f"- Adversary approval denied without steering coder: {resolution.reason}\n",
                 )
-            elif self.coder is not None:
+            elif self.coder is not None and self._runtime_enabled():
                 delivery_reason = resolution.reason
                 if self._is_coder_descendant(context.thread_id):
                     delivery_reason = (
@@ -2127,7 +2213,7 @@ class BelloController:
         return True
 
     async def decide_approval(self, context: ApprovalContext, reason: str) -> SupervisorDecision:
-        if self.supervisor is None:
+        if not self._runtime_enabled() or self.supervisor is None:
             raise SupervisorAgentError("supervisor not ready")
         self._reconcile_intervention_accounting()
         cfg = self.store.get_bello_config()
@@ -2511,7 +2597,7 @@ class BelloController:
             changed_files=changed_files,
             validation_trigger_reasons=validation_trigger_reasons,
         )
-        if repaired_runtime_controls:
+        if repaired_runtime_controls and self._runtime_enabled():
             runtime_decision = RuntimeTriggerDecision(
                 should_wake=True,
                 reasons=tuple(dict.fromkeys((*runtime_decision.reasons, "runtime_control_replacement"))),
@@ -3167,7 +3253,7 @@ class BelloController:
         repaired_runtime_controls = self._repair_snapshot_runtime_controls(source="coder_turn_completed")
         if await self._escalate_runtime_integrity_issue(source="coder_turn_completed"):
             return
-        if repaired_runtime_controls:
+        if repaired_runtime_controls and self._runtime_enabled():
             self._schedule_supervisor_check(
                 "Runtime integrity trigger: coder workspace runtime links were replaced and restored.",
                 triggering_item_id=item_id,
@@ -3183,7 +3269,7 @@ class BelloController:
                     self._deferred_completion_check = QueuedSupervisorCheck(
                         summary="Coder provided exact readiness marker; waiting for active subagents before completion.",
                         triggering_item_id=item_id,
-                        completion_review=self._effective_completion_review(),
+                        completion_review=self._post_coder_review_enabled(),
                     )
                     reason = (
                         "Coder declared readiness while relevant subagents are still active: "
@@ -3198,7 +3284,7 @@ class BelloController:
                     return
                 self._last_completion_marker_sequence = message.sequence
                 self.no_marker_idle_nudge_count = 0
-                done_gap = await self._done_without_fresh_behavioral_validation()
+                done_gap = await self._done_without_fresh_behavioral_validation() if self._runtime_enabled() else None
                 if done_gap is not None:
                     self._record_runtime_trigger_trace(
                         event_type="turn/completed",
@@ -3234,6 +3320,9 @@ class BelloController:
                 sequence=message.sequence,
             )
             return
+        if not self._runtime_enabled():
+            await self._handle_no_marker_idle()
+            return
         if self.pending_approvals:
             self._schedule_supervisor_check("Coder turn completed", triggering_item_id=item_id)
             return
@@ -3255,7 +3344,7 @@ class BelloController:
             self._deferred_completion_check = QueuedSupervisorCheck(
                 summary="Coder provided exact readiness marker; continuing completion after active subagents finish.",
                 triggering_item_id=triggering_item_id,
-                completion_review=self._effective_completion_review(),
+                completion_review=self._post_coder_review_enabled(),
             )
             reason = "Wait for active subagents, review and integrate their results, then emit the readiness marker again."
             self._append_event(
@@ -3265,11 +3354,11 @@ class BelloController:
             )
             await self._steer_for_marker(reason, message=reason)
             return
-        if not self._effective_completion_review():
+        if not self._post_coder_review_enabled():
             await self._finalize_completion_review_disabled()
             return
         self._schedule_supervisor_check(
-            "Coder provided exact readiness marker; running completion_review.",
+            "Coder provided exact readiness marker; running configured final reviews.",
             triggering_item_id=triggering_item_id,
             completion_review=True,
         )
@@ -3326,16 +3415,17 @@ class BelloController:
         if getattr(self, "_no_marker_completion_review_key", None) == review_key:
             return
         self._no_marker_completion_review_key = review_key
-        if not self._effective_completion_review():
+        if not self._post_coder_review_enabled():
             # No review gate to force: nudge the coder to finish and emit the marker,
             # which is the only terminal signal in this mode.
             await self._steer_for_marker(
                 "Coder is idle with no active turn and no readiness marker; completion review is disabled, nudging coder to finish.",
             )
             return
+        review_label = "completion_review" if self._effective_completion_review() else "adversary review"
         self.store.append_text_locked(
             PROGRESS,
-            "- Controller forcing completion_review: coder is idle with no active turn and no readiness marker.\n",
+            f"- Controller forcing {review_label}: coder is idle with no active turn and no readiness marker.\n",
         )
         self._append_event(
             AppEventSource.SUPERVISOR,
@@ -3343,7 +3433,7 @@ class BelloController:
             reason="coder idle with no active turn and no readiness marker",
         )
         self._schedule_supervisor_check(
-            "Coder is idle with no active turn and no readiness marker. Run completion_review on the current state.",
+            f"Coder is idle with no active turn and no readiness marker. Run {review_label} on the current state.",
             completion_review=True,
         )
 
@@ -3511,6 +3601,7 @@ class BelloController:
             intelligence=self._active_coder_intelligence(),
             multi_agent=self._multi_agent_config(),
             plan_path=self._active_coder_plan_path(),
+            readonly_roots=self._active_dependency_roots(),
         )
         await self.coder.start_thread()
         if (
@@ -3671,7 +3762,9 @@ class BelloController:
                 recovery_path,
             )
         try:
-            result = await asyncio.to_thread(apply_snapshot_patch, snapshot)
+            result = await asyncio.to_thread(
+                apply_snapshot_patch, snapshot, runtime_enabled=self._runtime_enabled(),
+            )
         except (SnapshotPatchError, WorkspaceSnapshotError) as exc:
             recovery_path = await self._preserve_snapshot_for_recovery(snapshot, reason="patch_failed")
             message = (
@@ -3852,12 +3945,14 @@ class BelloController:
         patch_summary: str | None = None,
         completion_review: bool = False,
     ) -> None:
+        if not completion_review and not self._runtime_enabled():
+            return
         if (
             not self.running
             or getattr(self, "paused", False)
             or getattr(self, "_finalizing", False)
             or getattr(self, "_terminal_cleanup_started", False)
-            or getattr(self, "supervisor", None) is None
+            or (self._post_coder_review_agent() if completion_review else getattr(self, "supervisor", None)) is None
         ):
             return
         if not completion_review:
@@ -3893,6 +3988,8 @@ class BelloController:
         patch_summary: str | None = None,
         completion_review: bool,
     ) -> None:
+        if not completion_review and not self._runtime_enabled():
+            return
         self._supervisor_dirty = True
         queued = QueuedSupervisorCheck(
             summary=summary,
@@ -4171,6 +4268,8 @@ class BelloController:
         changed_files: list[ChangedFile],
         validation_trigger_reasons: tuple[str, ...] = (),
     ) -> RuntimeTriggerDecision:
+        if not self._runtime_enabled():
+            return RuntimeTriggerDecision(should_wake=False, reasons=())
         reasons: list[str] = list(validation_trigger_reasons)
         read_only_action = bool(action.command and _is_read_only_inspection_command(action.command))
         if (
@@ -4474,6 +4573,8 @@ class BelloController:
         patch_summary: str | None,
         completion_review: bool = False,
     ) -> None:
+        if not completion_review and not self._runtime_enabled():
+            return
         if not self._coder_lifecycle_accepts_activity():
             if completion_review:
                 await self._close_completion_review_session()
@@ -4514,7 +4615,7 @@ class BelloController:
             )
         else:
             runtime_trigger_actions = []
-        agent = self._completion_supervisor_agent() if completion_review else self.supervisor
+        agent = self._post_coder_review_agent() if completion_review else self.supervisor
         if agent is None:
             return
         self._reconcile_intervention_accounting()
@@ -4617,6 +4718,12 @@ class BelloController:
                 await self._close_completion_review_session()
             return
         if completion_review:
+            if not self._effective_completion_review():
+                if self._adversary_runs_remaining():
+                    await self._run_adversary_before_complete(None, packet=packet)
+                else:
+                    await self._finalize_adversary_only("adversary pass budget exhausted after coder follow-up")
+                return
             budget_action = self._completion_review_budget_action(packet=packet)
             if budget_action == "adversary":
                 await self._run_adversary_before_complete(None, packet=packet)
@@ -5122,6 +5229,8 @@ class BelloController:
         packet_thread_id: str | None,
         packet: SupervisorWakePacket | None = None,
     ) -> bool:
+        if not self._runtime_enabled():
+            return False
         cfg = self.store.get_bello_config()
         if not self._coder_lifecycle_accepts_activity(cfg, require_running=False):
             return False
@@ -5310,8 +5419,10 @@ class BelloController:
         adversary_run_count, max_adversary_runs = self._reserve_adversary_run()
         self._adversary_reservation_recovery_pending = False
         self._write_run_checkpoint("adversary", state="active")
-        forced_by_budget = decision is None
-        run_reason = "completion review budget" if forced_by_budget else "completion accept"
+        run_reason = (
+            "coder readiness" if not self._effective_completion_review()
+            else "completion review budget" if decision is None else "completion accept"
+        )
         self.tui.render(
             "ADVERSARY",
             f"running pre-complete adversarial tester ({adversary_run_count}/{max_adversary_runs}; {run_reason})",
@@ -5563,6 +5674,9 @@ class BelloController:
         )
         if accepted_completion_decision is None:
             self._accepted_adversary_report = report
+            if not self._effective_completion_review():
+                await self._finalize_adversary_only("adversary report contained no findings to return")
+                return
             await self._finalize_bounded_completion(
                 reason=(
                     "completion review budget reached and the normalized adversary "
@@ -5727,12 +5841,7 @@ class BelloController:
         )
 
     async def _finalize_completion_review_disabled(self) -> None:
-        """Completion review is disabled: the coder's readiness marker is the finish line.
-
-        Runtime supervision (approvals, steering, restarts) already ran its course; the
-        final report carries the validation ledger and states plainly that no completion
-        review or adversary pass certified the result.
-        """
+        """Finalize coder readiness when neither final review is configured."""
         self.store.append_text_locked(
             PROGRESS,
             "- Coder declared readiness; completion review is disabled by config, finalizing without review.\n",
@@ -5744,6 +5853,15 @@ class BelloController:
         )
         await self.finalize(
             "coder declared readiness; completion review disabled by config (no review or adversary certification)",
+            status=BelloStatus.COMPLETE,
+            completion_review_accepted=False,
+        )
+
+    async def _finalize_adversary_only(self, reason: str) -> None:
+        self._accepted_completion_decision = None
+        self.store.append_text_locked(PROGRESS, f"- Adversary-only review completed: {reason}; completion review is disabled.\n")
+        await self.finalize(
+            f"coder completed with adversary-only review: {reason}",
             status=BelloStatus.COMPLETE,
             completion_review_accepted=False,
         )
@@ -5880,10 +5998,6 @@ class BelloController:
         )
 
     def _effective_max_adversary_runs(self) -> int:
-        if not self._effective_completion_review():
-            # The adversary runs inside the completion-review accept path; without the
-            # review gate there is no point where it could fire.
-            return 0
         enabled = getattr(self, "adversary_enabled", None)
         if enabled is False:
             return 0
@@ -6164,6 +6278,7 @@ class BelloController:
             intelligence=self._revision_coder_intelligence(),
             multi_agent=self._multi_agent_config(),
             plan_path=None,
+            readonly_roots=self._active_dependency_roots(),
         )
         try:
             new_thread_id = await revision_coder.start_thread(persist_state=False)
@@ -6922,6 +7037,8 @@ class BelloController:
         return await asyncio.to_thread(self._generate_schema_hash)
 
     async def _structured_output_self_test(self) -> None:
+        if not self._runtime_enabled():
+            return
         agent = StatelessSupervisorAgent(
             self.client,
             self.store,
@@ -6954,6 +7071,9 @@ class BelloController:
             raise RuntimeError("structured-output supervisor self-test returned an unexpected decision")
 
     async def _configure_runtime_triage(self) -> None:
+        if not self._runtime_enabled():
+            self.runtime_triage_reviewer = None
+            return
         config = runtime_triage_config_from_env(enabled=self._cheap_runtime_enabled())
         self.runtime_triage_config = config
         self.runtime_triage_reviewer = None
@@ -6987,6 +7107,8 @@ class BelloController:
         self.tui.render("SYSTEM", f"cheap runtime triage enabled with model {config.model}")
 
     async def _cheap_runtime_structured_output_self_test(self, reviewer: CheapRuntimeReviewer) -> None:
+        if not self._runtime_enabled():
+            return
         packet = SupervisorWakePacket(
             wake_sequence=1,
             latest_event_sequence=0,
@@ -7001,6 +7123,8 @@ class BelloController:
             raise RuntimeError("cheap runtime structured-output self-test returned an unexpected decision")
 
     async def _cheap_runtime_route(self, packet: SupervisorWakePacket) -> CheapRuntimeDecision | None:
+        if not self._runtime_enabled():
+            return None
         reviewer = self.runtime_triage_reviewer
         if reviewer is None:
             return None

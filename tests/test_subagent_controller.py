@@ -484,7 +484,7 @@ def test_model_preflight_includes_only_enabled_active_stage_subagent_models(tmp_
     store.update_bello_config(
         lambda cfg: cfg.model_copy(update={"completion_review_enabled": False})
     )
-    assert controller._enabled_subagent_models_for_preflight() == (MODEL_GPT_5_6_LUNA,)
+    assert controller._enabled_subagent_models_for_preflight() == (MODEL_GPT_5_6_LUNA, "gpt-5.6-sol")
 
 
 def test_runtime_packet_subagent_summaries_are_bounded(tmp_path: Path) -> None:

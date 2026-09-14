@@ -8,6 +8,7 @@ import pytest
 from supervisor.runtime.journal import RuntimeJournal
 from supervisor.runtime.sandbox import SandboxResult
 from supervisor.runtime.tools import ToolHost, ToolScope
+from supervisor.runtime.output_budget import budget_command_output
 from supervisor.runtime.file_worker import frame_response
 
 _NONCE = "0123456789abcdef0123456789abcdef"
@@ -184,7 +185,7 @@ async def test_unknown_tools_and_malformed_arguments_never_execute(host):
 
 @pytest.mark.asyncio
 async def test_command_model_budget_does_not_truncate_controller_evidence(host):
-    output = "HEADER\n" + "message\n" * 3500 + "FINAL ERROR\n"
+    output = "HEADER\n" + "message\n" * 8000 + "FINAL ERROR\n"
     class Runner:
         def __init__(self, policy):
             pass
@@ -195,10 +196,96 @@ async def test_command_model_budget_does_not_truncate_controller_evidence(host):
     result = await call(host)
     packet = json.loads(result["content"][0]["text"])
     assert packet["outputBudget"]["truncated"]
-    assert "HEADER" not in packet["output"]
+    assert "HEADER" in packet["output"]
     assert "FINAL ERROR" in packet["output"]
     assert host[5][-1]["params"]["item"]["aggregatedOutput"] == output
     assert packet["exitCode"] == 1
+
+
+@pytest.mark.asyncio
+async def test_distiller_receives_native_bounded_body_and_preserves_command_metadata(host):
+    output = "HEADER\n" + "unneeded\n" * 8000 + "FINAL ERROR\n"
+    seen = []
+    class Runner:
+        def __init__(self, policy):
+            pass
+        async def run(self, command, cwd, timeout, on_output=None, *, cancel_event=None):
+            await on_output(output)
+            return SandboxResult(output, 1, .1)
+    async def distill(text, focus, command):
+        seen.append((text, focus, command))
+        return "FINAL ERROR\n"
+    host[0].runner_factory = Runner
+    host[0].distill = distill
+    host[2][("thread", "turn")] = ToolScope(host[1], "workspace-write", distiller_enabled=True)
+    args = {"command": "python checks.py", "focus": "Find failure", "max_output_tokens": 100}
+    result = await call(host, arguments=args)
+    assert seen == [(budget_command_output(output, 100).text, "Find failure", "python checks.py")]
+    packet = json.loads(result["content"][0]["text"])
+    assert packet["output"] == "FINAL ERROR\n"
+    assert packet["exitCode"] == 1 and packet["status"] == "failed"
+    assert packet["sessionId"]
+    assert result["isError"]
+    assert not any(key in packet for key in ("raw_handle", "focus", "distiller"))
+    assert await call(host, arguments=args) == result
+    assert len(seen) == 1
+    assert host[5][-1]["params"]["item"]["aggregatedOutput"] == output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled,focus", [(False, "Check"), (True, None)])
+async def test_distiller_off_or_missing_focus_keeps_normal_output(host, enabled, focus):
+    async def unexpected(*args):
+        raise AssertionError("distiller should not run")
+    seen = []
+    async def distill(*args):
+        seen.append(args)
+        return await unexpected(*args)
+    host[0].distill = distill
+    host[2][("thread", "turn")] = ToolScope(host[1], "workspace-write", distiller_enabled=enabled)
+    result = await call(host, arguments={"command": "true", **({"focus": focus} if focus else {})})
+    assert json.loads(result["content"][0]["text"])["output"] == "ok\n"
+    assert not seen
+
+
+@pytest.mark.asyncio
+async def test_distiller_failure_keeps_native_output(host):
+    async def fail(*args):
+        raise TimeoutError("local selector timed out")
+    host[0].distill = fail
+    host[2][("thread", "turn")] = ToolScope(host[1], "workspace-write", distiller_enabled=True)
+    result = await call(host, arguments={"command": "true", "focus": "Check"})
+    assert not result["isError"]
+    assert json.loads(result["content"][0]["text"])["output"] == "ok\n"
+
+
+@pytest.mark.asyncio
+async def test_poll_distills_using_original_command_not_session_id(host):
+    release = asyncio.Event()
+    seen = []
+    class Runner:
+        def __init__(self, policy):
+            pass
+        async def run(self, command, cwd, timeout, on_output=None, *, cancel_event=None):
+            await release.wait()
+            await on_output("diagnostic noise\npassed\n")
+            return SandboxResult("diagnostic noise\npassed\n", 0, .1)
+    async def distill(text, focus, command):
+        seen.append((focus, command))
+        return "passed\n"
+    host[0].runner_factory = Runner
+    host[0].distill = distill
+    host[2][("thread", "turn")] = ToolScope(host[1], "workspace-write", distiller_enabled=True)
+    try:
+        first = await call(host, arguments={"command": "python checks.py", "yield_time_ms": 0, "focus": "Run checks"})
+        session = first["details"]["sessionId"]
+        release.set()
+        polled = await call(host, "poll_command", {"session_id": session, "yield_time_ms": 1000, "focus": "Check results"}, "poll")
+        assert polled["details"]["output"] == "passed\n"
+        assert seen == [("Check results", "python checks.py")]
+    finally:
+        release.set()
+        await host[0].close()
 
 
 @pytest.mark.asyncio

@@ -106,7 +106,7 @@ async def test_coder_pins_task_authority_across_turns_and_journal_resume(task_sn
     store.initialize_bello(BelloConfig(project_root=str(project), task_path=str(task)), overwrite=True)
     state_dir = tmp_path / "runtime-state"
     backend = _Backend()
-    client = RuntimeClient(cwd=project, state_dir=state_dir, backends={"pi": backend})
+    client = RuntimeClient(cwd=project, state_dir=state_dir, backends={"codex": backend})
     coder = CoderSession(client, store, snapshot.snapshot_root, snapshot.task_path,
                          model="gpt-5.6-sol", intelligence="high")
     roots = [str(snapshot.snapshot_root), str(task)]
@@ -130,7 +130,7 @@ async def test_coder_pins_task_authority_across_turns_and_journal_resume(task_sn
         await client.stop()
 
         backend = _Backend()
-        client = RuntimeClient(cwd=project, state_dir=state_dir, backends={"pi": backend})
+        client = RuntimeClient(cwd=project, state_dir=state_dir, backends={"codex": backend})
         coder.client = client
         await coder.resume_thread()
         assert backend.calls[-1][1]["runtimeWorkspaceRoots"] == roots
@@ -162,7 +162,7 @@ def _has_native_posix_backend() -> bool:
 async def test_transport_fallback_keeps_previous_task_authority(task_snapshot, tmp_path: Path) -> None:
     project, task, sibling, snapshot = task_snapshot
     backend = _Backend()
-    client = RuntimeClient(cwd=project, state_dir=tmp_path / "fallback-state", backends={"pi": backend})
+    client = RuntimeClient(cwd=project, state_dir=tmp_path / "fallback-state", backends={"codex": backend})
     controller = BelloController(project, task_path=task, client=client)
     controller.store.initialize_bello(
         BelloConfig(project_root=str(project), task_path=str(task)), overwrite=True,

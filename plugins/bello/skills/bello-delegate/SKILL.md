@@ -25,7 +25,7 @@ Run from the target repository, or pass it with `--project`:
 python <SKILL_DIR>/scripts/bello_delegate.py start --project <repository>
 ```
 
-With no task or plan options, the launcher invokes `bello` with no arguments. Bello then uses the project's existing `.supervisor/config.json` and its normal task discovery. Do not infer or pass any model, provider, effort, service-tier, review, cleanup, or restart option from the frontend session.
+With no task or plan options, the launcher invokes `bello` with no arguments. Bello then uses the project's existing `.supervisor/config.json` and its normal task discovery. Do not infer or pass any model, provider, effort, service-tier, runtime, distiller, review, cleanup, or restart option from the frontend session.
 
 When the user supplies or approves a task file or plan file, append the corresponding option. This includes a plan created in a separately approved planning pass; do not invent or add a planning pass yourself:
 
@@ -34,6 +34,8 @@ python <SKILL_DIR>/scripts/bello_delegate.py start --project <repository> --task
 ```
 
 The launcher validates both files as ordinary files inside the repository. It rejects a duplicate active launch and starts Bello in the background. It never installs, updates, authenticates, configures, or publishes Bello. Do not run the Bello configuration advisor as part of this workflow. Run `bello config` only if the user separately asks to configure Bello.
+
+Runtime supervision, completion review, adversary, and log distiller are independent saved switches. Runtime-off makes no runtime/triage model calls; C/A still follow their own settings. It reduces live protection and allows network inside the filesystem sandbox, not automatic outside-sandbox grants. Distiller is off by default. An approved enabled run downloads Bello's pinned default model once (about 599 MB) and reuses its cache, unless a compatible local bundle is selected. The optional `log-distiller` dependencies must be installed; native Codex also needs the compatible selection-hook executable. Report setup failures, do not silently install dependencies, change providers, or disable the selected feature. CPU selection has a 300-second request budget including queue time; do not promise savings. If changed runtime/distiller settings conflict with existing threads, report that a fresh run is required; do not silently restart or rewrite the saved policy.
 
 ## Monitor and report
 

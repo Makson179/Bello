@@ -1936,6 +1936,7 @@ async def test_summary_done_without_marker_steers_for_exact_marker_not_completio
 )
 async def test_former_material_limitation_phrases_are_not_terminal(tmp_path: Path, phrase: str) -> None:
     controller, store, _ = _runtime_controller(tmp_path)
+    controller.adversary_enabled = False
 
     class FakeCoder:
         def __init__(self) -> None:
@@ -1990,6 +1991,7 @@ async def test_no_marker_idle_forces_completion_review_once(tmp_path: Path) -> N
 
 async def test_marker_with_completion_review_disabled_finalizes_without_review(tmp_path: Path) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
+    controller.adversary_enabled = False
     store.update_bello_config(lambda cfg: cfg.model_copy(update={"completion_review_enabled": False}))
     controller.last_coder_message = CoderMessage(
         text="Summary: done\nValidation: pytest\nBELLO_READY_FOR_REVIEW",
@@ -2026,7 +2028,7 @@ async def test_completion_review_cli_override_beats_persisted_config(tmp_path: P
     assert controller._effective_completion_review() is False
 
 
-async def test_completion_review_disabled_suppresses_adversary(tmp_path: Path) -> None:
+async def test_completion_review_disabled_preserves_independent_adversary(tmp_path: Path) -> None:
     controller, store, _ = _runtime_controller(tmp_path)
     controller.adversary_enabled = True
     controller.adversary_runs = None
@@ -2034,12 +2036,13 @@ async def test_completion_review_disabled_suppresses_adversary(tmp_path: Path) -
         lambda cfg: cfg.model_copy(update={"max_adversary_runs": 2, "completion_review_enabled": False})
     )
 
-    assert controller._effective_max_adversary_runs() == 0
-    assert controller._adversary_model_required_for_preflight() is False
+    assert controller._effective_max_adversary_runs() == 2
+    assert controller._adversary_model_required_for_preflight() is True
 
 
 async def test_no_marker_idle_nudges_coder_when_completion_review_disabled(tmp_path: Path) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
+    controller.adversary_enabled = False
     store.update_bello_config(
         lambda cfg: cfg.model_copy(
             update={"active_coder_turn_id": None, "last_event_sequence": 17, "completion_review_enabled": False}
@@ -4046,6 +4049,7 @@ async def test_done_without_fresh_validation_runtime_noop_finalizes_when_review_
     tmp_path: Path,
 ) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
+    controller.adversary_enabled = False
     store.update_bello_config(lambda cfg: cfg.model_copy(update={"completion_review_enabled": False}))
     _prepare_done_without_fresh_validation(controller)
 
@@ -9557,6 +9561,7 @@ async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path:
         runtime_intelligence="xhigh",
         completion_intelligence="high",
         adversary_enabled=False,
+        completion_review=True,
         overwrite_state=True,
         use_git_diff=False,
     )
@@ -9582,10 +9587,7 @@ async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path:
     assert controller.completion_supervisor is not controller.supervisor
     assert controller.completion_supervisor.model == "gpt-completion"
     assert controller.completion_supervisor.intelligence == "high"
-    assert controller.adv_report_controller is not None
-    assert controller.adv_report_controller is not controller.completion_supervisor
-    assert controller.adv_report_controller.model == "gpt-completion"
-    assert controller.adv_report_controller.intelligence == "high"
+    assert controller.adv_report_controller is None
     assert client.stopped is True
     assert controller.running is False
 

@@ -10,7 +10,7 @@ def test_old_model_keeps_subscription_route():
     selected = parse_model_selection("gpt-5.6-sol")
     assert selected.qualified == "openai-codex/gpt-5.6-sol"
     assert selected.billing_route == "subscription"
-    assert selected.engine == "pi"
+    assert selected.engine == "codex"
     assert parse_model_selection("openai/gpt-5.6-sol").billing_route == "provider-api"
     assert parse_model_selection("claude-code/claude-sonnet-4-6").engine == "claude-code"
     assert parse_model_selection("openrouter/qwen/qwen3-coder").model == "qwen/qwen3-coder"

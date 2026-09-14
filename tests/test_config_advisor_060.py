@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import itertools
 import json
 import os
 from pathlib import Path
@@ -51,7 +52,8 @@ def policy():
 
 def config():
     result = dict(review_limit_format="explicit", task="TASK.md", speed="usual",
-                  revision_coder_enabled=False, cheap_runtime=False, start_over=False,
+                  revision_coder_enabled=False, runtime_enabled=True, cheap_runtime=False,
+                  log_distiller={"enabled": False, "model_path": None}, start_over=False,
                   completion_review=True, adversary=True, max_adversary_runs=1,
                   max_completion_returns_before_adversary=1,
                   max_completion_returns_after_adversary=1, clean=False, protected_path=[])
@@ -127,7 +129,7 @@ class AdvisorValidationTests(unittest.TestCase):
     def test_runtime_c_a_and_combined_schedules_pass(self):
         for completion, adversary, before, after, runs in (
             (False, False, 0, 0, 0), (True, False, 1, 0, 0),
-            (True, True, 0, 0, 1), (True, True, 2, 1, 2),
+            (False, True, 0, 0, 1), (True, True, 0, 0, 1), (True, True, 2, 1, 2),
         ):
             candidate = config()
             candidate.update(completion_review=completion, adversary=adversary,
@@ -136,11 +138,129 @@ class AdvisorValidationTests(unittest.TestCase):
                              max_adversary_runs=runs)
             self.assertEqual(validate(candidate), [])
 
-    def test_runtime_only_with_revision_or_nonzero_budget_rejected(self):
+    def test_no_final_review_with_revision_or_nonzero_budget_rejected(self):
         candidate = config()
-        candidate["completion_review"] = False
-        candidate["revision_coder_enabled"] = True
-        self.assertTrue(any("runtime-only" in error for error in validate(candidate)))
+        candidate.update(completion_review=False, adversary=False, max_adversary_runs=0,
+                         max_completion_returns_before_adversary=0,
+                         max_completion_returns_after_adversary=0, revision_coder_enabled=True)
+        self.assertTrue(any("no final review" in error for error in validate(candidate)))
+        candidate["revision_coder_enabled"] = False
+        candidate["max_completion_returns_before_adversary"] = 1
+        self.assertTrue(any("both completion return budgets=0" in error for error in validate(candidate)))
+
+    def test_all_four_switches_are_independent(self):
+        for runtime, completion, adversary, distiller in itertools.product((False, True), repeat=4):
+            candidate = config()
+            candidate.update(runtime_enabled=runtime, completion_review=completion, adversary=adversary,
+                             max_completion_returns_before_adversary=int(completion),
+                             max_completion_returns_after_adversary=0, max_adversary_runs=int(adversary),
+                             log_distiller={"enabled": distiller, "model_path": "/supplied/bundle"})
+            with self.subTest(runtime=runtime, completion=completion, adversary=adversary, distiller=distiller):
+                with mock.patch("supervisor.runtime.distiller_bundle.validate_bundle", return_value={}) as check:
+                    self.assertEqual(validate(candidate), [])
+                    self.assertEqual(check.call_count, int(distiller))
+
+    def test_runtime_off_has_no_runtime_or_triage_catalog_requirement(self):
+        candidate = config()
+        candidate.update(runtime_enabled=False, runtime_mod="unconfigured/runtime")
+        self.assertEqual(validate(candidate), [])
+        candidate["cheap_runtime"] = True
+        errors = validate(candidate)
+        self.assertTrue(any("must be false when runtime_enabled=false" in error for error in errors))
+        self.assertFalse(any("unavailable" in error for error in errors))
+
+    def test_a_only_uses_adversary_and_revision_profiles_not_completion(self):
+        candidate = config()
+        candidate.update(runtime_enabled=False, completion_review=False,
+                         max_completion_returns_before_adversary=0,
+                         max_completion_returns_after_adversary=0,
+                         completion_mod="unconfigured/completion", revision_coder_enabled=True)
+        self.assertEqual(validate(candidate), [])
+        candidate["adversary_intelligence"] = "xhigh"
+        self.assertTrue(any("adversary_mod/adversary_intelligence" in error for error in validate(candidate)))
+        candidate["adversary_intelligence"] = "high"
+        candidate["revision_coder_mod"] = "unconfigured/revision"
+        self.assertTrue(any("revision_coder_mod" in error for error in validate(candidate)))
+
+    def test_a_only_validates_its_own_children(self):
+        candidate = config()
+        candidate.update(completion_review=False, max_completion_returns_before_adversary=0,
+                         max_completion_returns_after_adversary=0)
+        for field in ("completion_multi_agent", "adversary_multi_agent"):
+            candidate[field] = dict(enabled=True, max_concurrent=1,
+                                   default={"model": "unconfigured/child", "intelligence": "high"},
+                                   allowed={"unconfigured/child": ["high"]})
+        errors = validate(candidate)
+        self.assertTrue(any("adversary_multi_agent" in error for error in errors))
+        self.assertFalse(any("completion_multi_agent" in error for error in errors))
+
+    def test_complete_recommendation_requires_new_root_and_nested_fields(self):
+        for field in ("runtime_enabled", "log_distiller"):
+            candidate = config()
+            del candidate[field]
+            self.assertTrue(any("missing keys" in error and field in error for error in validate(candidate)))
+        for field in ("enabled", "model_path"):
+            candidate = config()
+            del candidate["log_distiller"][field]
+            self.assertTrue(any("expected exactly enabled and model_path" in error for error in validate(candidate)))
+
+    def test_distiller_config_shape_and_explicit_local_bundle_are_checked(self):
+        for value in (None, True, {}, {"enabled": "yes", "model_path": None},
+                      {"enabled": False, "model_path": []},
+                      {"enabled": False, "model_path": ""},
+                      {"enabled": False, "model_path": "bad\x00path"},
+                      {"enabled": False, "model_path": None, "timeout": 30}):
+            candidate = config()
+            candidate["log_distiller"] = value
+            self.assertTrue(any("log_distiller" in error for error in validate(candidate)))
+        candidate = config()
+        candidate["log_distiller"] = {"enabled": True, "model_path": "relative/bundle"}
+        self.assertTrue(any("requires --project-root" in error for error in validate(candidate)))
+        with tempfile.TemporaryDirectory() as name:
+            self.assertTrue(any("unavailable or incompatible" in error for error in validate(candidate, project_root=Path(name))))
+
+    def test_default_distiller_advice_does_not_resolve_or_download_model(self):
+        candidate = config()
+        candidate["log_distiller"] = {"enabled": True, "model_path": None}
+        with mock.patch.dict(sys.modules, {
+            "huggingface_hub": None,
+            "supervisor.runtime.distiller_download": None,
+            "supervisor.runtime.distiller_bundle": None,
+        }):
+            self.assertEqual(validate(candidate), [])
+
+    def test_distiller_bundle_check_is_local_metadata_only(self):
+        from supervisor.runtime import distiller_bundle
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            bundle = root / "bundle"
+            bundle.mkdir()
+            for asset in distiller_bundle.REQUIRED_ASSETS:
+                (bundle / asset).write_text("{}")
+            (bundle / "config.json").write_text(json.dumps(dict(
+                model_type="modernbert", hidden_size=768, num_hidden_layers=22)))
+            (bundle / "checkpoint.pt").write_text("not real weights; validation must not load this")
+            manifest = dict(format=distiller_bundle.FORMAT, architecture=distiller_bundle.ARCHITECTURE,
+                            checkpoint={"file": "checkpoint.pt", "format": "torch", "sha256": "0" * 64},
+                            assets_sha256={asset: "0" * 64 for asset in distiller_bundle.REQUIRED_ASSETS},
+                            recipe=dict(max_length=distiller_bundle.MAX_LENGTH, overlap=distiller_bundle.OVERLAP,
+                                        renderer=distiller_bundle.RENDERER, cutoff=0))
+            (bundle / "manifest.json").write_text(json.dumps(manifest))
+            candidate = config()
+            candidate["log_distiller"] = {"enabled": True, "model_path": "bundle"}
+            with mock.patch.object(distiller_bundle, "sha256", side_effect=AssertionError("no weight hashing")):
+                self.assertEqual(validate(candidate, project_root=root), [])
+            manifest["architecture"] = "incompatible"
+            (bundle / "manifest.json").write_text(json.dumps(manifest))
+            self.assertTrue(any("incompatible" in error for error in validate(candidate, project_root=root)))
+
+    def test_enabled_distiller_requires_bello_python_but_disabled_path_is_dormant(self):
+        candidate = config()
+        candidate["log_distiller"]["model_path"] = "/unavailable/bundle"
+        with mock.patch.dict(sys.modules, {"supervisor.runtime.distiller_bundle": None}):
+            self.assertEqual(validate(candidate), [])
+            candidate["log_distiller"]["enabled"] = True
+            self.assertTrue(any("Bello's Python environment" in error for error in validate(candidate)))
 
     def test_no_catalog_no_recommendation_validation(self):
         self.assertTrue(validate(config(), catalog=None))
@@ -276,6 +396,8 @@ class ConfigInspectionTests(unittest.TestCase):
         self.assertEqual(result["apply_guard"], "clear")
         self.assertEqual(current["max_completion_returns_before_adversary"], 1)
         self.assertEqual(current["max_completion_returns_after_adversary"], 0)
+        self.assertTrue(current["runtime_enabled"])
+        self.assertEqual(current["log_distiller"], {"enabled": False, "model_path": None})
 
     def test_sparse_explicit_config_uses_current_review_defaults(self):
         with tempfile.TemporaryDirectory() as name:
@@ -351,6 +473,29 @@ class ConfigInspectionTests(unittest.TestCase):
         self.assertEqual(result["revision_coder_mod"], CLAUDE)
         self.assertEqual(result["revision_coder_intelligence"], "max")
         self.assertEqual(result["max_completion_returns_before_adversary"], 3)
+
+    def test_inspector_preserves_independent_flags_and_dormant_source_values(self):
+        payload = config()
+        payload.update(runtime_enabled=False, completion_review=False, cheap_runtime=True,
+                       log_distiller={"enabled": False, "model_path": "/not/on/this/host"})
+        current = INSPECTOR._normalize(payload, config_exists=True)
+        self.assertEqual(current, payload)
+        self.assertEqual(INSPECTOR._source_config_errors(payload, current, config_exists=True), [])
+        self.assertTrue(current["adversary"])
+
+    def test_inspector_normalizes_sparse_distiller_without_hiding_source_errors(self):
+        payload = {"log_distiller": {"enabled": True}}
+        current = INSPECTOR._normalize(payload, config_exists=True)
+        self.assertEqual(current["log_distiller"], {"enabled": True, "model_path": None})
+        for value in ([], None, {"enabled": "yes"}, {"model_path": []}, {"unknown": 1}):
+            payload = {"log_distiller": value}
+            current = INSPECTOR._normalize(payload, config_exists=True)
+            self.assertTrue(any("log_distiller" in error for error in
+                                INSPECTOR._source_config_errors(payload, current, config_exists=True)))
+        payload = {"runtime_enabled": "false"}
+        current = INSPECTOR._normalize(payload, config_exists=True)
+        self.assertIn("runtime_enabled must be boolean",
+                      INSPECTOR._source_config_errors(payload, current, config_exists=True))
 
     def test_explicit_and_legacy_zero_are_distinct(self):
         self.assertEqual(INSPECTOR._normalized_review_limits({"review_limit_format": "explicit",

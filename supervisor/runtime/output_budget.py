@@ -16,6 +16,37 @@ OutputBudgetMode = Literal["head", "tail"]
 
 OUTPUT_MAX_LINES = 2_000
 OUTPUT_MAX_BYTES = 50 * 1024
+COMMAND_MAX_OUTPUT_TOKENS = 10_000
+
+
+def budget_command_output(text: str, max_output_tokens: int | None = None) -> BudgetedOutput:
+    """Codex-like approximate output budget: preserve both ends, not just the tail.
+
+    Four UTF-8 bytes per token is a size estimate, not a model tokenizer. The
+    host ceiling applies even when a tool asks for more. File pagination keeps
+    its separate line-aware head policy. Notices do not consume the body budget.
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    if max_output_tokens is not None and (
+        isinstance(max_output_tokens, bool) or not isinstance(max_output_tokens, int)
+        or max_output_tokens < 0
+    ):
+        raise ValueError("max_output_tokens must be a non-negative integer")
+    tokens = min(COMMAND_MAX_OUTPUT_TOKENS, max_output_tokens) if max_output_tokens is not None else COMMAND_MAX_OUTPUT_TOKENS
+    limit = tokens * 4
+    total = _byte_length(text)
+    metadata = {"truncated": total > limit, "mode": "head_tail", "totalBytes": total,
+                "maxBytes": limit, "maxOutputTokens": tokens, "approximateTokens": True,
+                "returnedBytes": total}
+    if total <= limit:
+        return BudgetedOutput(text, metadata)
+    head = _utf8_prefix(text, limit // 2)
+    tail = _utf8_suffix(text, limit - limit // 2) if limit else ""
+    kept = _byte_length(head) + _byte_length(tail)
+    metadata["returnedBytes"] = kept
+    marker = f"\n[… {total - kept} bytes omitted …]\n"
+    return BudgetedOutput(head + marker + tail, metadata)
 
 
 @dataclass(frozen=True, slots=True)

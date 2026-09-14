@@ -5,11 +5,44 @@ import pytest
 from supervisor.runtime.output_budget import (
     OUTPUT_MAX_BYTES,
     OUTPUT_MAX_LINES,
+    budget_command_output,
     budget_output,
 )
 
 
 NOTICE = "\n\n[bello: tool output truncated"
+
+
+def test_command_budget_preserves_both_ends_and_honors_smaller_request():
+    source = "HEADER" + "x" * 1000 + "FINAL ERROR"
+    result = budget_command_output(source, 10)
+    assert result.text.startswith(source[:20])
+    assert result.text.endswith(source[-20:])
+    assert "bytes omitted" in result.text
+    assert result.metadata["returnedBytes"] == 40
+    assert result.metadata["mode"] == "head_tail"
+    assert budget_command_output("fine").text == "fine"
+
+
+def test_command_budget_ceiling_utf8_and_zero():
+    source = "🙂" * 20_000
+    result = budget_command_output(source, 50_000)
+    assert result.metadata["maxOutputTokens"] == 10_000
+    assert result.metadata["returnedBytes"] == 40_000
+    assert "�" not in result.text
+    assert result.text.startswith("🙂") and result.text.endswith("🙂")
+    assert budget_command_output("abc", 0).text == "\n[… 3 bytes omitted …]\n"
+
+
+@pytest.mark.parametrize("limit", [-1, True, 1.5, "100"])
+def test_command_budget_rejects_invalid_limit(limit):
+    with pytest.raises(ValueError, match="non-negative integer"):
+        budget_command_output("log", limit)
+
+
+def test_command_budget_rejects_non_text():
+    with pytest.raises(TypeError, match="text must be a string"):
+        budget_command_output(b"log")
 
 
 def body_of(rendered: str) -> str:

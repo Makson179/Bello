@@ -142,9 +142,10 @@ def _response_chunks(flow: str, step: int, delta: dict[str, Any], finish_reason:
 
 
 class _LocalProviderState:
-    def __init__(self, output_schema: dict[str, Any], final_mode: str):
+    def __init__(self, output_schema: dict[str, Any], final_mode: str, distiller_enabled: bool = False):
         self.output_schema = output_schema
         self.final_mode = final_mode
+        self.distiller_enabled = distiller_enabled
         self.condition = threading.Condition()
         self.first_requests: set[str] = set()
         self.steps: dict[str, int] = {}
@@ -179,29 +180,48 @@ class _LocalProviderState:
             raise AssertionError(f"missing controlled tools: {sorted(required_tools - tools.keys())}")
         if tools["submit_result"].get("parameters") != self.output_schema:
             raise AssertionError("Pi did not send the exact Bello output schema to the local provider")
+        for name in ("write_file", "read_file", "exec_command"):
+            assert ("focus" in tools[name]["parameters"]["properties"]) is self.distiller_enabled
 
         filename = f"flow-{flow.lower()}.txt"
+        focus = {"focus": "Keep the useful tool result."} if self.distiller_enabled else {}
         if step == 0:
             return _tool_chunk(flow, step, "write_file", {
                 "path": filename,
                 "content": f"payload-{flow}\n",
+                **focus,
             })
         if step == 1:
             if f"call-{flow.lower()}-write_file" not in serialized or "bytes_written" not in serialized:
                 raise AssertionError("the write result did not return through the Pi conversation")
-            return _tool_chunk(flow, step, "read_file", {"path": filename})
+            return _tool_chunk(flow, step, "read_file", {"path": filename, **focus})
         if step == 2:
             if f"call-{flow.lower()}-read_file" not in serialized or f"payload-{flow}" not in serialized:
                 raise AssertionError("the read result did not return through the Pi conversation")
             command = (
-                f'findstr /x /c:"payload-{flow}" {filename} && echo exec-{flow}-ok'
+                f'findstr /x /c:"payload-{flow}" {filename} && echo synthetic-^noise-{flow} && echo exec-{flow}-ok'
                 if os.name == "nt"
-                else f'test "$(cat {filename})" = "payload-{flow}" && printf "exec-{flow}-ok"'
+                else f'test "$(cat {filename})" = "payload-{flow}" && printf "synthetic-%s-%s\\n" noise {flow} && printf "exec-{flow}-ok"'
             )
-            return _tool_chunk(flow, step, "exec_command", {"command": command, "timeout": 10})
+            return _tool_chunk(flow, step, "exec_command", {"command": command, "timeout": 10, **focus})
         if step == 3:
             if f"call-{flow.lower()}-exec_command" not in serialized or f"exec-{flow}-ok" not in serialized:
                 raise AssertionError("the command result did not return through the Pi conversation")
+            tool_message = next(message for message in body["messages"]
+                                if message.get("role") == "tool"
+                                and message.get("tool_call_id") == f"call-{flow.lower()}-exec_command")
+            packet = json.loads(tool_message["content"])
+            assert (f"synthetic-noise-{flow}" not in packet["output"]) is self.distiller_enabled
+            if self.distiller_enabled:
+                assert packet["output"].strip() == f"exec-{flow}-ok"
+                assert f"synthetic-noise-{flow}" not in serialized
+            assert packet["status"] == "completed" and packet["exitCode"] == 0
+            assert packet["timedOut"] is False and packet["cancelled"] is False
+            assert packet["outputTruncated"] is False and isinstance(packet["sessionId"], str)
+            assert packet["outputBudget"]["truncated"] is False
+            assert packet["outputBudget"]["returnedBytes"] == packet["outputBudget"]["totalBytes"]
+            if self.distiller_enabled:
+                assert packet["outputBudget"]["totalBytes"] > len(packet["output"].encode())
             if self.final_mode == "text":
                 return _response_chunks(flow, step, {
                     "role": "assistant",
@@ -213,9 +233,9 @@ class _LocalProviderState:
 
 @contextmanager
 def _local_openai_provider(
-    output_schema: dict[str, Any], final_mode: str,
+    output_schema: dict[str, Any], final_mode: str, distiller_enabled: bool = False,
 ) -> Iterator[tuple[str, _LocalProviderState]]:
-    state = _LocalProviderState(output_schema, final_mode)
+    state = _LocalProviderState(output_schema, final_mode, distiller_enabled)
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -295,8 +315,9 @@ def _worker_environment(node: Path, home: Path, scratch: Path) -> dict[str, str]
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("final_mode", ["submit_result", "text"])
+@pytest.mark.parametrize("distiller_enabled", [False, True], ids=["original", "distilled"])
 async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, final_mode: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, final_mode: str, distiller_enabled: bool,
 ) -> None:
     file_tool_commands: list[tuple[str, ...]] = []
     if os.name == "nt":
@@ -348,10 +369,30 @@ async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(
         notification_handler=notification,
         transport_error_handler=transport_error,
     )
+    selected_inputs: list[str] = []
+    if distiller_enabled:
+        from supervisor.runtime import distiller
+
+        class FakeSelector:
+            async def distill(self, text, focus, command):
+                assert focus == "Keep the useful tool result."
+                assert isinstance(command, str) and command
+                if "synthetic-noise-" in text:
+                    selected_inputs.append(text)
+                    return "".join(line for line in text.splitlines(keepends=True) if line.startswith("exec-"))
+                return text
+
+            async def close(self):
+                pass
+
+        monkeypatch.setattr(distiller, "LogDistiller", lambda _path: FakeSelector())
+        monkeypatch.setattr(distiller, "validate_bundle", lambda _path: {})
+        monkeypatch.setattr(distiller, "require_dependencies", lambda: None)
+        client.configure_run(log_distiller={"enabled": True, "model_path": str(tmp_path / "fake-bundle")})
     await client.start()
     transport: WorkerTransport | None = None
     try:
-        with _local_openai_provider(output_schema, final_mode) as (base_url, provider):
+        with _local_openai_provider(output_schema, final_mode, distiller_enabled) as (base_url, provider):
             (agent_dir / "models.json").write_text(json.dumps({
                 "providers": {
                     "bello-local": {
@@ -405,7 +446,7 @@ async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(
 
             transport = await start_worker()
 
-            listed = await client.request("model/list", {})
+            listed = await client.request("model/list", {"engines": ["pi"]})
             local = next(item for item in listed["data"] if item.get("qualifiedId") == "bello-local/integration-model")
             assert local["configured"] is True
             assert local["supportedEfforts"] == ["off"]
@@ -421,6 +462,7 @@ async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(
                     "effort": "off",
                     "sandbox": "workspace-write",
                     "approvalPolicy": "never",
+                    "belloRole": "coder",
                 })
                 thread_id = started["thread"]["id"]
                 thread_ids[flow] = thread_id
@@ -455,6 +497,7 @@ async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(
             assert provider.first_requests == {"A", "B"}
             assert provider.steps == {"A": 4, "B": 4}
             assert len(provider.requests) == 8
+            assert len(selected_inputs) == (2 if distiller_enabled else 0)
             assert not transport_errors
             usage_events = [
                 raw["params"]["item"]

@@ -17,6 +17,8 @@ class ModelSelection:
 
     @property
     def engine(self) -> str:
+        if self.provider == "openai-codex":
+            return "codex"
         return "claude-code" if self.provider == "claude-code" else "pi"
 
     @property

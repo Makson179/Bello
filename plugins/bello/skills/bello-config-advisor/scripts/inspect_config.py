@@ -168,6 +168,12 @@ def _normalize(payload: dict[str, Any], *, config_exists: bool) -> dict[str, Any
     else:
         protected = [item.strip() for item in protected if isinstance(item, str) and item.strip()]
 
+    raw_distiller = payload.get("log_distiller", {})
+    log_distiller = (
+        {"enabled": raw_distiller.get("enabled", False), "model_path": raw_distiller.get("model_path")}
+        if isinstance(raw_distiller, dict) else copy.deepcopy(raw_distiller)
+    )
+
     return {
         "review_limit_format": "explicit",
         "task": _optional_nonempty_string(_first(payload, ("task", "task_path"), None, skip_none=True)),
@@ -189,7 +195,9 @@ def _normalize(payload: dict[str, Any], *, config_exists: bool) -> dict[str, Any
             _first(payload, ("adversary_intelligence",), "xhigh", skip_none=True)
         ),
         "speed": speed,
+        "runtime_enabled": payload.get("runtime_enabled", True),
         "cheap_runtime": _first(payload, ("cheap_runtime", "cheap_runtime_enabled"), True),
+        "log_distiller": log_distiller,
         "start_over": payload.get("start_over", False),
         "completion_review": _first(
             payload,
@@ -292,6 +300,7 @@ def _source_config_errors(payload: dict[str, Any], current: dict[str, Any], *, c
         errors.append("fast must be boolean")
     for field in (
         "revision_coder_enabled",
+        "runtime_enabled",
         "cheap_runtime",
         "start_over",
         "completion_review",
@@ -300,6 +309,18 @@ def _source_config_errors(payload: dict[str, Any], current: dict[str, Any], *, c
     ):
         if not isinstance(current[field], bool):
             errors.append(f"{field} must be boolean")
+    distiller = current["log_distiller"]
+    raw_distiller = payload.get("log_distiller", {})
+    if not isinstance(raw_distiller, dict) or set(raw_distiller) - {"enabled", "model_path"}:
+        errors.append("log_distiller must contain only enabled and model_path")
+    if isinstance(distiller, dict):
+        if not isinstance(distiller["enabled"], bool):
+            errors.append("log_distiller.enabled must be boolean")
+        model_path = distiller["model_path"]
+        if model_path is not None and (
+            not isinstance(model_path, str) or not model_path.strip() or "\x00" in model_path
+        ):
+            errors.append("log_distiller.model_path must be a non-empty local folder path or null")
     if not _is_int(current["max_adversary_runs"]):
         errors.append("max_adversary_runs must be a non-negative integer")
     if (
@@ -592,6 +613,7 @@ def inspect(workspace: Path, *, include_bello_version: bool, timeout_seconds: fl
         "source_config_valid": not source_errors,
         "source_config_errors": source_errors,
         "model_capabilities_checked": False,
+        "distiller_bundle_checked": False,
         "current_project_config": current,
         "warnings": warnings,
     }

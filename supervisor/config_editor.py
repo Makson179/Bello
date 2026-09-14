@@ -495,7 +495,7 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
         config.runtime_mod,
         config.runtime_intelligence,
         models,
-    )
+    ) if config.runtime_enabled else ()
     completion_parameters = (
         _role_parameters(
             "completion",
@@ -520,7 +520,7 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
         else ()
     )
     adversary_enabled = config.adversary and config.adversary_runs > 0
-    adversary_active = config.completion_review and adversary_enabled
+    adversary_active = adversary_enabled
     adversary_parameters = (
         _role_parameters(
             "adversary",
@@ -551,20 +551,19 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
     if config.protected_path:
         protected_options.append(EditorOption(f"remove last ({config.protected_path[-1]})", "protected_path", config.protected_path[:-1]))
 
-    review_parameters: list[EditorParameter] = []
-    if config.completion_review:
-        review_parameters.append(
-            EditorParameter(
-                "adversary",
-                "adversary",
-                _format_bool(adversary_enabled),
-                (EditorOption("true", "adversary", True), EditorOption("false", "adversary", False)),
-                help_text=(
-                    "Run the adversarial tester before completion. It attacks the candidate in a disposable "
-                    "snapshot and requires completion review."
-                ),
-            )
+    review_parameters: list[EditorParameter] = [
+        EditorParameter(
+            "adversary",
+            "adversary",
+            _format_bool(adversary_enabled),
+            (EditorOption("true", "adversary", True), EditorOption("false", "adversary", False)),
+            help_text=(
+                "Run the adversarial tester before completion. It attacks the candidate in a disposable "
+                "snapshot independently of completion review."
+            ),
         )
+    ]
+    if config.completion_review:
         before_adversary_help = (
             "Maximum completion-review rounds that may return work before Bello forces the first adversary. "
             "An earlier accept starts the adversary immediately. 0 skips these rounds; Unlimited removes the cap."
@@ -585,17 +584,18 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
                 help_text=before_adversary_help,
             )
         )
-        if adversary_enabled:
-            review_parameters.append(
-                EditorParameter(
-                    "adversary_runs",
-                    "max-adversary-runs",
-                    str(config.adversary_runs),
-                    (),
-                    edit_kind="non_negative_int",
-                    help_text="Maximum adversary passes in one run. 0 disables adversary passes.",
-                )
+    if adversary_enabled:
+        review_parameters.append(
+            EditorParameter(
+                "adversary_runs",
+                "max-adversary-runs",
+                str(config.adversary_runs),
+                (),
+                edit_kind="non_negative_int",
+                help_text="Maximum adversary passes in one run. 0 disables adversary passes.",
             )
+        )
+        if config.completion_review:
             review_parameters.append(
                 EditorParameter(
                     "completion_returns_after_adversary",
@@ -624,6 +624,14 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
         revision_coder_toggle,
         *revision_coder_parameters,
         *multi_agent_parameters,
+        EditorParameter(
+            "runtime_enabled",
+            "runtime",
+            _format_bool(config.runtime_enabled),
+            (EditorOption("true", "runtime_enabled", True), EditorOption("false", "runtime_enabled", False)),
+            help_text=("Run runtime supervision and its optional cheap triage. Off reduces safety: network is enabled "
+                       "inside the filesystem sandbox, with no runtime review or outside-sandbox escalation."),
+        ),
         *runtime_parameters,
         *completion_parameters,
         *completion_multi_agent_parameters,
@@ -639,7 +647,7 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
                 "usual leaves the service tier unset."
             ),
         ),
-        EditorParameter(
+        *((EditorParameter(
             "cheap_runtime",
             "cheap-runtime",
             _format_bool(config.cheap_runtime),
@@ -651,7 +659,7 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
                 "true lets cheap triage (Luna by default) dismiss routine runtime checks. Human messages, "
                 "approvals, and mandatory checks bypass it. false uses the full runtime supervisor for every check."
             ),
-        ),
+        ),) if config.runtime_enabled else ()),
         EditorParameter(
             "start_over",
             "start-over",
@@ -672,10 +680,25 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
             ),
             help_text=(
                 "true sends validated coder readiness to an independent read-only reviewer. false skips the final "
-                "review and adversary, then completes once coder readiness passes required validation checks."
+                "review. Adversary remains independently configurable."
             ),
         ),
         *review_parameters,
+        EditorParameter(
+            "log_distiller_enabled",
+            "log-distiller",
+            _format_bool(config.log_distiller.enabled),
+            (EditorOption("true", "log_distiller_enabled", True), EditorOption("false", "log_distiller_enabled", False)),
+            help_text="Use a local model bundle to select relevant tool-output excerpts before returning them to the coder.",
+        ),
+        *((EditorParameter(
+            "distiller_model_path",
+            "distiller-model",
+            config.log_distiller.model_path or "automatic",
+            (),
+            edit_kind="optional_text",
+            help_text="Leave empty to download and cache the published model. Optional local bundle override; relative paths use this project folder.",
+        ),) if config.log_distiller.enabled else ()),
         EditorParameter(
             "clean",
             "clean",
@@ -1015,7 +1038,9 @@ def _inline_initial_value(config: ProjectConfig, parameter: EditorParameter) -> 
     if parameter.key == "task":
         return config.task or ""
     if parameter.key == "adversary_runs":
-        return str(config.adversary_runs if config.adversary and config.completion_review else 0)
+        return str(config.adversary_runs if config.adversary else 0)
+    if parameter.key == "distiller_model_path":
+        return config.log_distiller.model_path or ""
     if parameter.key == "completion_returns_before_adversary":
         return format_review_limit(config.completion_returns_before_adversary)
     if parameter.key == "completion_returns_after_adversary":
@@ -1065,6 +1090,10 @@ def _commit_inline_edit(
 
 
 def _replace_config_field(config: ProjectConfig, field: str, value: Any) -> ProjectConfig:
+    if field == "log_distiller_enabled":
+        return replace(config, log_distiller=replace(config.log_distiller, enabled=bool(value)))
+    if field == "distiller_model_path":
+        return replace(config, log_distiller=replace(config.log_distiller, model_path=value))
     multi_agent_parts = _multi_agent_editor_field_parts(field)
     if multi_agent_parts is not None:
         config_field, setting_field = multi_agent_parts
@@ -2005,6 +2034,9 @@ def _parameter_icon(parameter_key: str, theme: Theme) -> str:
             "revision_coder_mod": "R",
             "revision_coder_mod_variant": "V",
             "runtime_mod": "R",
+            "runtime_enabled": "R",
+            "log_distiller_enabled": "D",
+            "distiller_model_path": "P",
             "runtime_mod_variant": "V",
             "completion_mod": "F",
             "completion_mod_variant": "V",
@@ -2034,6 +2066,9 @@ def _parameter_icon(parameter_key: str, theme: Theme) -> str:
         "revision_coder_mod": "↪",
         "revision_coder_mod_variant": "↪",
         "runtime_mod": "☆",
+        "runtime_enabled": "☆",
+        "log_distiller_enabled": "≋",
+        "distiller_model_path": "⌂",
         "runtime_mod_variant": "☆",
         "completion_mod": "✓",
         "completion_mod_variant": "✓",
@@ -2206,6 +2241,8 @@ def _parameter_value_fragments(
 def _option_matches_current(config: ProjectConfig, parameter: EditorParameter, option: EditorOption) -> bool:
     if option.action is not None or option.field is None:
         return False
+    if option.field == "log_distiller_enabled":
+        return config.log_distiller.enabled == option.value
     multi_agent_parts = _multi_agent_editor_field_parts(option.field)
     if multi_agent_parts is not None:
         config_field, setting_field = multi_agent_parts
@@ -2456,7 +2493,7 @@ def _available_models_from_app_server(project_root: Path) -> tuple[str, ...]:
         try:
             await client.initialize()
             response = await client.request("model/list", {
-                "engines": ["pi", "claude-code"], "optionalEngines": True,
+                "engines": ["codex", "pi", "claude-code"], "optionalEngines": True,
             })
             for descriptor in response.get("data", []):
                 if not isinstance(descriptor, dict):

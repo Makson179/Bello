@@ -1245,6 +1245,62 @@ async def test_native_restricted_filesystem_and_network_enforcement(tmp_path: Pa
 
 @pytest.mark.skipif(not _native_backend_expected(), reason="no supported native sandbox backend installed")
 @pytest.mark.asyncio
+async def test_native_network_enabled_download_keeps_filesystem_isolation(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    sibling = tmp_path / "private.txt"
+    sibling.write_text("private", encoding="utf-8")
+    runner = SandboxRunner(SandboxPolicy(root, mode="workspace-write", network_access=True))
+    try:
+        await runner.run("true", root, 5)
+    except SandboxUnavailableError as exc:
+        if os.environ.get("BELLO_REQUIRE_NATIVE_SANDBOX") == "1":
+            raise
+        pytest.skip(str(exc))
+
+    async def serve(_reader, writer):
+        writer.write(b"dependency bytes")
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(serve, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    script = (
+        "import socket; from pathlib import Path; "
+        f"s=socket.create_connection(('127.0.0.1',{port}),2); "
+        "Path('download.bin').write_bytes(s.recv(1024)); s.close()"
+    )
+    try:
+        try:
+            result = await runner.run(
+                f"{shlex.quote(str(Path(sys.executable).resolve()))} -I -c {shlex.quote(script)}", root, 5
+            )
+        except SandboxUnavailableError as exc:
+            if os.environ.get("BELLO_REQUIRE_NATIVE_SANDBOX") == "1":
+                raise
+            pytest.skip(str(exc))
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert result.exit_code == 0, result.output
+    assert (root / "download.bin").read_bytes() == b"dependency bytes"
+    denied = await runner.run(f"/bin/cat {shlex.quote(str(sibling))}", root, 5)
+    assert denied.exit_code != 0 and denied.output.strip() != "private"
+    outside = tmp_path / "outside.txt"
+    for target in (sibling, outside):
+        write = await runner.run(f"printf bad > {shlex.quote(str(target))}", root, 5)
+        # Linux creates private mount-parent directories under its tmpfs /tmp.
+        # A write to this spelling may succeed there without touching the host;
+        # Seatbelt instead denies the write to the original filesystem path.
+        if not sys.platform.startswith("linux"):
+            assert write.exit_code != 0
+    assert sibling.read_text(encoding="utf-8") == "private"
+    assert not outside.exists()
+
+
+@pytest.mark.skipif(not _native_backend_expected(), reason="no supported native sandbox backend installed")
+@pytest.mark.asyncio
 async def test_native_private_namespace_cannot_be_aliased_to_expose_state(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     private = root / ".codex" / "bello-run"

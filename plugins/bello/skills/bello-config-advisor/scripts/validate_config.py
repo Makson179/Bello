@@ -30,7 +30,9 @@ REQUIRED_KEYS = {
     "completion_intelligence",
     "adversary_intelligence",
     "speed",
+    "runtime_enabled",
     "cheap_runtime",
+    "log_distiller",
     "start_over",
     "completion_review",
     "adversary",
@@ -178,6 +180,39 @@ def _resolve_expected_task(project_root: Path, task_file: Path) -> str:
     return relative.as_posix()
 
 
+def _validate_log_distiller(value: Any, errors: list[str], *, project_root: Path | None) -> None:
+    if not isinstance(value, dict) or set(value) != {"enabled", "model_path"}:
+        errors.append("log_distiller: expected exactly enabled and model_path")
+        return
+    if not isinstance(value["enabled"], bool):
+        errors.append("log_distiller.enabled: expected boolean")
+    model_path = value["model_path"]
+    if model_path is not None and (
+        not isinstance(model_path, str) or not model_path.strip() or "\x00" in model_path
+    ):
+        errors.append("log_distiller.model_path: expected a non-empty local folder path or null")
+        return
+    if value["enabled"] is not True:
+        return  # A saved, disabled path need not exist on this host.
+    if model_path is None:
+        return  # The approved run resolves the pinned default; advice must not download it.
+    directory = Path(model_path).expanduser()
+    if not directory.is_absolute():
+        if project_root is None:
+            errors.append("log_distiller.model_path: a relative bundle requires --project-root and --task-file")
+            return
+        directory = project_root / directory
+    try:
+        from supervisor.runtime.distiller_bundle import validate_bundle
+    except ImportError:
+        errors.append("log_distiller: use Bello's Python environment to verify bundle compatibility; no weights are downloaded")
+        return
+    try:
+        validate_bundle(directory)  # Metadata/file presence only; no inference or weight loading.
+    except (OSError, ValueError) as exc:
+        errors.append(f"log_distiller.model_path: unavailable or incompatible local bundle ({exc})")
+
+
 def validate(
     config: Any,
     *,
@@ -186,6 +221,7 @@ def validate(
     expected_task: str | None = None,
     catalog: Any = None,
     triage_model: str = "openai-codex/gpt-5.6-luna",
+    project_root: Path | None = None,
 ) -> list[str]:
     if not isinstance(config, dict):
         return ["root: expected a JSON object"]
@@ -210,17 +246,23 @@ def validate(
         errors.append(f"task: {task_error}")
     elif expected_task is not None and task != expected_task:
         errors.append(f"task: expected the resolved input task {expected_task!r}")
+    runtime = config.get("runtime_enabled") is True
     review = config.get("completion_review") is True
-    active_roles = {"coder", "runtime"}
+    adversary_enabled = config.get("adversary") is True
+    active_roles = {"coder"}
+    if runtime:
+        active_roles.add("runtime")
     if review:
-        active_roles.add("completion")  # Also used by the adversary-report controller.
-        if config.get("revision_coder_enabled") is True:
-            active_roles.add("revision_coder")
-        if config.get("adversary") is True:
-            active_roles.add("adversary")
+        active_roles.add("completion")
+    if adversary_enabled:
+        active_roles.add("adversary")  # Also normalizes reports when completion is off.
+    if (review or adversary_enabled) and config.get("revision_coder_enabled") is True:
+        active_roles.add("revision_coder")
     for role in ("coder", "revision_coder", "runtime", "completion", "adversary"):
         _validate_role(config, role, errors, catalog=entries, active=role in active_roles)
-    if config.get("cheap_runtime") is True:
+    if not runtime and config.get("cheap_runtime") is True:
+        errors.append("cheap_runtime: must be false when runtime_enabled=false")
+    if runtime and config.get("cheap_runtime") is True:
         try:
             identity = qualified_model(triage_model, allow_legacy=True)
             triage = entries.get(identity)
@@ -232,6 +274,7 @@ def validate(
         errors.append("speed: expected 'usual' or 'fast'")
     for field in (
         "revision_coder_enabled",
+        "runtime_enabled",
         "cheap_runtime",
         "start_over",
         "completion_review",
@@ -242,6 +285,7 @@ def validate(
             errors.append(f"{field}: expected boolean")
     if config.get("clean") is True and not allow_clean:
         errors.append("clean: true requires explicit authorization and --allow-clean")
+    _validate_log_distiller(config.get("log_distiller"), errors, project_root=project_root)
 
     if not _is_int(config.get("max_adversary_runs")):
         errors.append("max_adversary_runs: expected a non-negative integer")
@@ -257,19 +301,18 @@ def validate(
     before = config.get("max_completion_returns_before_adversary")
     after = config.get("max_completion_returns_after_adversary")
     if completion is False:
-        if config.get("revision_coder_enabled") is True:
-            errors.append("revision_coder_enabled: runtime-only has no review finding to hand off")
-        if adversary is not False or adversary_runs != 0 or before != 0 or after != 0:
-            errors.append("review pipeline: runtime-only requires adversary=false and all review budgets=0")
-    elif completion is True:
-        if adversary is True:
-            if not _is_int(adversary_runs, minimum=1):
-                errors.append("review pipeline: adversary=true requires max_adversary_runs >= 1")
-        elif adversary is False:
-            if adversary_runs != 0 or after != 0:
-                errors.append("review pipeline: adversary=false requires adversary runs and post-adversary returns=0")
-            if before == 0:
-                errors.append("review pipeline: completion review has no scheduled return budget")
+        if before != 0 or after != 0:
+            errors.append("review pipeline: completion_review=false requires both completion return budgets=0")
+        if adversary is False and config.get("revision_coder_enabled") is True:
+            errors.append("revision_coder_enabled: no final review can return a finding to hand off")
+    if adversary is True:
+        if not _is_int(adversary_runs, minimum=1):
+            errors.append("review pipeline: adversary=true requires max_adversary_runs >= 1")
+    elif adversary is False:
+        if adversary_runs != 0 or after != 0:
+            errors.append("review pipeline: adversary=false requires adversary runs and post-adversary returns=0")
+        if completion is True and before == 0:
+            errors.append("review pipeline: completion review has no scheduled return budget")
 
     protected = config.get("protected_path")
     if not isinstance(protected, list) or any(not isinstance(item, str) or not item.strip() for item in protected):
@@ -282,7 +325,8 @@ def validate(
         "completion_multi_agent",
         "adversary_multi_agent",
     ):
-        active = field == "multi_agent" or (review and (field == "completion_multi_agent" or config.get("adversary") is True))
+        active = {"multi_agent": True, "completion_multi_agent": review,
+                  "adversary_multi_agent": adversary_enabled}[field]
         _validate_multi_agent(config.get(field), field, errors, catalog=entries,
                               active=active, fast=config.get("speed") == "fast")
     return errors
@@ -331,6 +375,7 @@ def main() -> int:
         expected_task=expected_task,
         catalog=catalog,
         triage_model=args.triage_model,
+        project_root=args.project_root,
     )
     if errors:
         for error in errors:

@@ -212,7 +212,7 @@ def test_pi_failure_does_not_hide_sandbox_and_claude_results(
 
     monkeypatch.setattr(install, dependency, unavailable)
     results = doctor._runtime_dependency_results()
-    assert any(result.level == "fail" and "Pi runtime" in result.message for result in results)
+    assert any(result.level == "warn" and "Pi runtime" in result.message for result in results)
     assert any(result.level == "ok" and "OS sandbox" in result.message for result in results)
     assert any(result.level == "ok" and "Claude Code SDK bundle" in result.message for result in results)
 

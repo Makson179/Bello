@@ -8,8 +8,10 @@ Branch: `mystery`. Review/CI changes are pushed there, not released to main or P
 
 ## Agreed scope
 
-Replace the Codex app-server executor with Pi for supported subscription/API
-providers. Use the official Claude Code execution path for the user's included
+Updated 2026-09-13: subscription Codex (`openai-codex/*`, including bare `gpt-*`)
+returns to the native Codex app-server, its native base prompt and tools. Pi
+continues to serve other supported providers/API routes. Use the official Claude
+Code execution path for the user's included
 Claude subscription, where Pi's direct API authentication is not equivalent.
 Keep one Bello product, with Codex and Claude Code front-end plugins. Other
 front ends can be added later. This is a full implementation, not a pilot or a
@@ -39,6 +41,108 @@ Claude Code uses its official client and the same Bello-managed tools. No copied
 subscription tokens, unofficial API billing, native unmanaged subagents or
 permission bypasses. Unsupported capabilities must be surfaced, not emulated by
 guessing or quietly weakening an existing safety property.
+
+Native Codex is a third backend of this same controller, not a second product.
+It uses first-party subscription authentication without Pi OAuth or API fallback.
+Host/native thread and turn identities are persisted explicitly; native requests
+are not replayed after uncertain failures. Native approvals feed the controller,
+while cross-provider delegation alone uses Bello dynamic tools. The native
+distiller needs the explicitly selected, verified output-hook binary;
+stock app-server remains usable with distillation off. The tested 0.153.4 build
+is hash-pinned and selected with `BELLO_CODEX_BINARY`; alternate compatible builds
+use a trusted local `BELLO_CODEX_SELECTION_MANIFEST`. No experiment-specific
+Python patch is needed. See [runtime details](runtime.md) and
+[native selection setup](native-codex-selection.md).
+
+## Independent run controls and local output distillation
+
+The working implementation adds independent runtime, completion-review,
+adversary and log-distiller switches. `runtime_enabled` defaults to true;
+`completion_review`, `adversary` and `log_distiller.enabled` default to false.
+Completion review no longer gates the adversary setting. Revision-coder feedback
+handling is available when either completion review or adversary is enabled.
+Configuration, CLI overrides and persisted runtime state carry these choices.
+The editor keeps the switches available independently and hides runtime
+model/effort/cheap-triage controls when runtime supervision is disabled.
+
+Runtime-off makes cheap triage effectively false and omits runtime model review.
+It enables networking inside the assigned filesystem sandbox, with escalation
+disabled. This explicitly reduces safety: network access can transmit readable
+data, and there is no runtime model review. Filesystem containment, protected
+inputs, the completion-marker protocol and enabled completion/adversary reviews
+still apply. Runtime behavioral-validation/readiness gates are disabled.
+This optional online mode does not alter the separately documented limitations
+or historical verification of restricted offline mode.
+
+Command packets now keep both ends of output under an approximate 10,000-token
+default/maximum, estimated at four UTF-8 bytes per token (40,000 body bytes).
+Smaller tool-requested budgets are honored; omission markers and metadata sit
+outside that body budget. File reads, search and listings retain head truncation
+at 2000 lines/50 KiB and file continuation offsets. These are ordinary output
+limits, applied before optional distillation. Captured controller evidence is
+separate and larger, but remains bounded.
+
+The common ToolHost distills eligible text results only for the coder lifecycle,
+including revision/resumed coders and coder children across Pi and Claude Code.
+Reviewer results remain unchanged. A short tool `focus` conditions selection;
+missing focus preserves the ordinary result. Selection changes only model-facing
+text, retaining command/session metadata and controller evidence. Worker failure
+or its fixed 300-second timeout retains the ordinary bounded result, without
+replaying execution. The trained selector uses 8192-token ModernBERT windows with
+256-token overlap and covers the full received, already-budgeted text.
+
+A host-side document/help exclusion runs before the selector: the configured task,
+explicit reads of named instruction/README/specification files, and recognised
+CLI-help calls retain their whole normal packet, also in mixed commands and later
+polls/stops. Generic Markdown, docs directories, JSON and diffs are not blanket
+exclusions. This does not disable the
+ordinary output budget or claim to detect arbitrary semantic importance. No
+additional inference, coder instructions, or raw-log recall mechanism is added.
+
+Inference dependencies are optional through `.[log-distiller]`. With distillation
+enabled and no local `model_path` override, Bello downloads the public
+`Makson179/bello-log-distiller` bundle at pinned revision
+`436bf8dceecb30d5494519d21175bc03e5c98795` into the Hugging Face cache and reuses
+it offline. Disabled runs do not download or load the model. The prefetch command
+is `python -m supervisor.runtime.distiller_download`.
+
+The `bello.log-distiller.v1` bundle identifies the fresh ModernBERT-base token-MLP
+architecture, original tokenizer/config assets, file hashes and cutoff recipe.
+The published weights use safetensors, with SHA-256 integrity checks and local
+inference. Model files carry Apache 2.0 and the upstream notice; Bello code stays
+MIT. The model repository contains no dataset, private logs or benchmark results.
+The local export helper remains available for compatible alternate checkpoints;
+the older R12 architecture is not a substitute. Installation and override examples
+are in [the runtime guide](runtime.md#optional-local-log-distiller).
+
+The test counts and native/account acceptance results below describe their
+recorded historical checkpoints. They do not certify these subsequent controls
+or establish distiller quality, recall or benchmark savings. Current change
+verification is recorded separately when completed.
+
+### Local verification of the independent controls (2026-09-12)
+
+- Complete offline Python suite: **1654 passed, 25 skipped, 21 subtests passed**
+  in 47.22 seconds on macOS/Python 3.14. Skipped native/network cases are not
+  counted as passing.
+- Separate required native macOS execution: **2 passed**, checking offline
+  network denial and online localhost download with outside-file read/write
+  still denied. These checks make no claim about Windows or Linux acceptance.
+- Separate required real Pi SDK/local-provider execution: **4 passed**, covering
+  original/distilled output and both structured-result modes. A fake selector
+  proves selected text reaches the next provider request, removed noise stays
+  absent, and command status/session metadata survives. No external model was
+  called.
+- Bundle/backend tests cover lazy startup, queue deadlines, process cleanup,
+  recovery, missing dependencies and inference recipe checks. A one-off parity
+  check with the original local tokenizer matched the frozen training recipe
+  across six inputs/seven windows, including a long multi-window log.
+- Advisor/delegate skill validation passed. The advisor tests include all
+  sixteen switch combinations. Both skills explain the new controls without
+  changing the existing concise, non-JSON recommendation workflow.
+
+These checks used the code and fixtures available on 2026-09-12, not the later
+published model bundle. They do not establish its quality or benchmark savings.
 
 ## Work and acceptance checklist
 
@@ -76,14 +180,15 @@ platform limitations remain visible until resolved.
 
 ## Current verification notes
 
-- The default controller now routes through `RuntimeClient`, not a Codex
-  app-server process. Its internal thread/turn/item names remain compatible
-  with the existing controller. All provider tools pass through `ToolHost`.
+- The default controller routes through `RuntimeClient`, whose backends are
+  native Codex app-server, the official Claude Agent SDK and Pi. Its internal
+  thread/turn/item names remain compatible with the existing controller. Pi and
+  Claude Code use `ToolHost`; native Codex retains its own tools and approvals.
 - Pi 0.85.1 is pinned with its npm lockfile. Its SDK worker has real offline
   bootstrap coverage and structured-schema tests using Bello's actual schemas.
 - The optional official Claude Agent SDK is pinned at 0.2.152. Its adapter has
   isolated SDK control/auth/schema tests. No subscription tokens are copied.
-- Current local checkpoint: 1506 pytest tests and six Pi SDK integration tests
+- Historical local checkpoint: 1506 pytest tests and six Pi SDK integration tests
   passed. All seven general CI jobs passed at `a99d556`.
   At `a99d556`, native Windows Server 2022 CI is fully green; Server 2025 fails
   only the previous full-DNS-denial assertion below. This records the actual run,

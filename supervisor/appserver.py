@@ -325,6 +325,8 @@ class AppServerClient:
         server_request_handler: ServerRequestHandler | None = None,
         transport_error_handler: TransportErrorHandler | None = None,
         stdout_limit: int = APP_SERVER_STDOUT_LIMIT,
+        environment_overrides: Mapping[str, str | None] | None = None,
+        persistent_isolated_home: Path | None = None,
     ):
         self.command = command or ["codex", "app-server", *CODEX_NO_WEB_SEARCH_CONFIG_FLAGS, "--listen", "stdio://"]
         self.cwd = cwd
@@ -332,6 +334,8 @@ class AppServerClient:
         self.server_request_handler = server_request_handler
         self.transport_error_handler = transport_error_handler
         self.stdout_limit = stdout_limit
+        self.environment_overrides = dict(environment_overrides or {})
+        self.persistent_isolated_home = Path(persistent_isolated_home).absolute() if persistent_isolated_home is not None else None
         self.process: asyncio.subprocess.Process | None = None
         self._next_id = 1
         self._pending: dict[int | str, asyncio.Future[dict[str, Any]]] = {}
@@ -348,9 +352,17 @@ class AppServerClient:
         if self.process is not None:
             return
         env = _app_server_environment()
+        for key, value in self.environment_overrides.items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
         resolved_command = _app_server_command(self.command, cwd=self.cwd, environ=env)
         source_codex_home = _codex_home_from_environment(env)
-        if reuse_isolated_codex_home:
+        if self.persistent_isolated_home is not None:
+            self._isolated_codex_home = _prepare_persistent_codex_home(source_codex_home, self.persistent_isolated_home)
+            env["CODEX_HOME"] = str(self._isolated_codex_home)
+        elif reuse_isolated_codex_home:
             isolated = self._isolated_codex_home
             if isolated is None or not isolated.is_dir():
                 raise AppServerError(
@@ -453,6 +465,10 @@ class AppServerClient:
 
     def _cleanup_isolated_codex_home(self) -> None:
         if self._isolated_codex_home is None:
+            return
+        if self.persistent_isolated_home is not None:
+            # Native rollouts store absolute paths into this explicitly owned
+            # backend state. Process shutdown must not invalidate those paths.
             return
         isolated = self._isolated_codex_home
         _remove_codex_home_tree(isolated)
@@ -889,7 +905,7 @@ def _codex_home_from_environment(environ: Mapping[str, str]) -> Path:
     return (home / ".codex").absolute()
 
 
-def _create_isolated_codex_home(source: Path) -> Path:
+def _create_isolated_codex_home(source: Path, *, scratch_parent: Path | None = None) -> Path:
     lexical_source = source.expanduser().absolute()
     if _IS_WINDOWS and is_link_or_reparse(lexical_source):
         raise AppServerError(
@@ -898,7 +914,7 @@ def _create_isolated_codex_home(source: Path) -> Path:
     source = lexical_source.resolve(strict=True)
     if not source.is_dir():
         raise AppServerError(f"CODEX_HOME is not a directory: {source}")
-    isolated = Path(tempfile.mkdtemp(prefix="bello-codex-home-")).resolve()
+    isolated = Path(tempfile.mkdtemp(prefix="bello-codex-home-", dir=scratch_parent)).resolve()
     try:
         children = list(source.iterdir())
         if _IS_WINDOWS:
@@ -925,6 +941,82 @@ def _create_isolated_codex_home(source: Path) -> Path:
         except OSError:
             pass
         raise
+
+
+_PERSISTENT_HOME_MARKER = ".bello-native-home-v1"
+_PERSISTENT_HOME_CONTENT = b"bello-native-codex-home-v1\n"
+
+
+def _private_owned_directory(path: Path) -> None:
+    metadata = path.lstat()
+    if is_link_or_reparse(path, stat_result=metadata) or not stat.S_ISDIR(metadata.st_mode):
+        raise AppServerError("persistent Codex home and its parent must be real private directories")
+    if os.name != "nt" and (metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o077):
+        raise AppServerError("persistent Codex home and its parent must be owned by this user and mode 0700")
+
+
+def _validate_persistent_codex_home(path: Path) -> None:
+    _private_owned_directory(path)
+    marker = path / _PERSISTENT_HOME_MARKER
+    try:
+        info = marker.lstat()
+    except FileNotFoundError as exc:
+        raise AppServerError("refusing an unrecognized persistent Codex home") from exc
+    if (is_link_or_reparse(marker, stat_result=info) or not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1 or info.st_size != len(_PERSISTENT_HOME_CONTENT)
+            or os.name != "nt" and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077)):
+        raise AppServerError("persistent Codex home marker must be a private, unshared regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    with os.fdopen(os.open(marker, flags), "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino) or stream.read(len(_PERSISTENT_HOME_CONTENT) + 1) != _PERSISTENT_HOME_CONTENT:
+            raise AppServerError("invalid persistent Codex home marker")
+
+
+def _prepare_persistent_codex_home(source: Path, destination: Path) -> Path:
+    """Reuse one configured state child, never a path recovered from a rollout.
+
+    The caller owns a mode-0700 state directory. Populate an isolated sibling
+    before atomic publication; only this helper's own temporary clone is removed
+    on failure. Existing unmarked directories and links are never overwritten.
+    """
+    destination = destination.absolute()
+    _private_owned_directory(destination.parent)
+    parent = destination.parent.resolve(strict=True)
+    target = parent / destination.name
+    if target.exists() or is_link_or_reparse(target):
+        _validate_persistent_codex_home(target)
+        return target
+    scratch = None
+    try:
+        if source.is_dir():
+            scratch = _create_isolated_codex_home(source, scratch_parent=parent)
+        else:
+            scratch = Path(tempfile.mkdtemp(prefix="bello-codex-home-", dir=parent)).resolve()
+            (scratch / "rules").mkdir(mode=0o700)
+        marker = scratch / _PERSISTENT_HOME_MARKER
+        with os.fdopen(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as stream:
+            stream.write(_PERSISTENT_HOME_CONTENT)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if target.exists() or is_link_or_reparse(target):
+            _validate_persistent_codex_home(target)
+            return target
+        # The parent is private, and a completed competing clone is nonempty;
+        # rename cannot replace it. Do not use a remove-and-replace fallback.
+        try:
+            scratch.rename(target)
+        except OSError:
+            if target.exists():
+                _validate_persistent_codex_home(target)
+                return target
+            raise
+        scratch = None
+        _validate_persistent_codex_home(target)
+        return target
+    finally:
+        if scratch is not None:
+            _remove_codex_home_tree(scratch)
 
 
 def _validate_windows_codex_home_names(directory: Path, names: list[str]) -> None:

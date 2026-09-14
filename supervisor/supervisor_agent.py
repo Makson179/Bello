@@ -307,7 +307,9 @@ class StatelessSupervisorAgent:
                     )
                 decision_workspace_root = self.completion_workspace_snapshot.snapshot_root
             runtime_workspace_roots = task_runtime_workspace_roots(
-                decision_workspace_root, self.task_path
+                decision_workspace_root, self.task_path,
+                readonly_roots=(self.completion_source_snapshot.readonly_dependency_roots
+                                if self.completion_source_snapshot is not None else ()),
             )
             for root in additional_runtime_roots or []:
                 resolved = root.resolve()

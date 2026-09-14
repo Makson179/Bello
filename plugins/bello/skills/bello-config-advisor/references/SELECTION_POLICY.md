@@ -40,18 +40,26 @@ Choose each role for the judgment it must perform rather than copying a preset p
 
 Every available provider/model profile is eligible for primary roles whose interface it supports. Choose each role's model and effort from the judgment it must perform, the user's objective, and the expected trajectory. Do not impose a provider or family floor merely because a role is a reviewer; an inexpensive completion reviewer or adversary can be the right choice in a cost-sensitive configuration. Reviewer parents remain responsible for synthesis, final judgment, and the report when they delegate bounded work to children.
 
+### Runtime and distiller decisions
+
+Decide runtime supervision, completion review, adversary, and log distiller independently. Runtime defaults on. Runtime-off can fit an explicitly requested raw-coder comparison or a task whose live-risk tradeoff the user accepts; explain its reduced protection. It makes zero runtime/cheap-triage calls, skips semantic approval/steering/readiness gates, and routes user messages directly to the coder. It keeps the filesystem sandbox and protocol/integrity checks, preauthorizes network inside that sandbox, and denies unsupported outside-sandbox requests without automatic escalation. Completion and adversary can still be enabled independently; neither replaces live supervision.
+
+Keep log distiller off by default. Consider enabling it when shorter coder-tool excerpts have a task-specific purpose and local inference fits the user's setup. Bello provides a pinned default model, downloaded once on an approved enabled run; a user-supplied compatible local bundle is an optional override. Advice remains read-only: do not inspect previous runs, fetch weights, or install dependencies. Native Codex additionally requires the compatible selection-hook executable, not just the inference extra. The local CPU selector can omit useful context; its 300-second request budget includes queue time, and unusable output or failure retains the ordinary bounded result. Do not promise token savings, equivalent context fidelity, or faster completion. Distiller is not a chat-model profile and does not require a provider-catalog entry.
+
 ### Review schedules
 
 The following are frequent useful baselines, not the only valid choices:
 
-- **`runtime-only`:** live supervision with no completion-review return or adversary pass;
+- **No final review:** neither completion nor adversary; called `runtime-only` if runtime is on, or a raw-coder run if runtime is also off;
 - **`C`:** one bounded completion-review return opportunity;
-- **`A`:** one adversary pass with no completion-review return before or after it;
+- **`A`:** completion off and one adversary pass; report normalization uses the adversary profile;
 - **`C+A`:** one completion-review return opportunity followed by one adversary pass.
 
 Bello's underlying scheduler is general. Select `2C+A`, `C+A+C`, multiple adversary cycles, or another supported schedule whenever a concrete residual risk or user preference makes the extra opportunity worthwhile. There is no need to prove that every common baseline fails first. Internally tie each additional return or pass to a concrete purpose and account for its possible serial reviewer call, coder repair, and revalidation.
 
 Review budgets are upper bounds, not guaranteed call counts. An early accept can advance the schedule, while a useful finding can return work to the coder. The adversary-report controller also adds a normalization call even though it is not a completion-return budget unit.
+
+All final-review schedules allow runtime on or off. Completion-off zeros only its two return budgets, not the adversary switch or its pass budget. Adversary-off zeros its pass budget and post-adversary completion returns. Cheap runtime must be off whenever runtime is off.
 
 ## Model and effort choices
 
@@ -65,7 +73,7 @@ Treat every choice as a **provider/model/effort profile**. Reasoning labels are 
 
 Choose the initial coder from the reasoning needed to form or execute the solution, domain novelty, coupling, existing analogues, the planning decision, and user preference. Treat inexpensive models as legitimate options rather than fallbacks by definition. A useful private plan or a clear nearby analogue can make a cheaper coder appropriate, provided that coder can still verify assumptions and respond to implementation evidence.
 
-Choose the revision coder for applying findings that completion or adversary has already made concrete. It is dormant in runtime-only runs, so keep it disabled when no review stage can return work. With reviews active, enable it only when bounded findings are plausible and one or more likely correction cycles make a cheaper fresh thread worth the handoff; a single likely-small repair normally stays with the initial coder. Do not use it as planned capability escalation: a recommendation must not make the revision profile more capable than the initial coder. If the initial profile may be unable to form the architecture, strengthen the initial profile instead of expecting review to rescue it later. Prefer a cheaper revision profile when the expected repairs are bounded and explicit; use the same profile or leave revision disabled when findings may require architectural reasoning, broad redesign, or the original thread's context.
+Choose the revision coder for applying findings that completion or adversary has already made concrete. It is dormant when neither final reviewer is enabled, so keep it disabled when no review stage can return work. A-only may use revision coder even with runtime off. With reviews active, enable it only when bounded findings are plausible and one or more likely correction cycles make a cheaper fresh thread worth the handoff; a single likely-small repair normally stays with the initial coder. Do not use it as planned capability escalation: a recommendation must not make the revision profile more capable than the initial coder. If the initial profile may be unable to form the architecture, strengthen the initial profile instead of expecting review to rescue it later. Prefer a cheaper revision profile when the expected repairs are bounded and explicit; use the same profile or leave revision disabled when findings may require architectural reasoning, broad redesign, or the original thread's context.
 
 Reviewer parents may use a more reasoning-intensive profile than either coder because discovering omissions and adversarial failures is their independent job, but they may also use an inexpensive model when the bounded review judgment and cost objective make it sufficient. A demanding review profile does not imply the repair role needs equal capability once the reviewer has supplied a precise diagnosis. Avoid obvious upward revision steps such as a higher effort on the same model. For cross-family profiles whose capability ordering is unclear, resolve the uncertainty in favor of the initial coder rather than building a weak-first/strong-later repair strategy.
 

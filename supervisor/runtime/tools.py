@@ -18,20 +18,44 @@ import subprocess
 import sys
 import os
 import secrets
+from copy import deepcopy
 from typing import Any
 
 from jsonschema import Draft202012Validator
 
-from supervisor.policy import is_secret_path
+from supervisor.policy import is_secret_path, is_workspace_control_path
 from supervisor.runtime.journal import RuntimeJournal
 from supervisor.runtime.file_worker import parse_response
 from supervisor.runtime.command_sessions import CommandCompletion, CommandSessionManager
-from supervisor.runtime.output_budget import budget_output
+from supervisor.runtime.distiller_policy import preserve_tool_output
+from supervisor.runtime.output_budget import budget_output, budget_command_output
 from supervisor.runtime.sandbox import SandboxPolicy, SandboxRunner
 
 
 TOOL_DEFINITIONS = json.loads(Path(__file__).with_name("tools.json").read_text(encoding="utf-8"))
-_SCHEMAS = {entry["name"]: Draft202012Validator(entry["parameters"]) for entry in TOOL_DEFINITIONS}
+_TEXT_TOOLS = frozenset({"exec_command", "poll_command", "stop_command", "read_file", "search", "list_directory", "write_file", "edit_file"})
+
+
+def tool_definitions(*, distiller: bool = False, runtime_enabled: bool = True) -> list[dict[str, Any]]:
+    definitions = deepcopy(TOOL_DEFINITIONS)
+    for entry in definitions:
+        if distiller and entry["name"] in _TEXT_TOOLS:
+            entry["parameters"]["properties"]["focus"] = {
+                "type": "string", "minLength": 1, "maxLength": 120,
+                "description": "Very short purpose of this call.",
+            }
+        if entry["name"] == "exec_command" and not runtime_enabled:
+            entry["description"] = (
+                "Execute a shell command inside the assigned isolated workspace. Network access is enabled. "
+                "Long commands return a sessionId for poll_command or stop_command. "
+                "timeout is the execution deadline in seconds (default 120); yield_time_ms controls the initial wait "
+                "(default 10000). Install dependencies in the writable project or temporary directory. "
+                "Outside-sandbox execution is unavailable in this run. No interactive stdin or PTY."
+            )
+    return definitions
+
+
+_SCHEMAS = {entry["name"]: Draft202012Validator(entry["parameters"]) for entry in tool_definitions(distiller=True)}
 _CHILD_TOOLS = frozenset({"spawn_agent", "send_message", "wait_agent", "close_agent"})
 
 # These validate the trusted filesystem worker's transport, not model answers.
@@ -52,6 +76,9 @@ class ToolScope:
     readable_roots: tuple[Path, ...] = ()
     approval_policy: str = "on-request"
     network_access: bool = False
+    distiller_enabled: bool = False
+    runtime_enabled: bool = True
+    task_path: Path | None = None
 
 
 def tool_result(text: str, *, details: dict[str, Any] | None = None, error: bool = False) -> dict[str, Any]:
@@ -68,10 +95,13 @@ class ToolHost:
         delegate: Callable[[str, dict[str, Any], str, str], Awaitable[dict[str, Any]]],
         *,
         runner_factory: Callable[[SandboxPolicy], SandboxRunner] = SandboxRunner,
+        distill: Callable[[str, str, str], Awaitable[str]] | None = None,
     ):
         self.journal, self.scope_for, self.approve, self.emit, self.delegate = journal, scope_for, approve, emit, delegate
         self.runner_factory = runner_factory
+        self.distill = distill
         self._active: dict[tuple[str, str], asyncio.Task] = {}
+        self._session_commands: dict[tuple[str, str, str], dict[str, Any]] = {}
         self.sessions = CommandSessionManager(journal.directory / "commands")
 
     async def call(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -94,14 +124,29 @@ class ToolHost:
         assert task is not None
         self._active[(thread_id, call_id)] = task
         try:
+            execution_arguments = {k: v for k, v in arguments.items() if k != "focus"}
             if name in _CHILD_TOOLS:
-                result = await self.delegate(name, arguments, thread_id, turn_id)
+                result = await self.delegate(name, execution_arguments, thread_id, turn_id)
             elif name in {"poll_command", "stop_command"}:
                 operation = self.sessions.poll if name == "poll_command" else self.sessions.stop
-                snapshot = await operation(thread_id=thread_id, turn_id=turn_id, **arguments)
-                result = self._command_packet(snapshot, stop_requested=name == "stop_command")
+                session_args = {k: v for k, v in execution_arguments.items() if k != "max_output_tokens"}
+                snapshot = await operation(thread_id=thread_id, turn_id=turn_id, **session_args)
+                result = self._command_packet(snapshot, stop_requested=name == "stop_command",
+                                              max_output_tokens=arguments.get("max_output_tokens"))
             else:
-                result = await self._execute(name, arguments, scope, thread_id, turn_id, call_id)
+                result = await self._execute(name, execution_arguments, scope, thread_id, turn_id, call_id)
+            session_id = result.get("details", {}).get("sessionId")
+            if name == "exec_command" and session_id:
+                self._session_commands[(thread_id, turn_id, session_id)] = {
+                    "command": arguments["command"], "cwd": arguments.get("cwd", str(scope.root)),
+                }
+            if scope.distiller_enabled and self.distill and name in _TEXT_TOOLS:
+                original = self._session_commands.get((thread_id, turn_id, session_id), {})
+                # A later poll has no cwd of its own. Keep the original read's
+                # context so custom task paths stay protected after yielding.
+                distiller_args = {**arguments, "cwd": original["cwd"]} if original else arguments
+                result = await self._distill_result(result, name, distiller_args,
+                                                   command=original.get("command"), scope=scope)
             self.journal.complete_tool(thread_id, call_id, result)
             return result
         except asyncio.CancelledError:
@@ -122,21 +167,59 @@ class ToolHost:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await self.sessions.cancel_thread(thread_id)
+        self._session_commands = {key: command for key, command in self._session_commands.items() if key[0] != thread_id}
 
     async def finish_turn(self, thread_id: str, turn_id: str) -> None:
         await self.sessions.cancel_turn(thread_id, turn_id)
+        self._session_commands = {key: command for key, command in self._session_commands.items() if key[:2] != (thread_id, turn_id)}
 
     async def close(self) -> None:
         for thread_id in {owner for owner, _ in self._active}:
             await self.cancel_turn(thread_id)
         await self.sessions.close()
+        self._session_commands.clear()
+
+    async def _distill_result(self, result: dict[str, Any], name: str, args: dict[str, Any], *, command: str | None = None, scope: ToolScope | None = None) -> dict[str, Any]:
+        if preserve_tool_output(name, args, command=command,
+                                task_path=scope.task_path if scope else None,
+                                workspace=scope.root if scope else None):
+            return result
+        focus = args.get("focus")
+        if not isinstance(focus, str) or not focus.strip():
+            return result
+        # Only successful transport packets are transformed. Tool failures with
+        # ordinary command output still have an output field and are included.
+        packet = result.get("details", {})
+        command_packet = name in {"exec_command", "poll_command", "stop_command"}
+        if command_packet:
+            source = packet.get("output")
+        else:
+            content = result.get("content", [])
+            source = content[0].get("text") if len(content) == 1 and content[0].get("type") == "text" else None
+        if not isinstance(source, str) or not source:
+            return result
+        command = command or args.get("command") or f"{name} " + json.dumps({k: v for k, v in args.items() if k != "focus"}, ensure_ascii=False)
+        try:
+            selected = await self.distill(source, focus, command)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return result
+        if not isinstance(selected, str) or len(selected.encode("utf-8")) >= len(source.encode("utf-8")):
+            return result
+        if command_packet:
+            # Replace only text; existing session/status/exit metadata survives.
+            packet = {**packet, "output": selected}
+            return tool_result(json.dumps(packet, ensure_ascii=False), details=packet, error=result.get("isError", False))
+        return {**result, "content": [{"type": "text", "text": selected}]}
 
     @staticmethod
-    def _command_packet(snapshot: dict[str, Any], *, stop_requested: bool = False) -> dict[str, Any]:
+    def _command_packet(snapshot: dict[str, Any], *, stop_requested: bool = False,
+                        max_output_tokens: int | None = None) -> dict[str, Any]:
         # Tool details are not model-visible on every provider. Put the session
         # handle and exit status in content, without duplicating full output.
         packet = {key: value for key, value in snapshot.items() if key != "aggregatedOutput"}
-        bounded = budget_output(packet.get("output", ""), mode="tail")
+        bounded = budget_command_output(packet.get("output", ""), max_output_tokens)
         packet["output"] = bounded.text
         packet["outputBudget"] = bounded.metadata
         return tool_result(json.dumps(packet, ensure_ascii=False), details=packet,
@@ -149,10 +232,16 @@ class ToolHost:
         if not path.is_absolute():
             path = scope.root / path
         path = path.resolve()
-        roots = (scope.root.resolve(),) if writing else (scope.root.resolve(), *scope.readable_roots)
+        workspace = scope.root.resolve()
+        roots = (workspace,) if writing else (workspace, *scope.readable_roots)
         if scope.mode != "danger-full-access" and not any(path == root or path.is_relative_to(root) for root in roots):
             raise PermissionError("path is outside this agent's assigned workspace")
-        if is_secret_path(path):
+        # Runtime-off removes name guesses, not filesystem authority. Readonly
+        # external dependencies and explicit escapes keep the full secret check.
+        check_path_heuristics = scope.runtime_enabled or not path.is_relative_to(workspace)
+        protected = (is_secret_path(path) if check_path_heuristics
+                     else is_workspace_control_path(workspace, path))
+        if protected:
             raise PermissionError("access to secret material is not allowed")
         if writing and scope.mode == "read-only":
             raise PermissionError("this agent's workspace is read-only")
@@ -231,7 +320,7 @@ class ToolHost:
                     runner=runner, command=command, cwd=cwd, timeout=args.get("timeout", 120),
                     yield_time_ms=args.get("yield_time_ms", 10_000), on_output=output_delta, on_finished=finished)
                 yielded = True
-                return self._command_packet(snapshot)
+                return self._command_packet(snapshot, max_output_tokens=args.get("max_output_tokens"))
 
             result = await runner.run(command, cwd, args.get("timeout", 120), on_output=output_delta)
             # Preserve the complete transport for diagnostics even if parsing fails.

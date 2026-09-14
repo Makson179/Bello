@@ -31,10 +31,10 @@ async def make_client(tmp_path, *, approval_handler=None):
     workspace = tmp_path / "snapshot"
     root.mkdir()
     workspace.mkdir()
-    pi, claude = FakeBackend(), FakeBackend()
-    client = RuntimeClient(cwd=root, backends={"pi": pi, "claude-code": claude}, server_request_handler=approval_handler)
+    codex, claude = FakeBackend(), FakeBackend()
+    client = RuntimeClient(cwd=root, backends={"codex": codex, "claude-code": claude}, server_request_handler=approval_handler)
     await client.start()
-    return client, workspace, pi, claude
+    return client, workspace, codex, claude
 
 
 async def start(client, workspace, model="gpt-5.6-sol", **extra):
@@ -45,14 +45,69 @@ async def start(client, workspace, model="gpt-5.6-sol", **extra):
 
 @pytest.mark.asyncio
 async def test_routes_models_without_changing_billing(tmp_path):
-    client, workspace, pi, claude = await make_client(tmp_path)
+    client, workspace, codex, claude = await make_client(tmp_path)
     try:
         await start(client, workspace)
         await start(client, workspace, "claude-code/claude-sonnet-4-6")
-        assert pi.calls[0][1]["provider"] == "openai-codex"
-        assert pi.calls[0][1]["model"] == "gpt-5.6-sol"
+        assert codex.calls[0][1]["provider"] == "openai-codex"
+        assert codex.calls[0][1]["model"] == "gpt-5.6-sol"
         assert claude.calls[0][1]["provider"] == "claude-code"
-        assert not any(t["name"] == "spawn_agent" for t in pi.calls[0][1]["tools"])
+        assert not any(t["name"] == "spawn_agent" for t in codex.calls[0][1]["tools"])
+        pi = FakeBackend()
+        client._engines["pi"] = pi
+        await start(client, workspace, "openai/gpt-5.6-sol")
+        await start(client, workspace, "anthropic/claude-sonnet-4-6")
+        assert [params["provider"] for method, params in pi.calls] == ["openai", "anthropic"]
+        assert len(codex.calls) == 1 and len(claude.calls) == 1
+    finally:
+        await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_old_pi_subscription_thread_requires_fresh_native_run(tmp_path):
+    client, workspace, native, _ = await make_client(tmp_path)
+    try:
+        thread = await start(client, workspace)
+        client._threads[thread]["engine"] = "pi"
+        for method in ("thread/resume", "turn/start"):
+            with pytest.raises(AppServerError, match="previous Pi subscription route"):
+                await client.request(method, {"threadId": thread})
+        assert len(native.calls) == 1
+    finally:
+        await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_native_approval_response_is_routed_without_loading_pi(tmp_path):
+    client, _, native, _ = await make_client(tmp_path)
+    received = []
+    async def respond(request_id, result, **kwargs):
+        received.append((request_id, result, kwargs))
+        return True
+    native.respond = respond
+    try:
+        await client.respond("codex:request", {"decision": "accept"})
+        assert received == [("codex:request", {"decision": "accept"}, {"error": None, "timeout": 15})]
+        assert "pi" not in client._engines
+    finally:
+        await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_pi_catalog_cannot_advertise_subscription_route(tmp_path):
+    client, _, native, _ = await make_client(tmp_path)
+    pi = FakeBackend()
+    client._engines["pi"] = pi
+    async def catalog(method, params, timeout=30):
+        return {"data": [
+            {"id": "gpt-native", "provider": "openai-codex", "qualifiedId": "openai-codex/gpt-native"},
+            {"id": "gpt-api", "provider": "openai", "qualifiedId": "openai/gpt-api"},
+        ]}
+    pi.request = catalog
+    try:
+        result = await client.request("model/list", {"engines": ["pi"]})
+        assert all(item["provider"] == "openai" for item in result["data"])
+        assert not native.calls
     finally:
         await client.stop()
 
@@ -68,9 +123,9 @@ async def test_thread_lifecycle_notifications_are_emitted_once_by_host(tmp_path)
     client.notification_handler = notify
     try:
         thread = await start(client, workspace)
-        await client._emit({"method": "thread/started", "params": {"thread": {"id": thread}}}, engine="pi")
+        await client._emit({"method": "thread/started", "params": {"thread": {"id": thread}}}, engine="codex")
         await client.request("thread/archive", {"threadId": thread})
-        await client._emit({"method": "thread/closed", "params": {"threadId": thread}}, engine="pi")
+        await client._emit({"method": "thread/closed", "params": {"threadId": thread}}, engine="codex")
         assert [message.method for message in received] == ["thread/started", "thread/closed"]
     finally:
         await client.stop()
@@ -78,14 +133,14 @@ async def test_thread_lifecycle_notifications_are_emitted_once_by_host(tmp_path)
 
 @pytest.mark.asyncio
 async def test_failed_cleanup_is_reported_after_other_engines_are_stopped(tmp_path):
-    client, workspace, pi, claude = await make_client(tmp_path)
+    client, workspace, codex, claude = await make_client(tmp_path)
     await start(client, workspace)
 
     async def fail():
         raise RuntimeError("transport did not terminate")
 
-    pi.stop = fail
-    with pytest.raises(AppServerError, match="cleanup failed for pi"):
+    codex.stop = fail
+    with pytest.raises(AppServerError, match="cleanup failed for codex"):
         await client.stop()
     assert claude.stopped
     assert client._journal is None
@@ -104,7 +159,7 @@ async def test_engine_failure_fences_turns_and_closes_cross_engine_children_befo
         if parent_completed:
             await client._emit({"method": "turn/completed", "params": {
                 "threadId": parent, "turn": {"id": parent_turn, "status": "completed"},
-            }}, engine="pi")
+            }}, engine="codex")
         observed = []
 
         async def notify(error):
@@ -113,8 +168,8 @@ async def test_engine_failure_fences_turns_and_closes_cross_engine_children_befo
             assert client._threads[child]["closed"]
 
         client.transport_error_handler = notify
-        error = AppServerError("Pi stream failed")
-        await client._engine_failed("pi", error)
+        error = AppServerError("Codex stream failed")
+        await client._engine_failed("codex", error)
         assert observed == [error]
         if not parent_completed:
             assert client._threads[parent]["interruptedTurnId"] == parent_turn
@@ -126,11 +181,11 @@ async def test_engine_failure_fences_turns_and_closes_cross_engine_children_befo
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["turn/interrupt", "thread/archive", "stop"])
 async def test_cancelled_cleanup_finishes_before_returning_to_caller(tmp_path, operation):
-    client, workspace, pi, claude = await make_client(tmp_path)
+    client, workspace, codex, claude = await make_client(tmp_path)
     thread = await start(client, workspace)
     turn = (await client.turn_start({"threadId": thread}))["turn"]["id"]
     entered, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    original = pi.request
+    original = codex.request
 
     async def slow_request(method, params, timeout=30):
         if method == "turn/interrupt":
@@ -142,10 +197,10 @@ async def test_cancelled_cleanup_finishes_before_returning_to_caller(tmp_path, o
     async def slow_stop():
         entered.set()
         await release.wait()
-        pi.stopped = True
+        codex.stopped = True
         finished.set()
 
-    pi.request, pi.stop = slow_request, slow_stop
+    codex.request, codex.stop = slow_request, slow_stop
     task = asyncio.create_task(client.stop() if operation == "stop" else client.request(
         operation, {"threadId": thread, "turnId": turn}))
     try:
@@ -161,9 +216,9 @@ async def test_cancelled_cleanup_finishes_before_returning_to_caller(tmp_path, o
             await asyncio.wait_for(task, 2)
         assert finished.is_set()
         if operation == "thread/archive":
-            assert any(method == "thread/archive" for method, _ in pi.calls)
+            assert any(method == "thread/archive" for method, _ in codex.calls)
         if operation == "stop":
-            assert pi.stopped and claude.stopped
+            assert codex.stopped and claude.stopped
             assert client._journal is None
             assert not client._started
     finally:
@@ -173,7 +228,7 @@ async def test_cancelled_cleanup_finishes_before_returning_to_caller(tmp_path, o
 
 @pytest.mark.asyncio
 async def test_optional_catalog_failure_does_not_hide_other_engine(tmp_path):
-    client, _, pi, claude = await make_client(tmp_path)
+    client, _, codex, claude = await make_client(tmp_path)
 
     async def list_pi(method, params, timeout=30):
         return {"data": [{"id": "gpt-5.6-sol", "qualifiedId": "openai-codex/gpt-5.6-sol"}]}
@@ -181,9 +236,9 @@ async def test_optional_catalog_failure_does_not_hide_other_engine(tmp_path):
     async def missing_claude(method, params, timeout=30):
         raise AppServerError("Claude Code is not signed in")
 
-    pi.request, claude.request = list_pi, missing_claude
+    codex.request, claude.request = list_pi, missing_claude
     try:
-        result = await client.request("model/list", {"engines": ["pi", "claude-code"], "optionalEngines": True})
+        result = await client.request("model/list", {"engines": ["codex", "claude-code"], "optionalEngines": True})
         assert result["data"][-1]["id"] == "openai-codex/gpt-5.6-sol"
         assert "claude-code" in result["unavailableEngines"]
         with pytest.raises(AppServerError, match="not signed in"):
@@ -195,14 +250,14 @@ async def test_optional_catalog_failure_does_not_hide_other_engine(tmp_path):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["turn/interrupt", "thread/archive"])
 async def test_one_failed_child_cleanup_cannot_skip_parent_or_siblings(tmp_path, operation):
-    client, workspace, pi, _ = await make_client(tmp_path)
+    client, workspace, codex, _ = await make_client(tmp_path)
     try:
         parent = await start(client, workspace)
         child = await start(client, workspace, parentThreadId=parent)
         sibling = await start(client, workspace, parentThreadId=parent)
         turns = {thread: (await client.turn_start({"threadId": thread}))["turn"]["id"]
                  for thread in (parent, child, sibling)}
-        original = pi.request
+        original = codex.request
 
         async def fail_child(method, params, timeout=30):
             response = await original(method, params, timeout)
@@ -210,14 +265,14 @@ async def test_one_failed_child_cleanup_cannot_skip_parent_or_siblings(tmp_path,
                 raise AppServerError("child archive failed")
             return response
 
-        pi.request = fail_child
-        pi.calls.clear()
+        codex.request = fail_child
+        codex.calls.clear()
         with pytest.raises(AppServerError, match="cleanup attempts were made"):
             await client.request(operation, {"threadId": parent, "turnId": turns[parent]})
-        assert ("turn/interrupt", {"threadId": parent, "turnId": turns[parent]}) in pi.calls
-        assert any(method == "thread/archive" and params["threadId"] == sibling for method, params in pi.calls)
+        assert ("turn/interrupt", {"threadId": parent, "turnId": turns[parent]}) in codex.calls
+        assert any(method == "thread/archive" and params["threadId"] == sibling for method, params in codex.calls)
         if operation == "thread/archive":
-            assert any(method == operation and params["threadId"] == parent for method, params in pi.calls)
+            assert any(method == operation and params["threadId"] == parent for method, params in codex.calls)
             assert client._threads[parent]["closed"]
         assert all(not client._threads[thread].get("activeTurnId") for thread in turns)
     finally:
@@ -226,30 +281,30 @@ async def test_one_failed_child_cleanup_cannot_skip_parent_or_siblings(tmp_path,
 
 @pytest.mark.asyncio
 async def test_rejected_turn_keeps_previous_effort_and_next_turn_sends_it_explicitly(tmp_path):
-    client, workspace, pi, _ = await make_client(tmp_path)
+    client, workspace, codex, _ = await make_client(tmp_path)
     try:
         thread = await start(client, workspace, effort="high")
-        original = pi.request
+        original = codex.request
 
         async def reject(method, params, timeout=30):
             if method == "turn/start" and params.get("effort") == "ultra":
                 raise AppServerError("unsupported effort")
             return await original(method, params, timeout)
 
-        pi.request = reject
+        codex.request = reject
         with pytest.raises(AppServerError, match="unsupported effort"):
             await client.turn_start({"threadId": thread, "effort": "ultra"})
         assert client._threads[thread]["effort"] == "high"
         await client.turn_start({"threadId": thread})
-        assert pi.calls[-1][1]["effort"] == "high"
+        assert codex.calls[-1][1]["effort"] == "high"
     finally:
         await client.stop()
 
 
 @pytest.mark.asyncio
 async def test_engine_default_effort_is_recorded_but_explicit_profile_cannot_be_changed(tmp_path):
-    client, workspace, pi, _ = await make_client(tmp_path)
-    original = pi.request
+    client, workspace, codex, _ = await make_client(tmp_path)
+    original = codex.request
 
     async def resolved(method, params, timeout=30):
         response = await original(method, params, timeout)
@@ -257,33 +312,33 @@ async def test_engine_default_effort_is_recorded_but_explicit_profile_cannot_be_
             response["thread"]["reasoningEffort"] = "medium"
         return response
 
-    pi.request = resolved
+    codex.request = resolved
     try:
         thread = await start(client, workspace)
         assert client._public_thread(thread)["reasoningEffort"] == "medium"
         await client.turn_start({"threadId": thread})
-        assert pi.calls[-1][1]["effort"] == "medium"
+        assert codex.calls[-1][1]["effort"] == "medium"
         with pytest.raises(AppServerError, match="changed the requested"):
             await start(client, workspace, effort="high")
-        assert pi.calls[-1][0] == "thread/archive"
+        assert codex.calls[-1][0] == "thread/archive"
     finally:
         await client.stop()
 
 
 @pytest.mark.asyncio
 async def test_rejects_workspace_with_private_runtime_state(tmp_path):
-    client, workspace, pi, _ = await make_client(tmp_path)
+    client, workspace, codex, _ = await make_client(tmp_path)
     try:
         with pytest.raises(AppServerError, match="private runtime"):
             await start(client, client.cwd)
-        assert not pi.calls
+        assert not codex.calls
     finally:
         await client.stop()
 
 
 @pytest.mark.asyncio
 async def test_active_turn_ownership_and_scope_are_host_owned(tmp_path):
-    client, workspace, pi, _ = await make_client(tmp_path)
+    client, workspace, codex, _ = await make_client(tmp_path)
     try:
         thread = await start(client, workspace)
         with pytest.raises(AppServerError, match="weaken"):
@@ -340,7 +395,7 @@ async def test_approval_round_trip_does_not_deadlock(tmp_path):
 
 @pytest.mark.asyncio
 async def test_cross_provider_children_have_same_scope_and_enforced_profile(tmp_path):
-    client, workspace, pi, claude = await make_client(tmp_path)
+    client, workspace, codex, claude = await make_client(tmp_path)
     try:
         thread = await start(client, workspace, config={"agents": {"enabled": True, "max_concurrent_threads_per_session": 1,
             "allowed_profiles": {"claude-code/claude-sonnet-4-6": ["high"]}}})
@@ -409,20 +464,20 @@ async def test_late_events_cannot_change_next_turn_or_readiness(tmp_path):
 
 @pytest.mark.asyncio
 async def test_uncertain_turn_start_is_fenced_and_interrupted_not_replayed(tmp_path):
-    client, workspace, pi, _ = await make_client(tmp_path)
+    client, workspace, codex, _ = await make_client(tmp_path)
     try:
         thread = await start(client, workspace)
-        original = pi.request
+        original = codex.request
         async def uncertain(method, params, timeout=30):
             result = await original(method, params, timeout)
             if method == "turn/start":
                 raise asyncio.TimeoutError("reply lost after dispatch")
             return result
-        pi.request = uncertain
+        codex.request = uncertain
         with pytest.raises(asyncio.TimeoutError):
             await client.turn_start({"threadId": thread})
         assert not client._threads[thread].get("activeTurnId")
-        methods = [method for method, _ in pi.calls]
+        methods = [method for method, _ in codex.calls]
         assert methods.count("turn/start") == 1
         assert methods[-1] == "turn/interrupt"
     finally:
@@ -431,8 +486,8 @@ async def test_uncertain_turn_start_is_fenced_and_interrupted_not_replayed(tmp_p
 
 @pytest.mark.asyncio
 async def test_uncertain_thread_start_is_closed_without_replaying_creation(tmp_path):
-    client, workspace, pi, _ = await make_client(tmp_path)
-    original = pi.request
+    client, workspace, codex, _ = await make_client(tmp_path)
+    original = codex.request
 
     async def uncertain(method, params, timeout=30):
         result = await original(method, params, timeout)
@@ -440,12 +495,12 @@ async def test_uncertain_thread_start_is_closed_without_replaying_creation(tmp_p
             raise asyncio.TimeoutError("created session but acknowledgement was lost")
         return result
 
-    pi.request = uncertain
+    codex.request = uncertain
     try:
         with pytest.raises(asyncio.TimeoutError):
             await start(client, workspace)
-        assert [method for method, _ in pi.calls] == ["thread/start", "thread/archive"]
-        assert pi.calls[0][1]["threadId"] == pi.calls[1][1]["threadId"]
+        assert [method for method, _ in codex.calls] == ["thread/start", "thread/archive"]
+        assert codex.calls[0][1]["threadId"] == codex.calls[1][1]["threadId"]
         assert all(record["closed"] for record in client._threads.values())
     finally:
         await client.stop()
@@ -453,12 +508,12 @@ async def test_uncertain_thread_start_is_closed_without_replaying_creation(tmp_p
 
 @pytest.mark.asyncio
 async def test_failed_child_turn_start_closes_the_new_child(tmp_path):
-    client, workspace, pi, _ = await make_client(tmp_path)
+    client, workspace, codex, _ = await make_client(tmp_path)
     try:
         parent = await start(client, workspace, config={"agents": {"enabled": True,
             "allowed_profiles": {"gpt-5.6-luna": ["high"]}}})
         turn = (await client.turn_start({"threadId": parent}))["turn"]["id"]
-        original = pi.request
+        original = codex.request
 
         async def reject_child(method, params, timeout=30):
             result = await original(method, params, timeout)
@@ -466,13 +521,13 @@ async def test_failed_child_turn_start_closes_the_new_child(tmp_path):
                 raise AppServerError("child provider rejected the request")
             return result
 
-        pi.request = reject_child
+        codex.request = reject_child
         with pytest.raises(AppServerError, match="child provider rejected"):
             await client._delegate("spawn_agent", {"model": "gpt-5.6-luna", "effort": "high", "message": "inspect"}, parent, turn)
         child = next(key for key, record in client._threads.items() if record.get("parentThreadId") == parent)
         assert client._threads[child]["closed"]
         assert not client._threads[child].get("activeTurnId")
-        assert pi.calls[-1] == ("thread/archive", {"threadId": child})
+        assert codex.calls[-1] == ("thread/archive", {"threadId": child})
         assert client._threads[parent]["activeTurnId"] == turn
     finally:
         await client.stop()
@@ -480,17 +535,17 @@ async def test_failed_child_turn_start_closes_the_new_child(tmp_path):
 
 @pytest.mark.asyncio
 async def test_fast_completion_is_reported_in_start_reply(tmp_path):
-    client, workspace, pi, _ = await make_client(tmp_path)
+    client, workspace, codex, _ = await make_client(tmp_path)
     try:
         thread = await start(client, workspace)
-        original = pi.request
+        original = codex.request
         async def immediate(method, params, timeout=30):
             result = await original(method, params, timeout)
             if method == "turn/start":
                 await client._emit({"method": "turn/completed", "params": {"threadId": thread,
                     "turn": {"id": params["turnId"], "status": "completed"}}})
             return result
-        pi.request = immediate
+        codex.request = immediate
         result = await client.turn_start({"threadId": thread})
         assert result["turn"]["status"] == "completed"
         assert not client._threads[thread].get("activeTurnId")

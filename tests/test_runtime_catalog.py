@@ -44,7 +44,7 @@ def test_editor_uses_both_engines_and_exact_advertised_efforts(monkeypatch, tmp_
     assert config_editor.intelligence_choices_for_model("claude-code/sonnet") == ("low", "medium", "high", "max")
     assert config_editor.intelligence_choices_for_model("openai/gpt-5.6-sol") == ("low", "high")
     assert "ultra" in config_editor.intelligence_choices_for_model("gpt-5.6-sol")
-    assert calls == [("model/list", {"engines": ["pi", "claude-code"], "optionalEngines": True}), "stop"]
+    assert calls == [("model/list", {"engines": ["codex", "pi", "claude-code"], "optionalEngines": True}), "stop"]
 
 
 def test_api_catalog_never_creates_subscription_alias():

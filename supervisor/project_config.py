@@ -92,7 +92,9 @@ RUNTIME_SYNC_FIELDS = (
     "completion_intelligence",
     "adversary_intelligence",
     "speed",
+    "runtime_enabled",
     "cheap_runtime",
+    "log_distiller",
     "start_over",
     "completion_review",
     "adversary",
@@ -112,6 +114,34 @@ class ProjectConfigError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class LogDistillerConfig:
+    enabled: bool = False
+    model_path: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ProjectConfigError("log_distiller.enabled must be a boolean")
+        if self.model_path is not None and (
+            not isinstance(self.model_path, str)
+            or not self.model_path.strip()
+            or "\x00" in self.model_path
+        ):
+            raise ProjectConfigError("log_distiller.model_path must be a nonempty local folder path or null")
+
+    def to_json_data(self) -> dict[str, Any]:
+        return {"enabled": self.enabled, "model_path": self.model_path}
+
+
+def _log_distiller_config(value: Any, *, path: Path) -> LogDistillerConfig:
+    if not isinstance(value, dict) or set(value) - {"enabled", "model_path"}:
+        raise ProjectConfigError(f"{path}: log_distiller must contain only enabled and model_path")
+    try:
+        return LogDistillerConfig(enabled=value.get("enabled", False), model_path=value.get("model_path"))
+    except ProjectConfigError as exc:
+        raise ProjectConfigError(f"{path}: {exc}") from exc
+
+
+@dataclass(frozen=True)
 class ProjectConfig:
     task: str | None = None
     coder_mod: str = DEFAULT_MODEL
@@ -126,7 +156,9 @@ class ProjectConfig:
     completion_intelligence: str = DEFAULT_INTELLIGENCE
     adversary_intelligence: str = DEFAULT_INTELLIGENCE
     speed: str = "usual"
+    runtime_enabled: bool = True
     cheap_runtime: bool = True
+    log_distiller: LogDistillerConfig = field(default_factory=LogDistillerConfig)
     start_over: bool = False
     completion_review: bool = False
     adversary: bool = False
@@ -142,6 +174,10 @@ class ProjectConfig:
     @property
     def fast(self) -> bool:
         return self.speed == "fast"
+
+    @property
+    def effective_cheap_runtime(self) -> bool:
+        return self.runtime_enabled and self.cheap_runtime
 
     def to_json_data(self) -> dict[str, Any]:
         return {
@@ -159,7 +195,9 @@ class ProjectConfig:
             "completion_intelligence": self.completion_intelligence,
             "adversary_intelligence": self.adversary_intelligence,
             "speed": self.speed,
+            "runtime_enabled": self.runtime_enabled,
             "cheap_runtime": self.cheap_runtime,
+            "log_distiller": self.log_distiller.to_json_data(),
             "start_over": self.start_over,
             "completion_review": self.completion_review,
             "adversary": self.adversary,
@@ -370,11 +408,13 @@ def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfi
             path=path,
         ),
         speed=_speed_from_payload(payload, default.speed, path=path),
+        runtime_enabled=_bool(payload.get("runtime_enabled", default.runtime_enabled), "runtime_enabled", path=path),
         cheap_runtime=_bool(
             _first_present(payload, ("cheap_runtime", "cheap_runtime_enabled"), default.cheap_runtime),
             "cheap_runtime",
             path=path,
         ),
+        log_distiller=_log_distiller_config(payload.get("log_distiller", default.log_distiller.to_json_data()), path=path),
         start_over=_bool(payload.get("start_over", default.start_over), "start_over", path=path),
         completion_review=_bool(
             _first_present(
@@ -681,8 +721,12 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
     if "speed" in selected:
         updates["speed"] = config.speed
         updates["fast"] = config.fast
-    if "cheap_runtime" in selected:
-        updates["cheap_runtime"] = config.cheap_runtime
+    if "runtime_enabled" in selected:
+        updates["runtime_enabled"] = config.runtime_enabled
+    if selected.intersection({"cheap_runtime", "runtime_enabled"}):
+        updates["cheap_runtime"] = config.effective_cheap_runtime
+    if "log_distiller" in selected:
+        updates["log_distiller"] = config.log_distiller.to_json_data()
     if "start_over" in selected:
         updates["start_over"] = config.start_over
     if "clean" in selected:

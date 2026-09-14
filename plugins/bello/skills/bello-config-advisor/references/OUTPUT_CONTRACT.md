@@ -12,6 +12,7 @@ I recommend this Bello setup for `TASK.md`:
 - Coding: GPT-5.6 Sol at high effort.
 - Execution mode: normal speed.
 - Runtime supervision: GPT-5.6 Sol at medium effort, with cheap runtime triage enabled.
+- Log distiller: off.
 - Completion review: GPT-5.6 Sol at high effort may return work to the coder once.
 - Adversarial testing: off.
 - Revision coder: off.
@@ -28,9 +29,11 @@ This is a shape example, not a preset. Populate it from the selected setup and o
 - Write the recommendation in the user's language.
 - State the exact normalized project-root-relative task path.
 - For planning, say either that no separate plan is needed or name the exact planner model, effort, and `PLAN.md` output. Planning is prepared before Bello and passed with `--plan`.
-- State the coder, runtime supervisor, and every active reviewer as model plus effort and its provider/billing route in compact readable terms. For example, distinguish Claude through the Claude Code subscription from Claude through OpenRouter. Do not bury that distinction in raw config keys. Mention Fast and cheap runtime triage in readable terms.
+- State each of the four switches: runtime supervision, completion review, adversarial testing, and log distiller. Give the coder and each active model role as model plus effort and provider/billing route in compact readable terms. For example, distinguish Claude through the Claude Code subscription from Claude through OpenRouter. Do not bury that distinction in raw config keys. Mention Fast and cheap runtime triage in readable terms.
+- If runtime is off, omit its dormant profile and state briefly that live supervision/triage is off with reduced protection; network remains inside the filesystem sandbox and outside-sandbox grants are unavailable. Do not imply C/A are disabled or equivalent live protection remains.
+- For log distiller, say off, on with Bello's default model (downloaded once at first use), or identify the selected local override. Omit implementation and timeout details; do not imply a provider subscription, guaranteed savings, or that advice has already downloaded weights.
 - Describe the review schedule as maximum allowed returns and adversary passes. For an adversarial schedule, state separately how many completion returns are allowed before the first adversary, how many adversary passes may run, and how many completion returns are allowed after each adversary pass. Make clear that a reviewer may accept earlier when that distinction matters.
-- Whenever adversarial testing is active, name the completion model and effort that processes adversary reports even when no ordinary completion-return stage is scheduled.
+- Adversary reports use the completion profile if completion is enabled, otherwise the adversary profile. Mention a report-processing profile only when it adds a role not already clear from the setup; do not add a redundant line for A-only or imply a hidden completion role.
 - State whether revision coder is off; when it is on, give its model and effort. Never show its dormant profile when it is off.
 - Describe sub-agents separately for each enabled parent role. Give maximum concurrency, the default child profile, and the allowed profile pool in compact prose. Do not show the policy object for a disabled role.
 - If all sub-agent policies are disabled, say simply that sub-agents are off.

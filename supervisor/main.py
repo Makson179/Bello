@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Coroutine
 
@@ -15,6 +15,7 @@ from supervisor import doctor, update_check
 from supervisor.controller import BelloController
 from supervisor.project_config import (
     INTELLIGENCE_CHOICES,
+    LogDistillerConfig,
     ProjectConfig,
     ProjectConfigError,
     intelligence_choices_for_model,
@@ -125,14 +126,32 @@ class BelloClickGroup(click.Group):
     help="Delete everything except the selected task, optional plan, and protected paths before starting.",
 )
 @click.option(
+    "--runtime/--no-runtime",
+    "runtime_enabled",
+    default=None,
+    help="Enable or disable runtime supervision for this run.",
+)
+@click.option(
+    "--log-distiller/--no-log-distiller",
+    "log_distiller_enabled",
+    default=None,
+    help="Enable or disable local tool-output distillation for this run.",
+)
+@click.option(
+    "--distiller-model",
+    "distiller_model_path",
+    type=click.Path(exists=False, file_okay=False, path_type=Path),
+    default=None,
+    help="Local log-distiller bundle override; otherwise download and cache the published model.",
+)
+@click.option(
     "--completion-review",
     "completion_review",
     default=None,
     type=click.BOOL,
     metavar="[true|false]",
     help=(
-        "Run the completion review before finishing. false finishes on the coder's "
-        "readiness marker and disables the adversary, which runs inside the review."
+        "Run the completion review before finishing. Independent of runtime supervision and adversary."
     ),
 )
 @click.option(
@@ -140,7 +159,7 @@ class BelloClickGroup(click.Group):
     default=None,
     type=click.BOOL,
     metavar="[true|false]",
-    help="Run the adversarial tester before final completion; requires completion review.",
+    help="Run the adversarial tester before final completion, independently of completion review.",
 )
 @click.option(
     "--adversary-runs",
@@ -176,6 +195,9 @@ def cli(
     start_over: bool | None,
     protected_paths: tuple[Path, ...],
     clean: bool | None,
+    runtime_enabled: bool | None,
+    log_distiller_enabled: bool | None,
+    distiller_model_path: Path | None,
     completion_review: bool | None,
     adversary: bool | None,
     adversary_runs: int | None,
@@ -203,6 +225,9 @@ def cli(
             start_over=start_over,
             protected_paths=protected_paths,
             clean=clean,
+            runtime_enabled=runtime_enabled,
+            log_distiller_enabled=log_distiller_enabled,
+            distiller_model_path=distiller_model_path,
             completion_review=completion_review,
             adversary=adversary,
             adversary_runs=adversary_runs,
@@ -452,7 +477,7 @@ def runtime_windows_sandbox_remove(yes: bool, drive: str | None, null_device: bo
 
 
 @runtime_group.command("models")
-@click.option("--engine", type=click.Choice(["all", "pi", "claude-code"]), default="all", show_default=True)
+@click.option("--engine", type=click.Choice(["all", "codex", "pi", "claude-code"]), default="all", show_default=True)
 def runtime_models_command(engine: str) -> None:
     """List the configured provider/model catalog without making a model request."""
     import tempfile
@@ -462,7 +487,7 @@ def runtime_models_command(engine: str) -> None:
         try:
             await client.start()
             return await client.request("model/list", {
-                "engines": ["pi", "claude-code"] if engine == "all" else [engine],
+                "engines": ["codex", "pi", "claude-code"] if engine == "all" else [engine],
                 "optionalEngines": engine == "all",
             })
         finally:
@@ -482,7 +507,9 @@ def runtime_login_command(provider: str) -> None:
     import subprocess
     from supervisor.runtime.install import worker_command
     try:
-        if provider == "claude-code":
+        if provider == "openai-codex":
+            command = [os.environ.get("BELLO_CODEX_BINARY", "codex"), "login"]
+        elif provider == "claude-code":
             from supervisor.runtime.claude import ClaudeBackend
             command = [str(ClaudeBackend._bundled_cli_path()), "auth", "login"]
         else:
@@ -510,10 +537,19 @@ def config_command() -> None:
     if config.revision_coder_enabled:
         click.echo(f"revision-coder-mod: {config.revision_coder_mod}")
         click.echo(f"revision-coder-intelligence: {config.revision_coder_intelligence}")
-    click.echo(f"runtime-mod: {config.runtime_mod}")
-    click.echo(f"completion-mod: {config.completion_mod}")
-    click.echo(f"adversary-mod: {config.adversary_mod}")
-    click.echo(f"cheap-runtime: {str(config.cheap_runtime).lower()}")
+    click.echo(f"runtime: {str(config.runtime_enabled).lower()}")
+    if config.runtime_enabled:
+        click.echo(f"runtime-mod: {config.runtime_mod}")
+        click.echo(f"cheap-runtime: {str(config.effective_cheap_runtime).lower()}")
+    click.echo(f"completion-review: {str(config.completion_review).lower()}")
+    if config.completion_review:
+        click.echo(f"completion-mod: {config.completion_mod}")
+    click.echo(f"adversary: {str(config.adversary).lower()}")
+    if config.adversary:
+        click.echo(f"adversary-mod: {config.adversary_mod}")
+    click.echo(f"log-distiller: {str(config.log_distiller.enabled).lower()}")
+    if config.log_distiller.enabled:
+        click.echo(f"distiller-model: {config.log_distiller.model_path or 'published model (automatic cache)'}")
 
 
 def _version_callback(ctx: click.Context, value: bool) -> None:
@@ -641,6 +677,8 @@ async def _run_bello(settings: RunSettings) -> int:
         overwrite_state=settings.start_over,
         declared_grading_roots=settings.protected_paths,
         clean_workspace=settings.clean,
+        runtime_enabled=settings.runtime_enabled,
+        log_distiller=settings.log_distiller,
         adversary_enabled=settings.adversary,
         adversary_runs=settings.adversary_runs,
         completion_review=settings.completion_review,
@@ -672,6 +710,8 @@ class RunSettings:
     completion_review: bool
     adversary: bool
     adversary_runs: int
+    runtime_enabled: bool = True
+    log_distiller: LogDistillerConfig = field(default_factory=LogDistillerConfig)
 
 
 def _resolve_run_settings(
@@ -693,6 +733,9 @@ def _resolve_run_settings(
     start_over: bool | None = None,
     protected_paths: tuple[Path, ...] = (),
     clean: bool | None = None,
+    runtime_enabled: bool | None = None,
+    log_distiller_enabled: bool | None = None,
+    distiller_model_path: Path | None = None,
     completion_review: bool | None = None,
     adversary: bool | None = None,
     adversary_runs: int | None = None,
@@ -718,16 +761,30 @@ def _resolve_run_settings(
     selected_runtime_intelligence = runtime_intelligence or project_config.runtime_intelligence
     selected_completion_intelligence = completion_intelligence or project_config.completion_intelligence
     selected_adversary_intelligence = adversary_intelligence or project_config.adversary_intelligence
+    selected_runtime_enabled = project_config.runtime_enabled if runtime_enabled is None else runtime_enabled
+    selected_completion_review = project_config.completion_review if completion_review is None else completion_review
+    selected_adversary = (
+        adversary if adversary is not None
+        else (adversary_runs > 0 if adversary_runs is not None else project_config.adversary)
+    )
+    selected_distiller = replace(
+        project_config.log_distiller,
+        enabled=project_config.log_distiller.enabled if log_distiller_enabled is None else log_distiller_enabled,
+        model_path=project_config.log_distiller.model_path if distiller_model_path is None else str(distiller_model_path),
+    )
     _validate_model_intelligence("coder", selected_coder_model, selected_coder_intelligence)
-    if project_config.revision_coder_enabled:
+    if project_config.revision_coder_enabled and (selected_completion_review or selected_adversary):
         _validate_model_intelligence(
             "revision coder",
             project_config.revision_coder_mod,
             project_config.revision_coder_intelligence,
         )
-    _validate_model_intelligence("runtime", selected_runtime_model, selected_runtime_intelligence)
-    _validate_model_intelligence("completion", selected_completion_model, selected_completion_intelligence)
-    _validate_model_intelligence("adversary", selected_adversary_model, selected_adversary_intelligence)
+    if selected_runtime_enabled:
+        _validate_model_intelligence("runtime", selected_runtime_model, selected_runtime_intelligence)
+    if selected_completion_review:
+        _validate_model_intelligence("completion", selected_completion_model, selected_completion_intelligence)
+    if selected_adversary:
+        _validate_model_intelligence("adversary", selected_adversary_model, selected_adversary_intelligence)
     selected_task = task_path if task_path is not None else Path(project_config.task) if project_config.task else None
     selected_protected_paths = protected_paths or tuple(Path(path) for path in project_config.protected_path)
     return RunSettings(
@@ -745,13 +802,11 @@ def _resolve_run_settings(
         start_over=project_config.start_over if start_over is None else start_over,
         protected_paths=selected_protected_paths,
         clean=project_config.clean if clean is None else clean,
-        completion_review=project_config.completion_review if completion_review is None else completion_review,
+        runtime_enabled=selected_runtime_enabled,
+        log_distiller=selected_distiller,
+        completion_review=selected_completion_review,
         # An explicit --adversary wins; otherwise an explicit --adversary-runs implies on/off (0 = off).
-        adversary=(
-            adversary
-            if adversary is not None
-            else (adversary_runs > 0 if adversary_runs is not None else project_config.adversary)
-        ),
+        adversary=selected_adversary,
         adversary_runs=project_config.adversary_runs if adversary_runs is None else adversary_runs,
     )
 

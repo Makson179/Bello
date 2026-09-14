@@ -547,6 +547,9 @@ class WorkspaceSnapshot:
     plan_sha256: str | None = None
     plan_exposed: bool = False
     readonly_dependency_paths: tuple[str, ...] = ()
+    # Canonical external authorities captured from controller-owned sources at
+    # snapshot creation. Never derive grants from coder-writable aliases later.
+    readonly_dependency_roots: tuple[Path, ...] = ()
     declared_grading_roots: tuple[str | Path, ...] = ()
     rewritten_symlinks: tuple[SnapshotSymlinkRewrite, ...] = ()
     excluded_external_symlink_paths: tuple[str, ...] = ()
@@ -1039,8 +1042,20 @@ def create_workspace_snapshot(
                 )
         state_source = original_root / ".supervisor"
         readonly_dependency_paths: list[str] = []
+        readonly_dependency_roots: list[Path] = []
         for source, relative in readonly_dependencies:
             if exposure_mode == RUNTIME_EXPOSURE_SYMLINK:
+                dependency_root = source.resolve(strict=True)
+                if (
+                    original_root.is_relative_to(dependency_root)
+                    or is_protected_path(original_root, dependency_root)
+                    or is_supervisor_runtime_path(original_root, dependency_root)
+                    or (original_plan is not None and original_plan.is_relative_to(dependency_root))
+                ):
+                    raise WorkspaceSnapshotError(
+                        f"dependency exposure would grant private workspace inputs: {relative}"
+                    )
+                readonly_dependency_roots.append(dependency_root)
                 _create_runtime_exposure(
                     snapshot_root / relative,
                     source,
@@ -1140,6 +1155,7 @@ def create_workspace_snapshot(
             plan_sha256=plan_sha256,
             plan_exposed=snapshot_plan is not None,
             readonly_dependency_paths=tuple(sorted(dict.fromkeys(readonly_dependency_paths))),
+            readonly_dependency_roots=tuple(dict.fromkeys(readonly_dependency_roots)),
             declared_grading_roots=declared_roots,
             rewritten_symlinks=rewritten_symlinks,
             excluded_external_symlink_paths=excluded_external_symlinks,
@@ -1341,16 +1357,21 @@ def remove_isolated_workspace_tree(path: Path) -> None:
     _remove_path(path)
 
 
-def apply_snapshot_patch(snapshot: WorkspaceSnapshot) -> SnapshotPatchResult:
+def apply_snapshot_patch(
+    snapshot: WorkspaceSnapshot, *, runtime_enabled: bool = True,
+) -> SnapshotPatchResult:
+    """Export a candidate with mandatory authority checks in either runtime mode."""
     try:
-        return _apply_snapshot_patch(snapshot)
+        return _apply_snapshot_patch(snapshot, runtime_enabled=runtime_enabled)
     except WorkspaceSnapshotError:
         raise
     except OSError as exc:
         raise SnapshotPatchError(f"snapshot patch filesystem operation failed: {exc}") from exc
 
 
-def _apply_snapshot_patch(snapshot: WorkspaceSnapshot) -> SnapshotPatchResult:
+def _apply_snapshot_patch(
+    snapshot: WorkspaceSnapshot, *, runtime_enabled: bool = True,
+) -> SnapshotPatchResult:
     _restore_trusted_snapshot_git_config(snapshot)
     if _is_windows_platform():
         # Git is an unsandboxed native executable.  Audit the mutable tree
@@ -1369,6 +1390,7 @@ def _apply_snapshot_patch(snapshot: WorkspaceSnapshot) -> SnapshotPatchResult:
         changed_paths,
         task_relative_path=snapshot.task_relative_path,
         declared_grading_roots=snapshot.declared_grading_roots,
+        check_path_heuristics=runtime_enabled,
     )
     if _is_windows_platform():
         _validate_windows_patch_targets(snapshot.original_root, changed_paths)
@@ -1733,10 +1755,16 @@ def _validate_snapshot_patch_paths(
     *,
     task_relative_path: str,
     declared_grading_roots: tuple[str | Path, ...],
+    check_path_heuristics: bool = True,
 ) -> None:
     if any(_path_is_at_or_below(path, task_relative_path) for path in paths):
         raise SnapshotPatchError(f"snapshot patch path rejected: task file is immutable: {task_relative_path}")
-    decision = PolicyEngine(original_root, declared_grading_roots=declared_grading_roots).evaluate_patch_paths(list(paths))
+    decision = PolicyEngine(
+        original_root, declared_grading_roots=declared_grading_roots,
+        immutable_paths=(task_relative_path,),
+    ).evaluate_patch_paths(
+        list(paths), check_path_heuristics=check_path_heuristics,
+    )
     if decision.kind != PolicyDecisionKind.ALLOW:
         raise SnapshotPatchError(f"snapshot patch path rejected: {decision.reason}")
 

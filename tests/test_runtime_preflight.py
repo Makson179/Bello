@@ -97,3 +97,16 @@ async def test_fast_tier_must_be_explicitly_validated_not_silently_ignored(tmp_p
     request = next(event for event in events if isinstance(event, tuple))
     assert request[1]["serviceTier"] == "priority"
     assert "paid-self-test" not in events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native_coder", [False, True])
+async def test_native_distiller_capability_only_required_for_coder_profiles(tmp_path, monkeypatch, native_coder):
+    controller, events = controller_for(tmp_path, monkeypatch)
+    controller._log_distiller_config = lambda: SimpleNamespace(enabled=True)
+    controller._coder_model = lambda: "gpt-6-astra" if native_coder else "claude-code/sonnet"
+    controller._runtime_model = lambda: "gpt-5.6-luna"
+    await controller._runtime_preflight()
+    validations = [params for method, params in (e for e in events if isinstance(e, tuple))]
+    requiring = [params["model"] for params in validations if params.get("distillerEnabled")]
+    assert requiring == (["gpt-6-astra"] if native_coder else [])

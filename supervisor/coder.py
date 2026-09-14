@@ -66,8 +66,9 @@ def codex_service_tier(*, fast: bool) -> str | None:
 
 def task_runtime_workspace_roots(
     workspace_root: Path, task_path: Path | None = None,
+    *, readonly_roots: tuple[Path, ...] = (),
 ) -> list[Path]:
-    """Keep snapshot task links readable without granting their source directory."""
+    """Add only host-pinned task/dependency authority, never infer it from links."""
 
     root = workspace_root.resolve()
     roots = [root]
@@ -78,6 +79,13 @@ def task_runtime_workspace_roots(
             if not task.is_file():
                 raise ValueError("task read authority must be an existing file")
             roots.append(task)
+    for dependency in readonly_roots:
+        # Callers supply canonical roots captured before any model work. Do not
+        # rescan the writable snapshot's dependency aliases on turns/resumes.
+        if not dependency.is_absolute():
+            raise ValueError("dependency read authority must be an absolute pinned path")
+        if dependency not in roots:
+            roots.append(dependency)
     return roots
 
 
@@ -138,6 +146,7 @@ def apply_multi_agent_thread_start_params(
     *,
     role: MultiAgentRole = "coder",
 ) -> dict[str, Any]:
+    params["belloRole"] = role
     agents: dict[str, Any] = {"enabled": config.enabled}
     if config.enabled:
         agents.update(
@@ -164,6 +173,7 @@ def coder_thread_params(
     project_root: Path,
     *,
     task_path: Path | None = None,
+    readonly_roots: tuple[Path, ...] = (),
     model: str | None = None,
     fast: bool = False,
     intelligence: str | None = None,
@@ -172,7 +182,7 @@ def coder_thread_params(
     multi_agent = multi_agent or MultiAgentConfig()
     params: dict[str, Any] = {
         "cwd": str(project_root),
-        "runtimeWorkspaceRoots": [str(root) for root in task_runtime_workspace_roots(project_root, task_path)],
+        "runtimeWorkspaceRoots": [str(root) for root in task_runtime_workspace_roots(project_root, task_path, readonly_roots=readonly_roots)],
         "approvalPolicy": "on-request",
         "approvalsReviewer": "user",
         "sandbox": coder_sandbox_mode(),
@@ -183,6 +193,8 @@ def coder_thread_params(
         "config": {},
     }
     apply_multi_agent_thread_start_params(params, multi_agent, role="coder")
+    if task_path is not None:
+        params["runtimeTaskPath"] = str((task_path if task_path.is_absolute() else project_root / task_path).resolve())
     if model:
         params["model"] = model
     return apply_intelligence(params, intelligence)
@@ -193,6 +205,7 @@ def coder_thread_resume_params(
     project_root: Path,
     *,
     task_path: Path | None = None,
+    readonly_roots: tuple[Path, ...] = (),
     model: str | None = None,
     fast: bool = False,
     intelligence: str | None = None,
@@ -204,7 +217,7 @@ def coder_thread_resume_params(
     params: dict[str, Any] = {
         "threadId": thread_id,
         "cwd": str(project_root.resolve()),
-        "runtimeWorkspaceRoots": [str(root) for root in task_runtime_workspace_roots(project_root, task_path)],
+        "runtimeWorkspaceRoots": [str(root) for root in task_runtime_workspace_roots(project_root, task_path, readonly_roots=readonly_roots)],
         "approvalPolicy": "on-request",
         "approvalsReviewer": "user",
         "sandbox": coder_sandbox_mode(),
@@ -212,6 +225,8 @@ def coder_thread_resume_params(
         "config": {},
     }
     apply_multi_agent_thread_start_params(params, multi_agent, role="coder")
+    if task_path is not None:
+        params["runtimeTaskPath"] = str((task_path if task_path.is_absolute() else project_root / task_path).resolve())
     if model:
         params["model"] = model
     return apply_intelligence(params, intelligence)
@@ -223,6 +238,7 @@ def coder_turn_params(
     project_root: Path,
     *,
     task_path: Path | None = None,
+    readonly_roots: tuple[Path, ...] = (),
     model: str | None = None,
     fast: bool = False,
     intelligence: str | None = None,
@@ -231,7 +247,7 @@ def coder_turn_params(
         "threadId": thread_id,
         "input": [text_input(text)],
         "cwd": str(project_root),
-        "runtimeWorkspaceRoots": [str(root) for root in task_runtime_workspace_roots(project_root, task_path)],
+        "runtimeWorkspaceRoots": [str(root) for root in task_runtime_workspace_roots(project_root, task_path, readonly_roots=readonly_roots)],
         "approvalPolicy": "on-request",
         "approvalsReviewer": "user",
         "sandboxPolicy": coder_turn_sandbox_policy(project_root),
@@ -256,6 +272,7 @@ class CoderSession:
     coder_rpc_timeout_seconds: float = APP_SERVER_CODER_RPC_TIMEOUT_SECONDS
     multi_agent: MultiAgentConfig = field(default_factory=MultiAgentConfig)
     plan_path: Path | None = None
+    readonly_roots: tuple[Path, ...] = ()
     _task_read_path: Path = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -263,6 +280,9 @@ class CoderSession:
         # become new read authority when a turn starts or a session resumes.
         task = self.task_path if self.task_path.is_absolute() else self.project_root / self.task_path
         self._task_read_path = task.resolve()
+        self.readonly_roots = tuple(dict.fromkeys(self.readonly_roots))
+        if any(not root.is_absolute() for root in self.readonly_roots):
+            raise ValueError("dependency read authority must be an absolute pinned path")
 
     @property
     def task_read_path(self) -> Path:
@@ -274,6 +294,7 @@ class CoderSession:
             coder_thread_params(
                 self.project_root,
                 task_path=self._task_read_path,
+                readonly_roots=self.readonly_roots,
                 model=self.model,
                 fast=self.fast,
                 intelligence=self.intelligence,
@@ -298,6 +319,7 @@ class CoderSession:
                 self.thread_id,
                 self.project_root,
                 task_path=self._task_read_path,
+                readonly_roots=self.readonly_roots,
                 model=self.model,
                 fast=self.fast,
                 intelligence=self.intelligence,
@@ -334,6 +356,7 @@ class CoderSession:
                 message,
                 self.project_root,
                 task_path=self._task_read_path,
+                readonly_roots=self.readonly_roots,
                 model=self.model,
                 fast=self.fast,
                 intelligence=self.intelligence,
