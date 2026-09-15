@@ -321,10 +321,15 @@ def _path_has_root_identity(path: Path, root: Path) -> bool:
         except (FileNotFoundError, NotADirectoryError):
             continue
         except OSError as exc:
-            if exc.errno != errno.ENAMETOOLONG:
+            if exc.errno != errno.ENAMETOOLONG and getattr(exc, "winerror", None) not in {
+                123,  # ERROR_INVALID_NAME
+                206,  # ERROR_FILENAME_EXCED_RANGE
+            }:
                 raise
             # Shell payloads/inline programs can be candidates without being
-            # filesystem names. Skip the impossible leaf, but still inspect
+            # filesystem names. Windows may report invalid syntax rather than
+            # ENAMETOOLONG; do not suppress generic EINVAL or access/I/O errors.
+            # Skip the impossible leaf, but still inspect
             # its parents so an existing protected authority is not bypassed.
             continue
         if (metadata.st_dev, metadata.st_ino) == identity:

@@ -312,6 +312,8 @@ jobs:
             ${{ runner.temp }}/bello-host-setup-restore.json
             ${{ runner.temp }}/bello-checkout-drive-prepare.json
             ${{ runner.temp }}/bello-checkout-drive-restore.json
+            ${{ runner.temp }}/bello-host-setup-*.mismatch.json
+            ${{ runner.temp }}/bello-checkout-drive-*.mismatch.json
             ${{ runner.temp }}/bello-null-device-prepare.json
             ${{ runner.temp }}/bello-null-device-restore.json
             ${{ runner.temp }}/bello-network-prepare.json

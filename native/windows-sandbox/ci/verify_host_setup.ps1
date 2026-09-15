@@ -99,13 +99,41 @@ function Read-AclSnapshot([string]$Target) {
     }
 }
 
-function Assert-AclEqual($Expected, $Actual) {
+function Describe-ControlFlags([int]$Value) {
+    return @{
+        value = $Value
+        hex = "0x{0:X4}" -f $Value
+        flags = ([Security.AccessControl.ControlFlags]$Value).ToString()
+    }
+}
+
+function Write-AclMismatch([string]$Field, $Expected, $Actual, [string]$Target) {
+    # Diagnostic snapshots only: never rewrite a target ACL to make CI pass.
+    $beforeControl = Describe-ControlFlags ([int]$Expected.control)
+    $afterControl = Describe-ControlFlags ([int]$Actual.control)
+    $changedControl = Describe-ControlFlags ([int]$Expected.control -bxor [int]$Actual.control)
+    @{
+        phase = $Phase; selectedDrive = $selectedDrive; target = $Target; field = $Field
+        expected = $Expected; actual = $Actual
+        expectedControl = $beforeControl; actualControl = $afterControl
+        changedControl = $changedControl
+    } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath "$Report.mismatch.json" -Encoding utf8
+    return "target=$Target; expected control=$($beforeControl.hex) [$($beforeControl.flags)]; actual control=$($afterControl.hex) [$($afterControl.flags)]; changed=$($changedControl.hex) [$($changedControl.flags)]"
+}
+
+function Assert-AclEqual($Expected, $Actual, [string]$Target) {
     foreach ($field in @("owner", "group", "control", "revision")) {
-        if ($Expected[$field] -ne $Actual[$field]) { throw "host setup changed unrelated ACL field: $field" }
+        if ($Expected[$field] -ne $Actual[$field]) {
+            $diagnostic = Write-AclMismatch $field $Expected $Actual $Target
+            throw "host setup changed unrelated ACL field: $field; $diagnostic"
+        }
     }
     $before = @($Expected.aces | ForEach-Object { $_.binary }) | ConvertTo-Json -Compress
     $after = @($Actual.aces | ForEach-Object { $_.binary }) | ConvertTo-Json -Compress
-    if ($before -cne $after) { throw "host setup changed unrelated ACE bytes or order" }
+    if ($before -cne $after) {
+        $diagnostic = Write-AclMismatch "aces" $Expected $Actual $Target
+        throw "host setup changed unrelated ACE bytes or order; $diagnostic"
+    }
 }
 
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $SnapshotPath) | Out-Null
@@ -155,7 +183,7 @@ if ($Phase -eq "Prepare") {
             }
             $after.aces = @($after.aces | Where-Object { $_.sid -ne $status.capabilitySid })
         }
-        Assert-AclEqual $before[$target.kind] $after
+        Assert-AclEqual $before[$target.kind] $after $target.path
     }
     @{
         phase = $Phase; systemRoot = $status.systemRoot; capabilitySid = $status.capabilitySid
@@ -190,7 +218,7 @@ else {
     }
     elseif (-not $status.prepared) { throw "pre-existing host setup disappeared" }
     foreach ($target in $status.targets) {
-        Assert-AclEqual $snapshot.acls[$target.kind] (Read-AclSnapshot $target.path)
+        Assert-AclEqual $snapshot.acls[$target.kind] (Read-AclSnapshot $target.path) $target.path
     }
     @{ phase = $Phase; originalAclRestored = $true; preservedExistingSetup = $snapshot.status.prepared } |
         ConvertTo-Json | Set-Content -LiteralPath $Report -Encoding utf8
