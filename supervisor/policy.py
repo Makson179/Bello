@@ -1717,6 +1717,19 @@ class PolicyEngine:
     def _command_immutable_hit(self, analysis: CommandAnalysis, *, cwd: str | None) -> str | None:
         if not self.immutable_paths:
             return None
+        if not self.windows_paths:
+            from supervisor.immutable_reads import literal_pinned_read_tokens
+            checked = literal_pinned_read_tokens(
+                analysis.command,
+                cwd=Path(cwd).resolve() if cwd else self.workspace,
+                immutable_paths=self.immutable_paths,
+                workspace=self.workspace,
+            )
+            if checked is not None:
+                # Only this hard-deny check sees the masked operands. Normal
+                # analysis, runtime review and execution retain the original
+                # command, including every destructive or unknown segment.
+                analysis = analysis.model_copy(update={"command": shlex.join(checked), "tokens": checked})
         raw_hit = self._raw_windows_command_path_hit(
             analysis.command,
             self.immutable_paths,

@@ -2065,6 +2065,148 @@ async def test_no_marker_idle_nudges_coder_when_completion_review_disabled(tmp_p
     assert controller.coder.messages == [NO_MARKER_IDLE_NUDGE]
 
 
+@pytest.mark.parametrize("cheap_runtime", [False, True])
+@pytest.mark.parametrize("completion_review", [False, True])
+async def test_denied_native_turn_runtime_noop_continues_idle_policy(
+    tmp_path: Path, cheap_runtime: bool, completion_review: bool,
+) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    controller.adversary_enabled = False
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(update={
+            "active_coder_turn_id": "turn",
+            "completion_review_enabled": completion_review,
+        })
+    )
+
+    class NativeCoder:
+        thread_id = "thread"
+        active_turn_id = "turn"
+
+        def __init__(self):
+            self.messages = []
+
+        async def steer_or_start(self, message):
+            self.messages.append(message)
+            self.active_turn_id = self.active_turn_id or "resumed-turn"
+            store.update_bello_config(
+                lambda cfg: cfg.model_copy(update={"active_coder_turn_id": self.active_turn_id})
+            )
+            return self.active_turn_id
+
+        def mark_turn_completed(self, turn_id):
+            if self.active_turn_id == turn_id:
+                self.active_turn_id = None
+                store.update_bello_config(lambda cfg: cfg.model_copy(update={"active_coder_turn_id": None}))
+
+    class NativeClient:
+        def __init__(self):
+            self.responses = []
+
+        async def respond(self, request_id, response):
+            self.responses.append((request_id, response))
+
+    controller.coder = NativeCoder()
+    controller.client = NativeClient()
+    controller.approvals = ApprovalManager(tmp_path)
+    cheap = _CheapRuntimeNoopReviewer()
+    if cheap_runtime:
+        controller.runtime_triage_reviewer = cheap
+        controller.runtime_triage_config = SimpleNamespace(model=cheap.model)
+    controller._current_turn_action_count = 1
+    await controller.handle_server_request(AppServerMessage({
+        "id": 56,
+        "method": "item/fileChange/requestApproval",
+        "params": {
+            "threadId": "thread", "turnId": "turn",
+            "grantRoot": str(store.path(CONFIG)),
+            "availableDecisions": ["accept", "decline", "cancel"],
+        },
+    }))
+    await controller.handle_notification(AppServerMessage({
+        "method": "serverRequest/resolved", "params": {"requestId": 56},
+    }))
+    await controller.handle_notification(AppServerMessage({
+        "method": "turn/completed",
+        "params": {"threadId": "thread", "turn": {"id": "turn", "status": "interrupted"}},
+    }))
+    await controller._supervisor_task
+
+    assert controller.client.responses == [(56, {"decision": "decline"})]
+    assert controller.pending_approvals == {}
+    assert len(cheap.calls) == int(cheap_runtime)
+    assert len(fake.runtime_packets) == int(not cheap_runtime)
+    assert len(fake.completion_packets) == int(completion_review)
+    assert controller.coder.messages[-1] == ("not used" if completion_review else NO_MARKER_IDLE_NUDGE)
+    assert controller.coder.active_turn_id == "resumed-turn"
+    assert store.get_bello_config().active_coder_turn_id == "resumed-turn"
+    assert store.get_bello_config().status != BelloStatus.COMPLETE
+
+
+@pytest.mark.parametrize("changed_during_refresh", [False, True])
+@pytest.mark.parametrize("blocker", [
+    "missing_coder", "active_turn", "coder_active_turn", "active_subagent", "generation", "thread", "new_event",
+    "pending_approval", "persisted_approval", "queued_runtime", "queued_completion",
+    "deferred_completion", "paused", "paused_status", "stopped", "finalizing", "terminal_cleanup",
+])
+async def test_runtime_noop_idle_does_not_resume_changed_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocker: str, changed_during_refresh: bool,
+) -> None:
+    controller, store, _fake = _runtime_controller(tmp_path)
+    controller.coder = SimpleNamespace(thread_id="thread", active_turn_id=None)
+    packet = SupervisorWakePacket(
+        wake_sequence=1, latest_event_sequence=0, generation=0, restart_count=0,
+        coder_thread_id="thread", task_path=str(controller.task_path), task_contents="# Task",
+        current_summary="Coder turn completed",
+    )
+
+    def change_state():
+        config_changes = {
+            "active_turn": {"active_coder_turn_id": "new-turn"},
+            "generation": {"generation": 1},
+            "thread": {"coder_thread_id": "new-thread"},
+            "persisted_approval": {"pending_server_request_ids": [57]},
+            "paused_status": {"status": BelloStatus.PAUSED},
+        }
+        if blocker in config_changes:
+            store.update_bello_config(lambda cfg: cfg.model_copy(update=config_changes[blocker]))
+        elif blocker == "missing_coder":
+            controller.coder = None
+        elif blocker == "coder_active_turn":
+            controller.coder = SimpleNamespace(active_turn_id="new-turn")
+        elif blocker == "active_subagent":
+            monkeypatch.setattr(controller, "_active_coder_subagents", lambda: [object()])
+        elif blocker == "new_event":
+            controller._append_event(AppEventSource.APP_SERVER, "turn/started", thread_id="thread")
+        elif blocker == "pending_approval":
+            controller.pending_approvals[57] = object()
+        elif blocker == "queued_runtime":
+            controller._supervisor_next_runtime_summary = "new runtime evidence"
+        elif blocker == "queued_completion":
+            controller._supervisor_next_completion_summary = "ready for review"
+        elif blocker == "deferred_completion":
+            controller._deferred_completion_check = object()
+        else:
+            attribute, value = {
+                "paused": ("paused", True), "stopped": ("running", False),
+                "finalizing": ("_finalizing", True), "terminal_cleanup": ("_terminal_cleanup_started", True),
+            }[blocker]
+            setattr(controller, attribute, value)
+
+    async def refresh():
+        if changed_during_refresh:
+            change_state()
+
+    async def unexpected_idle(**kwargs):
+        raise AssertionError("stale runtime noop must not restart or review the coder")
+
+    monkeypatch.setattr(controller, "_refresh_coder_subagents", refresh)
+    monkeypatch.setattr(controller, "_handle_no_marker_idle", unexpected_idle)
+    if not changed_during_refresh:
+        change_state()
+    assert await controller._resume_idle_after_runtime_noop(packet) is False
+
+
 def test_runtime_supervisor_schema_rejects_complete() -> None:
     with pytest.raises(Exception):
         SupervisorDecision.model_validate({"decision": "complete"})

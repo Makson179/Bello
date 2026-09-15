@@ -3394,11 +3394,12 @@ class BelloController:
         if self.coder:
             await self._deliver_coder_message(message)
 
-    async def _handle_no_marker_idle(self) -> None:
+    async def _handle_no_marker_idle(self, *, subagents_refreshed: bool = False) -> None:
         cfg = self.store.get_bello_config()
         if cfg.active_coder_turn_id:
             return
-        await self._refresh_coder_subagents()
+        if not subagents_refreshed:
+            await self._refresh_coder_subagents()
         if self._active_coder_subagents():
             return
         if not getattr(self, "_generation_has_coder_turn", True):
@@ -4756,6 +4757,7 @@ class BelloController:
                     cheap = await self._cheap_runtime_route(packet)
                     if cheap is not None and cheap.decision == "noop":
                         self._ack_runtime_trigger_batch(runtime_trigger_batch)
+                        await self._resume_idle_after_runtime_noop(packet)
                         return
                 decision = await agent.decide(packet)
         except SupervisorAgentError as exc:
@@ -4914,6 +4916,12 @@ class BelloController:
                 self._runtime_decision_retry_count = 0
                 self._ack_runtime_trigger_batch(runtime_trigger_batch)
                 await self._resume_readiness_after_runtime_noop(decision, packet)
+                if (
+                    decision.decision == SupervisorDecisionKind.NOOP
+                    and decision.wake_sequence == packet.wake_sequence
+                    and decision.generation == packet.generation
+                ):
+                    await self._resume_idle_after_runtime_noop(packet)
             elif not applied:
                 attempts = int(getattr(self, "_runtime_decision_retry_count", 0) or 0)
                 if attempts < 1:
@@ -4932,6 +4940,40 @@ class BelloController:
                     "runtime supervisor returned a stale or mismatched decision after retry",
                     status=BelloStatus.PROVIDER_FAILURE,
                 )
+
+    async def _resume_idle_after_runtime_noop(self, packet: SupervisorWakePacket) -> bool:
+        # A denied native approval can end a turn after its last action. A runtime
+        # noop means no intervention is needed, not that the now-idle coder is done.
+        # Continue the existing no-marker review/nudge policy without waiting for
+        # the idle watchdog, and never revive a paused or superseded lifecycle.
+        if not self._runtime_noop_idle_context_is_current(packet):
+            return False
+        await self._refresh_coder_subagents()
+        if not self._runtime_noop_idle_context_is_current(packet) or self._active_coder_subagents():
+            return False
+        await self._handle_no_marker_idle(subagents_refreshed=True)
+        return True
+
+    def _runtime_noop_idle_context_is_current(self, packet: SupervisorWakePacket) -> bool:
+        cfg = self.store.get_bello_config()
+        coder = getattr(self, "coder", None)
+        return bool(
+            packet.current_summary == "Coder turn completed"
+            and coder is not None
+            and self._coder_lifecycle_accepts_activity(cfg)
+            and cfg.generation == packet.generation
+            and cfg.coder_thread_id == packet.coder_thread_id
+            and not self._readiness_snapshot_has_new_invalidating_event(packet, cfg=cfg)
+            and cfg.active_coder_turn_id is None
+            and not getattr(coder, "active_turn_id", None)
+            and not self.pending_approvals
+            and not cfg.pending_server_request_ids
+            and getattr(self, "_supervisor_next_runtime_summary", None) is None
+            and getattr(self, "_supervisor_next_runtime_check", None) is None
+            and getattr(self, "_supervisor_next_completion_summary", None) is None
+            and getattr(self, "_supervisor_next_completion_check", None) is None
+            and getattr(self, "_deferred_completion_check", None) is None
+        )
 
     async def _resume_readiness_after_runtime_noop(
         self,
