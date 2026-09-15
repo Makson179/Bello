@@ -625,6 +625,28 @@ class BelloController:
             await self.fail_provider(f"app-server RPC failed: {exc}")
         except WorkspaceSnapshotError as exc:
             await self.fail_provider(f"run infrastructure failed: {exc}")
+        except Exception as exc:
+            # An unexpected local failure must not leave a dead run advertised
+            # as running. Preserve the unaccepted snapshot via the existing
+            # failure path, then re-raise so CLI callers retain a nonzero exit
+            # and the original traceback. Cancellation/KeyboardInterrupt are
+            # BaseExceptions and deliberately keep their existing behavior.
+            detail = f"run infrastructure failed: {type(exc).__name__}: {sanitize_error_text(str(exc))}"
+            try:
+                await self.fail_provider(detail)
+                self.pending_approvals.clear()
+                if self.coder is not None:
+                    self.coder.active_turn_id = None
+                self.store.update_bello_config(
+                    lambda cfg: cfg.model_copy(update={
+                        "active_coder_turn_id": None,
+                        "pending_server_request_ids": [],
+                    })
+                )
+                self._write_run_checkpoint("terminal", state="terminal", detail=detail)
+            except Exception as finalization_error:
+                exc.add_note(f"Failure finalization also failed: {type(finalization_error).__name__}")
+            raise
         finally:
             self.running = False
             await self._stop_supervisor_task()

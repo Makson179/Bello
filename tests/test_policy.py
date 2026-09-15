@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import errno
+import shlex
 from pathlib import Path
 
 import pytest
@@ -20,6 +22,77 @@ def _symlink_or_skip(link: Path, target: Path, *, target_is_directory: bool = Fa
         link.symlink_to(target, target_is_directory=target_is_directory)
     except (NotImplementedError, OSError) as exc:
         pytest.skip(f"filesystem symlinks are unavailable: {exc}")
+
+
+def test_long_inline_javascript_routes_to_review_instead_of_crashing(workspace: Path) -> None:
+    task = workspace / "TASK.md"
+    task.write_text("Build the game", encoding="utf-8")
+    script = (
+        "const tab = await fetch('http://127.0.0.1:9222/json/new'); "
+        + "const unused = '" + "x" * 2000 + "'; "
+        + "console.log(await tab.text());"
+    )
+    command = "/bin/zsh -c " + shlex.quote("node --input-type=module -e " + shlex.quote(script))
+    decision = _policy_engine(workspace, immutable_paths=(task,)).evaluate(
+        {"command": command, "cwd": str(workspace)},
+    )
+    assert decision.kind == PolicyDecisionKind.ROUTE_LLM
+    analysis = command_analysis_from_policy_decision(decision)
+    assert analysis is not None
+    assert "unknown_executable" in analysis.risk_tags
+
+
+@pytest.mark.parametrize("protected_kind", ["immutable", "grading"])
+def test_long_inline_javascript_keeps_later_protected_path_operands_denied(
+    workspace: Path, protected_kind: str,
+) -> None:
+    protected = workspace / "restricted"
+    protected.mkdir()
+    script = "const padding = '" + "x" * 2000 + "'; console.log('" + str(protected / "file.txt") + "');"
+    command = (
+        "/bin/zsh -c " + shlex.quote("node -e " + shlex.quote(script))
+        + " && cat " + shlex.quote(str(protected / "file.txt"))
+    )
+    kwargs = {"immutable_paths" if protected_kind == "immutable" else "declared_grading_roots": (protected,)}
+    decision = _policy_engine(workspace, **kwargs).evaluate({"command": command, "cwd": str(workspace)})
+    assert decision.kind == PolicyDecisionKind.DENY
+    assert str(protected) in decision.reason
+
+
+def test_root_identity_checks_parent_after_overlong_leaf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    leaf = protected / ("x" * 300)
+    original_stat = Path.stat
+
+    def fake_stat(path: Path, *args, **kwargs):
+        if path == leaf:
+            raise OSError(errno.ENAMETOOLONG, "File name too long")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    assert policy_module._path_has_root_identity(leaf, protected) is True
+    assert policy_module._path_has_root_identity(leaf, tmp_path / "unrelated") is False
+
+
+@pytest.mark.parametrize("error_number", [errno.EACCES, errno.EIO])
+def test_root_identity_does_not_silently_ignore_other_stat_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_number: int,
+) -> None:
+    candidate = tmp_path / "candidate"
+    original_stat = Path.stat
+
+    def fake_stat(path: Path, *args, **kwargs):
+        if path == candidate:
+            raise OSError(error_number, "unavailable")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    with pytest.raises(OSError) as error:
+        policy_module._path_has_root_identity(candidate, tmp_path)
+    assert error.value.errno == error_number
 
 
 def test_tracked_path_git_query_uses_isolated_configuration(

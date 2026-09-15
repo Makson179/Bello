@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import fnmatch
 import ntpath
 import os
@@ -318,6 +319,13 @@ def _path_has_root_identity(path: Path, root: Path) -> bool:
         try:
             metadata = ancestor.stat()
         except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as exc:
+            if exc.errno != errno.ENAMETOOLONG:
+                raise
+            # Shell payloads/inline programs can be candidates without being
+            # filesystem names. Skip the impossible leaf, but still inspect
+            # its parents so an existing protected authority is not bypassed.
             continue
         if (metadata.st_dev, metadata.st_ino) == identity:
             return True

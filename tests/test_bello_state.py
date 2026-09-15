@@ -9813,6 +9813,100 @@ async def test_execpolicy_amendment_approval_is_not_rendered_as_denied(
     assert controller.coder.messages == []
 
 
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError, asyncio.CancelledError, KeyboardInterrupt])
+async def test_run_unexpected_exception_finalizes_failure_without_applying_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_type: type[BaseException],
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    source = tmp_path / "app.py"
+    source.write_text("original\n", encoding="utf-8")
+
+    class Client:
+        def __init__(self):
+            self.stopped = False
+            self.responses = []
+
+        async def start(self):
+            pass
+
+        async def initialize(self):
+            return {}
+
+        async def stop(self):
+            self.stopped = True
+
+        async def respond(self, request_id, response):
+            self.responses.append((request_id, response))
+
+    class Coder:
+        def __init__(self, client, store, *args, **kwargs):
+            self.store = store
+            self.thread_id = "coder-thread"
+            self.active_turn_id = None
+
+        async def start_thread(self):
+            self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"coder_thread_id": self.thread_id}))
+
+        async def start_initial_turn(self):
+            self.active_turn_id = "coder-turn"
+            self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"active_coder_turn_id": self.active_turn_id}))
+
+        async def interrupt(self):
+            pass
+
+    monkeypatch.setattr(controller_module, "CoderSession", Coder)
+    client = Client()
+    controller = BelloController(
+        tmp_path, task_path=task, client=client, tui=_FakeTUI(),
+        runtime_enabled=False, completion_review=False, adversary_enabled=False,
+        overwrite_state=True, use_git_diff=False,
+    )
+    controller.preflight = _async_noop
+    failure = error_type("synthetic event-loop failure")
+
+    async def broken_event_loop():
+        (controller._active_workspace_root() / "app.py").write_text("unaccepted change\n", encoding="utf-8")
+        context = normalize_approval_request(AppServerMessage({
+            "id": "pending-1", "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "coder-thread", "turnId": "coder-turn",
+                       "command": "node -e 'test'", "availableDecisions": ["accept", "decline"]},
+        }))
+        controller.pending_approvals["pending-1"] = context
+        controller.store.update_bello_config(lambda cfg: cfg.model_copy(update={"pending_server_request_ids": ["pending-1"]}))
+        raise failure
+
+    controller.event_loop = broken_event_loop
+    with pytest.raises(error_type) as caught:
+        await controller.run()
+    assert caught.value is failure
+    assert any(frame.name == "broken_event_loop" for frame in caught.traceback)
+    assert client.stopped is True
+    assert source.read_text(encoding="utf-8") == "original\n"
+    recovery = tmp_path / ".supervisor" / "recovery" / "run1" / "workspace"
+    assert (recovery / "app.py").read_text(encoding="utf-8") == "unaccepted change\n"
+    assert controller._snapshot_patch_applied is False
+    if not issubclass(error_type, Exception):
+        # These control-flow exceptions are not converted into provider errors.
+        assert controller.store.get_bello_config().status != BelloStatus.PROVIDER_FAILURE
+        return
+    cfg = controller.store.get_bello_config()
+    assert cfg.status == BelloStatus.PROVIDER_FAILURE
+    assert cfg.active_coder_turn_id is None
+    assert cfg.pending_server_request_ids == []
+    assert controller.pending_approvals == {}
+    assert client.responses == [("pending-1", {"decision": "decline"})]
+    checkpoint = json.loads(controller.store.path(RUN_CHECKPOINT).read_text(encoding="utf-8"))
+    assert checkpoint["status"] == "provider_failure"
+    assert checkpoint["phase"] == checkpoint["state"] == "terminal"
+    assert checkpoint["active_coder_turn_id"] is None
+    report = controller.store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert "- Status: provider_failure" in report
+    assert f"run infrastructure failed: {error_type.__name__}" in report
+    assert "unaccepted coder workspace preserved" in report
+    assert controller.running is False
+
+
 async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path: Path, monkeypatch) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
