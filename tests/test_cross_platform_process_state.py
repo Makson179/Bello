@@ -485,10 +485,8 @@ def test_posix_app_server_preserves_command_without_path_resolution(
     ]
 
 
-class _BlockingReader:
-    async def readline(self) -> bytes:
-        await asyncio.Event().wait()
-        return b""
+class _BlockingReader(asyncio.StreamReader):
+    """An unfed pipe: both read() and readline() block until cancelled."""
 
 
 async def test_windows_app_server_start_and_graceful_stop_use_group_and_job(

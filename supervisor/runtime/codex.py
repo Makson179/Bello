@@ -468,6 +468,24 @@ class CodexBackend:
         return {"id": record["id"], "model": record["model"], "cwd": record["cwd"],
                 "engine": "codex", "nativeThreadId": record["nativeId"], "turns": []}
 
+    def reconcile_terminal_turn(self, thread_id: str, turn_id: str,
+                                turn: dict[str, Any]) -> bool:
+        """Fence only the active mapped turn after a controller-owned read probe."""
+        if (self._closing or self._failure is not None or not isinstance(thread_id, str)
+                or not isinstance(turn_id, str) or not turn_id or not isinstance(turn, dict)
+                or turn.get("id") != turn_id
+                or turn.get("status") not in ("completed", "failed", "interrupted")):
+            return False
+        record = self._threads.get(thread_id)
+        if (record is None or record.get("closed") or record.get("activeTurnId") not in (None, turn_id)
+                or turn_id not in record.get("turnIds", {}).values()):
+            return False
+        # The native completion event may have already cleared this exact mapped
+        # turn while host cleanup awaited. A different active turn is never touched.
+        record.pop("activeTurnId", None)
+        self._save(record)
+        return True
+
     def _to_native(self, record: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
         result = deepcopy(params)
         result["threadId"] = record["nativeId"]

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import os
+import re
 import shutil
 import signal
 import stat
 import subprocess
 import tempfile
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +26,7 @@ from supervisor.executables import (
     require_trusted_executable,
     windows_system_executable,
 )
+from supervisor.runtime_errors import sanitize_error_text
 
 CODEX_NO_WEB_SEARCH_CONFIG_FLAGS = ["-c", 'web_search="disabled"']
 
@@ -96,6 +100,11 @@ APP_SERVER_RESPOND_TIMEOUT_SECONDS = 15.0
 APP_SERVER_CLEANUP_RPC_TIMEOUT_SECONDS = 10.0
 APP_SERVER_CODER_RPC_TIMEOUT_SECONDS = 3600.0
 APP_SERVER_PROCESS_EXIT_TIMEOUT_SECONDS = 3.0
+APP_SERVER_STDERR_TAIL_CHARS = 8192
+APP_SERVER_STDERR_LINE_CHARS = 8192
+APP_SERVER_STDERR_TAIL_LINES = 32
+_STDERR_PRIVATE_KEY_BEGIN = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")
+_STDERR_PRIVATE_KEY_END = re.compile(r"-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----")
 
 _IS_WINDOWS = os.name == "nt"
 _WINDOWS_CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
@@ -341,6 +350,8 @@ class AppServerClient:
         self._pending: dict[int | str, asyncio.Future[dict[str, Any]]] = {}
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
+        self._stderr_tail: deque[str] = deque(maxlen=APP_SERVER_STDERR_TAIL_LINES)
+        self._stderr_private_key_open = False
         self._waiters: list[tuple[Callable[[AppServerMessage], bool], asyncio.Future[AppServerMessage]]] = []
         self.incoming: asyncio.Queue[AppServerMessage] = asyncio.Queue()
         self.reader_error: BaseException | None = None
@@ -351,6 +362,8 @@ class AppServerClient:
     async def start(self, *, reuse_isolated_codex_home: bool = False) -> None:
         if self.process is not None:
             return
+        self._stderr_tail.clear()
+        self._stderr_private_key_open = False
         env = _app_server_environment()
         for key, value in self.environment_overrides.items():
             if value is None:
@@ -608,7 +621,9 @@ class AppServerClient:
             await self._send_with_timeout(payload, timeout, stage=f"app-server RPC {method} send")
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError as exc:
-            raise AppServerTimeoutError(f"app-server RPC {method} response timed out after {timeout:g}s") from exc
+            raise AppServerTimeoutError(self._diagnostic_message(
+                f"app-server RPC {method} response timed out after {timeout:g}s"
+            )) from exc
         finally:
             self._pending.pop(request_id, None)
 
@@ -652,7 +667,9 @@ class AppServerClient:
         try:
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError as exc:
-            raise AppServerTimeoutError(f"app-server notification wait timed out after {timeout:g}s") from exc
+            raise AppServerTimeoutError(self._diagnostic_message(
+                f"app-server notification wait timed out after {timeout:g}s"
+            )) from exc
         finally:
             self._waiters = [(pred, fut) for pred, fut in self._waiters if fut is not future]
 
@@ -790,7 +807,7 @@ class AppServerClient:
         try:
             await asyncio.wait_for(self._send(payload), timeout=timeout)
         except asyncio.TimeoutError as exc:
-            raise AppServerTimeoutError(f"{stage} timed out after {timeout:g}s") from exc
+            raise AppServerTimeoutError(self._diagnostic_message(f"{stage} timed out after {timeout:g}s")) from exc
 
     async def _read_loop(self) -> None:
         assert self.process is not None
@@ -801,7 +818,8 @@ class AppServerClient:
             while True:
                 line = await self.process.stdout.readline()
                 if not line:
-                    error = AppServerError("app-server stream closed")
+                    await self._collect_terminal_stderr()
+                    error = AppServerError(self._diagnostic_message("app-server stream closed"))
                     self.reader_error = error
                     await self._notify_transport_error(error)
                     break
@@ -816,6 +834,7 @@ class AppServerClient:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            await self._collect_terminal_stderr()
             error = self._normalize_reader_error(exc)
             self.reader_error = error
             await self._notify_transport_error(error)
@@ -827,12 +846,24 @@ class AppServerClient:
 
     def _normalize_reader_error(self, exc: Exception) -> AppServerError:
         if isinstance(exc, AppServerError):
-            return exc
+            return type(exc)(self._diagnostic_message(str(exc)))
         if isinstance(exc, ValueError) and "chunk is longer than limit" in str(exc):
-            return AppServerProtocolError(
+            return AppServerProtocolError(self._diagnostic_message(
                 f"app-server stdout line exceeded stream limit ({self.stdout_limit} bytes): {exc}"
-            )
-        return AppServerError(f"app-server stream reader failed: {exc}")
+            ))
+        return AppServerError(self._diagnostic_message(f"app-server stream reader failed: {exc}"))
+
+    async def _collect_terminal_stderr(self) -> None:
+        # stdout EOF and the final stderr bytes can become ready together.
+        # Give the independent drainer a bounded chance to finish, but never
+        # let an open stderr pipe hold up transport-failure handling.
+        task = self._stderr_task
+        if task is None or task is asyncio.current_task():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=0.05)
+        except Exception:
+            pass
 
     async def _notify_transport_error(self, error: BaseException) -> None:
         if self.transport_error_handler is None:
@@ -844,12 +875,58 @@ class AppServerClient:
         except Exception:
             pass
 
+    @property
+    def stderr_tail(self) -> str:
+        """Bounded, sanitized diagnostics only; never a raw stderr log."""
+        return "\n".join(self._stderr_tail)
+
+    def _diagnostic_message(self, message: str) -> str:
+        message = sanitize_error_text(message)
+        tail = self.stderr_tail
+        return f"{message}\nRecent app-server stderr:\n{tail}" if tail else message
+
+    def _record_stderr_line(self, line: str) -> None:
+        # The shared text sanitizer handles single strings; preserve its PEM
+        # redaction across stderr lines without retaining the private payload.
+        if self._stderr_private_key_open:
+            if _STDERR_PRIVATE_KEY_END.search(line):
+                self._stderr_private_key_open = False
+            return
+        if _STDERR_PRIVATE_KEY_BEGIN.search(line):
+            self._stderr_private_key_open = _STDERR_PRIVATE_KEY_END.search(line) is None
+        safe = sanitize_error_text(line, max_chars=2048).strip()
+        if not safe:
+            return
+        self._stderr_tail.append(safe)
+        while len(self.stderr_tail) > APP_SERVER_STDERR_TAIL_CHARS:
+            self._stderr_tail.popleft()
+
     async def _drain_stderr(self) -> None:
         if self.process is None or self.process.stderr is None:
             return
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        pending = ""
+        oversized = False
         while True:
-            line = await self.process.stderr.readline()
-            if not line:
+            chunk = await self.process.stderr.read(4096)
+            text = decoder.decode(chunk, final=not chunk)
+            # Buffer complete lines before sanitizing: credentials may straddle
+            # read boundaries. Oversized lines are discarded, not split into
+            # fragments whose lost context could expose a credential.
+            pieces = text.split("\n")
+            for index, piece in enumerate(pieces):
+                if not oversized:
+                    if len(pending) + len(piece) > APP_SERVER_STDERR_LINE_CHARS:
+                        pending = ""
+                        oversized = True
+                    else:
+                        pending += piece
+                if index < len(pieces) - 1:
+                    self._record_stderr_line("[oversized stderr line omitted]" if oversized else pending)
+                    pending = ""
+                    oversized = False
+            if not chunk:
+                self._record_stderr_line("[oversized stderr line omitted]" if oversized else pending)
                 return
 
     async def _dispatch(self, message: AppServerMessage) -> None:

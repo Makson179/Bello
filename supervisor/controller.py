@@ -31,6 +31,8 @@ from supervisor.appserver import (
     last_agent_message_text,
 )
 from supervisor.runtime.client import RuntimeClient
+from supervisor.runtime_errors import bounded_provider_error, sanitize_error_text
+from supervisor.runtime.models import parse_model_selection
 from supervisor.approvals import ApprovalManager, normalize_approval_request
 from supervisor.coder import (
     CODER_SANDBOX_DANGER_FULL_ACCESS,
@@ -162,6 +164,11 @@ MANDATORY_FULL_RUNTIME_WAKE_REASONS = {
 }
 CONTROLLER_IDLE_GUARD_INTERVAL_SECONDS = 60.0
 CONTROLLER_IDLE_GUARD_STALL_SECONDS = 120.0
+# These are transport diagnostics, not a time limit on coding or commands. Silence
+# alone never fails a run. Only an explicitly retrying provider gets a budget.
+CODER_STATUS_PROBE_AFTER_SECONDS = 300.0
+CODER_STATUS_PROBE_TIMEOUT_SECONDS = 10.0
+CODER_PROVIDER_RETRY_BUDGET_SECONDS = 300.0
 # Provider no_message (empty-completion) recovery for the completion review. A transient
 # backend blip can return empty "completed" turns for a couple of minutes; ride it out with
 # backed-off retries before declaring the run infra-invalid. The budget is CONSECUTIVE
@@ -324,6 +331,17 @@ class SubagentRuntimeState:
         )
         self.recent_actions = self.recent_actions[-SUBAGENT_ACTION_LIMIT:]
         self.last_sequence = sequence
+
+
+@dataclass
+class _ActiveCoderWatch:
+    identity: tuple[int, str, str, int]
+    last_progress: float
+    last_probe: float = float("-inf")
+    retry_since: float | None = None
+    last_error: str = ""
+    reported_stall: bool = False
+    running_tools: set[str] = field(default_factory=set)
 
 
 class BelloController:
@@ -1679,6 +1697,12 @@ class BelloController:
                     await self.handle_controller_event(completed)
                 elif isinstance(completed, UserCommand):
                     await self.handle_user_command(completed)
+            # Quota/status notifications must not indefinitely postpone the
+            # active-turn diagnostic just because the event queue stays busy.
+            now = time.monotonic()
+            if now - getattr(self, "_last_active_guard_tick", float("-inf")) >= CONTROLLER_IDLE_GUARD_INTERVAL_SECONDS:
+                self._last_active_guard_tick = now
+                await self._handle_active_coder_guard(now=now)
 
     def _mark_controller_activity(self) -> None:
         self._last_controller_activity_monotonic = time.monotonic()
@@ -1689,6 +1713,7 @@ class BelloController:
             return
         cfg = self.store.get_bello_config()
         if cfg.active_coder_turn_id:
+            await self._handle_active_coder_guard(now=now)
             return
         coder = getattr(self, "coder", None)
         if coder is None:
@@ -1721,6 +1746,117 @@ class BelloController:
             }
         )
         await self._handle_no_marker_idle()
+
+    def _active_coder_watch(self, cfg: BelloConfig | None = None, *, now: float | None = None) -> _ActiveCoderWatch | None:
+        cfg = cfg or self.store.get_bello_config()
+        coder = getattr(self, "coder", None)
+        if (not self._coder_lifecycle_accepts_activity(cfg) or coder is None
+                or not cfg.coder_thread_id or not cfg.active_coder_turn_id):
+            return None
+        identity = (cfg.generation, cfg.coder_thread_id, cfg.active_coder_turn_id, id(coder))
+        watch = getattr(self, "_coder_watch", None)
+        if watch is None or watch.identity != identity:
+            watch = _ActiveCoderWatch(identity, time.monotonic() if now is None else now)
+            self._coder_watch = watch
+        return watch
+
+    def _record_coder_progress(self, method: str, params: dict[str, Any], cfg: BelloConfig) -> None:
+        watch = self._active_coder_watch(cfg)
+        if watch is None:
+            return
+        item = params.get("item")
+        item_id = _item_id_from_params(params)
+        if isinstance(item, dict) and item_id:
+            if (method == "item/started" and _is_completed_action(item)
+                    and item.get("status") in {None, "inProgress"}
+                    and (item.get("type") != "commandExecution" or item.get("command"))):
+                watch.running_tools.add(item_id)
+            elif method == "item/completed":
+                watch.running_tools.discard(item_id)
+        # A repeated item/started, token counter, or retry is not forward
+        # progress. Real output and completed work break the retry streak.
+        meaningful = method == "item/completed" or (
+            _is_stream_delta_method(method) and bool(params.get("delta"))
+        )
+        if meaningful:
+            watch.last_progress = time.monotonic()
+            watch.retry_since = None
+            watch.last_error = ""
+            watch.reported_stall = False
+
+    async def _handle_active_coder_guard(self, *, now: float | None = None) -> None:
+        current_time = time.monotonic() if now is None else now
+        watch = self._active_coder_watch(now=current_time)
+        if watch is None or getattr(self, "_transport_error_pending", False):
+            return
+        # Other engines keep their own lifecycle. The read-only reconciliation
+        # below relies specifically on native Codex turn records.
+        if parse_model_selection(self._active_coder_model() or DEFAULT_MODEL).engine != "codex":
+            return
+        if (getattr(self, "pending_approvals", None) or watch.running_tools
+                or self._active_coder_subagents()):
+            # Waiting on an approved tool/user is not waiting for model retry.
+            watch.retry_since = None
+        retry_expired = (watch.retry_since is not None
+                         and current_time - watch.retry_since >= CODER_PROVIDER_RETRY_BUDGET_SECONDS)
+        if (not retry_expired and current_time - watch.last_progress < CODER_STATUS_PROBE_AFTER_SECONDS
+                or current_time - watch.last_probe < CONTROLLER_IDLE_GUARD_INTERVAL_SECONDS):
+            return
+        watch.last_probe = current_time
+        progress_before_probe = watch.last_progress
+        _, thread_id, turn_id, _ = watch.identity
+        probe_error = None
+        turn = None
+        try:
+            result = await asyncio.wait_for(
+                self.client.thread_read(thread_id, include_turns=True,
+                                        timeout=CODER_STATUS_PROBE_TIMEOUT_SECONDS),
+                timeout=CODER_STATUS_PROBE_TIMEOUT_SECONDS,
+            )
+            thread = result.get("thread", {})
+            if isinstance(thread, dict) and thread.get("id") == thread_id:
+                turn = _thread_turn_by_id(thread, turn_id)
+        except (AppServerError, TimeoutError) as exc:
+            probe_error = sanitize_error_text(str(exc) or "thread/read timed out")
+        if (self._active_coder_watch() is not watch or watch.last_progress != progress_before_probe
+                or not self.event_queue.empty()):
+            return  # Paused/restarted/completed or made progress during the RPC.
+        if isinstance(turn, dict) and turn.get("status") in {"completed", "failed", "interrupted"}:
+            reconcile = getattr(self.client, "reconcile_terminal_turn", None)
+            if reconcile is not None:
+                try:
+                    reconciled = await asyncio.wait_for(reconcile(thread_id, turn_id, turn),
+                                                        timeout=CODER_STATUS_PROBE_TIMEOUT_SECONDS)
+                    if reconciled and self._active_coder_watch() is watch:
+                        self._append_event(AppEventSource.APP_SERVER, "coder/completionRecovered",
+                                           thread_id=thread_id, turn_id=turn_id,
+                                           reason="Recovered terminal status from native thread/read; no task replay")
+                        # The final agentMessage notification may have been lost
+                        # along with completion. Restore it from the exact turn,
+                        # not from other turns or an untrusted thread status.
+                        text = last_agent_message_text(turn)
+                        if text and text.strip():
+                            self.last_coder_message = CoderMessage(text=text.strip(), sequence=self._sequence)
+                    return  # Normal queued turn/completed performs review exactly once.
+                except (AppServerError, TimeoutError) as exc:
+                    probe_error = sanitize_error_text(str(exc) or "turn reconciliation timed out")
+                    # The provider did finish; a local cleanup problem must not
+                    # be misreported as an exhausted model retry budget.
+                    retry_expired = False
+        if not watch.reported_stall:
+            reason = ("Coder has no new progress; checking native turn status without restarting it. "
+                      + (f"Status read failed: {probe_error}" if probe_error else
+                         f"Native turn status: {turn.get('status', 'unknown') if turn else 'unknown'}"))
+            self._append_event(AppEventSource.APP_SERVER, "coder/progressStalled", thread_id=thread_id,
+                               turn_id=turn_id, reason=reason)
+            self.tui.render("SYSTEM", reason)
+            watch.reported_stall = True
+        if retry_expired:
+            await self.fail_provider(
+                "Coder provider retry budget exceeded: no forward progress for "
+                f"{CODER_PROVIDER_RETRY_BUDGET_SECONDS:g}s after a retryable error. "
+                f"No task replay was attempted. Last error: {watch.last_error}"
+            )
 
     async def handle_controller_event(self, event: ControllerEvent) -> None:
         try:
@@ -2251,6 +2387,10 @@ class BelloController:
         turn_id = _turn_id_from_params(params)
         item_id = _item_id_from_params(params)
         cfg = self.store.get_bello_config()
+        current_coder_turn = bool(thread_id == cfg.coder_thread_id and turn_id
+                                  and turn_id == cfg.active_coder_turn_id)
+        if current_coder_turn:
+            self._record_coder_progress(method, params, cfg)
         if _is_stream_delta_method(method):
             # Completion/adversary commands are deliberately outside the coder evidence
             # ledger. Do not retain their potentially large output chunks waiting for a
@@ -2258,7 +2398,8 @@ class BelloController:
             if thread_id == cfg.coder_thread_id or self._is_coder_descendant(thread_id, cfg=cfg):
                 self._record_command_output_delta(method, params, item_id=item_id)
             return
-        event_payload = _bounded_subagent_event_payload(method, params)
+        event_payload = (bounded_provider_error(params) if method == "error"
+                         else _bounded_subagent_event_payload(method, params))
         if self._exposes_review_private_input(event_payload):
             event_payload.pop("prompt", None)
         self._append_event(
@@ -2267,12 +2408,33 @@ class BelloController:
             thread_id=thread_id,
             turn_id=turn_id,
             item_id=item_id,
+            reason=event_payload.get("error", {}).get("message") if method == "error" else None,
             payload=event_payload,
         )
         if getattr(self, "_terminal_cleanup_started", False) and method != "serverRequest/resolved":
             return
 
         lifecycle_accepts_activity = self._coder_lifecycle_accepts_activity(cfg)
+
+        if method == "error":
+            # Reviewer/old-turn errors remain journalled but may not terminate
+            # the current coder. Missing willRetry is unknown, never False.
+            if not lifecycle_accepts_activity or not current_coder_turn:
+                return
+            error = event_payload.get("error", {})
+            detail = error.get("message") if isinstance(error, dict) else None
+            detail = detail or "provider sent an error without a message"
+            retry = event_payload.get("willRetry")
+            if retry is False:
+                await self.fail_provider(f"coder execution failed: {detail}")
+            else:
+                watch = self._active_coder_watch()
+                if watch is not None:
+                    if retry is True and watch.retry_since is None:
+                        watch.retry_since = time.monotonic()
+                    watch.last_error = detail
+                self.tui.render("SYSTEM", f"Coder provider {'is retrying' if retry is True else 'reported an error'}: {detail}")
+            return
         await self._track_subagent_notification(
             method,
             params,
@@ -2311,6 +2473,7 @@ class BelloController:
             self._current_turn_action_count = 0
             self._generation_has_coder_turn = True
             self.store.update_bello_config(lambda current: current.model_copy(update={"active_coder_turn_id": turn_id}))
+            self._active_coder_watch()
             self._write_run_checkpoint("coder", state="active")
             self.tui.render("CODER", f"turn started {turn_id}")
             return
@@ -2340,9 +2503,19 @@ class BelloController:
             )
             return
         if method == "turn/completed" and thread_id == cfg.coder_thread_id:
+            completion_key = (cfg.generation, thread_id, turn_id)
+            seen_completions = getattr(self, "_handled_coder_completions", None)
+            if seen_completions is None:
+                seen_completions = deque(maxlen=128)
+                self._handled_coder_completions = seen_completions
+            if completion_key in seen_completions or (
+                    cfg.active_coder_turn_id and turn_id != cfg.active_coder_turn_id):
+                return
+            seen_completions.append(completion_key)
             turn = params.get("turn", {})
             if isinstance(turn, dict) and turn.get("status") == "failed":
-                await self.fail_provider(f"coder execution failed: {turn.get('error') or 'provider returned a failed turn'}")
+                detail = bounded_provider_error({"error": turn.get("error")}).get("error", {})
+                await self.fail_provider(f"coder execution failed: {detail or 'provider returned a failed turn'}")
                 return
             if self.coder and isinstance(turn_id, str):
                 self.coder.mark_turn_completed(turn_id)

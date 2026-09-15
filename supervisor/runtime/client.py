@@ -41,6 +41,7 @@ class RuntimeClient(AppServerClient):
         self._engines: dict[str, Any] = backends or {}
         self._approval_waiters: dict[str, asyncio.Future] = {}
         self._recent: deque[AppServerMessage] = deque(maxlen=256)
+        self._terminal_turns_inflight: set[tuple[str, str]] = set()
         self._host: ToolHost | None = None
         self._started = False
         self._closing = False
@@ -204,6 +205,30 @@ class RuntimeClient(AppServerClient):
                          distiller_enabled=record.get("distillerEnabled", False),
                          runtime_enabled=self.runtime_enabled,
                          task_path=Path(record["runtimeTaskPath"]) if record.get("runtimeTaskPath") else None)
+
+    async def reconcile_terminal_turn(self, thread_id: str, turn_id: str,
+                                      turn: dict[str, Any]) -> bool:
+        """Apply a controller-verified native thread/read result without replaying work."""
+        if (not self._started or self._closing or not isinstance(thread_id, str)
+                or not isinstance(turn_id, str) or not turn_id or not isinstance(turn, dict)
+                or turn.get("id") != turn_id
+                or turn.get("status") not in ("completed", "failed", "interrupted")):
+            return False
+        record = self._threads.get(thread_id)
+        if (record is None or record.get("engine") != "codex" or record.get("closed")
+                or record.get("activeTurnId") != turn_id
+                or (thread_id, turn_id) in self._terminal_turns_inflight):
+            return False
+        backend = self._engines.get("codex")
+        reconcile = getattr(backend, "reconcile_terminal_turn", None)
+        if not callable(reconcile):
+            return False
+        # The ordinary event path owns host cleanup before synchronously fencing
+        # both identity layers. Cancellation during cleanup leaves this retryable.
+        await self._emit({"method": "turn/completed", "params": {
+            "threadId": thread_id, "turn": deepcopy(turn),
+        }}, engine="codex", _reconcile_native=True)
+        return record.get("lastTurnId") == turn_id and record.get("lastTurnStatus") == turn["status"]
 
     async def request(self, method: str, params: dict[str, Any] | None = None, *, timeout: float = 30) -> dict[str, Any]:
         if not self._started:
@@ -465,7 +490,8 @@ class RuntimeClient(AppServerClient):
         }:
             raise AppServerError("a turn cannot expand its assigned filesystem scope")
 
-    async def _emit(self, raw: dict[str, Any], *, engine: str | None = None) -> None:
+    async def _emit(self, raw: dict[str, Any], *, engine: str | None = None,
+                    _reconcile_native: bool = False) -> None:
         if not isinstance(raw, dict) or not isinstance(raw.get("method"), str) or not isinstance(raw.get("params", {}), dict):
             raise AppServerError("execution engine sent an invalid event")
         message = AppServerMessage(raw)
@@ -492,15 +518,35 @@ class RuntimeClient(AppServerClient):
         if record and message.method == "turn/completed":
             if turn.get("status") not in {"completed", "failed", "interrupted"}:
                 raise AppServerError("execution engine sent an invalid terminal status")
-            if self._host and turn_id:
-                await self._host.finish_turn(thread_id, turn_id)
-            if record.get("activeTurnId") == turn_id:
-                record.pop("activeTurnId", None)
-            if record.get("interruptedTurnId") == turn_id:
-                record.pop("interruptedTurnId", None)
-            record["lastTurnId"] = turn_id
-            record["lastTurnStatus"] = turn["status"]
-            self._save(thread_id)
+            identity = (thread_id, turn_id)
+            if identity in self._terminal_turns_inflight:
+                return
+            self._terminal_turns_inflight.add(identity)
+            try:
+                if self._host and turn_id:
+                    await self._host.finish_turn(thread_id, turn_id)
+                # Cleanup yields: an interruption/new turn may have superseded
+                # this event. Never publish old readiness into the new turn.
+                if turn_id not in {record.get("activeTurnId"), record.get("interruptedTurnId")}:
+                    return
+                if _reconcile_native:
+                    # A paused/replaced turn must not be reconciled by a stale
+                    # read result, even if ordinary interrupted events may finish.
+                    if (engine != "codex" or self._closing or record.get("closed")
+                            or record.get("activeTurnId") != turn_id):
+                        return
+                    reconcile = getattr(self._engines.get("codex"), "reconcile_terminal_turn", None)
+                    if not callable(reconcile) or not reconcile(thread_id, turn_id, turn):
+                        return
+                if record.get("activeTurnId") == turn_id:
+                    record.pop("activeTurnId", None)
+                if record.get("interruptedTurnId") == turn_id:
+                    record.pop("interruptedTurnId", None)
+                record["lastTurnId"] = turn_id
+                record["lastTurnStatus"] = turn["status"]
+                self._save(thread_id)
+            finally:
+                self._terminal_turns_inflight.discard(identity)
         self._recent.append(message)
         await self._dispatch(message)
 

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from supervisor.appserver import (
+    APP_SERVER_CLEANUP_RPC_TIMEOUT_SECONDS,
     APP_SERVER_CODER_RPC_TIMEOUT_SECONDS,
     APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
     AppServerClient,
@@ -273,6 +274,7 @@ class CoderSession:
     multi_agent: MultiAgentConfig = field(default_factory=MultiAgentConfig)
     plan_path: Path | None = None
     readonly_roots: tuple[Path, ...] = ()
+    cleanup_rpc_timeout_seconds: float = APP_SERVER_CLEANUP_RPC_TIMEOUT_SECONDS
     _task_read_path: Path = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -397,7 +399,7 @@ class CoderSession:
         await self.client.turn_interrupt(
             self.thread_id,
             self.active_turn_id,
-            timeout=self.coder_rpc_timeout_seconds,
+            timeout=self.cleanup_rpc_timeout_seconds,
         )
 
     def mark_turn_completed(self, turn_id: str) -> None:
