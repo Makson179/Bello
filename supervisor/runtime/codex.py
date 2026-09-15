@@ -21,6 +21,7 @@ from supervisor.appserver import (AppServerClient, AppServerError, AppServerMess
     AppServerTimeoutError, _private_owned_directory)
 from supervisor.runtime.journal import RuntimeJournal
 from supervisor.runtime.codex_permissions import native_permission_params
+from supervisor.runtime.codex_toolchains import native_toolchain_read_paths
 
 
 _DELEGATION = frozenset({"spawn_agent", "send_message", "wait_agent", "close_agent"})
@@ -71,6 +72,7 @@ class CodexBackend:
         self._selection_lock = asyncio.Lock()
         self._native_command = None
         self._runtime_read_paths: tuple[Path, ...] = ()
+        self._toolchain_read_paths: dict[str, tuple[Path, ...]] = {}
         self._client = None
         self._journal = RuntimeJournal(self.state_dir)
         self._tool_tmp = self.state_dir / "codex-tmp"
@@ -127,6 +129,9 @@ class CodexBackend:
                 return
             environment = {"OPENAI_API_KEY": None, "CODEX_API_KEY": None, "OPENAI_BASE_URL": None}
             environment.update({key: str(self._tool_tmp) for key in ("TMPDIR", "TMP", "TEMP")})
+            # Git must work without opening the user's private global config
+            # (or invoking its credential helpers) outside the assigned scope.
+            environment.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
             command = self._command or [os.environ.get("BELLO_CODEX_BINARY", "codex"), "app-server", "--listen", "stdio://"]
             self._native_command = list(command)
             # Deployment-owned capability files are host settings, not thread
@@ -321,8 +326,15 @@ class CodexBackend:
             mapping = "Use Bello's configured delegation tools: " + ", ".join(t["name"] for t in dynamic) + "."
             native["developerInstructions"] = ((native.get("developerInstructions") or "") + "\n" + mapping).strip()
         native.update(model=model, modelProvider="openai", config=config, dynamicTools=dynamic)
+        toolchain_paths: tuple[Path, ...] = ()
+        if params.get("sandbox", "workspace-write") != "danger-full-access":
+            cwd = params.get("cwd")
+            if isinstance(cwd, str) and Path(cwd).is_absolute():
+                if cwd not in self._toolchain_read_paths:
+                    self._toolchain_read_paths[cwd] = native_toolchain_read_paths(Path(cwd))
+                toolchain_paths = self._toolchain_read_paths[cwd]
         permissions = native_permission_params(params, temp_dir=self._tool_tmp,
-            runtime_read_paths=self._runtime_read_paths)
+            runtime_read_paths=(*self._runtime_read_paths, *toolchain_paths))
         if "permissions" in permissions:
             native.pop("sandbox", None)
             config.pop("sandbox_workspace_write.network_access", None)

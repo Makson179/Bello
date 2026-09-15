@@ -45,9 +45,9 @@ def native_permission_params(
     child's TMPDIR/TMP/TEMP to the same path. This helper does no filesystem IO.
     Read-only threads do not acquire writable scratch space. Explicit
     danger-full-access keeps native legacy behavior without a custom profile.
-    ``runtime_read_paths`` are exact executable files resolved by the host, not
-    tool/model arguments. Linux Bubblewrap re-executes Codex inside the sandbox;
-    the launcher's symlink target may be outside native ``:minimal`` roots.
+    ``runtime_read_paths`` are exact executables and narrow toolchain roots
+    resolved by the host, never tool/model arguments. Native ``:minimal`` does
+    not cover every installed interpreter, SDK or launcher symlink target.
     """
     mode = params.get("sandbox", "workspace-write")
     if mode == "danger-full-access":

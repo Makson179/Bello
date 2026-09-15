@@ -181,15 +181,22 @@ def _windows_executable_names(command: str, environ: Mapping[str, str]) -> tuple
 
 def _path_is_blocked(path: Path, roots: Iterable[Path]) -> bool:
     try:
-        candidate = os.path.normcase(str(path.resolve(strict=False)))
-    except OSError:
+        candidates = {
+            os.path.normcase(os.path.abspath(path)),
+            os.path.normcase(str(path.resolve(strict=False))),
+        }
+    except (OSError, RuntimeError):
         return True
     for root in roots:
         try:
-            boundary = os.path.normcase(str(root.resolve(strict=False)))
-            if os.path.commonpath([candidate, boundary]) == boundary:
+            boundaries = {
+                os.path.normcase(os.path.abspath(root)),
+                os.path.normcase(str(root.resolve(strict=False))),
+            }
+            if any(os.path.commonpath([candidate, boundary]) == boundary
+                   for candidate in candidates for boundary in boundaries):
                 return True
-        except (OSError, ValueError):
+        except (OSError, ValueError, RuntimeError):
             return True
     return False
 
@@ -262,16 +269,23 @@ def _resolve_scoped_executable(
         try:
             lexical = candidate.absolute()
             metadata = lexical.lstat()
-            if not stat.S_ISREG(metadata.st_mode):
+            if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
                 continue
             if use_windows and _is_link_or_reparse(lexical, metadata):
                 continue
-            if not use_windows and not os.access(lexical, os.X_OK):
-                continue
+            # POSIX installers such as pipx expose a symlink into their venv.
+            # Check both its origin and destination, then execute the resolved
+            # regular file, never the mutable PATH entry itself.
             resolved = lexical.resolve(strict=True)
             if _path_is_blocked(lexical, blocked) or _path_is_blocked(resolved, blocked):
                 continue
-            if use_windows and _has_reparse_ancestor(resolved.parent):
+            if not resolved.is_file():
+                continue
+            if not use_windows and not os.access(resolved, os.X_OK):
+                continue
+            if use_windows and (
+                _has_reparse_ancestor(lexical.parent) or _has_reparse_ancestor(resolved.parent)
+            ):
                 continue
             return resolved
         except (FileNotFoundError, NotADirectoryError, OSError, RuntimeError):

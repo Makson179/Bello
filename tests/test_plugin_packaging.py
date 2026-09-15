@@ -186,14 +186,17 @@ def test_launcher_unlinked_inode_retry_stays_bounded_and_rejects_unsafe_replacem
 
 
 @pytest.mark.skipif(os.name == "nt", reason="the test fixture uses a POSIX shebang")
-def test_start_runs_fake_bello_in_background_and_reports_durable_result(
+def test_start_runs_pipx_bello_symlink_in_background_and_reports_durable_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     launcher = _load_launcher()
     project = tmp_path / "project"
     project.mkdir()
-    executable = tmp_path / "fake bello"
+    bin_dir = tmp_path / "home" / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    executable = tmp_path / "home" / ".local" / "share" / "pipx" / "venvs" / "bello" / "bin" / "bello"
+    executable.parent.mkdir(parents=True)
     executable.write_text(
         "#!/usr/bin/env python3\n"
         "import json\n"
@@ -206,7 +209,8 @@ def test_start_runs_fake_bello_in_background_and_reports_durable_result(
         encoding="utf-8",
     )
     executable.chmod(0o755)
-    monkeypatch.setattr(launcher, "_find_bello", lambda _project: executable.resolve())
+    (bin_dir / "bello").symlink_to(executable)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(bin_dir), os.environ.get("PATH", "")]))
 
     initial = launcher.start(project)
     assert initial["launcher"]["status"] in {"launching", "running", "exited"}
@@ -228,6 +232,104 @@ def test_start_runs_fake_bello_in_background_and_reports_durable_result(
     assert "Status: complete" in observed["artifacts"]["finalReport"]
     assert not (project / ".codex" / "bello-run" / "active.lock").exists()
     assert sys.executable not in observed["launcher"]["command"]
+
+
+@pytest.mark.parametrize("absolute_command", [False, True], ids=["path-lookup", "absolute-command"])
+@pytest.mark.parametrize("relative_target", [False, True], ids=["absolute-link", "relative-link"])
+def test_posix_lookup_accepts_pipx_executable_symlink(
+    tmp_path: Path, absolute_command: bool, relative_target: bool,
+) -> None:
+    launcher = _load_launcher()
+    project, current = tmp_path / "project", tmp_path / "current"
+    project.mkdir()
+    current.mkdir()
+    bin_dir = tmp_path / "home" / ".local" / "bin"
+    target = tmp_path / "home" / ".local" / "share" / "pipx" / "venvs" / "bello" / "bin" / "bello"
+    bin_dir.mkdir(parents=True)
+    target.parent.mkdir(parents=True)
+    target.write_text("placeholder", encoding="utf-8")
+    target.chmod(0o755)
+    link = bin_dir / "bello"
+    link.symlink_to(os.path.relpath(target, bin_dir) if relative_target else target)
+
+    assert launcher._resolve_scoped_executable(
+        str(link) if absolute_command else "bello", project,
+        environ={"PATH": str(bin_dir)}, cwd=current, windows=False,
+    ) == target.resolve()
+
+
+@pytest.mark.parametrize("location", ["project", "cwd"])
+@pytest.mark.parametrize("direction", ["origin", "target"])
+@pytest.mark.parametrize("absolute_command", [False, True], ids=["path-lookup", "absolute-command"])
+def test_executable_symlink_cannot_origin_or_resolve_inside_blocked_scope(
+    tmp_path: Path, location: str, direction: str, absolute_command: bool,
+) -> None:
+    launcher = _load_launcher()
+    project, current, trusted = tmp_path / "project", tmp_path / "current", tmp_path / "trusted"
+    for directory in (project, current, trusted):
+        directory.mkdir()
+    blocked = project if location == "project" else current
+    origin = blocked if direction == "origin" else trusted
+    destination = trusted if direction == "origin" else blocked
+    target = destination / "real-bello"
+    target.write_text("placeholder", encoding="utf-8")
+    target.chmod(0o755)
+    link = origin / "bello"
+    link.symlink_to(target)
+
+    assert launcher._resolve_scoped_executable(
+        str(link) if absolute_command else "bello", project,
+        environ={"PATH": str(origin)}, cwd=current, windows=False,
+    ) is None
+
+
+@pytest.mark.parametrize("kind", ["broken", "cycle", "directory", "non-executable"])
+def test_posix_lookup_rejects_invalid_symlink_target(tmp_path: Path, kind: str) -> None:
+    if os.name == "nt" and kind == "non-executable":
+        pytest.skip("POSIX execute-bit check")
+    launcher = _load_launcher()
+    project, current, trusted = tmp_path / "project", tmp_path / "current", tmp_path / "trusted"
+    for directory in (project, current, trusted):
+        directory.mkdir()
+    target, link = trusted / "target", trusted / "bello"
+    if kind == "cycle":
+        target.symlink_to(link)
+    elif kind == "directory":
+        target.mkdir()
+    elif kind == "non-executable":
+        target.write_text("placeholder", encoding="utf-8")
+        target.chmod(0o644)
+    link.symlink_to(target, target_is_directory=kind == "directory")
+
+    assert launcher._resolve_scoped_executable(
+        "bello", project, environ={"PATH": str(trusted)}, cwd=current, windows=False,
+    ) is None
+
+
+@pytest.mark.parametrize("link_kind", ["executable", "ancestor"])
+def test_windows_lookup_keeps_symlink_and_reparse_ancestor_rejection(
+    tmp_path: Path, link_kind: str,
+) -> None:
+    launcher = _load_launcher()
+    project, current, trusted, alias = (
+        tmp_path / name for name in ("project", "current", "trusted", "alias")
+    )
+    for directory in (project, current, trusted):
+        directory.mkdir()
+    target = trusted / "real.EXE"
+    target.write_text("placeholder", encoding="utf-8")
+    if link_kind == "executable":
+        (trusted / "bello.EXE").symlink_to(target)
+        search_dir = trusted
+    else:
+        (trusted / "bello.EXE").write_text("placeholder", encoding="utf-8")
+        alias.symlink_to(trusted, target_is_directory=True)
+        search_dir = alias
+
+    assert launcher._resolve_scoped_executable(
+        "bello", project, environ={"PATH": str(search_dir), "PATHEXT": ".EXE"},
+        cwd=current, windows=True,
+    ) is None
 
 
 def test_windows_lookup_skips_relative_project_and_current_directory_entries(

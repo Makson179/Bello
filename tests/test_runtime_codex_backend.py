@@ -157,6 +157,8 @@ async def test_native_prompt_tools_and_subscription_are_preserved(tmp_path):
         assert command[1:4] == ["app-server", "--listen", "stdio://"]
         assert 'forced_login_method="chatgpt"' in command
         assert client.options["environment_overrides"]["OPENAI_API_KEY"] is None
+        assert client.options["environment_overrides"]["GIT_CONFIG_GLOBAL"] == os.devnull
+        assert client.options["environment_overrides"]["GIT_CONFIG_NOSYSTEM"] == "1"
         assert {client.options["environment_overrides"][key] for key in ("TMPDIR", "TMP", "TEMP")} == {str(backend._tool_tmp)}
         await drain(backend)
         assert events[0]["params"]["thread"]["id"] == "host-thread"

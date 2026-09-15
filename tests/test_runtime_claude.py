@@ -11,7 +11,8 @@ from claude_agent_sdk._internal.sdk_mcp_bridge import SdkMcpBridge
 from supervisor.appserver import AppServerError
 from supervisor.runtime.claude import ClaudeBackend, SUPPORTED_EFFORTS
 from supervisor.runtime.journal import RuntimeJournal
-from supervisor.runtime.tools import TOOL_DEFINITIONS, ToolHost, ToolScope, tool_result
+from supervisor.runtime.sandbox import SandboxResult
+from supervisor.runtime.tools import TOOL_DEFINITIONS, ToolHost, ToolScope, tool_definitions, tool_result
 
 
 AUTH = {
@@ -363,6 +364,125 @@ async def test_sdk_mcp_protocol_tool_use_id_preserves_host_at_most_once(tmp_path
         if bridge is not None:
             await bridge.aclose()
         await instance.stop()
+        journal.close()
+
+
+@pytest.mark.parametrize("enabled", [False, True], ids=["distiller-off", "distiller-on"])
+@pytest.mark.parametrize("exit_code", [0, 1], ids=["success", "failure"])
+async def test_sdk_mcp_delivers_selected_command_output_and_keeps_policy_after_repair(
+    tmp_path: Path, enabled: bool, exit_code: int,
+) -> None:
+    """Real SDK MCP/ToolHost/session path; fake provider and sandbox execution."""
+    original = "diagnostic noise\n" * 40 + "check value=42\n"
+    selected = "check value=42\n"
+    events, host_events, selections, routed = [], [], [], []
+    journal = RuntimeJournal(tmp_path / "journal")
+
+    async def forbidden(*_args):
+        raise AssertionError("this command needs neither approval nor delegation")
+
+    async def host_emit(message):
+        host_events.append(message)
+
+    async def distill(text, focus, command):
+        selections.append((text, focus, command))
+        return selected
+
+    class Runner:
+        def __init__(self, policy):
+            assert policy.mode == "workspace-write"
+            assert policy.root == tmp_path
+
+        async def run(self, command, cwd, timeout, on_output=None, *, cancel_event=None):
+            assert command == "python checks.py"
+            await on_output(original)
+            return SandboxResult(original, exit_code, .1)
+
+    def scope_for(thread_id, turn_id):
+        assert thread_id == "thread-1" and turn_id in {"initial-turn", "repair-turn"}
+        return ToolScope(tmp_path, "workspace-write", distiller_enabled=enabled,
+                         approval_policy="never", runtime_enabled=False)
+
+    host = ToolHost(journal, scope_for, forbidden, host_emit, forbidden,
+                    runner_factory=Runner, distill=distill)
+
+    async def tool_handler(request):
+        routed.append(request)
+        return await host.call(request)
+
+    factory = FakeFactory()
+    instance = backend(tmp_path, factory, events, tool_handler=tool_handler)
+    bridge = None
+    sessions = []
+    definitions = [tool for tool in tool_definitions(distiller=enabled)
+                   if tool["name"] == "exec_command"]
+    try:
+        await instance.request("initialize", {})
+        await instance.request("thread/start", {
+            "threadId": "thread-1", "provider": "claude-code", "model": "sonnet",
+            "cwd": str(tmp_path), "tools": definitions, "effort": "high",
+        })
+        for turn_id in ("initial-turn", "repair-turn"):
+            if turn_id == "repair-turn":
+                await instance.request("thread/resume", {"threadId": "thread-1", "tools": definitions})
+            events.clear()
+            prior_clients = len(factory.clients)
+            await instance.request("turn/start", {
+                "threadId": "thread-1", "turnId": turn_id,
+                "input": [{"type": "text", "text": turn_id}],
+            })
+            async with asyncio.timeout(2):
+                while len(factory.clients) == prior_clients or not factory.clients[-1].queries:
+                    await asyncio.sleep(0)
+            client = factory.clients[-1]
+            config = client.options.mcp_servers["bello"]
+            bridge = SdkMcpBridge("bello", config["instance"])
+            await bridge.handle({
+                "jsonrpc": "2.0", "id": "initialize", "method": "initialize",
+                "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                           "clientInfo": {"name": "test", "version": "1"}},
+            })
+            await bridge.handle({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+            arguments = {"command": "python checks.py", **({"focus": "Check result"} if enabled else {})}
+            reply = await bridge.handle({
+                "jsonrpc": "2.0", "id": "wire-tool", "method": "tools/call",
+                "params": {"name": "exec_command", "arguments": arguments,
+                           "_meta": {"claudecode/toolUseId": "toolu_check"}},
+            })
+            assert reply["result"]["isError"] == bool(exit_code)
+            assert len(reply["result"]["content"]) == 1
+            assert reply["result"]["content"][0]["type"] == "text"
+            packet = json.loads(reply["result"]["content"][0]["text"])
+            assert set(packet) == {"sessionId", "status", "output", "outputTruncated",
+                                   "exitCode", "duration", "timedOut", "cancelled", "outputBudget"}
+            assert packet["output"] == (selected if enabled else original)
+            assert packet["exitCode"] == exit_code
+            assert packet["status"] == ("failed" if exit_code else "completed")
+            assert packet["duration"] == .1
+            assert not packet["timedOut"] and not packet["cancelled"]
+            assert isinstance(packet["sessionId"], str) and packet["sessionId"]
+            sessions.append(packet["sessionId"])
+            if enabled:
+                assert "diagnostic noise" not in json.dumps(reply)
+            await bridge.aclose()
+            bridge = None
+            await client.messages.put(result_message(session_id=instance._record("thread-1")["claudeSessionId"]))
+            completed = await wait_completed(events)
+            assert completed["params"]["turn"]["status"] == "completed"
+            await wait_disconnected(client)
+            await host.finish_turn("thread-1", turn_id)
+
+        assert selections == [(original, "Check result", "python checks.py")] * (2 if enabled else 0)
+        assert [request["turnId"] for request in routed] == ["initial-turn", "repair-turn"]
+        assert routed[0]["callId"] != routed[1]["callId"]
+        assert len(set(sessions)) == 2
+        finished = [event["params"]["item"] for event in host_events if event["method"] == "item/completed"]
+        assert [item["aggregatedOutput"] for item in finished] == [original, original]
+    finally:
+        if bridge is not None:
+            await bridge.aclose()
+        await instance.stop()
+        await host.close()
         journal.close()
 
 

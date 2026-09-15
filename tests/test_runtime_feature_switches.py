@@ -35,7 +35,7 @@ def make_client(tmp_path, *, runtime=True, distiller=False):
     root.mkdir()
     workspace.mkdir()
     codex, claude = FakeBackend(), FakeBackend()
-    client = RuntimeClient(cwd=root, backends={"codex": codex, "claude-code": claude})
+    client = RuntimeClient(cwd=root, backends={"codex": codex, "claude-code": claude, "pi": FakeBackend()})
     client.configure_run(runtime_enabled=runtime, log_distiller={"enabled": distiller, "model_path": "bundle"})
     return client, workspace, codex, claude
 
@@ -47,25 +47,35 @@ def has_focus(record):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("runtime", [True, False])
 @pytest.mark.parametrize("distiller", [True, False])
-async def test_run_switches_control_roles_not_review_dependencies(tmp_path, selector, runtime, distiller):
+@pytest.mark.parametrize("model", [
+    "gpt-6-astra", "claude-code/claude-sonnet-4-6",
+    "openai/gpt-6-astra", "anthropic/claude-sonnet-4-6",
+])
+async def test_run_switches_control_roles_not_review_dependencies(tmp_path, selector, runtime, distiller, model):
     client, workspace, _, _ = make_client(tmp_path, runtime=runtime, distiller=distiller)
     try:
         for role in ("coder", "completion_review", "adversary", "runtime"):
-            thread = await start(client, workspace, belloRole=role, developerInstructions="role instructions")
+            thread = await start(client, workspace, model, belloRole=role, developerInstructions="role instructions")
             record = client._threads[thread]
             assert record["distillerEnabled"] == (distiller and role == "coder")
             assert has_focus(record) == (distiller and role == "coder")
             assert record["networkAccess"] == (not runtime)
             assert record["sandbox"] == "workspace-write"
             assert record["approvalPolicy"] == ("on-request" if runtime else "never")
-            assert ("Add a short focus" in record["developerInstructions"]) == (distiller and role == "coder")
+            focus_line = ("Add a short focus to each command or poll call."
+                          if record["engine"] == "codex" else "Add a very short focus to each text tool call.")
+            assert (focus_line in record["developerInstructions"]) == (distiller and role == "coder")
+            assert record["developerInstructions"].count("focus") == int(distiller and role == "coder")
         assert len(selector) == int(distiller)
     finally:
         await client.stop()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model", ["gpt-5.6-sol", "claude-code/claude-sonnet-4-6"])
+@pytest.mark.parametrize("model", [
+    "gpt-5.6-sol", "gpt-6-astra", "claude-code/claude-sonnet-4-6",
+    "openai/gpt-6-astra", "anthropic/claude-sonnet-4-6",
+])
 async def test_coder_resume_repair_turn_and_new_revision_keep_distillation(tmp_path, selector, model):
     client, workspace, codex, claude = make_client(tmp_path, runtime=False, distiller=True)
     try:
@@ -73,9 +83,10 @@ async def test_coder_resume_repair_turn_and_new_revision_keep_distillation(tmp_p
         turn = (await client.turn_start({"threadId": thread}))["turn"]["id"]
         await client._emit({"method": "turn/completed", "params": {"threadId": thread, "turn": {"id": turn, "status": "completed"}}})
         await client.request("thread/resume", {"threadId": thread, "belloRole": "coder", "developerInstructions": "caller cannot replace tools", "approvalPolicy": "on-request"})
-        backend = claude if model.startswith("claude-code/") else codex
+        record = client._threads[thread]
+        backend = client._engines[record["engine"]]
         sent = backend.calls[-1][1]
-        assert ("Add a very short focus" if model.startswith("claude-code/") else "Add a short focus") in sent["developerInstructions"]
+        assert ("Add a short focus" if record["engine"] == "codex" else "Add a very short focus") in sent["developerInstructions"]
         assert sent["approvalPolicy"] == "never" and has_focus(sent)
         next_turn = (await client.turn_start({"threadId": thread, "sandboxPolicy": {"type": "workspaceWrite", "networkAccess": False, "writableRoots": [str(workspace)]}}))["turn"]["id"]
         scope = client._scope_for(thread, next_turn)
