@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import stat
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,7 @@ def host(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.setattr(tools, "_current_python_paths", lambda: ())
     monkeypatch.setattr(tools, "_mac_developer_directory", lambda: None)
+    monkeypatch.setattr(tools, "_mac_cryptex_alias_directory", lambda: None)
     monkeypatch.setattr(tools.sandbox, "_TOOLCHAIN_COMMANDS", ("python3", "git"))
     monkeypatch.setattr(tools.sandbox, "_runtime_root", lambda: None)
     monkeypatch.setattr(tools.sandbox, "_windows_current_python_root", lambda policy: None)
@@ -34,6 +36,81 @@ def executable(path):
     path.write_text("#!/bin/sh\nexit 0\n")
     path.chmod(0o755)
     return path
+
+
+@pytest.mark.parametrize(("mode", "uid", "accepted"), [
+    (stat.S_IFDIR | 0o755, 0, True),
+    (stat.S_IFDIR | 0o555, 0, True),
+    (stat.S_IFDIR | 0o755, 501, False),
+    (stat.S_IFDIR | 0o775, 0, False),
+    (stat.S_IFDIR | 0o757, 0, False),
+    (stat.S_IFLNK | 0o755, 0, False),
+    (stat.S_IFREG | 0o755, 0, False),
+], ids=["root-owned", "readonly", "user-owned", "group-writable", "other-writable", "symlink", "file"])
+def test_mac_cryptex_directory_requires_safe_system_metadata(tmp_path, monkeypatch, mode, uid, accepted):
+    directory = tmp_path / "System" / "Cryptexes"
+    directory.mkdir(parents=True)
+    original_lstat = Path.lstat
+    monkeypatch.setattr(tools, "_IS_MACOS", True)
+    monkeypatch.setattr(tools, "_MAC_CRYPTEX_ALIASES", directory)
+    monkeypatch.setattr(Path, "lstat", lambda self, *a, **kw:
+                        SimpleNamespace(st_mode=mode, st_uid=uid) if self == directory
+                        else original_lstat(self, *a, **kw))
+    assert tools._mac_cryptex_alias_directory() == (directory if accepted else None)
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError(), PermissionError(), OSError("unavailable")])
+def test_mac_cryptex_missing_or_uninspectable_is_not_granted(monkeypatch, error):
+    monkeypatch.setattr(tools, "_IS_MACOS", True)
+    def unavailable(self):
+        raise error
+    monkeypatch.setattr(Path, "lstat", unavailable)
+    assert tools._mac_cryptex_alias_directory() is None
+
+
+def test_non_macos_does_not_inspect_cryptex(monkeypatch):
+    monkeypatch.setattr(tools, "_IS_MACOS", False)
+    monkeypatch.setattr(Path, "lstat", lambda self: pytest.fail("must not inspect macOS paths"))
+    assert tools._mac_cryptex_alias_directory() is None
+
+
+def test_mac_cryptex_rejects_redirected_ancestor(tmp_path, monkeypatch):
+    directory = tmp_path / "System" / "Cryptexes"
+    directory.mkdir(parents=True)
+    original_lstat, original_resolve = Path.lstat, Path.resolve
+    monkeypatch.setattr(tools, "_IS_MACOS", True)
+    monkeypatch.setattr(tools, "_MAC_CRYPTEX_ALIASES", directory)
+    monkeypatch.setattr(Path, "lstat", lambda self, *a, **kw:
+                        SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+                        if self == directory else original_lstat(self, *a, **kw))
+    monkeypatch.setattr(Path, "resolve", lambda self, *a, **kw:
+                        tmp_path / "redirected" if self == directory
+                        else original_resolve(self, *a, **kw))
+    assert tools._mac_cryptex_alias_directory() is None
+
+
+def test_mac_cryptex_grant_is_exact_readonly_and_not_home_or_preboot(host, monkeypatch):
+    home, work = host
+    directory = home / "System" / "Cryptexes"
+    directory.mkdir(parents=True)
+    monkeypatch.setattr(tools, "_IS_MACOS", True)
+    monkeypatch.setattr(tools, "_mac_cryptex_alias_directory", lambda: directory)
+    result = tools.native_toolchain_read_paths(work)
+    assert result == (directory,)
+    permission = native_permission_params({"cwd": str(work)}, runtime_read_paths=result)
+    fs = permission["config"]["permissions"][PROFILE_ID]["filesystem"]
+    assert fs[str(directory)] == "read"
+    assert all(str(path) not in fs for path in (
+        directory.parent, home, home / ".codex", Path("/System"),
+        Path("/System/Volumes/Preboot"), Path("/System/Volumes/Preboot/Cryptexes"),
+    ))
+
+
+def test_mac_cryptex_discovery_cannot_override_workspace_scope(host, monkeypatch):
+    _, work = host
+    monkeypatch.setattr(tools, "_IS_MACOS", True)
+    monkeypatch.setattr(tools, "_mac_cryptex_alias_directory", lambda: work)
+    assert tools.native_toolchain_read_paths(work) == ()
 
 
 def test_native_public_ssl_and_apple_dispatcher_paths_are_readonly_exact(host, monkeypatch):

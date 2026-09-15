@@ -1386,6 +1386,96 @@ def test_skipped_compound_test_branch_is_not_behavioral_evidence(
 
 
 @pytest.mark.parametrize(
+    "command",
+    [
+        "/bin/zsh -lc \"printf '\\n===== test/game.test.js =====\\n'; sed -n '1,260p' 'test/game.test.js'\"",
+        "/bin/zsh -lc 'git -c core.excludesFile=/dev/null diff -- game.js app.js styles.css index.html test/game.test.js'",
+        "/bin/zsh -lc 'git --no-pager --no-optional-locks -c core.excludesfile=/dev/null -c global.excludesfile=/dev/null diff -- game.js app.js test/game.test.js styles.css package.json'",
+        "/bin/zsh -lc \"sleep 2; stat -f '%Sm %N' -t '%H:%M:%S' game.js app.js test/game.test.js styles.css package.json\"",
+        "printf '%s' ./test/game.test.js",
+        "printf '%s' 'node --test'",
+        "printf '%s' 'python -m pytest'",
+        "printf '%s' ';' ./run_tests.sh",
+        r"printf '%s' \; ./run_tests.sh",
+        "sed -n '1,20p' ./run_tests.sh",
+        "git diff -- ./run_tests.sh",
+        "sleep 2; stat ./run_tests.sh",
+        "command -v playwright || true",
+        "command -v chromium || command -v playwright || true",
+    ],
+    ids=["saved-printf-sed", "saved-git-config", "saved-git-options", "saved-sleep-stat",
+         "printf-path", "printed-node", "printed-pytest", "quoted-separator", "escaped-separator",
+         "sed-path", "diff-path", "stat-path", "which-runner", "which-fallbacks"],
+)
+def test_test_names_in_inspection_arguments_do_not_create_trusted_validation(
+    posix_command_semantics: None, command: str,
+) -> None:
+    # Even reading a log containing genuine runner output must not turn the
+    # inspection into an executed test or advance trusted validation freshness.
+    validation = _validation_from_action(
+        TriggeringAction(kind="commandExecution", command=command, exit_code=0,
+                         status="completed", summary="command completed"),
+        sequence=850, item={"stdout": "# tests 5\n# pass 5\n# fail 0\n"},
+        changed_paths=["game.js", "test/game.test.js"],
+    )
+    assert validation is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "./run_visible_tests.sh",
+        "/bin/bash -lc ./run_visible_tests.sh",
+        "sh ./run_tests.sh",
+        "bash -eu ./run_tests.sh",
+        "python3 -B ./test_game.py",
+        "python3 -W ignore ./test_game.py",
+        "python3 -X dev -m unittest -v",
+        "node test/game.test.js",
+        "node --no-warnings test/game.test.js",
+        "ruby ./game_test.rb",
+        "env CI=1 python3 -m pytest tests/test_game.py",
+        "./node_modules/.bin/mocha test/game.test.js",
+        "npx --no-install vitest run",
+        "node --test",
+        "cd app && node test/game.test.js",
+        "printf '%s' 'test/game.test.js'; sh ./run_tests.sh",
+        "sh ./run_tests.sh && git diff --check",
+    ],
+)
+def test_test_wrappers_are_recognized_only_at_execution_positions(
+    posix_command_semantics: None, command: str,
+) -> None:
+    validation = _validation_from_action(
+        TriggeringAction(kind="commandExecution", command=command, exit_code=0,
+                         status="completed", summary="command completed"),
+        sequence=900, item={"stdout": "# tests 5\n# pass 5\n# fail 0\n"},
+    )
+    assert validation is not None
+    assert validation.type == "behavioral"
+    assert validation.trusted_validation_outcome == "passed"
+    assert _has_passing_behavioral_validation([validation])
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 -W test_game.py application.py",
+        "python3 -c 'print(1)' test_game.py",
+        "node -e 'console.log(1)' test/game.test.js",
+        "node --check test/game.test.js",
+        "node app.js --test test/game.test.js",
+        "bash -n ./run_tests.sh",
+    ],
+)
+def test_interpreter_flag_values_and_script_arguments_are_not_test_wrappers(
+    posix_command_semantics: None, command: str,
+) -> None:
+    assert not controller_module._is_behavioral_validation_command(command)
+    assert not controller_module._is_test_wrapper_script_command(command)
+
+
+@pytest.mark.parametrize(
     "output",
     [
         "ℹ tests 5\nℹ pass 5\nℹ fail 0\n1 failed\n",

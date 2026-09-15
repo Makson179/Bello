@@ -48,6 +48,7 @@ from supervisor.health import (
     patch_health,
     record_restart_issue_intervention,
 )
+from supervisor.immutable_reads import _literal_parts
 from supervisor.filesystem_safety import is_link_or_reparse, is_windows_platform
 from supervisor.executables import ExecutableResolutionError, require_trusted_executable
 from supervisor.project_config import DEFAULT_MODEL, LogDistillerConfig, MultiAgentConfig, ProjectConfig
@@ -8304,7 +8305,7 @@ def _classify_validation_command(
     # Classify individual shell segments first, preserving static-only commands
     # such as `node --check game.test.js` and ignoring quoted/printed test names.
     inner = _shell_command_payload(command)
-    segments = _inspection_command_segments(inner if inner is not None else command)
+    segments = _posix_validation_command_segments(inner if inner is not None else command)
     # A shell branch can skip the named tests and still exit zero. Promote a
     # mixed command only with runner evidence, not merely a test name in argv.
     has_runner_output = _captured_output_looks_like_test_runner(output) or any(
@@ -8510,59 +8511,111 @@ def _is_behavioral_validation_command(command: str) -> bool:
     windows_surface, windows_tokens, _payload = _windows_classification_tokens(command)
     if windows_surface:
         return bool(windows_tokens and _windows_tokens_are_behavioral_validation(windows_tokens))
-    inner = _shell_command_payload(command)
-    if inner is not None and inner != command:
-        return _is_behavioral_validation_command(inner)
-    lowered = command.lower()
-    executable_prefix = r"(^|[\s;&|()'\"])(?:npx\s+|(?:\.{0,2}/|/)?(?:[\w.-]+/)*)"
-    python_flags = r"(?:\s+-(?!m(?:\s|$))[a-z][\w-]*(?:=[^\s;&|()'\"]+)?)"
-    node_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*node(?:js)?"
-    python_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*python(?:3(?:\.\d+)?)?"
-    patterns = (
-        executable_prefix + r"mocha(\s|$)",
-        r"(^|[\s;&|()'\"])(npm|pnpm|yarn)\s+(run\s+)?test(\s|$|:)",
-        r"(^|[\s;&|()'\"])" + node_exec + r"\s+--test(\s|$)",
-        r"(^|[\s;&|()'\"])" + python_exec + python_flags + r"*\s+-m\s+(pytest|unittest|tox|nose2?)($|[\s;&|()'\"])",
-        executable_prefix + r"(jest|ava|tap|vitest|playwright|cypress|pytest|tox|rspec)(\s|$)",
-        executable_prefix + r"(go|cargo|mvn|gradle|swift|dotnet|make)\s+test(\s|$)",
-    )
-    return any(re.search(pattern, lowered) for pattern in patterns) or _is_test_wrapper_script_command(command)
+    return any(_posix_tokens_are_behavioral_validation(tokens)
+               for tokens in _posix_validation_command_segments(command) or [])
+
+
+def _posix_validation_command_segments(command: str) -> list[list[str]] | None:
+    """Find literal command positions, never test names in arbitrary argv.
+
+    Reuse the quote-aware splitter: a printed/escaped ';' is not a new command.
+    This is evidence classification, not a shell evaluator or execution gate.
+    Unsupported syntax is not promoted to trusted test evidence.
+    """
+    parts = _literal_parts(command)
+    if parts is None:
+        return None
+    segments: list[list[str]] = []
+    for index, (text, operator) in enumerate(parts):
+        try:
+            tokens = _strip_env_command_prefix(shlex.split(text))
+        except ValueError:
+            return None
+        if not tokens:
+            if index == len(parts) - 1 and operator is None:
+                continue
+            return None
+        inner = _shell_command_payload(shlex.join(tokens))
+        if inner is not None:
+            nested = _posix_validation_command_segments(inner)
+            if nested is None:
+                return None
+            segments.extend(nested)
+        else:
+            segments.append(tokens)
+    return segments
+
+
+def _posix_tokens_are_behavioral_validation(tokens: list[str]) -> bool:
+    executable = tokens[0].rsplit("/", 1)[-1].lower()
+    args = tokens[1:]
+    if executable == "npx":
+        while args and args[0] in {"--yes", "-y", "--no-install"}:
+            args = args[1:]
+        return bool(args and not args[0].startswith("-")
+                    and _posix_tokens_are_behavioral_validation(args))
+    if executable == "pytest":
+        return not _pytest_args_request_no_test_execution(args)
+    if executable in {"mocha", "jest", "ava", "tap", "vitest", "playwright", "cypress", "tox", "rspec"}:
+        return True
+    if executable in {"npm", "pnpm", "yarn"}:
+        args = args[1:] if args[:1] == ["run"] else args
+        return bool(args and (args[0] == "test" or args[0].startswith("test:")))
+    if executable in {"node", "nodejs"} and args[:1] == ["--test"]:
+        return True
+    # The existing Python action parser consumes option values and stops at
+    # the actual script/-c/-m operand, rather than scanning later arguments.
+    python_action = _windows_python_action([executable, *args])
+    if python_action is not None and python_action[0] == "module":
+        module = python_action[1]
+        if module == "pytest":
+            return not _pytest_args_request_no_test_execution(python_action[2])
+        return module in {"unittest", "tox", "nose", "nose2"}
+    if executable in {"go", "cargo", "mvn", "gradle", "swift", "dotnet", "make"}:
+        return args[:1] == ["test"]
+    script = _posix_script_execution_operand(tokens)
+    return bool(script and re.search(r"(^|[._-])tests?([._-]|$)",
+                                    script.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()))
+
+
+def _posix_script_execution_operand(tokens: list[str]) -> str | None:
+    executable = tokens[0].rsplit("/", 1)[-1].lower()
+    script = tokens[0]
+    args = tokens[1:]
+    python_action = _windows_python_action([executable, *args])
+    if python_action is not None:
+        script = python_action[1] if python_action[0] == "script" else ""
+    elif re.fullmatch(r"python(?:3(?:\.\d+)?)?", executable):
+        return None
+    elif executable in {"node", "nodejs", "ruby", "bash", "sh", "zsh"}:
+        # Only known no-value execution options may precede a script. In
+        # particular -c/-e inline code, --check/-n and flag operands aren't it.
+        no_value_options = ({"--no-warnings", "--enable-source-maps"} if executable in {"node", "nodejs"}
+                            else {"-w"} if executable == "ruby" else {"-e", "-u", "-x", "-eu", "-eux"})
+        while args and args[0] in no_value_options:
+            args = args[1:]
+        if args[:1] == ["--"]:
+            args = args[1:]
+        if not args or args[0].startswith("-"):
+            return None
+        script = args[0]
+    return script if re.fullmatch(r"[\w./ -]+\.(?:py|js|mjs|cjs|rb|sh)", script, re.IGNORECASE) else None
 
 
 def _is_test_wrapper_script_command(command: str) -> bool:
-    lowered = command.lower()
-    boundary = r"(?=$|[\s;&|()'\"])"
-    test_script_basename = r"(?:tests?(?:[._-][\w.-]+)*|[\w.-]+[._-]tests?(?:[._-][\w.-]+)*)"
-    script_with_test_token = (
-        r"(?:\.{1,2}/|/)?(?:[\w.-]+/)*" + test_script_basename + r"\.(py|js|mjs|cjs|rb|sh)"
-    )
-    interpreter_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*(?:python(?:3(?:\.\d+)?)?|node(?:js)?|ruby|bash|sh)"
-    shell_prefix = r"(^|[\s;&|()'\"])(?:\.{0,2}/|/)?(?:[\w.-]+/)*(?:bash|sh|zsh)"
-    patterns = (
-        r"(^|[\s;&|()'\"])" + interpreter_exec + r"\s+(?!-)" + script_with_test_token + boundary,
-        r"(^|[\s;&|()'\"])" + script_with_test_token + boundary,
-        shell_prefix + r"\s+-[a-z]*c\s+['\"]?" + script_with_test_token + boundary,
-    )
-    return any(re.search(pattern, lowered) for pattern in patterns)
+    for tokens in _posix_validation_command_segments(command) or []:
+        script = _posix_script_execution_operand(tokens)
+        if script and re.search(r"(^|[._-])tests?([._-]|$)", script.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()):
+            return True
+    return False
 
 
 def _is_direct_script_execution_command(command: str) -> bool:
     windows_surface, windows_tokens, _payload = _windows_classification_tokens(command)
     if windows_surface:
         return bool(windows_tokens and _windows_tokens_execute_script(windows_tokens))
-    lowered = command.lower()
-    boundary = r"(?=$|[\s;&|()'\"])"
-    python_flags = r"(?:\s+-(?!m(?:\s|$))[a-z][\w-]*(?:=[^\s;&|()'\"]+)?)"
-    python_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*python(?:3(?:\.\d+)?)?"
-    interpreter_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*(?:node(?:js)?|ruby|bash|sh)"
-    shell_prefix = r"(^|[\s;&|()'\"])(?:\.{0,2}/|/)?(?:[\w.-]+/)*(?:bash|sh|zsh)"
-    patterns = (
-        r"(^|[\s;&|()'\"])" + python_exec + python_flags + r"*\s+(?!-)[\w./-]+\.py" + boundary,
-        r"(^|[\s;&|()'\"])" + interpreter_exec + r"\s+(?!-)[\w./-]+\.(js|mjs|cjs|rb|sh)" + boundary,
-        r"(^|[\s;&|()'\"])(?:\.{1,2}/|/)[\w./-]+\.(py|js|mjs|cjs|rb|sh)" + boundary,
-        shell_prefix + r"\s+-[a-z]*c\s+['\"]?(?!-)[\w./-]+\.(py|js|mjs|cjs|rb|sh)" + boundary,
-    )
-    return any(re.search(pattern, lowered) for pattern in patterns)
+    return any(_posix_script_execution_operand(tokens) is not None
+               for tokens in _posix_validation_command_segments(command) or [])
 
 
 def _is_behavior_demo_command(command: str, *, changed_paths: list[str]) -> bool:

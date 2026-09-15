@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 
@@ -21,6 +22,29 @@ _IS_WINDOWS = sys.platform == "win32"
 _XCODE_SELECT = Path("/usr/bin/xcode-select")
 _COMMAND_LINE_TOOLS = Path("/Library/Developer/CommandLineTools")
 _APPLICATIONS = Path("/Applications")
+_MAC_CRYPTEX_ALIASES = Path("/System/Cryptexes")
+
+
+def _mac_cryptex_alias_directory() -> Path | None:
+    """Permit Apple's public alias directory, not its broader Preboot tree.
+
+    macOS puts /System/Cryptexes/App/usr/bin on PATH. Native permissions
+    canonicalize an exact App symlink grant, leaving its lexical metadata
+    inaccessible. libuv's spawn("sh") then stops on EPERM before reaching
+    /bin/sh, so npm scripts fail even though their tests work directly.
+    Only the fixed, root-owned, non-writable system directory is eligible.
+    """
+    if not _IS_MACOS:
+        return None
+    try:
+        metadata = _MAC_CRYPTEX_ALIASES.lstat()
+        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0
+                or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or _MAC_CRYPTEX_ALIASES.resolve(strict=True) != _MAC_CRYPTEX_ALIASES):
+            return None
+    except (OSError, RuntimeError):
+        return None
+    return _MAC_CRYPTEX_ALIASES
 
 
 def _mac_developer_directory() -> Path | None:
@@ -160,4 +184,7 @@ def native_toolchain_read_paths(workspace: Path) -> tuple[Path, ...]:
     if _IS_MACOS:
         for path in (*sandbox._mac_public_ssl_files(), *sandbox._mac_developer_selector_paths()):
             append(path)
+        cryptex_aliases = _mac_cryptex_alias_directory()
+        if cryptex_aliases is not None:
+            append(cryptex_aliases)
     return tuple(selected)
