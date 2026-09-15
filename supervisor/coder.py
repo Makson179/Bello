@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any, Literal
 
 from supervisor.appserver import (
-    APP_SERVER_CLEANUP_RPC_TIMEOUT_SECONDS,
     APP_SERVER_CODER_RPC_TIMEOUT_SECONDS,
     APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
     AppServerClient,
@@ -24,6 +23,8 @@ CODER_SANDBOX_WORKSPACE_WRITE = "workspace-write"
 CODER_SANDBOX_DANGER_FULL_ACCESS = "danger-full-access"
 CODEX_FAST_SERVICE_TIER = "priority"
 DEFAULT_INTELLIGENCE = "xhigh"
+# Time to acknowledge an explicit interruption, not a coding/tool execution limit.
+CODER_INTERRUPT_RPC_TIMEOUT_SECONDS = 600.0
 
 
 def coder_sandbox_mode() -> str:
@@ -274,7 +275,7 @@ class CoderSession:
     multi_agent: MultiAgentConfig = field(default_factory=MultiAgentConfig)
     plan_path: Path | None = None
     readonly_roots: tuple[Path, ...] = ()
-    cleanup_rpc_timeout_seconds: float = APP_SERVER_CLEANUP_RPC_TIMEOUT_SECONDS
+    cleanup_rpc_timeout_seconds: float = CODER_INTERRUPT_RPC_TIMEOUT_SECONDS
     _task_read_path: Path = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
