@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -114,6 +116,89 @@ async def test_cross_provider_children_inherit_distiller_only_for_coder(tmp_path
         assert has_focus(record) == (role == "coder")
         assert record["developerInstructions"].count("Add a very short focus") == int(role == "coder")
         assert record["networkAccess"] and record["approvalPolicy"] == "never"
+    finally:
+        await client.stop()
+
+
+@pytest.mark.parametrize("role", ["coder", "completion_review", "adversary"])
+async def test_native_child_resume_and_revision_preserve_selection_at_appserver_boundary(
+    tmp_path, selector, monkeypatch, role,
+):
+    """Cross-engine delegation traverses the real native adapter, not FakeBackend."""
+    from supervisor.runtime import codex_distiller
+    from supervisor.runtime.codex import CodexBackend
+    from tests.test_runtime_codex_backend import FakeNative, drain
+
+    scopes, native_clients = [], []
+    bridge = SimpleNamespace(environment={"BELLO_SELECTOR_SOCKET": "/synthetic/selector.sock"},
+        thread_config={codex_distiller.FEATURE_KEY: True}, start=AsyncMock(), close=AsyncMock(),
+        register_scope=lambda workspace, task=None: scopes.append((workspace, task)))
+    monkeypatch.setattr(codex_distiller, "validate_native_selection", AsyncMock(return_value={}))
+    monkeypatch.setattr(codex_distiller, "CodexDistillerBridge", lambda *a, **k: bridge)
+    client, workspace, _, _ = make_client(tmp_path, runtime=False, distiller=True)
+    await client.start()
+
+    def native_factory(**kwargs):
+        native = FakeNative(**kwargs)
+        native_clients.append(native)
+        return native
+
+    backend = CodexBackend(state_dir=client.state_dir / "native-fixture", distiller=client._distiller,
+        client_factory=native_factory, emit=lambda raw: client._emit(raw, engine="codex"))
+    client._engines["codex"] = backend
+    task = workspace / "custom-ticket.data"
+    enabled = role == "coder"
+
+    def assert_native_policy(params, *, resumed=False):
+        assert params["config"].get(codex_distiller.FEATURE_KEY, False) is enabled
+        assert params["developerInstructions"].count(codex_distiller.FOCUS_GUIDANCE) == int(enabled)
+        assert "Add a very short focus" not in params["developerInstructions"]
+        assert params["developerInstructions"].count("focus") == int(enabled)
+        assert not ({"tools", "distillerEnabled", "runtimeTaskPath"} & params.keys())
+        if resumed:
+            assert "dynamicTools" not in params  # Native resume retains its existing schemas.
+        else:
+            names = {tool["name"] for tool in params["dynamicTools"]}
+            assert names <= {"bello_spawn_agent", "bello_send_message", "bello_wait_agent", "bello_close_agent"}
+        assert not any(word in params["developerInstructions"].lower()
+                       for word in ("raw handle", "full log", "compression", "distill"))
+
+    try:
+        parent = await start(client, workspace, "claude-code/claude-sonnet-4-6", belloRole=role,
+            developerInstructions="Inspect the assigned code.", runtimeTaskPath=str(task),
+            config={"agents": {"enabled": True, "role": role, "max_concurrent_threads_per_session": 2,
+                               "allowed_profiles": {"gpt-6-astra": ["xhigh"]}}})
+        parent_turn = (await client.turn_start({"threadId": parent}))["turn"]["id"]
+        reply = await client._delegate("spawn_agent", {"model": "gpt-6-astra", "effort": "xhigh",
+                                                       "message": "Inspect the assigned code."}, parent, parent_turn)
+        child = json.loads(reply["content"][0]["text"])["agent_id"]
+        await drain(backend)
+        native = native_clients[0]
+        record = client._threads[child]
+        assert record["engine"] == "codex" and record["parentThreadId"] == parent
+        assert record["distillerEnabled"] is enabled and has_focus(record) is enabled
+        assert record["runtimeTaskPath"] == str(task)
+        assert_native_policy(next(params for method, params in native.calls if method == "thread/start"))
+        assert scopes == ([(workspace, task)] if enabled else [])
+
+        await native.notify_event("turn/completed", {"threadId": "native-thread-1",
+            "turn": {"id": "native-turn-1", "status": "completed"}})
+        await drain(backend)
+        await client.request("thread/resume", {"threadId": child, "belloRole": role,
+                                                "developerInstructions": "Caller cannot replace policy."})
+        assert_native_policy(next(params for method, params in reversed(native.calls) if method == "thread/resume"),
+                             resumed=True)
+        repair = (await client.turn_start({"threadId": child, "input": "Address review feedback."}))["turn"]["id"]
+        await drain(backend)
+        assert client._scope_for(child, repair).distiller_enabled is enabled
+        assert backend._threads[child]["params"]["distillerEnabled"] is enabled
+
+        revision = await start(client, workspace, "gpt-6-astra", belloRole=role, effort="xhigh",
+                               developerInstructions="Continue after review.", runtimeTaskPath=str(task))
+        assert client._threads[revision]["distillerEnabled"] is enabled
+        assert_native_policy(next(params for method, params in reversed(native.calls) if method == "thread/start"))
+        assert scopes == ([(workspace, task)] * 3 if enabled else [])
+        assert len(selector) == 1
     finally:
         await client.stop()
 

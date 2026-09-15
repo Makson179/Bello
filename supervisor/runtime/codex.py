@@ -60,7 +60,8 @@ def _tier(value: Any) -> str:
 
 class CodexBackend:
     def __init__(self, *, state_dir: Path, emit, tool_handler=None, client_factory=None,
-                 on_error=None, command: list[str] | None = None, distiller=None):
+                 on_error=None, command: list[str] | None = None, distiller=None,
+                 selection_manifest: Path | None = None):
         self.state_dir = Path(state_dir).absolute()
         self.emit, self.tool_handler, self.on_error = emit, tool_handler, on_error
         self._factory = client_factory or AppServerClient
@@ -68,7 +69,7 @@ class CodexBackend:
         self._distiller = distiller
         self._bridge = None
         self._selection_verified = False
-        self._selection_manifest: Path | None = None
+        self._selection_manifest = selection_manifest
         self._selection_lock = asyncio.Lock()
         self._native_command = None
         self._runtime_read_paths: tuple[Path, ...] = ()
@@ -137,7 +138,8 @@ class CodexBackend:
             # Deployment-owned capability files are host settings, not thread
             # configuration and not instructions supplied by the coder.
             manifest = os.environ.get("BELLO_CODEX_SELECTION_MANIFEST", "").strip()
-            self._selection_manifest = Path(manifest).expanduser().absolute() if manifest else None
+            if self._selection_manifest is None and manifest:
+                self._selection_manifest = Path(manifest).expanduser().absolute()
             executable = shutil.which(command[0])
             if executable is not None:
                 launcher = Path(executable).absolute()

@@ -124,6 +124,20 @@ def _argv_read(argv: list[str], important: Callable[[str], bool], depth: int, st
         for index, arg in enumerate(args[:-1]):
             if arg in {"-c", "-lc", "-command", "-Command"}:
                 return _shell_read(args[index + 1], important, depth + 1)
+        if program in {"sh", "bash", "zsh"}:
+            # A literal script receives its own argv; `bash script.sh --help`
+            # is a help request too. Do not inspect arbitrary shell source or
+            # mistake a --help string inside `-c`/stdin for a help option.
+            script_args = list(args)
+            while script_args and script_args[0] in {"-e", "-u", "-x", "-v", "-n", "-f"}:
+                script_args.pop(0)
+            if script_args and script_args[0] == "--":
+                script_args.pop(0)
+            if script_args and not script_args[0].startswith(("-", "+")):
+                options = script_args[1:]
+                options = options[:options.index("--")] if "--" in options else options
+                return "--help" in options or "-h" in options
+            return args == ["--help"]
         return False
     if _PYTHON.fullmatch(program):
         if "-c" in args:

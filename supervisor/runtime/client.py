@@ -143,11 +143,18 @@ class RuntimeClient(AppServerClient):
                 raise
         elif name == "codex":
             from supervisor.runtime.codex import CodexBackend
+            command, manifest = None, None
+            if self._distiller is not None:
+                from supervisor.runtime.native_codex_install import ensure_native_selection
+                # Installation is not an app-server request and can take longer
+                # than an RPC deadline on the first run. Never change global Codex.
+                command, manifest = await asyncio.to_thread(ensure_native_selection)
             backend = CodexBackend(state_dir=self.state_dir / "codex",
                                    emit=lambda raw: self._emit(raw, engine="codex"),
                                    tool_handler=self._call_tool,
                                    on_error=lambda error: self._engine_failed("codex", error),
-                                   distiller=self._distiller)
+                                   distiller=self._distiller, command=command,
+                                   selection_manifest=manifest)
             await backend.request("initialize", {})
         elif name == "claude-code":
             from supervisor.runtime.claude import ClaudeBackend

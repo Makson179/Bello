@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 import time
@@ -29,7 +30,8 @@ def test_codex_and_claude_manifests_share_one_versioned_skill() -> None:
     claude = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
 
     assert codex["name"] == claude["name"] == "bello"
-    assert codex["version"] == claude["version"] == "0.6.0-dev.0"
+    assert codex["version"] == claude["version"]
+    assert re.fullmatch(r"0\.6\.0-dev\.0(?:\+codex\.[a-z0-9-]+)?", codex["version"])
     assert codex["skills"] == claude["skills"] == "./skills/"
     assert (PLUGIN / "skills" / "bello-delegate" / "SKILL.md").is_file()
     assert SCRIPT.is_file()

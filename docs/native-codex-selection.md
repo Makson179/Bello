@@ -6,13 +6,30 @@ stock app-server notifications cannot replace results in the model's conversatio
 The other provider engines do not need this patch.
 
 Bello does not replace the user's global `codex`, modify its configuration, or fall
-back to Pi when selection is unavailable. The model bundle download is separate
-from the native executable: installing `Bello[log-distiller]` does not install a
-patched Codex binary.
+back to Pi when selection is unavailable. The model bundle and native executable
+are separate downloads. On platforms listed in
+[`native_codex_install.py`](../supervisor/runtime/native_codex_install.py), an
+approved native-Codex run with log distiller enabled prepares both automatically.
+Installing `Bello[log-distiller]` installs the inference dependencies; the native
+helper is fetched when that execution engine is first needed, not by pip.
+
+## Automatic preparation
+
+The native archive and its capability manifest are pinned by SHA-256. The helper,
+code-mode host and license files are cached under `~/.bello/runtime/native-codex/`
+(or the host's `BELLO_RUNTIME_DIR`). A complete verified cache works offline. Each
+version has its own private directory; changed or unsafe cached files cause an
+error rather than replacement underneath a running process.
+
+The first download finishes before app-server starts, outside model-RPC timeouts.
+Codex runs without distiller use the ordinary executable. Claude/Pi-only runs do
+not download this helper. Unsupported platforms require an explicit compatible
+build; Bello does not silently turn distillation off or change the provider.
 
 ## Select an installed build
 
-Set these host environment variables before starting Bello:
+To override the pinned download with a custom build, set these host environment
+variables before starting Bello:
 
 ```sh
 export BELLO_CODEX_BINARY=/opt/bello-native/bin/codex
@@ -45,9 +62,12 @@ distilled coder turn starts. D-off does not read this manifest or run these chec
 
 The tested Linux x86-64 Codex 0.153.4 executable has SHA-256
 `49f183a9cbd91a7e87d0f44c27d1aa60f150359c44eab69084127888bd32dc6c`.
-The bridge uses Unix sockets. Windows native selection is not supported; a macOS
-build has not been validated. There is currently no automatic native binary
-download or universal prebuilt package.
+The bridge uses Unix sockets. Automatic native selection is available for macOS
+Apple Silicon (arm64); the archive contains both native executables and their
+license notices. The macOS executable has SHA-256
+`e01aceea077958b9d9bc3645f3dbd6ab8d86f4b45e6e0a5391a20f67175a5656`.
+Linux currently uses the explicit compatible-build option above. Windows native
+selection is not supported. This is not a universal prebuilt package.
 
 ## Build from source
 
@@ -122,6 +142,13 @@ D-off delivered the original text and D-on delivered the exact selector text for
 both direct commands and code-mode polling, with exit code preserved. Rebuilds
 should repeat that boundary check before being used for comparisons; a feature
 listing alone is not evidence of model-visible delivery.
+
+For macOS arm64, `scripts/verify_native_codex_selection.py` exercises nine
+offline provider-boundary cases: direct command, code-mode and polling with
+selection on/off, missing focus, a custom task file, and CLI help. It uses
+synthetic logs and a local provider, with no account credentials or paid model
+calls. All nine cases pass for the macOS executable pinned above. The helper's
+transport checks are separate from the learned selector's quality evaluation.
 
 The [official app-server protocol](https://learn.chatgpt.com/docs/app-server#protocol)
 remains the external native transport. The private selection socket is a Bello
