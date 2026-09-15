@@ -56,6 +56,15 @@ _OUTPUT_TRUNCATED = "\n[bello: command output truncated at 8M characters]\n"
 _TERMINATE_GRACE_SECONDS = 0.5
 _BACKEND_PROBE_SECONDS = 5.0
 _MAC_OTOOL = Path("/usr/bin/otool")
+_MAC_PUBLIC_SSL_CONFIGS = (
+    Path("/System/Library/OpenSSL/openssl.cnf"),
+    Path("/private/etc/ssl/openssl.cnf"),
+)
+_MAC_DEVELOPER_SELECTORS = (
+    Path("/var/select/developer_dir"), Path("/private/var/select/developer_dir"),
+)
+_MAC_COMMAND_LINE_TOOLS = Path("/Library/Developer/CommandLineTools")
+_MAC_APPLICATIONS = Path("/Applications")
 
 # These are host-selected developer tools, not model-supplied command names.
 # A fixed catalog keeps PATH useful without exposing a user's generic bin
@@ -536,6 +545,37 @@ def _workspace_bin_dirs(root: Path) -> tuple[Path, ...]:
     return tuple(path for path in candidates if path.is_dir())
 
 
+def _mac_public_ssl_files() -> tuple[Path, ...]:
+    """Exact public OS configs, never their sibling key/certificate directories."""
+    return tuple(path for path in _MAC_PUBLIC_SSL_CONFIGS if path.is_file() and not path.is_symlink())
+
+
+def _mac_developer_selector_paths() -> tuple[Path, ...]:
+    """Allow Apple's dispatcher link only when it selects a public Apple SDK.
+
+    Reading /usr/bin/python3 or git alone is insufficient: their dispatcher
+    reads this link and then loads the selected developer tree. Do not grant
+    arbitrary link targets or the containing /var/select directory.
+    """
+    roots: list[Path] = []
+    for path in _MAC_DEVELOPER_SELECTORS:
+        try:
+            if not path.is_symlink():
+                continue
+            target = path.resolve(strict=True)
+            is_xcode = (target.name == "Developer" and target.parent.name == "Contents"
+                        and target.parent.parent.suffix == ".app"
+                        and target.parent.parent.parent == _MAC_APPLICATIONS)
+            if not target.is_dir() or not (target == _MAC_COMMAND_LINE_TOOLS or is_xcode):
+                continue
+        except (OSError, RuntimeError):
+            continue
+        for entry in (path, target):
+            if entry not in roots:
+                roots.append(entry)
+    return tuple(roots)
+
+
 def _mac_system_roots() -> tuple[Path, ...]:
     roots = list(_existing((
         "/System",
@@ -572,6 +612,8 @@ def _mac_system_roots() -> tuple[Path, ...]:
     selector = Path("/private/var/select/sh")
     if selector.exists():
         roots.append(selector)
+    roots.extend(_mac_public_ssl_files())
+    roots.extend(_mac_developer_selector_paths())
     return tuple(dict.fromkeys(roots))
 
 

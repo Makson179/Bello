@@ -8165,10 +8165,12 @@ def _validation_from_action(
 ) -> ValidationRun | None:
     if action.kind != "commandExecution" or not action.command:
         return None
-    validation_type = _classify_validation_command(action.command, changed_paths=changed_paths or [])
+    output = _command_output_from_item(item)
+    validation_type = _classify_validation_command(
+        action.command, changed_paths=changed_paths or [], output=output,
+    )
     if validation_type is None:
         return None
-    output = _command_output_from_item(item)
     normalized_command = _normalize_command(action.command)
     raw_selector = _raw_validation_selector(action.command)
     executed_test_names = _executed_test_names(action.command, output)
@@ -8273,7 +8275,26 @@ def _inspection_from_action(
     )
 
 
-def _classify_validation_command(command: str, *, changed_paths: list[str]) -> str | None:
+def _classify_validation_command(
+    command: str, *, changed_paths: list[str], output: str = "",
+) -> str | None:
+    # A test followed by a syntax/diff check still supplies behavioral evidence.
+    # Classify individual shell segments first, preserving static-only commands
+    # such as `node --check game.test.js` and ignoring quoted/printed test names.
+    inner = _shell_command_payload(command)
+    segments = _inspection_command_segments(inner if inner is not None else command)
+    # A shell branch can skip the named tests and still exit zero. Promote a
+    # mixed command only with runner evidence, not merely a test name in argv.
+    has_runner_output = _captured_output_looks_like_test_runner(output) or any(
+        count is not None for count in _test_count_summary(output)
+    )
+    if segments is not None and len(segments) > 1 and has_runner_output:
+        for segment in segments:
+            segment_command = shlex.join(segment)
+            if _is_observationless_output_command(segment_command):
+                continue
+            if _classify_validation_command(segment_command, changed_paths=changed_paths) == "behavioral":
+                return "behavioral"
     if _is_git_inspection_command(command):
         return "static" if _is_git_diff_check_command(command) else None
     if _is_read_only_inspection_command(command):
@@ -8668,8 +8689,10 @@ def _tests_executed(command: str, output: str) -> bool:
         return True
     lowered = output.lower()
     zero_test_patterns = (
-        r"\b0\s+(passing|failing|pending|tests?|specs?)\b",
-        r"\b0\s+tests?\s+(run|executed|passed|failed|total)\b",
+        # Do not treat npm's `package@1.0.0 test` header as zero tests.
+        r"(?<![\w.])0[ \t]+(passing|failing|pending|tests?|specs?)\b",
+        r"(?<![\w.])0[ \t]+tests?[ \t]+(run|executed|passed|failed|total)\b",
+        r"(?m)^[ \t]*[#ℹ][ \t]+tests[ \t]+0[ \t]*$",
         r"\btests?:\s+0\s+total\b",
         r"\btest suites?:\s+0\b",
         r"\bran\s+0\s+tests?\b",
@@ -8927,6 +8950,7 @@ def _test_count_summary(output: str) -> tuple[int | None, int | None]:
             r"\b(\d+)\s+passing\b",
             r"\bpasses:\s*(\d+)\b",
             r"\btests?:\s*(\d+)\s+passed\b",
+            r"(?m)^[ \t]*[#ℹ][ \t]+pass[ \t]+(\d+)[ \t]*$",
         ),
     )
     failed = _first_int_match(
@@ -8938,6 +8962,14 @@ def _test_count_summary(output: str) -> tuple[int | None, int | None]:
             r"\btests?:\s*\d+\s+passed,\s*(\d+)\s+failed\b",
         ),
     )
+    # A zero-failure Node summary must not hide a failure from another runner
+    # or an earlier Node invocation in the same shell command.
+    node_failures = [
+        int(match.group(1))
+        for match in re.finditer(r"(?m)^[ \t]*[#ℹ][ \t]+fail[ \t]+(\d+)[ \t]*$", lowered)
+    ]
+    if node_failures:
+        failed = max(failed or 0, *node_failures)
     if passed is not None and failed is None:
         failed = 0
     return passed, failed

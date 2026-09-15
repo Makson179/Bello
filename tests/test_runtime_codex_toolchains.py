@@ -23,6 +23,8 @@ def host(tmp_path, monkeypatch):
     monkeypatch.setattr(tools.sandbox, "_runtime_root", lambda: None)
     monkeypatch.setattr(tools.sandbox, "_windows_current_python_root", lambda policy: None)
     monkeypatch.setattr(tools.sandbox, "_mac_linked_kegs", lambda path: ())
+    monkeypatch.setattr(tools.sandbox, "_mac_public_ssl_files", lambda: ())
+    monkeypatch.setattr(tools.sandbox, "_mac_developer_selector_paths", lambda: ())
     monkeypatch.setenv("PATH", "")
     return home, work
 
@@ -32,6 +34,26 @@ def executable(path):
     path.write_text("#!/bin/sh\nexit 0\n")
     path.chmod(0o755)
     return path
+
+
+def test_native_public_ssl_and_apple_dispatcher_paths_are_readonly_exact(host, monkeypatch):
+    home, work = host
+    config = home / "public-system" / "openssl.cnf"
+    config.parent.mkdir()
+    config.write_text("openssl_conf = openssl_init\n")
+    developer = home / "public-apple-sdk"
+    developer.mkdir()
+    selector = home / "system-selector"
+    selector.write_text("placeholder")
+    monkeypatch.setattr(tools, "_IS_MACOS", True)
+    monkeypatch.setattr(tools.sandbox, "_mac_public_ssl_files", lambda: (config,))
+    monkeypatch.setattr(tools.sandbox, "_mac_developer_selector_paths", lambda: (selector, developer))
+    result = tools.native_toolchain_read_paths(work)
+    assert set(result) == {config, selector, developer}
+    permission = native_permission_params({"cwd": str(work)}, runtime_read_paths=result)
+    fs = permission["config"]["permissions"][PROFILE_ID]["filesystem"]
+    assert all(fs[str(path)] == "read" for path in result)
+    assert str(config.parent) not in fs and str(selector.parent) not in fs
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX executable alias; Windows rejects reparse leaves")

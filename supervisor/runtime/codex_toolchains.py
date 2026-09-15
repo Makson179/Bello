@@ -157,4 +157,7 @@ def native_toolchain_read_paths(workspace: Path) -> tuple[Path, ...]:
     developer = _mac_developer_directory()
     if developer is not None:
         append(developer)
+    if _IS_MACOS:
+        for path in (*sandbox._mac_public_ssl_files(), *sandbox._mac_developer_selector_paths()):
+            append(path)
     return tuple(selected)

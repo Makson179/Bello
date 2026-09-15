@@ -139,12 +139,19 @@ def test_download_checksum_rejected_without_publishing_cache(release, monkeypatc
     assert not list(cache.glob(".download-*"))
 
 
-def test_explicit_host_build_does_not_download_or_probe_platform(monkeypatch):
-    monkeypatch.setenv("BELLO_CODEX_BINARY", "/host/custom-codex")
-    monkeypatch.setenv("BELLO_CODEX_SELECTION_MANIFEST", "/host/manifest.json")
+@pytest.mark.parametrize("relative_manifest", [False, True])
+def test_explicit_host_build_does_not_download_or_probe_platform(tmp_path, monkeypatch, relative_manifest):
+    binary = tmp_path / "host" / "custom-codex"
+    manifest = tmp_path / "host" / "manifest.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("BELLO_CODEX_BINARY", str(binary))
+    monkeypatch.setenv("BELLO_CODEX_SELECTION_MANIFEST", str(
+        manifest.relative_to(tmp_path) if relative_manifest else manifest))
     monkeypatch.setattr(install.platform, "system", lambda: pytest.fail("explicit build"))
+    monkeypatch.setattr(install.platform, "machine", lambda: pytest.fail("explicit build"))
+    monkeypatch.setattr(install, "_download", lambda *a: pytest.fail("explicit build"))
     assert install.ensure_native_selection() == (
-        ["/host/custom-codex", "app-server", "--listen", "stdio://"], Path("/host/manifest.json"))
+        [str(binary), "app-server", "--listen", "stdio://"], manifest)
 
 
 def test_unsupported_platform_fails_explicitly(release, monkeypatch):

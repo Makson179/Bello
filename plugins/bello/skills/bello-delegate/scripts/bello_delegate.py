@@ -391,12 +391,52 @@ def _open_log(path: Path):
     return os.fdopen(fd, "wb")
 
 
-def _pid_alive(value: Any) -> bool:
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+def _windows_pid_alive(pid: int) -> bool | None:
+    # os.kill(pid, 0) calls TerminateProcess on Windows, unlike POSIX.
+    # A zero-time wait needs only SYNCHRONIZE and does not confuse an exited
+    # process with exit code 259 with the GetExitCodeProcess STILL_ACTIVE value.
+    import ctypes
+    from ctypes import wintypes
+
+    if pid > 0xFFFFFFFF:
         return False
     try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE only.
+        if not handle:
+            return False if ctypes.get_last_error() == 87 else None
+        try:
+            wait = kernel32.WaitForSingleObject(handle, 0)
+            if wait == 0:  # WAIT_OBJECT_0: the process has exited.
+                return False
+            if wait == 258:  # WAIT_TIMEOUT: the process is still running.
+                return True
+            return None
+        finally:
+            kernel32.CloseHandle(handle)
+    except (AttributeError, OSError, OverflowError, ValueError):
+        return None
+
+
+def _pid_alive(value: Any) -> bool | None:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        return False
+    if sys.platform == "win32":
+        return _windows_pid_alive(value)
+    try:
         os.kill(value, 0)
-    except (OSError, ValueError):
+    except ProcessLookupError:
+        return False
+    except OSError:
+        # A sandbox can forbid process inspection. Unknown is not a dead run.
+        return None
+    except ValueError:
         return False
     return True
 
@@ -471,9 +511,9 @@ def status(project_value: str | os.PathLike[str] = ".") -> dict[str, Any]:
     launcher_alive = _pid_alive(state.get("launcherPid")) if state else False
     child_alive = _pid_alive(state.get("pid")) if state else False
     effective = raw_status if isinstance(raw_status, str) else "invalid"
-    if effective == "launching" and not launcher_alive:
+    if effective == "launching" and launcher_alive is False:
         effective = "stale"
-    elif effective == "running" and not (launcher_alive or child_alive):
+    elif effective == "running" and launcher_alive is False and child_alive is False:
         effective = "stale"
 
     public_state = {}
@@ -493,7 +533,8 @@ def status(project_value: str | os.PathLike[str] = ".") -> dict[str, Any]:
     public_state.update(
         {
             "status": effective,
-            # A PID can be reused. These are liveness hints, never durable run identity.
+            # PIDs can be reused; null means inspection was unavailable.
+            # These are liveness hints, never durable run identity.
             "launcherProcessAliveUnverified": launcher_alive,
             "belloProcessAliveUnverified": child_alive,
         }
@@ -594,7 +635,7 @@ def start(
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
         observed = _read_json(run_dir / STATE_NAME) or {}
-        if observed.get("status") != "launching" or not _pid_alive(runner.pid):
+        if observed.get("status") != "launching" or _pid_alive(runner.pid) is False:
             break
         time.sleep(0.05)
     return status(project)

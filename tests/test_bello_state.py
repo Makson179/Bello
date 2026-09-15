@@ -1235,6 +1235,183 @@ async def test_runtime_git_inspection_waits_for_trusted_snapshot_config(tmp_path
         snapshot.cleanup()
 
 
+@pytest.mark.parametrize("passed_count", [4, 5])
+@pytest.mark.parametrize("reporter_prefix", ["ℹ", "#"])
+def test_node_test_summary_is_not_confused_with_npm_package_version(
+    tmp_path: Path,
+    posix_command_semantics: None,
+    passed_count: int,
+    reporter_prefix: str,
+) -> None:
+    # Reproduces the npm header from native 2048 runs: its final version digit
+    # is not the test count ("1.0.0 test" previously matched "0 test").
+    output = (
+        "> signalglass-2048@1.0.0 test\n> node --test\n"
+        "✔ validates persisted games defensively (0.616583ms)\n"
+        f"{reporter_prefix} tests {passed_count}\n"
+        f"{reporter_prefix} suites 0\n"
+        f"{reporter_prefix} pass {passed_count}\n"
+        f"{reporter_prefix} fail 0\n"
+        f"{reporter_prefix} cancelled 0\n"
+        f"{reporter_prefix} skipped 0\n"
+        f"{reporter_prefix} todo 0\n"
+    )
+    controller, store, _ = _runtime_controller(tmp_path)
+    for sequence in (335, 432):
+        validation = _validation_from_action(
+            TriggeringAction(
+                kind="commandExecution", command="/bin/zsh -c 'npm test'",
+                exit_code=0, status="completed", summary="command completed",
+            ),
+            sequence=sequence,
+            item={"aggregatedOutput": output},
+        )
+        assert validation is not None
+        assert validation.type == "behavioral"
+        assert validation.outcome == "pass"
+        assert validation.trusted_validation_outcome == "passed"
+        assert validation.passed is True
+        assert validation.passed_count == passed_count
+        assert validation.failed_count == 0
+        assert controller._record_validation_runtime_state(validation) == ()
+        controller._record_validation_progress(validation)
+    assert store.get_bello_config().last_trusted_passing_behavioral_validation_sequence == 432
+
+
+@pytest.mark.parametrize(
+    ("output", "expected_passed", "expected_failed"),
+    [
+        ("ℹ tests 5\nℹ pass 4\nℹ fail 1\n", 4, 1),
+        ("# tests 5\n# pass 4\n# fail 1\n", 4, 1),
+        ("ℹ tests 0\nℹ pass 0\nℹ fail 0\n", 0, 0),
+        ("# tests 0\n# pass 0\n# fail 0\n", 0, 0),
+        ("0 tests executed\n", None, None),
+    ],
+)
+def test_node_failed_or_empty_suite_is_not_a_successful_validation(
+    output: str, expected_passed: int | None, expected_failed: int | None,
+) -> None:
+    validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution", command="npm test", exit_code=0,
+            status="completed", summary="command completed",
+        ),
+        sequence=1, item={"stdout": output},
+    )
+    assert validation is not None
+    assert validation.type == "behavioral"
+    assert validation.outcome == "fail"
+    assert validation.trusted_validation_outcome == "failed"
+    assert validation.passed is False
+    assert validation.passed_count == expected_passed
+    assert validation.failed_count == expected_failed
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/bin/zsh -c 'npm test && git diff --check'",
+        "/bin/zsh -c 'npm test && node --check app.js && node --check game.js'",
+        "node --check game.js && npm test",
+        "git diff --check && npm test",
+        "npm run lint; npm test",
+    ],
+)
+def test_compound_test_and_static_checks_remain_behavioral(
+    tmp_path: Path, posix_command_semantics: None, command: str,
+) -> None:
+    validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution", command=command, exit_code=0,
+            status="completed", summary="command completed",
+        ),
+        sequence=815,
+        item={"stdout": (
+            "> signalglass-2048@1.0.0 test\n> node --test\n"
+            "✔ validates persisted games defensively (0.0925ms)\n"
+            "ℹ tests 5\nℹ suites 0\nℹ pass 5\nℹ fail 0\n"
+        )},
+    )
+    assert validation is not None
+    assert validation.type == "behavioral"
+    assert validation.trusted_validation_outcome == "passed"
+    controller, store, _ = _runtime_controller(tmp_path)
+    controller._record_validation_progress(validation)
+    assert store.get_bello_config().last_trusted_passing_behavioral_validation_sequence == 815
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "node --check game.test.js",
+        "node --check game.test.js && git diff --check",
+        "printf 'npm test' && node --check game.js",
+        "cat npm-test.log && node --check game.js",
+    ],
+)
+def test_compound_static_checks_do_not_invent_test_execution(
+    posix_command_semantics: None, command: str,
+) -> None:
+    validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution", command=command, exit_code=0,
+            status="completed", summary="command completed",
+        ),
+        sequence=1, item={"stdout": ""},
+    )
+    assert validation is not None
+    assert validation.type == "static"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "false && npm test; git diff --check",
+        "true || npm test; git diff --check",
+    ],
+)
+def test_skipped_compound_test_branch_is_not_behavioral_evidence(
+    posix_command_semantics: None, command: str,
+) -> None:
+    validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution", command=command, exit_code=0,
+            status="completed", summary="command completed",
+        ),
+        sequence=1, item={"stdout": ""},
+    )
+    assert validation is not None
+    assert validation.type == "static"
+    assert _has_passing_behavioral_validation([validation]) is False
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "ℹ tests 5\nℹ pass 5\nℹ fail 0\n1 failed\n",
+        "0 failed\nℹ tests 5\nℹ pass 4\nℹ fail 1\n",
+        "ℹ tests 5\nℹ pass 5\nℹ fail 0\nℹ tests 5\nℹ pass 4\nℹ fail 1\n",
+    ],
+    ids=["node-pass-other-runner-fail", "other-runner-pass-node-fail", "node-pass-node-fail"],
+)
+def test_compound_node_summary_cannot_hide_a_failing_validation(
+    posix_command_semantics: None, output: str,
+) -> None:
+    validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution", command="npm test; node --check game.js",
+            exit_code=0, status="completed", summary="command completed",
+        ),
+        sequence=1, item={"stdout": output},
+    )
+    assert validation is not None
+    assert validation.type == "behavioral"
+    assert validation.failed_count == 1
+    assert validation.outcome == "fail"
+    assert validation.trusted_validation_outcome == "failed"
+    assert validation.passed is False
+
+
 def test_validation_ledger_classifies_static_and_behavioral_commands(
     posix_command_semantics: None,
 ) -> None:

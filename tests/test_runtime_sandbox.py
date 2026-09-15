@@ -131,6 +131,52 @@ def test_macos_network_authority_is_explicit(tmp_path: Path) -> None:
     assert "(deny network*)" not in profile
 
 
+def test_macos_ssl_config_grants_only_existing_regular_files(tmp_path, monkeypatch):
+    config = tmp_path / "ssl" / "openssl.cnf"
+    config.parent.mkdir()
+    config.write_text("openssl_conf = openssl_init\n")
+    private = config.parent / "private"
+    private.mkdir()
+    (private / "key.pem").write_text("synthetic secret")
+    directory = tmp_path / "not-a-config"
+    directory.mkdir()
+    missing = tmp_path / "missing.cnf"
+    monkeypatch.setattr(sandbox, "_MAC_PUBLIC_SSL_CONFIGS", (config, directory, missing))
+    assert sandbox._mac_public_ssl_files() == (config,)
+    assert config in sandbox._mac_system_roots()
+    assert config.parent not in sandbox._mac_system_roots()
+    assert private not in sandbox._mac_system_roots()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="macOS system symlink authority")
+def test_macos_public_ssl_config_does_not_follow_unexpected_link(tmp_path, monkeypatch):
+    secret = tmp_path / "key.pem"
+    secret.write_text("synthetic secret")
+    config = tmp_path / "openssl.cnf"
+    config.symlink_to(secret)
+    monkeypatch.setattr(sandbox, "_MAC_PUBLIC_SSL_CONFIGS", (config,))
+    assert sandbox._mac_public_ssl_files() == ()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="macOS system symlink authority")
+@pytest.mark.parametrize("kind", ["clt", "xcode", "private"])
+def test_macos_apple_dispatcher_grants_exact_link_and_public_target(tmp_path, monkeypatch, kind):
+    clt = tmp_path / "Library" / "Developer" / "CommandLineTools"
+    apps = tmp_path / "Applications"
+    target = {"clt": clt, "xcode": apps / "Xcode.app" / "Contents" / "Developer",
+              "private": tmp_path / "unrelated-private"}[kind]
+    target.mkdir(parents=True)
+    selector = tmp_path / "var" / "select" / "developer_dir"
+    selector.parent.mkdir(parents=True)
+    selector.symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(sandbox, "_MAC_COMMAND_LINE_TOOLS", clt)
+    monkeypatch.setattr(sandbox, "_MAC_APPLICATIONS", apps)
+    monkeypatch.setattr(sandbox, "_MAC_DEVELOPER_SELECTORS", (selector,))
+    paths = sandbox._mac_developer_selector_paths()
+    assert paths == (() if kind == "private" else (selector, target))
+    assert selector.parent not in paths and target.parent not in paths
+
+
 def test_macos_invocation_scrubs_host_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     scratch = tmp_path / "scratch"
     (scratch / "home").mkdir(parents=True)

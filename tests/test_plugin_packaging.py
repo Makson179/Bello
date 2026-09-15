@@ -8,6 +8,7 @@ import re
 import stat
 import sys
 import time
+from unittest.mock import Mock
 
 import pytest
 
@@ -97,7 +98,9 @@ def test_task_and_plan_cannot_escape_project(tmp_path: Path) -> None:
         )
 
 
-def test_status_is_read_only_without_a_launch_and_marks_dead_process_stale(tmp_path: Path) -> None:
+def test_status_is_read_only_without_a_launch_and_marks_dead_process_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     launcher = _load_launcher()
     project = tmp_path / "project"
     project.mkdir()
@@ -112,9 +115,125 @@ def test_status_is_read_only_without_a_launch_and_marks_dead_process_stale(tmp_p
         json.dumps({"status": "running", "pid": 2_147_483_647}),
         encoding="utf-8",
     )
+    def missing_process(pid, signal):
+        raise ProcessLookupError("no such process")
+    monkeypatch.setattr(launcher.os, "kill", missing_process)
+    monkeypatch.setattr(launcher, "_windows_pid_alive", lambda pid: False)
     stale = launcher.status(project)
     assert stale["launcher"]["status"] == "stale"
     assert stale["launcher"]["belloProcessAliveUnverified"] is False
+
+
+@pytest.mark.parametrize("recorded_status", ["launching", "running", "exited"])
+def test_status_does_not_report_dead_run_when_process_probe_is_forbidden(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recorded_status: str,
+) -> None:
+    launcher = _load_launcher()
+    project = tmp_path / "project"
+    run_dir = project / ".codex" / "bello-run"
+    run_dir.mkdir(parents=True)
+    state = json.dumps({"status": recorded_status, "launcherPid": 1234, "pid": 5678})
+    state_path = run_dir / "state.json"
+    state_path.write_text(state, encoding="utf-8")
+
+    def forbidden(pid, signal):
+        raise PermissionError("sandbox forbids process inspection")
+    monkeypatch.setattr(launcher.os, "kill", forbidden)
+    monkeypatch.setattr(launcher, "_windows_pid_alive", lambda pid: None)
+
+    observed = launcher.status(project)["launcher"]
+    assert observed["status"] == recorded_status
+    assert observed["launcherProcessAliveUnverified"] is None
+    assert observed["belloProcessAliveUnverified"] is None
+    assert state_path.read_text(encoding="utf-8") == state
+
+
+@pytest.mark.parametrize("wait_result,open_error,expected", [
+    (258, None, True), (0, None, False), (0xFFFFFFFF, None, None),
+    (128, None, None), (None, 87, False), (None, 5, None), (None, 0, None),
+])
+def test_windows_liveness_is_a_query_only_zero_wait(
+    monkeypatch: pytest.MonkeyPatch, wait_result, open_error, expected,
+) -> None:
+    import ctypes
+
+    launcher = _load_launcher()
+    kernel32 = Mock()
+    kernel32.OpenProcess.return_value = 456 if open_error is None else 0
+    kernel32.WaitForSingleObject.return_value = wait_result
+    loader = Mock(return_value=kernel32)
+    monkeypatch.setattr(ctypes, "WinDLL", loader, raising=False)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: open_error, raising=False)
+    monkeypatch.setattr(launcher.sys, "platform", "win32")
+    monkeypatch.setattr(launcher.os, "kill", lambda *a: pytest.fail("Windows must never signal the PID"))
+
+    assert launcher._pid_alive(1234) is expected
+    loader.assert_called_once_with("kernel32", use_last_error=True)
+    kernel32.OpenProcess.assert_called_once_with(0x00100000, False, 1234)
+    if open_error is None:
+        kernel32.WaitForSingleObject.assert_called_once_with(456, 0)
+        kernel32.CloseHandle.assert_called_once_with(456)
+    else:
+        kernel32.WaitForSingleObject.assert_not_called()
+        kernel32.CloseHandle.assert_not_called()
+
+
+def test_windows_liveness_closes_handle_when_query_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ctypes
+
+    launcher = _load_launcher()
+    kernel32 = Mock()
+    kernel32.OpenProcess.return_value = 456
+    kernel32.WaitForSingleObject.side_effect = OSError("query unavailable")
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *a, **kw: kernel32, raising=False)
+    monkeypatch.setattr(launcher.sys, "platform", "win32")
+    monkeypatch.setattr(launcher.os, "kill", lambda *a: pytest.fail("Windows must never signal the PID"))
+
+    assert launcher._pid_alive(1234) is None
+    kernel32.CloseHandle.assert_called_once_with(456)
+
+
+@pytest.mark.parametrize("recorded_status", ["launching", "running"])
+def test_unknown_liveness_keeps_active_lock_duplicate_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recorded_status: str,
+) -> None:
+    launcher = _load_launcher()
+    run_dir = tmp_path / ".codex" / "bello-run"
+    run_dir.mkdir(parents=True)
+    state = json.dumps({"status": recorded_status, "launcherPid": 1234, "pid": 5678})
+    (run_dir / "state.json").write_text(state, encoding="utf-8")
+    (run_dir / "active.lock").write_text("existing lock", encoding="utf-8")
+    monkeypatch.setattr(launcher, "_pid_alive", lambda pid: None)
+    monkeypatch.setattr(launcher, "_git_status", lambda project: "")
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *a, **kw: pytest.fail("duplicate launched"))
+
+    observed = launcher.start(tmp_path)
+    assert observed["duplicateRejected"] is True
+    assert observed["launcher"]["status"] == recorded_status
+    assert (run_dir / "state.json").read_text(encoding="utf-8") == state
+    assert (run_dir / "active.lock").read_text(encoding="utf-8") == "existing lock"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="actual Windows process-handle semantics")
+def test_actual_windows_status_probe_preserves_live_child_and_detects_exit_259() -> None:
+    import subprocess
+
+    launcher = _load_launcher()
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        for _ in range(3):
+            assert launcher._pid_alive(child.pid) is True
+            assert child.poll() is None
+    finally:
+        if child.poll() is None:
+            child.terminate()
+        child.wait(timeout=10)
+    with subprocess.Popen([sys.executable, "-c", "raise SystemExit(259)"]) as exited:
+        assert exited.wait(timeout=10) == 259
+        assert launcher._pid_alive(exited.pid) is False
 
 
 @pytest.mark.skipif(os.name == "nt", reason="the race fixture unlinks an open POSIX inode")
