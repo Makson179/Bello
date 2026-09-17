@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="430" viewBox="0 0 480 430" role="img" aria-labelledby="readme-model-comparison-mobile-title readme-model-comparison-mobile-desc">
+<title id="readme-model-comparison-mobile-title">Mean ProgramBench score, Raw versus Bello</title>
+<desc id="readme-model-comparison-mobile-desc">Luna: Raw 32.75%, Bello 46.32%; Terra: Raw 31.75%, Bello 41.24%; Sol: Raw 48.98%, Bello 55.44%; Astra: Raw 59.70%, Bello 65.68%. Mean across Solar, Samtools and rumdl. 24 total runs. Score axis 25–72%.</desc>
+<style>
+svg { --bg:#fff; --ink:#26323e; --muted:#64707c; --grid:#e4e9ee;
+  --raw:#557ca6; --bello:#c84b32; }
+@media (prefers-color-scheme:dark) {
+  svg { --bg:#0d1117; --ink:#edf2f7; --muted:#a6b2bf; --grid:#2b3542;
+    --raw:#8dadd2; --bello:#ef987e; }
+}
+.paper { fill:var(--bg); }
+text { font-family:Arial,Helvetica,sans-serif; fill:var(--ink);
+  font-variant-numeric:tabular-nums; }
+.muted { fill:var(--muted); }
+.raw { fill:var(--raw); }
+.bello { fill:var(--bello); }
+.halo { paint-order:stroke; stroke:var(--bg); stroke-width:5; stroke-linejoin:round; }
+.grid { stroke:var(--grid); stroke-width:1; }
+.raw-line { stroke:var(--raw); fill:none; stroke-width:2.5; stroke-dasharray:7 5; }
+.bello-line { stroke:var(--bello); fill:none; stroke-width:3; }
+.raw-point { fill:var(--bg); stroke:var(--raw); stroke-width:2; }
+.bello-point { fill:var(--bello); }
+.raw-bar { fill:var(--raw); fill-opacity:.22; stroke:var(--raw); stroke-width:1.3; }
+.bello-bar { fill:var(--bello); }
+</style>
+<rect class="paper" width="480" height="430"/>
+<line x1="24.00" y1="24.00" x2="48.00" y2="24.00" class="raw-line"/>
+<circle cx="36.00" cy="24.00" r="5" class="raw-point"/>
+<text x="54.00" y="30.00" font-size="17" font-weight="400" class="raw" text-anchor="start">Raw</text>
+<line x1="244.00" y1="24.00" x2="268.00" y2="24.00" class="bello-line"/>
+<path d="M256.00 18.00 l6 6 l-6 6 l-6 -6 Z" class="bello-point"/>
+<text x="274.00" y="30.00" font-size="17" font-weight="400" class="bello" text-anchor="start">Bello</text>
+<text x="24.00" y="73.00" font-size="18" font-weight="400" class="muted" text-anchor="start">Score (%)</text>
+<line x1="46.00" y1="336.98" x2="453.00" y2="336.98" class="grid"/>
+<text x="36.00" y="341.98" font-size="14" font-weight="400" class="muted" text-anchor="end">30</text>
+<line x1="46.00" y1="228.89" x2="453.00" y2="228.89" class="grid"/>
+<text x="36.00" y="233.89" font-size="14" font-weight="400" class="muted" text-anchor="end">50</text>
+<line x1="46.00" y1="120.81" x2="453.00" y2="120.81" class="grid"/>
+<text x="36.00" y="125.81" font-size="14" font-weight="400" class="muted" text-anchor="end">70</text>
+<polyline points="72.00,322.10 190.00,327.54 308.00,234.42 426.00,176.47" class="raw-line"/>
+<circle cx="72.00" cy="322.10" r="5" class="raw-point"/>
+<text x="72.00" y="349.10" font-size="18" font-weight="600" class="raw halo" text-anchor="middle">32.75</text>
+<circle cx="190.00" cy="327.54" r="5" class="raw-point"/>
+<text x="190.00" y="354.54" font-size="18" font-weight="600" class="raw halo" text-anchor="middle">31.75</text>
+<circle cx="308.00" cy="234.42" r="5" class="raw-point"/>
+<text x="308.00" y="261.42" font-size="18" font-weight="600" class="raw halo" text-anchor="middle">48.98</text>
+<circle cx="426.00" cy="176.47" r="5" class="raw-point"/>
+<text x="426.00" y="203.47" font-size="18" font-weight="600" class="raw halo" text-anchor="middle">59.70</text>
+<polyline points="72.00,248.76 190.00,276.23 308.00,199.49 426.00,144.14" class="bello-line"/>
+<path d="M72.00 242.76 l6 6 l-6 6 l-6 -6 Z" class="bello-point"/>
+<text x="72.00" y="232.76" font-size="18" font-weight="600" class="bello halo" text-anchor="middle">46.32</text>
+<path d="M190.00 270.23 l6 6 l-6 6 l-6 -6 Z" class="bello-point"/>
+<text x="190.00" y="260.23" font-size="18" font-weight="600" class="bello halo" text-anchor="middle">41.24</text>
+<path d="M308.00 193.49 l6 6 l-6 6 l-6 -6 Z" class="bello-point"/>
+<text x="308.00" y="183.49" font-size="18" font-weight="600" class="bello halo" text-anchor="middle">55.44</text>
+<path d="M426.00 138.14 l6 6 l-6 6 l-6 -6 Z" class="bello-point"/>
+<text x="426.00" y="128.14" font-size="18" font-weight="600" class="bello halo" text-anchor="middle">65.68</text>
+<text x="72.00" y="408.00" font-size="20" font-weight="400" class="" text-anchor="middle">Luna</text>
+<text x="190.00" y="408.00" font-size="20" font-weight="400" class="" text-anchor="middle">Terra</text>
+<text x="308.00" y="408.00" font-size="20" font-weight="400" class="" text-anchor="middle">Sol</text>
+<text x="426.00" y="408.00" font-size="20" font-weight="400" class="" text-anchor="middle">Astra</text>
+</svg>

@@ -1,8 +1,8 @@
 <h1 align="center">Bello</h1>
 
 <p align="center">
-  <strong>Your coding agent. Your choice of models, checks, and budget.</strong><br>
-  Run a task with Codex, Claude Code, or API models. Add supervision, independent review, adversarial testing, or local log compression when you need them.
+  <strong>Run coding tasks with the models and checks you choose.</strong><br>
+  A coder plus four optional parts: a runtime supervisor, a completion reviewer, an adversary, and a local log distiller. Each has its own switch and its own model, so a run can be set up for quality, cost, or time.
 </p>
 
 <p align="center">
@@ -21,62 +21,68 @@
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Bello in 42 seconds](#bello-in-42-seconds)
-- [Build your own team](#build-your-own-team)
+- [How Bello runs a task](#how-bello-runs-a-task)
 - [Results](#results)
 - [Configuration](#configuration)
 - [License](#license)
 
 ## TL;DR
 
-Bello lets you choose a coding team, not just a coding model. Use Codex or
-Claude Code subscriptions, or models from supported API providers. Mix models
-across roles and subagents; the advisor can recommend a setup for your task.
+Bello runs a coding task through a coder and four optional parts: a runtime
+supervisor, a completion reviewer, an adversary, and a local log distiller.
+The coder, the supervisor, the reviewer, and the adversary each have their own
+model and reasoning effort, from a Codex or Claude Code subscription or from
+an API provider. Turn on the parts you need: a cheap coder with a strong
+reviewer, one expensive model everywhere, or runtime supervision alone.
 
-- **Runtime** follows the live run, checks risky actions, and intervenes when the coder drifts.
-- **Completion review** checks the implementation against the task and returns unfinished work.
-- **Adversary** tries to break the solution with edge cases and unexpected inputs.
-- **Log distiller** uses a locally fine-tuned ModernBERT to shorten tool output before the coder and its subagents read it.
-
-All four are independently optional. Spend more on review when quality matters,
-choose cheaper models when budget matters, or keep the pipeline light.
-In our [tests](#results), Budget used **66.3% less** of the weekly Codex limit
-than Raw GPT-5.6 Sol XHigh **without losing average completion quality**:
-its mean score was **1.45% higher**.
-Sol Ultra C+A improved the score by **26.4% relative**; distillation reduced
-estimated usage by **22.0% on Astra** and **14.8% on Luna**.
-These are different configurations and comparisons, not simultaneous guarantees.
+In our [tests](#results), the Efficient Budget configuration used 66.3% less
+of the weekly Codex limit than Raw GPT-5.6 Sol XHigh without lowering average
+quality, and its mean score was 1.45% higher. Sol Ultra C+A raised the mean
+score over Raw Codex by 26.4%. The log distiller cut estimated usage by 22% on
+Astra and by 14.8% on Luna.
 
 ## Install
 
-**Requirements:**
-
-- **Codex CLI** installed and authenticated. Bello drives `codex app-server`,
-  and your Codex account provides the models.
-- **Python 3.11+** and **git**.
-- macOS, Linux, or a supported native Windows installation.
-
-Verify your environment at any time with `bello doctor`.
-
-**Option A: Codex plugin** (recommended if you work inside Codex):
-
-```bash
-pipx install bello
-codex plugin marketplace add AlexeyKulaev/Bello-codex-marketplace --ref main
-codex plugin add bello@bello-marketplace
-```
-
-Then open Codex in your project folder and ask it to run Bello on your task
-file. The plugin checks for updates and launches the run for you.
-
-**Option B: standalone CLI**
+Bello needs Python 3.11 or newer, git, and macOS, Linux, or native 64-bit
+Windows 11 or Windows Server 2022/2025. Linux also needs the `bubblewrap`
+package for the sandbox, and native Windows needs a one-time sandbox
+preparation described in [docs/windows.md](./docs/windows.md).
 
 ```bash
 pipx install bello
 bello doctor
 ```
 
-Bello checks for updates at startup and offers to install them. Run
-`bello update` to update explicitly.
+Then set up the model sources you want to use. One is enough for a run, and
+they can be combined.
+
+- Codex subscription: install the Codex CLI and run `codex login`.
+- Claude Code subscription: `pipx install 'bello[claude]' --force`, then
+  `bello runtime login claude-code`. The extra bundles the official Claude
+  Agent SDK and its CLI; a separately installed `claude` is not used.
+- API providers (OpenAI, Anthropic, OpenRouter, and other Pi providers):
+  install Node.js 22.19 or newer, run `bello runtime install` once, then
+  `bello runtime login <provider>`, which asks for the provider's key or runs
+  its OAuth flow.
+- Log distiller: `pipx install 'bello[log-distiller]' --force`. The model
+  (about 599 MB) downloads on the first run with the distiller on. With
+  subscription Codex, the distiller also needs a patched Codex build, which
+  Bello prepares automatically on Apple Silicon. Linux needs a compatible
+  build, and native Windows is not supported yet. See
+  [docs/native-codex-selection.md](./docs/native-codex-selection.md).
+
+`bello doctor` reports which of these are ready. Bello checks for updates at
+startup and offers to install them, and `bello update` updates explicitly.
+
+If you work inside Codex, add the plugin as well. It includes the
+configuration advisor and launches runs for you:
+
+```bash
+codex plugin marketplace add AlexeyKulaev/Bello-codex-marketplace --ref main
+codex plugin add bello@bello-marketplace
+```
+
+The same plugin has a Claude Code manifest in [plugins/bello](./plugins/bello).
 
 ## Quick start
 
@@ -109,176 +115,193 @@ guidance, while completion review and adversarial testing remain independent.
 
 https://github.com/user-attachments/assets/f0324432-f616-45f6-beca-9bd8282f06ef
 
-## Build your own team
 
-The coder implements the task in a disposable workspace. Enabled reviewers send
-confirmed issues back for repair, within the review budget you choose.
-You can use one provider throughout or mix them:
+## How Bello runs a task
 
-| Role | One possible setup |
+The coder implements the task in a disposable workspace and runs its own
+checks. Bello then hands the final patch back to your project. Around the
+coder, four parts can be switched on or off independently.
+
+- **Runtime supervisor.** Follows the live run, judges risky commands before
+  they run, redirects the coder when it drifts from the task, and can restart
+  a failing run without losing the workspace. On by default.
+- **Completion reviewer.** Starts with a fresh context, compares the result and
+  its evidence with the task, and returns the work when something is missing
+  or unproven.
+- **Adversary.** Receives the finished result without the development history
+  and tries to break it with edge cases, invalid input, and feature
+  interactions. A separate check confirms its findings before they go back to
+  the coder.
+- **Log distiller.** A ModernBERT model we fine-tuned, running locally, that
+  shortens tool output before the coder and its subagents read it. Reviewers
+  get the undistilled output.
+
+Confirmed problems go back to the coder, and the number of review and
+adversary rounds is a setting. Roles can use different providers, including
+API providers such as OpenAI, Anthropic, and OpenRouter, and the coder, the
+reviewer, and the adversary can also delegate work to subagents with their own
+models. For example, when these models are available in your accounts:
+
+| Role | Model |
 | --- | --- |
 | Coder | GPT-5.6 Sol |
-| Coder's subagents | Claude Sonnet 5, a GLM model, and GPT-5.6 Luna |
+| Coder subagents, three in parallel | Claude Sonnet, GLM, GPT-5.6 Luna |
 | Runtime supervisor | GPT-5.6 Terra |
-| Completion reviewer | Claude Fable 5 |
+| Completion reviewer | Claude Fable |
 | Adversary | GPT-6 Astra |
-| Log distiller | Local ModernBERT, no paid model call |
+| Log distiller | ModernBERT on your machine |
 
-This is an example, not a preset: select models available through your connected
-accounts. Sonnet, GLM, and Luna can work as three concurrent subagents when their
-profiles are allowed and the concurrency limit is at least three. Each role has
-its own model and supported reasoning settings; completion and adversary can
-also have their own subagents.
-
-You can disable runtime without disabling review or distillation, or use an
-adversary without completion review. Runtime off also turns off cheap runtime
-triage. It means less protection: the filesystem sandbox remains, but the
-runtime model no longer assesses actions or steers the coder.
-
-The advisor reads your task and repository before suggesting a configuration.
-You decide the priorities and approve the setup. Every setting remains editable
-in `bello config`.
+You do not have to pick all of this by hand. The advisor in the Codex and
+Claude Code plugins reads the task and the repository and recommends one
+complete setup for the priority you name. Every setting is also in
+`bello config`.
 
 ## Results
 
-### Four models, with and without Bello
+Scores are ProgramBench completion scores unless a task has its own evaluator.
+Raw means a model run through Codex alone, without Bello.
 
-Two lines, four models, three ProgramBench tasks: Solar, Samtools, and rumdl.
-Each point is the unweighted mean of the three reported task scores.
-The 24 runs comprise 12 Raw and 12 Bello runs, not 24 pairs.
+### Four models, raw and with Bello
 
-![Mean ProgramBench score: Luna Raw 32.75%, Bello 46.32%; Terra 31.75%, 41.24%; Sol 48.98%, 55.44%; Astra 59.70%, 65.68%.](./docs/assets/readme-model-comparison.svg)
+Three ProgramBench tasks (Solar, Samtools, and Rumdl), four models, each run
+raw and through Bello: 24 runs in total. Sol ran at `xhigh` here.
 
-Across these reported results, the mean rises from **43.29% to 52.17%**
-(**+8.88 percentage points**). This comparison shows completion scores, not
-lower cost or faster execution; those depend on the configuration.
-[Browse the 24 solutions.](https://drive.google.com/drive/folders/1QkyIFUp4QwLSMtVYAOqbjSdmOIiaTnch)
+<picture>
+  <source media="(max-width: 600px)" srcset="./docs/assets/readme-model-comparison-mobile.svg">
+  <img src="./docs/assets/readme-model-comparison.svg" alt="Mean ProgramBench score per model: Luna raw 32.75%, Bello 46.32%; Terra 31.75%, 41.24%; Sol 48.98%, 55.44%; Astra 59.70%, 65.68%" width="100%">
+</picture>
 
-### Log distiller: send less tool output to the coder
+Bello scored higher with every model. The gap is 13.6 points on Luna, 9.5 on
+Terra, 6.5 on Sol, and 6.0 on Astra.
+[Solutions for all 24 runs.](https://drive.google.com/drive/folders/1QkyIFUp4QwLSMtVYAOqbjSdmOIiaTnch)
 
-The distiller is a fine-tuned **ModernBERT-base with a small token-selection
-head**, about **149 million parameters**. It selects original text rather than
-writing a summary. Inference stays on your machine; logs are not sent to Hugging
-Face or another paid model. Recognized task instructions, documentation reads,
-and command help bypass compression.
+### Efficient Budget: less usage at the same quality
 
-These JSON Schema runs compare the same coder model with and without
-distillation. Astra has runtime off in both arms; Luna's Bello arm also includes
-runtime supervision.
+Efficient Budget uses GPT-5.6 Luna at `xhigh` for the coder, the completion
+reviewer, and the adversary, and Luna at `high` for runtime supervision with
+cheap triage on. It allows one completion return before one adversary pass.
+The baseline is Raw GPT-5.6 Sol XHigh, a stronger model than Luna.
 
-![Estimated usage reduction: Astra XHigh 22.02%; Luna Max 14.78% including runtime, or 25.28% after subtracting recorded runtime cost.](./docs/assets/readme-distiller.svg)
+Across four tasks with three runs per task and system, Budget used 5.27% of a
+weekly Codex limit against 15.63% for Raw, which is 66.3% less. Its mean score
+was 48.80% against 48.10%, 1.45% higher. Runs took longer: 1:49:44 on average
+against 28:27.
 
-| Coder | Runs per arm | Score, off → on | Mean solution time, off → on |
-| --- | ---: | ---: | ---: |
-| Astra XHigh | 3 | 62.22% → 60.57% | 33:04 → 42:10 |
-| Luna Max | 6 | 56.75% → 55.45% | 1:41:53 → 1:22:38 |
+| Task | Raw score | Budget score | Change | Raw weekly limit | Budget weekly limit | Raw time | Budget time |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Revive | 40.990% | 45.530% | +11.08% | 3.2757% | 1.0555% | 24:52 | 1:23:22 |
+| JSONSchema | 56.821% | 54.673% | -3.78% | 3.0069% | 0.8138% | 23:34 | 1:20:43 |
+| LightningCSS | 60.750% | 60.302% | -0.74% | 6.0281% | 2.2569% | 40:39 | 2:58:52 |
+| Miller | 33.839% | 34.684% | +2.50% | 3.3190% | 1.1428% | 24:44 | 1:36:00 |
+| All 12 + 12 | 48.100% | 48.797% | +1.45% | 15.6297% | 5.2690% | 28:27 | 1:49:44 |
 
-**Luna's 14.8% includes runtime.** Subtracting the recorded runtime component
-gives **25.3% lower coder cost**. That is accounting for these same runs, not a
-separate runtime-off experiment. Astra used less while taking longer; Luna used
-less and finished sooner. Both had a small score decrease.
+*Scores and times are means over three runs; weekly limit is the sum.*
 
-[Download the model](https://huggingface.co/Makson179/bello-log-distiller)
-· [Solutions and SHA-256 checksums](https://drive.google.com/drive/folders/1jDUSJ-PyRpWfDSHKDp6UEX5ZMoN0NmG5)
+<picture>
+  <source media="(max-width: 600px)" srcset="./docs/assets/programbench-efficient-budget-quality-cost-mobile.svg">
+  <img src="./docs/assets/programbench-efficient-budget-quality-cost.svg" alt="Efficient Budget quality and weekly limit use compared with Raw GPT-5.6 Sol XHigh" width="100%">
+</picture>
 
-<details>
-<summary>Evaluation notes</summary>
+[Solutions and checksums.](https://drive.google.com/drive/folders/1W1Lm0U7gcb5rTa3DyXQH_6n6XbFXwB9c?usp=share_link)
+[Per-run rows.](https://github.com/Makson179/Bello/blob/v0.5.2/README.md#efficient-budget)
 
-Usage reductions are estimates calculated from recorded input, cached-input,
-and output tokens at API-equivalent rates; they are not direct readings of a
-subscription's weekly counter. Local inference and server rental are excluded.
-Times cover the solver, not the external verifier.
+### Sol Ultra C+A: higher quality for more time
 
-Astra uses the same native Codex app-server harness in both arms, with runtime,
-completion review, adversary, and Fast off. The displayed comparison uses
-control runs 2/3/4 and distiller runs 1/2/3. Two distiller scores come from
-separate verification of preserved candidates after handoff failures. Hosts and
-concurrency differed, so the time comparison is not an isolated latency test.
+With GPT-5.6 Sol at `ultra`, one completion review and one adversary pass
+raised the mean completion score on Solar, Samtools, and Rumdl from 53.53% to
+67.67%, which is 26.41% higher than Raw Codex. Total time across the three
+tasks rose from 2:48:55 to 7:08:06.
 
-Luna pools two batches of three runs per arm; all six are included.
-One solution needed a verifier-only executable-symlink repair, without rerunning
-the coder. Scores use all 2,932 test IDs, with unrun tests counting as zero.
-These are observations on one task, not guaranteed savings on every project.
+| Task | Raw completion | C+A completion | Change | Raw time | C+A time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Solar | 53.13% | 59.00% | +11.05% | 00:32:33 | 02:17:45 |
+| Samtools | 51.86% | 63.00% | +21.48% | 00:36:17 | 02:14:40 |
+| Rumdl | 55.60% | 81.00% | +45.68% | 01:40:05 | 02:35:41 |
+| Mean / total time | 53.53% | 67.67% | +26.41% | 02:48:55 | 07:08:06 |
 
-</details>
+<picture>
+  <source media="(max-width: 600px)" srcset="./docs/assets/programbench-ca-performance-mobile.svg">
+  <img src="./docs/assets/programbench-ca-performance.svg" alt="C+A completion and runtime compared with Raw Codex" width="100%">
+</picture>
 
-### Efficient Budget: a cheaper team
+[Run-level scores and times.](./programbench_ca_run_info.csv)
+[Solutions.](https://drive.google.com/drive/folders/1oWR5v3fziEZj1PkQ8xDyq5JBRCUPf5gV)
 
-The Budget setup uses Luna XHigh for coding, completion review, and adversarial
-testing, with Luna High / Medium for runtime and triage. Its baseline is
-**Raw Sol XHigh**, not Raw Luna.
+### Runtime-only: supervision alone
 
-| Across four tasks, 12 runs per arm | Raw Sol XHigh | Bello Budget |
-| --- | ---: | ---: |
-| Mean score | 48.100% | **48.797%** |
-| Weekly Codex limit used, all runs | 15.6297% | **5.2690%** |
-| Mean solution time | **28:27** | 1:49:44 |
+With only the runtime supervisor on, Bello scored higher on three custom tasks
+built from long specifications with contradictions and late corrections, in
+about the same time as Raw Codex. Each task has its own evaluator on a 0 to
+100 scale. On the shorter ProgramBench tasks (Solar, Samtools, and Rumdl) the
+average gain was about 2%.
 
-That is **66.3% less usage**, with a **1.45% relative score increase**, at the
-expense of longer runs. Tasks: Revive, JSON Schema, Lightning CSS, and Miller.
+| Task | Raw score | Runtime-only score | Change | Raw time | Runtime-only time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Marl | 32.91% | 37.91% | +15.19% | 00:58:49 | 00:46:09 |
+| Slab | 81.08% | 85.69% | +5.69% | 00:57:26 | 01:04:11 |
+| Pinch | 89.25% | 98.00% | +9.80% | 00:40:09 | 00:43:34 |
 
-[Solutions and checksums](https://drive.google.com/drive/folders/1W1Lm0U7gcb5rTa3DyXQH_6n6XbFXwB9c?usp=share_link)
-· [Per-run results](https://github.com/Makson179/Bello/blob/32450a17456f3e4df804d5a45068d5cf1e4168ba/README.md#efficient-budget)
+<picture>
+  <source media="(max-width: 600px)" srcset="./docs/assets/runtime-only-custom-task-results-mobile.svg">
+  <img src="./docs/assets/runtime-only-custom-task-results.svg" alt="Runtime-only results on large tasks with contradictory specifications" width="100%">
+</picture>
 
-### Sol Ultra C+A: spend more on checking
+[Task briefs, tests, and evaluator outputs.](https://drive.google.com/drive/folders/1eLut349Wu_uxw59H6u87cuWNRqYb3x7x)
 
-With Sol Ultra, one completion-review stage and an adversarial pass raised the
-mean score across Solar, Samtools, and rumdl from **53.53% to 67.67%**:
-**+14.14 percentage points**, or **+26.41% relative**.
-Total solution time across the three tasks rose from **2:48:55 to 7:08:06**.
+### Log distiller: less tool output for the coder
 
-[Run-level scores and times](./programbench_ca_run_info.csv)
-· [Solutions](https://drive.google.com/drive/folders/1oWR5v3fziEZj1PkQ8xDyq5JBRCUPf5gV)
+The distiller is a ModernBERT-base encoder with a small token-selection head,
+about 149 million parameters. It keeps the original text that matches what the
+coder says it is looking for instead of writing a summary. It runs on your CPU,
+so logs stay on your machine and no paid model call is added. The task file,
+reads of instruction files such as README or AGENTS.md, and command help pass
+through unchanged.
 
-### Runtime-only: supervision without scheduled reviews
+We measured it on the JSON Schema task with the same coder model, with and
+without distillation. Usage is estimated from recorded input, cached input, and
+output tokens at API rates.
 
-On three custom tasks with large, contradictory specifications, runtime-only
-improved the score in each case. These tasks use their own scoring criteria.
+<picture>
+  <source media="(max-width: 600px)" srcset="./docs/assets/readme-distiller-mobile.svg">
+  <img src="./docs/assets/readme-distiller.svg" alt="Cost versus quality: each model's Raw cost is normalized to 100. Astra XHigh changes from cost 100 and score 62.22% to cost 77.98 and score 60.57%. Luna Max changes from cost 100 and score 56.75% to cost 85.22 and score 55.45%, including runtime." width="100%">
+</picture>
 
-| Task | Raw score → runtime-only | Raw time → runtime-only |
-| --- | ---: | ---: |
-| Marl | 32.91% → **37.91%** | 58:49 → 46:09 |
-| Slab | 81.08% → **85.69%** | 57:26 → 1:04:11 |
-| Pinch | 89.25% → **98.00%** | 40:09 → 43:34 |
+| Coder | Runs per arm | Usage | Score, off to on | Mean solution time, off to on |
+| --- | ---: | ---: | ---: | ---: |
+| Astra XHigh, runtime off | 3 | -22.0% | 62.22% to 60.57% | 33:04 to 42:10 |
+| Luna Max, runtime on | 6 | -14.8% | 56.75% to 55.45% | 1:41:53 to 1:22:38 |
 
-[Task specifications and evidence](https://drive.google.com/drive/folders/1eLut349Wu_uxw59H6u87cuWNRqYb3x7x)
+Luna's 14.8% includes the runtime supervisor's usage in the Bello arm. After
+subtracting the recorded runtime cost, the coder alone used 25.3% less. Scores were 1.3 to 1.7 points lower with the
+distiller on.
 
-Older, deeper review schedules are kept in the
-[4C+A+2C experiment archive](https://github.com/Makson179/Bello/blob/32450a17456f3e4df804d5a45068d5cf1e4168ba/README.md#3-4ca2c-maximum-effort).
+[Model on Hugging Face.](https://huggingface.co/Makson179/bello-log-distiller)
+[Solutions and checksums.](https://drive.google.com/drive/folders/1jDUSJ-PyRpWfDSHKDp6UEX5ZMoN0NmG5)
+
+Results for the older 4C+A+2C schedule (four completion reviews before the
+adversary and two after) are archived in the
+[0.5.2 README](https://github.com/Makson179/Bello/blob/v0.5.2/README.md#3-4ca2c-maximum-effort).
 
 ## Configuration
 
 ```bash
-bello config
-bello runtime models
-bello --task TASK.md
+bello config                      # interactive editor, saves .supervisor/config.json
+bello runtime models              # models and reasoning efforts your accounts can use
+bello --task TASK.md --adversary  # run flags override the saved settings for one run
 ```
 
-The editor saves settings in `.supervisor/config.json`. Choose models and
-reasoning levels, permitted subagents and concurrency, review budgets, and the
-four independent switches. CLI flags override the saved settings for one run.
+The editor covers the model and reasoning effort of each role, subagent pools
+and concurrency, review budgets, and the four switches. `bello --help` lists
+the run flags.
 
-For Claude Code or local distillation, install the optional dependencies:
-
-```bash
-pipx install 'Bello[claude,log-distiller]' --force
-```
-
-When enabled, the distiller downloads its pinned model once, then reuses the
-local cache. With it off, Bello neither downloads nor loads the model.
-Subscription Codex additionally needs the compatible native helper: automatic
-setup is available on Apple Silicon; Linux needs a compatible build, and native
-Windows distillation is not currently supported.
-
-- [Providers, sign-in, independent switches, and local distillation](./docs/runtime.md)
-- [Native Codex distiller setup and platform support](./docs/native-codex-selection.md)
+- [Providers, sign-in, switches, and the distiller](./docs/runtime.md)
+- [Native Codex distiller setup](./docs/native-codex-selection.md)
 - [Windows sandbox](./docs/windows.md)
-- `bello --help` for command-line options; `bello doctor` to check your installation.
 
 ## License
 
-Bello is released under the MIT License. See [LICENSE](./LICENSE).
-The optional distiller model is distributed under Apache 2.0.
+Bello is released under the MIT License. See [LICENSE](./LICENSE). The
+distiller model is distributed separately under Apache 2.0.
 
 Contributions require signing the project [CLA](./CLA.md). A bot will prompt
 you on your first pull request, and you only sign once.
