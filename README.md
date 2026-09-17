@@ -212,7 +212,7 @@ These are observations on one task, not guaranteed savings on every project.
 
 <picture>
   <source media="(max-width: 600px)" srcset="./docs/assets/programbench-efficient-budget-quality-cost-mobile.svg">
-  <img src="./docs/assets/programbench-efficient-budget-quality-cost.svg" alt="Budget versus Raw Sol XHigh: 66.3% less weekly-limit usage with average quality preserved, mean score 48.100% to 48.797%. Per-task scores and usage for Revive, JSON Schema, Lightning CSS, and Miller; mean time 28:27 to 1:49:44." width="100%">
+  <img src="./docs/assets/programbench-efficient-budget-quality-cost.svg" alt="Budget versus Raw Sol XHigh: per-task mean scores and weekly-limit usage for Revive, JSON Schema, Lightning CSS, and Miller." width="100%">
 </picture>
 
 The Budget setup uses Luna XHigh for coding, completion review, and adversarial
@@ -250,7 +250,7 @@ Total solution time across the three tasks rose from **2:48:55 to 7:08:06**.
 
 <picture>
   <source media="(max-width: 600px)" srcset="./docs/assets/runtime-only-custom-task-results-mobile.svg">
-  <img src="./docs/assets/runtime-only-custom-task-results.svg" alt="Runtime-only versus Raw: Marl 32.91% to 37.91%; Slab 81.08% to 85.69%; Pinch 89.25% to 98.00%. Each task uses its own scoring criteria; solution times are shown separately." width="100%">
+  <img src="./docs/assets/runtime-only-custom-task-results.svg" alt="Runtime-only versus Raw scores: Marl 32.91% to 37.91%; Slab 81.08% to 85.69%; Pinch 89.25% to 98.00%. Each task uses its own scoring criteria." width="100%">
 </picture>
 
 On three custom tasks with large, contradictory specifications, runtime-only

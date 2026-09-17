@@ -1,12 +1,12 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="480" height="771" viewBox="0 0 480 771" role="img" aria-labelledby="readme-distiller-mobile-title readme-distiller-mobile-desc">
-<title id="readme-distiller-mobile-title">Log distiller: estimated usage reduction on JSON Schema</title>
-<desc id="readme-distiller-mobile-desc">Astra XHigh: 3 runs per arm, 22.02% estimated usage reduction, score 62.22 to 60.57%, solution time 33:04 to 42:10; runtime off in both arms. Luna Max: 6 runs per arm, 14.78% estimated usage reduction including runtime, score 56.75 to 55.45%, time 1:41:53 to 1:22:38. Subtracting recorded runtime cost gives 25.28% lower coder cost. This is accounting, not a separate runtime-off run. Usage is API-equivalent, not a measured weekly counter.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="401" viewBox="0 0 480 401" role="img" aria-labelledby="readme-distiller-mobile-title readme-distiller-mobile-desc">
+<title id="readme-distiller-mobile-title">Log distiller: estimated usage reduction</title>
+<desc id="readme-distiller-mobile-desc">JSON Schema. Astra XHigh, 3 runs per arm, runtime off: 22.02% lower estimated usage. Luna Max, 6 runs per arm, runtime included: 14.78% lower estimated usage. Subtracting recorded runtime cost gives 25.28%, an accounting estimate, not an additional run. Usage uses API-equivalent token rates. Score and time tradeoffs are in the README.</desc>
 <style>
-svg { --bg:#fff; --ink:#1e2934; --muted:#596672; --grid:#e2e7ec;
-  --raw:#4b709b; --bello:#c4472c; --soft:#f4f6f8; --connector:#c3cbd3; }
+svg { --bg:#fff; --ink:#26323e; --muted:#64707c; --grid:#e4e9ee;
+  --raw:#557ca6; --bello:#c84b32; }
 @media (prefers-color-scheme:dark) {
   svg { --bg:#0d1117; --ink:#edf2f7; --muted:#a6b2bf; --grid:#2b3542;
-    --raw:#94b8e4; --bello:#ff997e; --soft:#171f29; --connector:#526275; }
+    --raw:#8dadd2; --bello:#ef987e; }
 }
 .paper { fill:var(--bg); }
 text { font-family:Arial,Helvetica,sans-serif; fill:var(--ink);
@@ -14,48 +14,28 @@ text { font-family:Arial,Helvetica,sans-serif; fill:var(--ink);
 .muted { fill:var(--muted); }
 .raw { fill:var(--raw); }
 .bello { fill:var(--bello); }
-.overline { fill:var(--muted); font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
-  letter-spacing:1.6px; }
-.halo { paint-order:stroke; stroke:var(--bg); stroke-width:6; stroke-linejoin:round; }
+.halo { paint-order:stroke; stroke:var(--bg); stroke-width:5; stroke-linejoin:round; }
 .grid { stroke:var(--grid); stroke-width:1; }
-.connector { stroke:var(--connector); stroke-width:3; }
-.raw-line { stroke:var(--raw); fill:none; stroke-width:3; stroke-dasharray:8 5; }
-.bello-line { stroke:var(--bello); fill:none; stroke-width:4; }
-.raw-point { fill:var(--bg); stroke:var(--raw); stroke-width:2.8; }
-.bello-point { fill:var(--bello); stroke:var(--bg); stroke-width:1.5; }
-.raw-bar { fill:var(--raw); fill-opacity:.16; stroke:var(--raw); stroke-width:1.5; }
+.raw-line { stroke:var(--raw); fill:none; stroke-width:2.5; stroke-dasharray:7 5; }
+.bello-line { stroke:var(--bello); fill:none; stroke-width:3; }
+.raw-point { fill:var(--bg); stroke:var(--raw); stroke-width:2; }
+.bello-point { fill:var(--bello); }
+.raw-bar { fill:var(--raw); fill-opacity:.22; stroke:var(--raw); stroke-width:1.3; }
 .bello-bar { fill:var(--bello); }
 </style>
-<rect class="paper" width="480" height="771"/>
-<text x="24.00" y="31.00" font-size="13" font-weight="400" class="overline" text-anchor="start">02 / BELLO BENCHMARKS</text>
-<text x="24.00" y="72.00" font-size="29" font-weight="700" class="" text-anchor="start">Shorter logs.</text>
-<text x="24.00" y="106.00" font-size="29" font-weight="700" class="" text-anchor="start">Lower usage.</text>
-<text x="24.00" y="137.00" font-size="16" font-weight="400" class="muted" text-anchor="start">JSON Schema · estimated usage reduction</text>
-<circle cx="30.00" cy="173.00" r="5" class="raw-point"/>
-<text x="45.00" y="178.00" font-size="18" font-weight="600" class="raw" text-anchor="start">Raw = 100</text>
-<path d="M220.00 167.00 l6 6 l-6 6 l-6 -6 Z" class="bello-point"/>
-<text x="235.00" y="178.00" font-size="18" font-weight="600" class="bello" text-anchor="start">With distiller</text>
-<text x="24.00" y="226.00" font-size="26" font-weight="700" class="" text-anchor="start">Astra XHigh</text>
-<text x="24.00" y="252.00" font-size="15" font-weight="400" class="muted" text-anchor="start">3 runs / arm · runtime off</text>
-<text x="456.00" y="229.00" font-size="33" font-weight="700" class="bello" text-anchor="end">−22.02%</text>
-<rect x="24.00" y="287.00" width="428.00" height="14.00" class="raw-bar" />
-<rect x="24.00" y="317.00" width="333.74" height="20.00" class="bello-bar" />
-<line x1="357.74" y1="327.00" x2="452.00" y2="327.00" class="connector" stroke-dasharray="3 5"/>
-<line x1="452.00" y1="284.00" x2="452.00" y2="344.00" class="grid" />
-<text x="24.00" y="371.00" font-size="18" font-weight="600" class="" text-anchor="start">Score  62.22 → 60.57%</text>
-<text x="24.00" y="397.00" font-size="17" font-weight="400" class="muted" text-anchor="start">Time  33:04 → 42:10</text>
-<line x1="24.00" y1="431.00" x2="456.00" y2="431.00" class="grid" />
-<text x="24.00" y="463.00" font-size="26" font-weight="700" class="" text-anchor="start">Luna Max</text>
-<text x="24.00" y="489.00" font-size="15" font-weight="400" class="muted" text-anchor="start">6 runs / arm · runtime included</text>
-<text x="456.00" y="466.00" font-size="33" font-weight="700" class="bello" text-anchor="end">−14.78%</text>
-<rect x="24.00" y="524.00" width="428.00" height="14.00" class="raw-bar" />
-<rect x="24.00" y="554.00" width="364.76" height="20.00" class="bello-bar" />
-<line x1="388.76" y1="564.00" x2="452.00" y2="564.00" class="connector" stroke-dasharray="3 5"/>
-<line x1="452.00" y1="521.00" x2="452.00" y2="581.00" class="grid" />
-<text x="24.00" y="608.00" font-size="18" font-weight="600" class="" text-anchor="start">Score  56.75 → 55.45%</text>
-<text x="24.00" y="634.00" font-size="17" font-weight="400" class="muted" text-anchor="start">Time  1:41:53 → 1:22:38</text>
-<line x1="24.00" y1="677.00" x2="456.00" y2="677.00" class="grid" />
-<text x="24.00" y="707.00" font-size="29" font-weight="700" class="bello" text-anchor="start">25.28%</text>
-<text x="161.00" y="705.00" font-size="17" font-weight="600" class="" text-anchor="start">Luna: subtract runtime cost</text>
-<text x="24.00" y="737.00" font-size="15" font-weight="400" class="muted" text-anchor="start">Accounting subtraction, not an extra runtime-off run.</text>
+<rect class="paper" width="480" height="401"/>
+<text x="24.00" y="32.00" font-size="19" font-weight="400" class="" text-anchor="start">Estimated usage reduction (%)</text>
+<line x1="49.00" y1="305.00" x2="455.00" y2="305.00" class="grid"/>
+<text x="39.00" y="310.00" font-size="14" font-weight="400" class="muted" text-anchor="end">0</text>
+<line x1="49.00" y1="193.50" x2="455.00" y2="193.50" class="grid"/>
+<text x="39.00" y="198.50" font-size="14" font-weight="400" class="muted" text-anchor="end">15</text>
+<line x1="49.00" y1="82.00" x2="455.00" y2="82.00" class="grid"/>
+<text x="39.00" y="87.00" font-size="14" font-weight="400" class="muted" text-anchor="end">30</text>
+<rect x="116.00" y="141.29" width="66.00" height="163.71" class="bello-bar"/>
+<text x="149.00" y="128.29" font-size="22" font-weight="600" class="bello" text-anchor="middle">22.02%</text>
+<text x="149.00" y="339.00" font-size="19" font-weight="400" class="" text-anchor="middle">Astra XHigh</text>
+<rect x="321.00" y="195.17" width="66.00" height="109.83" class="bello-bar"/>
+<text x="354.00" y="182.17" font-size="22" font-weight="600" class="bello" text-anchor="middle">14.78%</text>
+<text x="354.00" y="339.00" font-size="19" font-weight="400" class="" text-anchor="middle">Luna Max</text>
+<text x="354.00" y="364.00" font-size="15" font-weight="400" class="muted" text-anchor="middle">runtime included</text>
 </svg>

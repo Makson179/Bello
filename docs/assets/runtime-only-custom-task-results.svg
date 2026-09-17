@@ -1,12 +1,12 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="640" viewBox="0 0 1080 640" role="img" aria-labelledby="runtime-only-custom-task-results-title runtime-only-custom-task-results-desc">
-<title id="runtime-only-custom-task-results-title">Runtime-only: score improved on all three custom tasks</title>
-<desc id="runtime-only-custom-task-results-desc">Marl: 32.91 to 37.91%, solution time 58:49 to 46:09; Slab: 81.08 to 85.69%, solution time 57:26 to 1:04:11; Pinch: 89.25 to 98.00%, solution time 40:09 to 43:34. Each task has its own scoring criteria; there is no pooled score.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="448" viewBox="0 0 1080 448" role="img" aria-labelledby="runtime-only-custom-task-results-title runtime-only-custom-task-results-desc">
+<title id="runtime-only-custom-task-results-title">Raw versus runtime-only</title>
+<desc id="runtime-only-custom-task-results-desc">Marl: Raw 32.91%, runtime-only 37.91%; Slab: Raw 81.08%, runtime-only 85.69%; Pinch: Raw 89.25%, runtime-only 98.00%. Each task has its own scoring criteria.</desc>
 <style>
-svg { --bg:#fff; --ink:#1e2934; --muted:#596672; --grid:#e2e7ec;
-  --raw:#4b709b; --bello:#c4472c; --soft:#f4f6f8; --connector:#c3cbd3; }
+svg { --bg:#fff; --ink:#26323e; --muted:#64707c; --grid:#e4e9ee;
+  --raw:#557ca6; --bello:#c84b32; }
 @media (prefers-color-scheme:dark) {
   svg { --bg:#0d1117; --ink:#edf2f7; --muted:#a6b2bf; --grid:#2b3542;
-    --raw:#94b8e4; --bello:#ff997e; --soft:#171f29; --connector:#526275; }
+    --raw:#8dadd2; --bello:#ef987e; }
 }
 .paper { fill:var(--bg); }
 text { font-family:Arial,Helvetica,sans-serif; fill:var(--ink);
@@ -14,61 +14,40 @@ text { font-family:Arial,Helvetica,sans-serif; fill:var(--ink);
 .muted { fill:var(--muted); }
 .raw { fill:var(--raw); }
 .bello { fill:var(--bello); }
-.overline { fill:var(--muted); font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
-  letter-spacing:1.6px; }
-.halo { paint-order:stroke; stroke:var(--bg); stroke-width:6; stroke-linejoin:round; }
+.halo { paint-order:stroke; stroke:var(--bg); stroke-width:5; stroke-linejoin:round; }
 .grid { stroke:var(--grid); stroke-width:1; }
-.connector { stroke:var(--connector); stroke-width:3; }
-.raw-line { stroke:var(--raw); fill:none; stroke-width:3; stroke-dasharray:8 5; }
-.bello-line { stroke:var(--bello); fill:none; stroke-width:4; }
-.raw-point { fill:var(--bg); stroke:var(--raw); stroke-width:2.8; }
-.bello-point { fill:var(--bello); stroke:var(--bg); stroke-width:1.5; }
-.raw-bar { fill:var(--raw); fill-opacity:.16; stroke:var(--raw); stroke-width:1.5; }
+.raw-line { stroke:var(--raw); fill:none; stroke-width:2.5; stroke-dasharray:7 5; }
+.bello-line { stroke:var(--bello); fill:none; stroke-width:3; }
+.raw-point { fill:var(--bg); stroke:var(--raw); stroke-width:2; }
+.bello-point { fill:var(--bello); }
+.raw-bar { fill:var(--raw); fill-opacity:.22; stroke:var(--raw); stroke-width:1.3; }
 .bello-bar { fill:var(--bello); }
 </style>
-<rect class="paper" width="1080" height="640"/>
-<text x="40.00" y="31.00" font-size="15" font-weight="400" class="overline" text-anchor="start">05 / BELLO BENCHMARKS</text>
-<text x="40.00" y="72.00" font-size="35" font-weight="700" class="" text-anchor="start">Supervision, without scheduled review.</text>
-<text x="40.00" y="103.00" font-size="19" font-weight="400" class="muted" text-anchor="start">Runtime-only · three custom tasks</text>
-<circle cx="46.00" cy="142.00" r="5" class="raw-point"/>
-<text x="61.00" y="147.00" font-size="18" font-weight="600" class="raw" text-anchor="start">Raw</text>
-<path d="M201.00 136.00 l6 6 l-6 6 l-6 -6 Z" class="bello-point"/>
-<text x="216.00" y="147.00" font-size="18" font-weight="600" class="bello" text-anchor="start">Runtime on</text>
-<text x="40.00" y="189.00" font-size="17" font-weight="400" class="muted" text-anchor="start">Score (%) ↑</text>
-<line x1="86.00" y1="473.00" x2="1023.00" y2="473.00" class="grid" />
-<text x="69.00" y="478.00" font-size="16" font-weight="400" class="muted" text-anchor="end">0</text>
-<line x1="86.00" y1="411.00" x2="1023.00" y2="411.00" class="grid" />
-<text x="69.00" y="416.00" font-size="16" font-weight="400" class="muted" text-anchor="end">25</text>
-<line x1="86.00" y1="349.00" x2="1023.00" y2="349.00" class="grid" />
-<text x="69.00" y="354.00" font-size="16" font-weight="400" class="muted" text-anchor="end">50</text>
-<line x1="86.00" y1="287.00" x2="1023.00" y2="287.00" class="grid" />
-<text x="69.00" y="292.00" font-size="16" font-weight="400" class="muted" text-anchor="end">75</text>
-<line x1="86.00" y1="225.00" x2="1023.00" y2="225.00" class="grid" />
-<text x="69.00" y="230.00" font-size="16" font-weight="400" class="muted" text-anchor="end">100</text>
-<text x="251.00" y="194.00" font-size="27" font-weight="700" class="" text-anchor="middle">Marl</text>
-<line x1="164.00" y1="391.38" x2="338.00" y2="378.98" class="bello-line" />
-<circle cx="164.00" cy="391.38" r="7" class="raw-point"/>
-<path d="M338.00 370.98 l8 8 l-8 8 l-8 -8 Z" class="bello-point"/>
-<text x="164.00" y="421.38" font-size="22" font-weight="700" class="raw halo" text-anchor="middle">32.91</text>
-<text x="338.00" y="362.98" font-size="22" font-weight="700" class="bello halo" text-anchor="middle">37.91</text>
-<text x="251.00" y="521.00" font-size="28" font-weight="700" class="bello" text-anchor="middle">+5.00 pp</text>
-<text x="251.00" y="552.00" font-size="19" font-weight="400" class="muted" text-anchor="middle">58:49 → 46:09</text>
-<text x="571.00" y="194.00" font-size="27" font-weight="700" class="" text-anchor="middle">Slab</text>
-<line x1="484.00" y1="271.92" x2="658.00" y2="260.49" class="bello-line" />
-<circle cx="484.00" cy="271.92" r="7" class="raw-point"/>
-<path d="M658.00 252.49 l8 8 l-8 8 l-8 -8 Z" class="bello-point"/>
-<text x="484.00" y="301.92" font-size="22" font-weight="700" class="raw halo" text-anchor="middle">81.08</text>
-<text x="658.00" y="244.49" font-size="22" font-weight="700" class="bello halo" text-anchor="middle">85.69</text>
-<text x="571.00" y="521.00" font-size="28" font-weight="700" class="bello" text-anchor="middle">+4.61 pp</text>
-<text x="571.00" y="552.00" font-size="19" font-weight="400" class="muted" text-anchor="middle">57:26 → 1:04:11</text>
-<text x="891.00" y="194.00" font-size="27" font-weight="700" class="" text-anchor="middle">Pinch</text>
-<line x1="804.00" y1="251.66" x2="978.00" y2="229.96" class="bello-line" />
-<circle cx="804.00" cy="251.66" r="7" class="raw-point"/>
-<path d="M978.00 221.96 l8 8 l-8 8 l-8 -8 Z" class="bello-point"/>
-<text x="804.00" y="281.66" font-size="22" font-weight="700" class="raw halo" text-anchor="middle">89.25</text>
-<text x="978.00" y="213.96" font-size="22" font-weight="700" class="bello halo" text-anchor="middle">98.00</text>
-<text x="891.00" y="521.00" font-size="28" font-weight="700" class="bello" text-anchor="middle">+8.75 pp</text>
-<text x="891.00" y="552.00" font-size="19" font-weight="400" class="muted" text-anchor="middle">40:09 → 43:34</text>
-<line x1="40.00" y1="590.00" x2="1040.00" y2="590.00" class="grid" />
-<text x="40.00" y="621.00" font-size="18" font-weight="400" class="muted" text-anchor="start">Task-specific scores; no pooled average. Times below each panel are solution times.</text>
+<rect class="paper" width="1080" height="448"/>
+<rect x="650.00" y="16.00" width="16.00" height="13.00" class="raw-bar"/>
+<text x="680.00" y="30.00" font-size="19" font-weight="400" class="raw" text-anchor="start">Raw</text>
+<rect x="850.00" y="16.00" width="16.00" height="13.00" class="bello-bar"/>
+<text x="880.00" y="30.00" font-size="19" font-weight="400" class="bello" text-anchor="start">Runtime on</text>
+<text x="76.00" y="80.00" font-size="21" font-weight="400" class="" text-anchor="start">Score (%)</text>
+<line x1="76.00" y1="390.00" x2="1016.00" y2="390.00" class="grid"/>
+<text x="66.00" y="395.00" font-size="16" font-weight="400" class="muted" text-anchor="end">0</text>
+<line x1="76.00" y1="256.00" x2="1016.00" y2="256.00" class="grid"/>
+<text x="66.00" y="261.00" font-size="16" font-weight="400" class="muted" text-anchor="end">50</text>
+<line x1="76.00" y1="122.00" x2="1016.00" y2="122.00" class="grid"/>
+<text x="66.00" y="127.00" font-size="16" font-weight="400" class="muted" text-anchor="end">100</text>
+<rect x="180.67" y="301.80" width="38.00" height="88.20" class="raw-bar"/>
+<text x="199.67" y="291.80" font-size="21" font-weight="500" class="raw" text-anchor="middle">32.91</text>
+<rect x="246.67" y="288.40" width="38.00" height="101.60" class="bello-bar"/>
+<text x="265.67" y="278.40" font-size="21" font-weight="500" class="bello" text-anchor="middle">37.91</text>
+<text x="232.67" y="421.00" font-size="18" font-weight="400" class="" text-anchor="middle">Marl</text>
+<rect x="494.00" y="172.71" width="38.00" height="217.29" class="raw-bar"/>
+<text x="513.00" y="162.71" font-size="21" font-weight="500" class="raw" text-anchor="middle">81.08</text>
+<rect x="560.00" y="160.35" width="38.00" height="229.65" class="bello-bar"/>
+<text x="579.00" y="150.35" font-size="21" font-weight="500" class="bello" text-anchor="middle">85.69</text>
+<text x="546.00" y="421.00" font-size="18" font-weight="400" class="" text-anchor="middle">Slab</text>
+<rect x="807.33" y="150.81" width="38.00" height="239.19" class="raw-bar"/>
+<text x="826.33" y="140.81" font-size="21" font-weight="500" class="raw" text-anchor="middle">89.25</text>
+<rect x="873.33" y="127.36" width="38.00" height="262.64" class="bello-bar"/>
+<text x="892.33" y="117.36" font-size="21" font-weight="500" class="bello" text-anchor="middle">98.00</text>
+<text x="859.33" y="421.00" font-size="18" font-weight="400" class="" text-anchor="middle">Pinch</text>
 </svg>

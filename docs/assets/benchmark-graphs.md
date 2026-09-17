@@ -11,7 +11,7 @@
 
 <picture>
   <source media="(max-width: 600px)" srcset="./readme-distiller-mobile.svg">
-  <img src="./readme-distiller.svg" alt="Distiller: estimated usage reductions of 22.02% on Astra and 14.78% on Luna including runtime; score and time comparisons included." width="100%">
+  <img src="./readme-distiller.svg" alt="Distiller: estimated usage reductions of 22.02% on Astra and 14.78% on Luna including runtime." width="100%">
 </picture>
 
 ## Budget C+A
@@ -53,7 +53,7 @@ python3 scripts/plot_readme_graphs.py
 | Figure | Data | What the comparison means |
 | --- | --- | --- |
 | `readme-model-comparison` | Reported 24-run table: Luna, Terra, Sol, Astra × Solar, Samtools, rumdl × Raw/Bello | Each point is the unweighted mean of three task scores. 12 Raw + 12 Bello runs, not 24 pairs or three seeds for every task. |
-| `readme-distiller` | JSON Schema Astra XHigh 3+3 and Luna Max 6+6 summaries | Estimated usage at API-equivalent token rates. Luna includes runtime; subtracting runtime cost is an accounting comparison, not another experiment. Scores and times accompany the savings. |
+| `readme-distiller` | JSON Schema Astra XHigh 3+3 and Luna Max 6+6 summaries | Estimated usage at API-equivalent token rates. Luna includes runtime; subtracting runtime cost is an accounting comparison, not another experiment. Scores, times, and that calculation remain in the README. |
 | `programbench-efficient-budget-quality-cost` | Published four-task Budget comparison, 12+12 runs | Luna-based Budget C+A versus Raw Sol XHigh. Scores are means; usage is summed across three runs per task. Headline usage is summed across all twelve runs per arm. |
 | `programbench-ca-performance` | [`programbench_ca_run_info.csv`](../../programbench_ca_run_info.csv) | Sol Ultra Raw versus one completion review + adversary. Not the older 4C+A+2C schedule. Score and solution time stay separate. |
 | `runtime-only-custom-task-results` | Published Marl / Slab / Pinch custom-task table | Task-specific scores, not a pooled ProgramBench score. |
@@ -66,17 +66,20 @@ The first link refers to the preview branch's source summary; its exact revision
 is also recorded in the history of this graphics branch.
 
 Published rounded aggregates are retained; do not recompute them from rounded
-per-run rows. `pp` means percentage points; `% relative` means relative change.
+per-run rows. Visible value labels use two decimal places; source precision is
+retained in the generator and SVG descriptions. `pp` means percentage points;
+`% relative` means relative change.
 No error bars, fitted curves, or confidence bands are inferred from these data.
 All bar lengths start at zero. The overview is a categorical line comparison
-with an explicitly labeled 25–72% score range, not a continuous model-size curve.
+whose score axis spans 25–72%, not a continuous model-size curve.
 
 ## Visual direction
 
-The design uses open plotting areas, direct numeric labels, and consistent
-series identities: blue hollow circles for Raw, vermilion diamonds for Bello.
-Different markers and dashed/solid lines preserve the distinction without
-depending only on colour. Narrow layouts stack multi-metric panels.
+Only metric labels, legends, axes, categories, and values appear in the figures.
+The model overview uses two polylines; the other comparisons use vertical
+columns. Raw columns are outlined blue and Bello columns are solid vermilion.
+The overview also distinguishes its series with hollow/solid markers and
+dashed/solid lines. Narrow layouts stack the two-panel comparisons.
 
 References examined for presentation, not for benchmark data:
 
