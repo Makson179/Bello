@@ -39,7 +39,9 @@ across roles and subagents; the advisor can recommend a setup for your task.
 
 All four are independently optional. Spend more on review when quality matters,
 choose cheaper models when budget matters, or keep the pipeline light.
-In our [tests](#results), Budget used **66.3% less** of the weekly limit;
+In our [tests](#results), Budget used **66.3% less** of the weekly Codex limit
+than Raw GPT-5.6 Sol XHigh **without losing average completion quality**:
+its mean score was **1.45% higher**.
 Sol Ultra C+A improved the score by **26.4% relative**; distillation reduced
 estimated usage by **22.0% on Astra** and **14.8% on Luna**.
 These are different configurations and comparisons, not simultaneous guarantees.
