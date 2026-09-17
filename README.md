@@ -43,39 +43,33 @@ Astra and by 14.8% on Luna.
 
 ## Install
 
-Bello needs Python 3.11 or newer, git, and macOS, Linux, or native 64-bit
-Windows 11 or Windows Server 2022/2025. Linux also needs the `bubblewrap`
-package for the sandbox, and native Windows needs a one-time sandbox
-preparation described in [docs/windows.md](./docs/windows.md).
+Python 3.11 or newer, git, and macOS, Linux with the `bubblewrap` package, or
+native 64-bit Windows 11 or Server 2022/2025 with the one-time sandbox
+preparation from [docs/windows.md](./docs/windows.md).
 
 ```bash
 pipx install bello
 bello doctor
 ```
 
-Then set up the model sources you want to use. One is enough for a run, and
-they can be combined.
+Then add the model sources you want, any one is enough:
 
 - Codex subscription: install the Codex CLI and run `codex login`.
 - Claude Code subscription: `pipx install 'bello[claude]' --force`, then
-  `bello runtime login claude-code`. The extra bundles the official Claude
-  Agent SDK and its CLI; a separately installed `claude` is not used.
+  `bello runtime login claude-code`. The extra bundles the official Agent SDK
+  and its CLI.
 - API providers (OpenAI, Anthropic, OpenRouter, and other Pi providers):
-  install Node.js 22.19 or newer, run `bello runtime install` once, then
-  `bello runtime login <provider>`, which asks for the provider's key or runs
-  its OAuth flow.
+  Node.js 22.19 or newer, `bello runtime install` once, then
+  `bello runtime login <provider>`.
 - Log distiller: `pipx install 'bello[log-distiller]' --force`. The model
-  (about 599 MB) downloads on the first run with the distiller on. With
-  subscription Codex, the distiller also needs a patched Codex build, which
-  Bello prepares automatically on Apple Silicon. Linux needs a compatible
-  build, and native Windows is not supported yet. See
+  (599 MB) downloads on the first run with the distiller on. With subscription
+  Codex it also needs a patched Codex build (automatic on Apple Silicon,
+  manual on Linux, not available on Windows), see
   [docs/native-codex-selection.md](./docs/native-codex-selection.md).
 
-`bello doctor` reports which of these are ready. Bello checks for updates at
-startup and offers to install them, and `bello update` updates explicitly.
-
-If you work inside Codex, add the plugin as well. It includes the
-configuration advisor and launches runs for you:
+`bello doctor` shows what is ready, and `bello update` updates Bello. To run
+Bello from inside your coding agent, add the plugin, which includes the
+configuration advisor. For Codex:
 
 ```bash
 codex plugin marketplace add AlexeyKulaev/Bello-codex-marketplace --ref main
@@ -86,26 +80,26 @@ The same plugin has a Claude Code manifest in [plugins/bello](./plugins/bello).
 
 ## Quick start
 
-After installing the plugin, open Codex in the project that contains `task.md`.
-The full start can be a short conversation:
+After installing the plugin, open your coding agent in the project that
+contains `task.md`. The full start can be a short conversation:
 
 > **You:** Do you see the Bello plugin?
 >
-> **Codex:** Yes. I can inspect the task, recommend a configuration, and run it
+> **Agent:** Yes. I can inspect the task, recommend a configuration, and run it
 > with Bello.
 >
 > **You:** Please recommend the best balance of price and quality for
 > completing `task.md`.
 >
-> **Codex:** I recommend Configuration X for `task.md`. It offers the best
+> **Agent:** I recommend Configuration X for `task.md`. It offers the best
 > balance of price, quality, and time for this task.
 >
 > **You:** Thanks. Please run `task.md` with Configuration X and keep me
 > updated on what is happening.
 
-Codex shows the resolved configuration before launch. Bello then runs the task
-and writes `.supervisor/FINAL_REPORT.md` with the result, changed files, checks,
-and remaining risks.
+The agent shows the resolved configuration before launch. Bello then runs the
+task and writes `.supervisor/FINAL_REPORT.md` with the result, changed files,
+checks, and remaining risks.
 
 You can also ask a stronger model to prepare an advisory `PLAN.md`, then have a
 less expensive Bello configuration execute it. The coder receives the plan as
