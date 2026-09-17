@@ -1,77 +1,79 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="480" viewBox="0 0 1000 480" role="img" aria-labelledby="title description">
-  <title id="title">Mean ProgramBench score across four models: Bello and Raw</title>
-  <desc id="description">Higher scores are better. Each point is the mean reported ProgramBench score over three tasks. Luna: Bello 46.32%, Raw 32.75%. Terra: Bello 41.24%, Raw 31.75%. Sol: Bello 55.44%, Raw 48.98%. Astra: Bello 65.68%, Raw 59.70%. There are 24 runs: three tasks, four models, and two systems. The vertical score scale runs from 20% to 70%. The horizontal axis is categorical; straight line segments connect model categories and do not represent cost or time.</desc>
-  <defs>
-    <linearGradient id="advantage" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#0b9689" stop-opacity=".13"/>
-      <stop offset="1" stop-color="#0b9689" stop-opacity=".025"/>
-    </linearGradient>
-    <style>
-      text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
-      .ink { fill: #172c38; }
-      .muted { fill: #637785; }
-      .number { font-variant-numeric: tabular-nums; font-weight: 650; }
-      .point-label { font-size: 24px; paint-order: stroke; stroke: #fff; stroke-width: 6px; stroke-linejoin: round; }
-      .grid { stroke: #e6edf0; stroke-width: 1; }
-    </style>
-  </defs>
-  <rect x=".5" y=".5" width="999" height="479" rx="20" fill="#fff" stroke="#dce6ea"/>
-  <rect x="36" y="31" width="5" height="26" rx="2.5" fill="#078b80"/>
-  <text x="54" y="53" class="ink" font-size="29" font-weight="700" letter-spacing="-.7">ProgramBench, across models</text>
-  <text x="54" y="81" class="muted" font-size="18">Mean reported score (%) · 24 runs</text>
-  <g font-size="18" font-weight="650">
-    <line x1="728" y1="47" x2="764" y2="47" stroke="#078b80" stroke-width="4" stroke-linecap="round"/>
-    <circle cx="746" cy="47" r="5.5" fill="#078b80" stroke="#fff" stroke-width="2"/>
-    <text x="774" y="53" fill="#087e74">Bello</text>
-    <line x1="861" y1="47" x2="897" y2="47" stroke="#6b8198" stroke-width="3" stroke-linecap="round"/>
-    <circle cx="879" cy="47" r="5.5" fill="#fff" stroke="#6b8198" stroke-width="2.5"/>
-    <text x="907" y="53" fill="#526b83">Raw</text>
-  </g>
-  <g class="grid">
-    <path d="M99 125H936 M99 175H936 M99 225H936 M99 275H936 M99 325H936 M99 375H936"/>
-  </g>
-  <g class="muted number" text-anchor="end" font-size="16">
-    <text x="83" y="131">70</text>
-    <text x="83" y="181">60</text>
-    <text x="83" y="231">50</text>
-    <text x="83" y="281">40</text>
-    <text x="83" y="331">30</text>
-    <text x="83" y="381">20</text>
-  </g>
-  <path d="M150 243.3833L390 268.8L630 197.8L870 146.5833L870 176.5L630 230.1167L390 316.2667L150 311.2333Z" fill="url(#advantage)"/>
-  <polyline points="150,311.2333 390,316.2667 630,230.1167 870,176.5" fill="none" stroke="#6b8198" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
-  <polyline points="150,243.3833 390,268.8 630,197.8 870,146.5833" fill="none" stroke="#078b80" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
-  <g fill="#fff" stroke="#6b8198" stroke-width="3">
-    <circle cx="150" cy="311.2333" r="7"/>
-    <circle cx="390" cy="316.2667" r="7"/>
-    <circle cx="630" cy="230.1167" r="7"/>
-    <circle cx="870" cy="176.5" r="7"/>
-  </g>
-  <g fill="#078b80" stroke="#fff" stroke-width="3">
-    <circle cx="150" cy="243.3833" r="8"/>
-    <circle cx="390" cy="268.8" r="8"/>
-    <circle cx="630" cy="197.8" r="8"/>
-    <circle cx="870" cy="146.5833" r="8"/>
-  </g>
-  <g class="number point-label" text-anchor="middle" fill="#087e74">
-    <text x="150" y="221">46.32</text>
-    <text x="390" y="247">41.24</text>
-    <text x="630" y="176">55.44</text>
-    <text x="870" y="125">65.68</text>
-  </g>
-  <g class="number point-label" text-anchor="middle" fill="#526b83">
-    <text x="150" y="345">32.75</text>
-    <text x="390" y="350">31.75</text>
-    <text x="630" y="264">48.98</text>
-    <text x="870" y="210">59.70</text>
-  </g>
-  <g class="ink" text-anchor="middle" font-size="25" font-weight="650" letter-spacing="-.4">
-    <text x="150" y="412">Luna</text>
-    <text x="390" y="412">Terra</text>
-    <text x="630" y="412">Sol</text>
-    <text x="870" y="412">Astra</text>
-  </g>
-  <path d="M36 434H964" stroke="#e6edf0"/>
-  <text x="40" y="461" class="muted" font-size="17">3 tasks × 4 models × 2 systems</text>
-  <text x="958" y="461" class="muted" font-size="17" text-anchor="end">Higher is better</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="650" viewBox="0 0 1080 650" role="img" aria-labelledby="readme-model-comparison-title readme-model-comparison-desc">
+<title id="readme-model-comparison-title">Four models, with and without Bello</title>
+<desc id="readme-model-comparison-desc">Luna: Raw 32.75%, Bello 46.32%; Terra: Raw 31.75%, Bello 41.24%; Sol: Raw 48.98%, Bello 55.44%; Astra: Raw 59.70%, Bello 65.68%. Each point is the mean reported score on Solar, Samtools and rumdl. 24 runs total: 12 Raw and 12 Bello. Score axis spans 25–72%.</desc>
+<style>
+svg { --bg:#fff; --ink:#1e2934; --muted:#596672; --grid:#e2e7ec;
+  --raw:#4b709b; --bello:#c4472c; --soft:#f4f6f8; --connector:#c3cbd3; }
+@media (prefers-color-scheme:dark) {
+  svg { --bg:#0d1117; --ink:#edf2f7; --muted:#a6b2bf; --grid:#2b3542;
+    --raw:#94b8e4; --bello:#ff997e; --soft:#171f29; --connector:#526275; }
+}
+.paper { fill:var(--bg); }
+text { font-family:Arial,Helvetica,sans-serif; fill:var(--ink);
+  font-variant-numeric:tabular-nums; }
+.muted { fill:var(--muted); }
+.raw { fill:var(--raw); }
+.bello { fill:var(--bello); }
+.overline { fill:var(--muted); font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
+  letter-spacing:1.6px; }
+.halo { paint-order:stroke; stroke:var(--bg); stroke-width:6; stroke-linejoin:round; }
+.grid { stroke:var(--grid); stroke-width:1; }
+.connector { stroke:var(--connector); stroke-width:3; }
+.raw-line { stroke:var(--raw); fill:none; stroke-width:3; stroke-dasharray:8 5; }
+.bello-line { stroke:var(--bello); fill:none; stroke-width:4; }
+.raw-point { fill:var(--bg); stroke:var(--raw); stroke-width:2.8; }
+.bello-point { fill:var(--bello); stroke:var(--bg); stroke-width:1.5; }
+.raw-bar { fill:var(--raw); fill-opacity:.16; stroke:var(--raw); stroke-width:1.5; }
+.bello-bar { fill:var(--bello); }
+</style>
+<rect class="paper" width="1080" height="650"/>
+<text x="40.00" y="31.00" font-size="15" font-weight="400" class="overline" text-anchor="start">01 / BELLO BENCHMARKS</text>
+<text x="40.00" y="72.00" font-size="35" font-weight="700" class="" text-anchor="start">Four models. Two trajectories.</text>
+<text x="40.00" y="103.00" font-size="19" font-weight="400" class="muted" text-anchor="start">Mean ProgramBench score · higher is better</text>
+<circle cx="766.00" cy="95.00" r="5" class="raw-point"/>
+<text x="781.00" y="100.00" font-size="18" font-weight="600" class="raw" text-anchor="start">Raw</text>
+<path d="M891.00 89.00 l6 6 l-6 6 l-6 -6 Z" class="bello-point"/>
+<text x="906.00" y="100.00" font-size="18" font-weight="600" class="bello" text-anchor="start">Bello</text>
+<line x1="80.00" y1="431.81" x2="1000.00" y2="431.81" class="grid" />
+<text x="70.00" y="436.81" font-size="17" font-weight="400" class="muted" text-anchor="end">30</text>
+<line x1="80.00" y1="365.43" x2="1000.00" y2="365.43" class="grid" />
+<text x="70.00" y="370.43" font-size="17" font-weight="400" class="muted" text-anchor="end">40</text>
+<line x1="80.00" y1="299.04" x2="1000.00" y2="299.04" class="grid" />
+<text x="70.00" y="304.04" font-size="17" font-weight="400" class="muted" text-anchor="end">50</text>
+<line x1="80.00" y1="232.66" x2="1000.00" y2="232.66" class="grid" />
+<text x="70.00" y="237.66" font-size="17" font-weight="400" class="muted" text-anchor="end">60</text>
+<line x1="80.00" y1="166.28" x2="1000.00" y2="166.28" class="grid" />
+<text x="70.00" y="171.28" font-size="17" font-weight="400" class="muted" text-anchor="end">70</text>
+<polyline points="115.00,413.53 355.00,420.21 595.00,305.84 835.00,234.65" class="raw-line"/>
+<circle cx="115.00" cy="413.53" r="7" class="raw-point"/>
+<text x="115.00" y="441.53" font-size="26" font-weight="700" class="raw halo" text-anchor="middle">32.75</text>
+<circle cx="355.00" cy="420.21" r="7" class="raw-point"/>
+<text x="355.00" y="448.21" font-size="26" font-weight="700" class="raw halo" text-anchor="middle">31.75</text>
+<circle cx="595.00" cy="305.84" r="7" class="raw-point"/>
+<text x="595.00" y="333.84" font-size="26" font-weight="700" class="raw halo" text-anchor="middle">48.98</text>
+<circle cx="835.00" cy="234.65" r="7" class="raw-point"/>
+<text x="835.00" y="262.65" font-size="26" font-weight="700" class="raw halo" text-anchor="middle">59.70</text>
+<polyline points="115.00,323.45 355.00,357.19 595.00,262.93 835.00,194.93" class="bello-line"/>
+<path d="M115.00 315.45 l8 8 l-8 8 l-8 -8 Z" class="bello-point"/>
+<text x="115.00" y="305.45" font-size="26" font-weight="700" class="bello halo" text-anchor="middle">46.32</text>
+<path d="M355.00 349.19 l8 8 l-8 8 l-8 -8 Z" class="bello-point"/>
+<text x="355.00" y="339.19" font-size="26" font-weight="700" class="bello halo" text-anchor="middle">41.24</text>
+<path d="M595.00 254.93 l8 8 l-8 8 l-8 -8 Z" class="bello-point"/>
+<text x="595.00" y="244.93" font-size="26" font-weight="700" class="bello halo" text-anchor="middle">55.44</text>
+<path d="M835.00 186.93 l8 8 l-8 8 l-8 -8 Z" class="bello-point"/>
+<text x="835.00" y="176.93" font-size="26" font-weight="700" class="bello halo" text-anchor="middle">65.68</text>
+<text x="887.00" y="201.93" font-size="26" font-weight="700" class="bello" text-anchor="start">Bello</text>
+<text x="887.00" y="241.65" font-size="26" font-weight="700" class="raw" text-anchor="start">Raw</text>
+<text x="115.00" y="514.00" font-size="26" font-weight="700" class="" text-anchor="middle">Luna</text>
+<text x="115.00" y="541.00" font-size="19" font-weight="600" class="bello" text-anchor="middle">+13.57 pp</text>
+<text x="355.00" y="514.00" font-size="26" font-weight="700" class="" text-anchor="middle">Terra</text>
+<text x="355.00" y="541.00" font-size="19" font-weight="600" class="bello" text-anchor="middle">+9.49 pp</text>
+<text x="595.00" y="514.00" font-size="26" font-weight="700" class="" text-anchor="middle">Sol</text>
+<text x="595.00" y="541.00" font-size="19" font-weight="600" class="bello" text-anchor="middle">+6.46 pp</text>
+<text x="835.00" y="514.00" font-size="26" font-weight="700" class="" text-anchor="middle">Astra</text>
+<text x="835.00" y="541.00" font-size="19" font-weight="600" class="bello" text-anchor="middle">+5.98 pp</text>
+<line x1="40.00" y1="575.00" x2="1040.00" y2="575.00" class="grid" />
+<text x="40.00" y="615.00" font-size="31" font-weight="700" class="" text-anchor="start">43.29 → 52.17%</text>
+<text x="1040.00" y="615.00" font-size="35" font-weight="700" class="bello" text-anchor="end">+8.88 pp</text>
+<text x="40.00" y="641.00" font-size="17" font-weight="400" class="muted" text-anchor="start">24 runs · 3 tasks · mean across all four models</text>
 </svg>

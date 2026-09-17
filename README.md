@@ -147,7 +147,10 @@ Two lines, four models, three ProgramBench tasks: Solar, Samtools, and rumdl.
 Each point is the unweighted mean of the three reported task scores.
 The 24 runs comprise 12 Raw and 12 Bello runs, not 24 pairs.
 
-![Mean ProgramBench score: Luna Raw 32.75%, Bello 46.32%; Terra 31.75%, 41.24%; Sol 48.98%, 55.44%; Astra 59.70%, 65.68%.](./docs/assets/readme-model-comparison.svg)
+<picture>
+  <source media="(max-width: 600px)" srcset="./docs/assets/readme-model-comparison-mobile.svg">
+  <img src="./docs/assets/readme-model-comparison.svg" alt="Mean ProgramBench score: Luna Raw 32.75%, Bello 46.32%; Terra 31.75%, 41.24%; Sol 48.98%, 55.44%; Astra 59.70%, 65.68%." width="100%">
+</picture>
 
 Across these reported results, the mean rises from **43.29% to 52.17%**
 (**+8.88 percentage points**). This comparison shows completion scores, not
@@ -166,7 +169,10 @@ These JSON Schema runs compare the same coder model with and without
 distillation. Astra has runtime off in both arms; Luna's Bello arm also includes
 runtime supervision.
 
-![Estimated usage reduction: Astra XHigh 22.02%; Luna Max 14.78% including runtime, or 25.28% after subtracting recorded runtime cost.](./docs/assets/readme-distiller.svg)
+<picture>
+  <source media="(max-width: 600px)" srcset="./docs/assets/readme-distiller-mobile.svg">
+  <img src="./docs/assets/readme-distiller.svg" alt="Estimated usage reduction: Astra XHigh 22.02%; Luna Max 14.78% including runtime, or 25.28% after subtracting recorded runtime cost. Scores: Astra 62.22% to 60.57%; Luna 56.75% to 55.45%." width="100%">
+</picture>
 
 | Coder | Runs per arm | Score, off → on | Mean solution time, off → on |
 | --- | ---: | ---: | ---: |
@@ -204,6 +210,11 @@ These are observations on one task, not guaranteed savings on every project.
 
 ### Efficient Budget: a cheaper team
 
+<picture>
+  <source media="(max-width: 600px)" srcset="./docs/assets/programbench-efficient-budget-quality-cost-mobile.svg">
+  <img src="./docs/assets/programbench-efficient-budget-quality-cost.svg" alt="Budget versus Raw Sol XHigh: 66.3% less weekly-limit usage with average quality preserved, mean score 48.100% to 48.797%. Per-task scores and usage for Revive, JSON Schema, Lightning CSS, and Miller; mean time 28:27 to 1:49:44." width="100%">
+</picture>
+
 The Budget setup uses Luna XHigh for coding, completion review, and adversarial
 testing, with Luna High / Medium for runtime and triage. Its baseline is
 **Raw Sol XHigh**, not Raw Luna.
@@ -222,6 +233,11 @@ expense of longer runs. Tasks: Revive, JSON Schema, Lightning CSS, and Miller.
 
 ### Sol Ultra C+A: spend more on checking
 
+<picture>
+  <source media="(max-width: 600px)" srcset="./docs/assets/programbench-ca-performance-mobile.svg">
+  <img src="./docs/assets/programbench-ca-performance.svg" alt="Sol Ultra C+A versus Raw Sol: mean score 53.53% to 67.67%, a 26.41% relative increase. Per-task scores and times for Solar, Samtools, and rumdl; total solution time 2:48:55 to 7:08:06." width="100%">
+</picture>
+
 With Sol Ultra, one completion-review stage and an adversarial pass raised the
 mean score across Solar, Samtools, and rumdl from **53.53% to 67.67%**:
 **+14.14 percentage points**, or **+26.41% relative**.
@@ -231,6 +247,11 @@ Total solution time across the three tasks rose from **2:48:55 to 7:08:06**.
 · [Solutions](https://drive.google.com/drive/folders/1oWR5v3fziEZj1PkQ8xDyq5JBRCUPf5gV)
 
 ### Runtime-only: supervision without scheduled reviews
+
+<picture>
+  <source media="(max-width: 600px)" srcset="./docs/assets/runtime-only-custom-task-results-mobile.svg">
+  <img src="./docs/assets/runtime-only-custom-task-results.svg" alt="Runtime-only versus Raw: Marl 32.91% to 37.91%; Slab 81.08% to 85.69%; Pinch 89.25% to 98.00%. Each task uses its own scoring criteria; solution times are shown separately." width="100%">
+</picture>
 
 On three custom tasks with large, contradictory specifications, runtime-only
 improved the score in each case. These tasks use their own scoring criteria.

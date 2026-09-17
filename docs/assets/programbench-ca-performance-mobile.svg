@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="926" viewBox="0 0 480 926" role="img" aria-labelledby="programbench-ca-performance-mobile-title programbench-ca-performance-mobile-desc">
+<title id="programbench-ca-performance-mobile-title">Sol Ultra C+A: better scores, longer runs</title>
+<desc id="programbench-ca-performance-mobile-desc">Solar: score 53.13 to 59.00%; time 00:32:33 to 02:17:45; Samtools: score 51.86 to 63.00%; time 00:36:17 to 02:14:40; Rumdl: score 55.60 to 81.00%; time 01:40:05 to 02:35:41. Mean score 53.53 to 67.67%, +26.41% relative. Total solution time 2:48:55 to 7:08:06.</desc>
+<style>
+svg { --bg:#fff; --ink:#1e2934; --muted:#596672; --grid:#e2e7ec;
+  --raw:#4b709b; --bello:#c4472c; --soft:#f4f6f8; --connector:#c3cbd3; }
+@media (prefers-color-scheme:dark) {
+  svg { --bg:#0d1117; --ink:#edf2f7; --muted:#a6b2bf; --grid:#2b3542;
+    --raw:#94b8e4; --bello:#ff997e; --soft:#171f29; --connector:#526275; }
+}
+.paper { fill:var(--bg); }
+text { font-family:Arial,Helvetica,sans-serif; fill:var(--ink);
+  font-variant-numeric:tabular-nums; }
+.muted { fill:var(--muted); }
+.raw { fill:var(--raw); }
+.bello { fill:var(--bello); }
+.overline { fill:var(--muted); font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
+  letter-spacing:1.6px; }
+.halo { paint-order:stroke; stroke:var(--bg); stroke-width:6; stroke-linejoin:round; }
+.grid { stroke:var(--grid); stroke-width:1; }
+.connector { stroke:var(--connector); stroke-width:3; }
+.raw-line { stroke:var(--raw); fill:none; stroke-width:3; stroke-dasharray:8 5; }
+.bello-line { stroke:var(--bello); fill:none; stroke-width:4; }
+.raw-point { fill:var(--bg); stroke:var(--raw); stroke-width:2.8; }
+.bello-point { fill:var(--bello); stroke:var(--bg); stroke-width:1.5; }
+.raw-bar { fill:var(--raw); fill-opacity:.16; stroke:var(--raw); stroke-width:1.5; }
+.bello-bar { fill:var(--bello); }
+</style>
+<rect class="paper" width="480" height="926"/>
+<text x="24.00" y="31.00" font-size="13" font-weight="400" class="overline" text-anchor="start">04 / BELLO BENCHMARKS</text>
+<text x="24.00" y="72.00" font-size="29" font-weight="700" class="" text-anchor="start">What review adds.</text>
+<text x="24.00" y="103.00" font-size="16" font-weight="400" class="muted" text-anchor="start">Sol Ultra · completion review + adversary</text>
+<text x="24.00" y="126.00" font-size="16" font-weight="400" class="muted" text-anchor="start">Solar, Samtools and rumdl</text>
+<text x="24.00" y="186.00" font-size="40" font-weight="700" class="bello" text-anchor="start">+26.41%</text>
+<text x="24.00" y="214.00" font-size="18" font-weight="400" class="muted" text-anchor="start">relative mean score</text>
+<text x="285.00" y="186.00" font-size="26" font-weight="700" class="bello" text-anchor="start">+14.14 pp</text>
+<text x="285.00" y="214.00" font-size="17" font-weight="400" class="muted" text-anchor="start">53.53 → 67.67%</text>
+<circle cx="30.00" cy="249.00" r="5" class="raw-point"/>
+<text x="45.00" y="254.00" font-size="18" font-weight="600" class="raw" text-anchor="start">Raw Sol</text>
+<path d="M205.00 243.00 l6 6 l-6 6 l-6 -6 Z" class="bello-point"/>
+<text x="220.00" y="254.00" font-size="18" font-weight="600" class="bello" text-anchor="start">Bello C+A</text>
+<text x="24.00" y="306.00" font-size="20" font-weight="700" class="" text-anchor="start">Completion score (%) ↑</text>
+<line x1="137.00" y1="347.00" x2="137.00" y2="551.00" class="grid" />
+<text x="137.00" y="335.00" font-size="14" font-weight="400" class="muted" text-anchor="middle">0</text>
+<line x1="209.00" y1="347.00" x2="209.00" y2="551.00" class="grid" />
+<text x="209.00" y="335.00" font-size="14" font-weight="400" class="muted" text-anchor="middle">25</text>
+<line x1="281.00" y1="347.00" x2="281.00" y2="551.00" class="grid" />
+<text x="281.00" y="335.00" font-size="14" font-weight="400" class="muted" text-anchor="middle">50</text>
+<line x1="353.00" y1="347.00" x2="353.00" y2="551.00" class="grid" />
+<text x="353.00" y="335.00" font-size="14" font-weight="400" class="muted" text-anchor="middle">75</text>
+<line x1="425.00" y1="347.00" x2="425.00" y2="551.00" class="grid" />
+<text x="425.00" y="335.00" font-size="14" font-weight="400" class="muted" text-anchor="middle">100</text>
+<text x="24.00" y="382.00" font-size="17" font-weight="600" class="" text-anchor="start">Solar</text>
+<line x1="290.01" y1="377.00" x2="306.92" y2="377.00" class="connector" />
+<circle cx="290.01" cy="377.00" r="6" class="raw-point"/>
+<path d="M306.92 370.00 l7 7 l-7 7 l-7 -7 Z" class="bello-point"/>
+<text x="290.01" y="362.00" font-size="17" font-weight="600" class="raw halo" text-anchor="middle">53.13</text>
+<text x="306.92" y="406.00" font-size="17" font-weight="700" class="bello halo" text-anchor="middle">59.00</text>
+<text x="24.00" y="454.00" font-size="17" font-weight="600" class="" text-anchor="start">Samtools</text>
+<line x1="286.36" y1="449.00" x2="318.44" y2="449.00" class="connector" />
+<circle cx="286.36" cy="449.00" r="6" class="raw-point"/>
+<path d="M318.44 442.00 l7 7 l-7 7 l-7 -7 Z" class="bello-point"/>
+<text x="286.36" y="434.00" font-size="17" font-weight="600" class="raw halo" text-anchor="middle">51.86</text>
+<text x="318.44" y="478.00" font-size="17" font-weight="700" class="bello halo" text-anchor="middle">63.00</text>
+<text x="24.00" y="526.00" font-size="17" font-weight="600" class="" text-anchor="start">Rumdl</text>
+<line x1="297.13" y1="521.00" x2="370.28" y2="521.00" class="connector" />
+<circle cx="297.13" cy="521.00" r="6" class="raw-point"/>
+<path d="M370.28 514.00 l7 7 l-7 7 l-7 -7 Z" class="bello-point"/>
+<text x="297.13" y="506.00" font-size="17" font-weight="600" class="raw halo" text-anchor="middle">55.60</text>
+<text x="370.28" y="550.00" font-size="17" font-weight="700" class="bello halo" text-anchor="middle">81.00</text>
+<text x="24.00" y="603.00" font-size="20" font-weight="700" class="" text-anchor="start">Solution time (hours) ↓</text>
+<line x1="137.00" y1="646.00" x2="137.00" y2="844.00" class="grid" />
+<text x="137.00" y="634.00" font-size="14" font-weight="400" class="muted" text-anchor="middle">0</text>
+<line x1="221.33" y1="646.00" x2="221.33" y2="844.00" class="grid" />
+<text x="221.33" y="634.00" font-size="14" font-weight="400" class="muted" text-anchor="middle">1</text>
+<line x1="305.67" y1="646.00" x2="305.67" y2="844.00" class="grid" />
+<text x="305.67" y="634.00" font-size="14" font-weight="400" class="muted" text-anchor="middle">2</text>
+<line x1="390.00" y1="646.00" x2="390.00" y2="844.00" class="grid" />
+<text x="390.00" y="634.00" font-size="14" font-weight="400" class="muted" text-anchor="middle">3</text>
+<text x="24.00" y="684.00" font-size="17" font-weight="600" class="" text-anchor="start">Solar</text>
+<rect x="137.00" y="655.00" width="45.75" height="13.00" class="raw-bar" />
+<text x="191.75" y="668.00" font-size="16" font-weight="600" class="raw" text-anchor="start">0.54h</text>
+<rect x="137.00" y="682.00" width="193.62" height="13.00" class="bello-bar" />
+<text x="339.62" y="695.00" font-size="16" font-weight="600" class="bello" text-anchor="start">2.30h</text>
+<text x="24.00" y="756.00" font-size="17" font-weight="600" class="" text-anchor="start">Samtools</text>
+<rect x="137.00" y="727.00" width="51.00" height="13.00" class="raw-bar" />
+<text x="197.00" y="740.00" font-size="16" font-weight="600" class="raw" text-anchor="start">0.60h</text>
+<rect x="137.00" y="754.00" width="189.28" height="13.00" class="bello-bar" />
+<text x="335.28" y="767.00" font-size="16" font-weight="600" class="bello" text-anchor="start">2.24h</text>
+<text x="24.00" y="828.00" font-size="17" font-weight="600" class="" text-anchor="start">Rumdl</text>
+<rect x="137.00" y="799.00" width="140.67" height="13.00" class="raw-bar" />
+<text x="286.67" y="812.00" font-size="16" font-weight="600" class="raw" text-anchor="start">1.67h</text>
+<rect x="137.00" y="826.00" width="218.82" height="13.00" class="bello-bar" />
+<text x="364.82" y="839.00" font-size="16" font-weight="600" class="bello" text-anchor="start">2.59h</text>
+<line x1="24.00" y1="864.00" x2="456.00" y2="864.00" class="grid" />
+<text x="24.00" y="890.00" font-size="16" font-weight="400" class="muted" text-anchor="start">Total solution time across the three tasks:</text>
+<text x="24.00" y="916.00" font-size="22" font-weight="700" class="" text-anchor="start">2:48:55 → 7:08:06</text>
+</svg>

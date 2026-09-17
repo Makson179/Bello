@@ -1,74 +1,95 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560" role="img" aria-labelledby="ca-title ca-desc">
-<title id="ca-title">C+A performance on ProgramBench</title>
-<desc id="ca-desc">Two grouped-bar panels compare Raw Codex and C+A completion scores and runtimes on Solar, Samtools, and Rumdl.</desc>
-<rect width="1200" height="560" fill="#FFFFFF"/>
-<text x="48.0" y="38.0" font-family="Georgia, 'Times New Roman', serif" font-size="22" font-weight="bold" font-style="normal" text-anchor="start" fill="#1B1B1B">C+A performance on ProgramBench</text>
-<text x="48.0" y="62.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="normal" font-style="normal" text-anchor="start" fill="#5B5B5B">GPT-5.6 Sol · ultra · matched task-level results</text>
-<rect x="846.0" y="35.0" width="25.0" height="17.0" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.5"/>
-<text x="882.0" y="49.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="normal" font-style="normal" text-anchor="start" fill="#1B1B1B">Raw Codex</text>
-<rect x="1000.0" y="35.0" width="25.0" height="17.0" fill="#C7654D" stroke="#B24A33" stroke-width="1.5"/>
-<text x="1036.0" y="49.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="normal" font-style="normal" text-anchor="start" fill="#1B1B1B">C+A</text>
-<text x="82.0" y="103.0" font-family="Georgia, 'Times New Roman', serif" font-size="16" font-weight="bold" font-style="normal" text-anchor="start" fill="#1B1B1B">(a)  Completion score (%)</text>
-<text x="650.0" y="103.0" font-family="Georgia, 'Times New Roman', serif" font-size="16" font-weight="bold" font-style="normal" text-anchor="start" fill="#1B1B1B">(b)  Runtime (hours)</text>
-<line x1="82.0" y1="430.0" x2="552.0" y2="430.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<text x="70.0" y="434.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">0</text>
-<line x1="82.0" y1="369.6" x2="552.0" y2="369.6" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<text x="70.0" y="373.6" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">20</text>
-<line x1="82.0" y1="309.2" x2="552.0" y2="309.2" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<text x="70.0" y="313.2" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">40</text>
-<line x1="82.0" y1="248.8" x2="552.0" y2="248.8" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<text x="70.0" y="252.8" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">60</text>
-<line x1="82.0" y1="188.4" x2="552.0" y2="188.4" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<text x="70.0" y="192.4" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">80</text>
-<line x1="82.0" y1="128.0" x2="552.0" y2="128.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<text x="70.0" y="132.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">100</text>
-<line x1="650.0" y1="430.0" x2="1120.0" y2="430.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<text x="638.0" y="434.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">0</text>
-<line x1="650.0" y1="379.7" x2="1120.0" y2="379.7" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<text x="638.0" y="383.7" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">0.5</text>
-<line x1="650.0" y1="329.3" x2="1120.0" y2="329.3" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<text x="638.0" y="333.3" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">1</text>
-<line x1="650.0" y1="279.0" x2="1120.0" y2="279.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<text x="638.0" y="283.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">1.5</text>
-<line x1="650.0" y1="228.7" x2="1120.0" y2="228.7" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<text x="638.0" y="232.7" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">2</text>
-<line x1="650.0" y1="178.3" x2="1120.0" y2="178.3" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<text x="638.0" y="182.3" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">2.5</text>
-<line x1="650.0" y1="128.0" x2="1120.0" y2="128.0" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<text x="638.0" y="132.0" font-family="Georgia, 'Times New Roman', serif" font-size="10" font-weight="normal" font-style="normal" text-anchor="end" fill="#5B5B5B">3</text>
-<line x1="82.0" y1="128.0" x2="82.0" y2="430.0" stroke="#1B1B1B" stroke-width="1.2"/>
-<line x1="82.0" y1="430.0" x2="552.0" y2="430.0" stroke="#1B1B1B" stroke-width="1.2"/>
-<line x1="650.0" y1="128.0" x2="650.0" y2="430.0" stroke="#1B1B1B" stroke-width="1.2"/>
-<line x1="650.0" y1="430.0" x2="1120.0" y2="430.0" stroke="#1B1B1B" stroke-width="1.2"/>
-<rect x="119.0" y="269.5" width="42.0" height="160.5" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.7"/>
-<text x="140.0" y="261.5" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#355F8A">53.13%</text>
-<rect x="169.0" y="251.8" width="42.0" height="178.2" fill="#C7654D" stroke="#B24A33" stroke-width="1.7"/>
-<text x="190.0" y="243.8" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#B24A33">59.00%</text>
-<rect x="687.0" y="375.4" width="42.0" height="54.6" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.7"/>
-<text x="708.0" y="367.4" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#355F8A">0.54h</text>
-<rect x="737.0" y="198.9" width="42.0" height="231.1" fill="#C7654D" stroke="#B24A33" stroke-width="1.7"/>
-<text x="758.0" y="190.9" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#B24A33">2.30h</text>
-<text x="165.0" y="455.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#1B1B1B">Solar</text>
-<text x="733.0" y="455.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#1B1B1B">Solar</text>
-<rect x="269.0" y="273.4" width="42.0" height="156.6" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.7"/>
-<text x="290.0" y="265.4" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#355F8A">51.86%</text>
-<rect x="319.0" y="239.7" width="42.0" height="190.3" fill="#C7654D" stroke="#B24A33" stroke-width="1.7"/>
-<text x="340.0" y="231.7" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#B24A33">63.00%</text>
-<rect x="837.0" y="369.1" width="42.0" height="60.9" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.7"/>
-<text x="858.0" y="361.1" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#355F8A">0.60h</text>
-<rect x="887.0" y="204.1" width="42.0" height="225.9" fill="#C7654D" stroke="#B24A33" stroke-width="1.7"/>
-<text x="908.0" y="196.1" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#B24A33">2.24h</text>
-<text x="315.0" y="455.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#1B1B1B">Samtools</text>
-<text x="883.0" y="455.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#1B1B1B">Samtools</text>
-<rect x="419.0" y="262.1" width="42.0" height="167.9" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.7"/>
-<text x="440.0" y="254.1" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#355F8A">55.60%</text>
-<rect x="469.0" y="185.4" width="42.0" height="244.6" fill="#C7654D" stroke="#B24A33" stroke-width="1.7"/>
-<text x="490.0" y="177.4" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#B24A33">81.00%</text>
-<rect x="987.0" y="262.1" width="42.0" height="167.9" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.7"/>
-<text x="1008.0" y="254.1" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#355F8A">1.67h</text>
-<rect x="1037.0" y="168.8" width="42.0" height="261.2" fill="#C7654D" stroke="#B24A33" stroke-width="1.7"/>
-<text x="1058.0" y="160.8" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" font-style="normal" text-anchor="middle" fill="#B24A33">2.59h</text>
-<text x="465.0" y="455.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#1B1B1B">Rumdl</text>
-<text x="1033.0" y="455.0" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" font-style="normal" text-anchor="middle" fill="#1B1B1B">Rumdl</text>
-<text x="48.0" y="522.0" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="normal" font-style="normal" text-anchor="start" fill="#5B5B5B">Completion uses a common 0–100% scale; runtime uses a common 0–3 hour scale.</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="639" viewBox="0 0 1080 639" role="img" aria-labelledby="programbench-ca-performance-title programbench-ca-performance-desc">
+<title id="programbench-ca-performance-title">Sol Ultra C+A: better scores, longer runs</title>
+<desc id="programbench-ca-performance-desc">Solar: score 53.13 to 59.00%; time 00:32:33 to 02:17:45; Samtools: score 51.86 to 63.00%; time 00:36:17 to 02:14:40; Rumdl: score 55.60 to 81.00%; time 01:40:05 to 02:35:41. Mean score 53.53 to 67.67%, +26.41% relative. Total solution time 2:48:55 to 7:08:06.</desc>
+<style>
+svg { --bg:#fff; --ink:#1e2934; --muted:#596672; --grid:#e2e7ec;
+  --raw:#4b709b; --bello:#c4472c; --soft:#f4f6f8; --connector:#c3cbd3; }
+@media (prefers-color-scheme:dark) {
+  svg { --bg:#0d1117; --ink:#edf2f7; --muted:#a6b2bf; --grid:#2b3542;
+    --raw:#94b8e4; --bello:#ff997e; --soft:#171f29; --connector:#526275; }
+}
+.paper { fill:var(--bg); }
+text { font-family:Arial,Helvetica,sans-serif; fill:var(--ink);
+  font-variant-numeric:tabular-nums; }
+.muted { fill:var(--muted); }
+.raw { fill:var(--raw); }
+.bello { fill:var(--bello); }
+.overline { fill:var(--muted); font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
+  letter-spacing:1.6px; }
+.halo { paint-order:stroke; stroke:var(--bg); stroke-width:6; stroke-linejoin:round; }
+.grid { stroke:var(--grid); stroke-width:1; }
+.connector { stroke:var(--connector); stroke-width:3; }
+.raw-line { stroke:var(--raw); fill:none; stroke-width:3; stroke-dasharray:8 5; }
+.bello-line { stroke:var(--bello); fill:none; stroke-width:4; }
+.raw-point { fill:var(--bg); stroke:var(--raw); stroke-width:2.8; }
+.bello-point { fill:var(--bello); stroke:var(--bg); stroke-width:1.5; }
+.raw-bar { fill:var(--raw); fill-opacity:.16; stroke:var(--raw); stroke-width:1.5; }
+.bello-bar { fill:var(--bello); }
+</style>
+<rect class="paper" width="1080" height="639"/>
+<text x="40.00" y="31.00" font-size="15" font-weight="400" class="overline" text-anchor="start">04 / BELLO BENCHMARKS</text>
+<text x="40.00" y="72.00" font-size="35" font-weight="700" class="" text-anchor="start">What review adds.</text>
+<text x="40.00" y="103.00" font-size="19" font-weight="400" class="muted" text-anchor="start">Sol Ultra · completion review + adversary · three ProgramBench tasks</text>
+<text x="40.00" y="164.00" font-size="46" font-weight="700" class="bello" text-anchor="start">+26.41%</text>
+<text x="40.00" y="192.00" font-size="20" font-weight="400" class="muted" text-anchor="start">relative mean score</text>
+<text x="565.00" y="164.00" font-size="38" font-weight="700" class="bello" text-anchor="start">+14.14 pp</text>
+<text x="565.00" y="192.00" font-size="21" font-weight="400" class="muted" text-anchor="start">53.53 → 67.67%</text>
+<circle cx="46.00" cy="227.00" r="5" class="raw-point"/>
+<text x="61.00" y="232.00" font-size="18" font-weight="600" class="raw" text-anchor="start">Raw Sol</text>
+<path d="M221.00 221.00 l6 6 l-6 6 l-6 -6 Z" class="bello-point"/>
+<text x="236.00" y="232.00" font-size="18" font-weight="600" class="bello" text-anchor="start">Bello C+A</text>
+<text x="213.00" y="284.00" font-size="22" font-weight="700" class="" text-anchor="start">Completion score (%) ↑</text>
+<text x="673.00" y="284.00" font-size="22" font-weight="700" class="" text-anchor="start">Solution time (hours) ↓</text>
+<line x1="214.00" y1="326.00" x2="214.00" y2="525.00" class="grid" />
+<text x="214.00" y="314.00" font-size="16" font-weight="400" class="muted" text-anchor="middle">0</text>
+<line x1="295.50" y1="326.00" x2="295.50" y2="525.00" class="grid" />
+<text x="295.50" y="314.00" font-size="16" font-weight="400" class="muted" text-anchor="middle">25</text>
+<line x1="377.00" y1="326.00" x2="377.00" y2="525.00" class="grid" />
+<text x="377.00" y="314.00" font-size="16" font-weight="400" class="muted" text-anchor="middle">50</text>
+<line x1="458.50" y1="326.00" x2="458.50" y2="525.00" class="grid" />
+<text x="458.50" y="314.00" font-size="16" font-weight="400" class="muted" text-anchor="middle">75</text>
+<line x1="540.00" y1="326.00" x2="540.00" y2="525.00" class="grid" />
+<text x="540.00" y="314.00" font-size="16" font-weight="400" class="muted" text-anchor="middle">100</text>
+<line x1="674.00" y1="326.00" x2="674.00" y2="525.00" class="grid" />
+<text x="674.00" y="314.00" font-size="16" font-weight="400" class="muted" text-anchor="middle">0</text>
+<line x1="774.67" y1="326.00" x2="774.67" y2="525.00" class="grid" />
+<text x="774.67" y="314.00" font-size="16" font-weight="400" class="muted" text-anchor="middle">1</text>
+<line x1="875.33" y1="326.00" x2="875.33" y2="525.00" class="grid" />
+<text x="875.33" y="314.00" font-size="16" font-weight="400" class="muted" text-anchor="middle">2</text>
+<line x1="976.00" y1="326.00" x2="976.00" y2="525.00" class="grid" />
+<text x="976.00" y="314.00" font-size="16" font-weight="400" class="muted" text-anchor="middle">3</text>
+<text x="40.00" y="367.00" font-size="20" font-weight="600" class="" text-anchor="start">Solar</text>
+<line x1="387.20" y1="362.00" x2="406.34" y2="362.00" class="connector" />
+<circle cx="387.20" cy="362.00" r="6" class="raw-point"/>
+<path d="M406.34 355.00 l7 7 l-7 7 l-7 -7 Z" class="bello-point"/>
+<text x="387.20" y="347.00" font-size="20" font-weight="600" class="raw halo" text-anchor="middle">53.13</text>
+<text x="406.34" y="391.00" font-size="20" font-weight="700" class="bello halo" text-anchor="middle">59.00</text>
+<rect x="674.00" y="337.00" width="54.61" height="13.00" class="raw-bar" />
+<text x="737.61" y="350.00" font-size="19" font-weight="600" class="raw" text-anchor="start">0.54h</text>
+<rect x="674.00" y="364.00" width="231.11" height="13.00" class="bello-bar" />
+<text x="914.11" y="377.00" font-size="19" font-weight="600" class="bello" text-anchor="start">2.30h</text>
+<text x="40.00" y="437.00" font-size="20" font-weight="600" class="" text-anchor="start">Samtools</text>
+<line x1="383.06" y1="432.00" x2="419.38" y2="432.00" class="connector" />
+<circle cx="383.06" cy="432.00" r="6" class="raw-point"/>
+<path d="M419.38 425.00 l7 7 l-7 7 l-7 -7 Z" class="bello-point"/>
+<text x="383.06" y="417.00" font-size="20" font-weight="600" class="raw halo" text-anchor="middle">51.86</text>
+<text x="419.38" y="461.00" font-size="20" font-weight="700" class="bello halo" text-anchor="middle">63.00</text>
+<rect x="674.00" y="407.00" width="60.88" height="13.00" class="raw-bar" />
+<text x="743.88" y="420.00" font-size="19" font-weight="600" class="raw" text-anchor="start">0.60h</text>
+<rect x="674.00" y="434.00" width="225.94" height="13.00" class="bello-bar" />
+<text x="908.94" y="447.00" font-size="19" font-weight="600" class="bello" text-anchor="start">2.24h</text>
+<text x="40.00" y="507.00" font-size="20" font-weight="600" class="" text-anchor="start">Rumdl</text>
+<line x1="395.26" y1="502.00" x2="478.06" y2="502.00" class="connector" />
+<circle cx="395.26" cy="502.00" r="6" class="raw-point"/>
+<path d="M478.06 495.00 l7 7 l-7 7 l-7 -7 Z" class="bello-point"/>
+<text x="395.26" y="487.00" font-size="20" font-weight="600" class="raw halo" text-anchor="middle">55.60</text>
+<text x="478.06" y="531.00" font-size="20" font-weight="700" class="bello halo" text-anchor="middle">81.00</text>
+<rect x="674.00" y="477.00" width="167.92" height="13.00" class="raw-bar" />
+<text x="850.92" y="490.00" font-size="19" font-weight="600" class="raw" text-anchor="start">1.67h</text>
+<rect x="674.00" y="504.00" width="261.20" height="13.00" class="bello-bar" />
+<text x="944.20" y="517.00" font-size="19" font-weight="600" class="bello" text-anchor="start">2.59h</text>
+<line x1="40.00" y1="569.00" x2="1040.00" y2="569.00" class="grid" />
+<text x="40.00" y="601.00" font-size="19" font-weight="400" class="muted" text-anchor="start">Total solution time</text>
+<text x="1040.00" y="601.00" font-size="28" font-weight="700" class="" text-anchor="end">2:48:55 → 7:08:06</text>
+<text x="40.00" y="626.00" font-size="17" font-weight="400" class="muted" text-anchor="start">Score is an unweighted task mean. Time bars show each run; the total is their sum.</text>
 </svg>
