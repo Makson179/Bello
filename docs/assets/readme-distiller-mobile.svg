@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="480" height="401" viewBox="0 0 480 401" role="img" aria-labelledby="readme-distiller-mobile-title readme-distiller-mobile-desc">
-<title id="readme-distiller-mobile-title">Log distiller: estimated usage reduction</title>
-<desc id="readme-distiller-mobile-desc">JSON Schema. Astra XHigh, 3 runs per arm, runtime off: 22.02% lower estimated usage. Luna Max, 6 runs per arm, runtime included: 14.78% lower estimated usage. Subtracting recorded runtime cost gives 25.28%, an accounting estimate, not an additional run. Usage uses API-equivalent token rates. Score and time tradeoffs are in the README.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="489" viewBox="0 0 480 489" role="img" aria-labelledby="readme-distiller-mobile-title readme-distiller-mobile-desc">
+<title id="readme-distiller-mobile-title">Log distiller: cost versus quality</title>
+<desc id="readme-distiller-mobile-desc">Astra XHigh: Raw cost index 100, score 62.22%; distiller cost index 77.98, score 60.57%; Luna Max: Raw cost index 100, score 56.75%; distiller cost index 85.22, score 55.45%. JSON Schema. Astra has 3 runs per arm and runtime off. Luna has 6 runs per arm; its distiller arm includes runtime. Cost is estimated at API-equivalent token rates, normalized separately to Raw = 100 for each model, not a comparison of absolute prices. Score axis 50–65%; cost axis 70–105. Lower cost and higher score are better.</desc>
 <style>
 svg { --bg:#fff; --ink:#26323e; --muted:#64707c; --grid:#e4e9ee;
   --raw:#557ca6; --bello:#c84b32; }
@@ -23,19 +23,41 @@ text { font-family:Arial,Helvetica,sans-serif; fill:var(--ink);
 .raw-bar { fill:var(--raw); fill-opacity:.22; stroke:var(--raw); stroke-width:1.3; }
 .bello-bar { fill:var(--bello); }
 </style>
-<rect class="paper" width="480" height="401"/>
-<text x="24.00" y="32.00" font-size="19" font-weight="400" class="" text-anchor="start">Estimated usage reduction (%)</text>
-<line x1="49.00" y1="305.00" x2="455.00" y2="305.00" class="grid"/>
-<text x="39.00" y="310.00" font-size="14" font-weight="400" class="muted" text-anchor="end">0</text>
-<line x1="49.00" y1="193.50" x2="455.00" y2="193.50" class="grid"/>
-<text x="39.00" y="198.50" font-size="14" font-weight="400" class="muted" text-anchor="end">15</text>
-<line x1="49.00" y1="82.00" x2="455.00" y2="82.00" class="grid"/>
-<text x="39.00" y="87.00" font-size="14" font-weight="400" class="muted" text-anchor="end">30</text>
-<rect x="116.00" y="141.29" width="66.00" height="163.71" class="bello-bar"/>
-<text x="149.00" y="128.29" font-size="22" font-weight="600" class="bello" text-anchor="middle">22.02%</text>
-<text x="149.00" y="339.00" font-size="19" font-weight="400" class="" text-anchor="middle">Astra XHigh</text>
-<rect x="321.00" y="195.17" width="66.00" height="109.83" class="bello-bar"/>
-<text x="354.00" y="182.17" font-size="22" font-weight="600" class="bello" text-anchor="middle">14.78%</text>
-<text x="354.00" y="339.00" font-size="19" font-weight="400" class="" text-anchor="middle">Luna Max</text>
-<text x="354.00" y="364.00" font-size="15" font-weight="400" class="muted" text-anchor="middle">runtime included</text>
+<rect class="paper" width="480" height="489"/>
+<style>.cost-link { stroke:var(--muted); stroke-opacity:.55; stroke-width:1.5; }</style>
+<line x1="24.00" y1="24.00" x2="48.00" y2="24.00" class="raw-line"/>
+<circle cx="36.00" cy="24.00" r="5" class="raw-point"/>
+<text x="54.00" y="30.00" font-size="17" font-weight="400" class="raw" text-anchor="start">Raw</text>
+<line x1="244.00" y1="24.00" x2="268.00" y2="24.00" class="bello-line"/>
+<path d="M256.00 18.00 l6 6 l-6 6 l-6 -6 Z" class="bello-point"/>
+<text x="274.00" y="30.00" font-size="17" font-weight="400" class="bello" text-anchor="start">Distiller</text>
+<text x="24.00" y="73.00" font-size="18" font-weight="400" class="muted" text-anchor="start">Score (%) ↑</text>
+<line x1="55.00" y1="383.00" x2="445.00" y2="383.00" class="grid"/>
+<text x="44.00" y="388.00" font-size="14" font-weight="400" class="muted" text-anchor="end">50</text>
+<line x1="55.00" y1="291.67" x2="445.00" y2="291.67" class="grid"/>
+<text x="44.00" y="296.67" font-size="14" font-weight="400" class="muted" text-anchor="end">55</text>
+<line x1="55.00" y1="200.33" x2="445.00" y2="200.33" class="grid"/>
+<text x="44.00" y="205.33" font-size="14" font-weight="400" class="muted" text-anchor="end">60</text>
+<line x1="55.00" y1="109.00" x2="445.00" y2="109.00" class="grid"/>
+<text x="44.00" y="114.00" font-size="14" font-weight="400" class="muted" text-anchor="end">65</text>
+<line x1="110.71" y1="109.00" x2="110.71" y2="383.00" class="grid"/>
+<text x="110.71" y="410.00" font-size="15" font-weight="400" class="muted" text-anchor="middle">75</text>
+<line x1="222.14" y1="109.00" x2="222.14" y2="383.00" class="grid"/>
+<text x="222.14" y="410.00" font-size="15" font-weight="400" class="muted" text-anchor="middle">85</text>
+<line x1="389.29" y1="109.00" x2="389.29" y2="383.00" class="grid"/>
+<text x="389.29" y="410.00" font-size="15" font-weight="400" class="muted" text-anchor="middle">100</text>
+<line x1="389.29" y1="159.75" x2="143.89" y2="189.87" class="cost-link"/>
+<circle cx="389.29" cy="159.75" r="5" class="raw-point"/>
+<path d="M143.89 183.87 l6 6 l-6 6 l-6 -6 Z" class="bello-point"/>
+<text x="389.29" y="142.75" font-size="18" font-weight="600" class="raw halo" text-anchor="middle">62.22</text>
+<text x="143.89" y="218.87" font-size="18" font-weight="600" class="bello halo" text-anchor="middle">60.57</text>
+<text x="252.59" y="147.81" font-size="16" font-weight="500" class="halo" text-anchor="middle">Astra XHigh · −22.02% cost</text>
+<line x1="389.29" y1="259.75" x2="224.64" y2="283.42" class="cost-link"/>
+<circle cx="389.29" cy="259.75" r="5" class="raw-point"/>
+<path d="M224.64 277.42 l6 6 l-6 6 l-6 -6 Z" class="bello-point"/>
+<text x="389.29" y="242.75" font-size="18" font-weight="600" class="raw halo" text-anchor="middle">56.75</text>
+<text x="224.64" y="312.42" font-size="18" font-weight="600" class="bello halo" text-anchor="middle">55.45</text>
+<text x="292.96" y="221.58" font-size="16" font-weight="500" class="halo" text-anchor="middle">Luna Max · −14.78% cost</text>
+<text x="292.96" y="249.58" font-size="14" font-weight="400" class="muted halo" text-anchor="middle">runtime included</text>
+<text x="250.00" y="448.00" font-size="16" font-weight="400" class="muted" text-anchor="middle">← Estimated cost (Raw = 100 per model)</text>
 </svg>

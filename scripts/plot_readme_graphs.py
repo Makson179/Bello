@@ -30,6 +30,11 @@ RUNTIME = [
     ("Slab", 81.08, 85.69),
     ("Pinch", 89.25, 98.00),
 ]
+DISTILLER = [
+    # Model, raw / distiller API-equivalent mean cost, raw / distiller mean score.
+    ("Astra XHigh", 10.31219067, 8.04112333, 62.22146430, 60.57298772),
+    ("Luna Max", 1.71064142, 1.45788090, 56.74738518, 55.45134152),
+]
 
 CSS = """
 svg { --bg:#fff; --ink:#26323e; --muted:#64707c; --grid:#e4e9ee;
@@ -221,26 +226,46 @@ def runtime(mobile):
 
 
 def distiller(mobile):
-    p=Chart("readme-distiller",401 if mobile else 419,
-            "Log distiller: estimated usage reduction",
-            "JSON Schema. Astra XHigh, 3 runs per arm, runtime off: 22.02% lower estimated usage. "
-            "Luna Max, 6 runs per arm, runtime included: 14.78% lower estimated usage. "
-            "Subtracting recorded runtime cost gives 25.28%, an accounting estimate, not an additional run. "
-            "Usage uses API-equivalent token rates. Score and time tradeoffs are in the README.",mobile)
-    x,right,top,bottom=(49,455,82,305) if mobile else (76,1024,82,331)
-    p.text(24 if mobile else 42,32,"Estimated usage reduction (%)",19 if mobile else 22)
-    yp=lambda v: bottom-v/30*(bottom-top)
-    for tick in [0,15,30]:
-        p.line(x,yp(tick),right,yp(tick))
-        p.text(x-10,yp(tick)+5,tick,14 if mobile else 17,"muted","end")
-    xs=[149,354] if mobile else [322,787]
-    bw=66 if mobile else 105
-    for xx,val,name,sub in zip(xs,[22.02313172,14.77577457],["Astra XHigh","Luna Max"],["","runtime included"]):
-        p.rect(xx-bw/2,yp(val),bw,bottom-yp(val),"bello-bar")
-        p.text(xx,yp(val)-13,f"{val:.2f}%",22 if mobile else 26,"bello","middle",600)
-        p.text(xx,bottom+34,name,19 if mobile else 22,anchor="middle")
-        if sub:
-            p.text(xx,bottom+59,sub,15 if mobile else 17,"muted","middle")
+    desc="; ".join(
+        f"{name}: Raw cost index 100, score {rs:.2f}%; distiller cost index "
+        f"{100*dc/rc:.2f}, score {ds:.2f}%"
+        for name,rc,dc,rs,ds in DISTILLER)
+    p=Chart("readme-distiller",489 if mobile else 467,
+            "Log distiller: cost versus quality",desc+
+            ". JSON Schema. Astra has 3 runs per arm and runtime off. Luna has 6 runs per arm; "
+            "its distiller arm includes runtime. Cost is estimated at API-equivalent token rates, "
+            "normalized separately to Raw = 100 for each model, not a comparison of absolute prices. "
+            "Score axis 50–65%; cost axis 70–105. Lower cost and higher score are better.",mobile)
+    p.parts.append('<style>.cost-link { stroke:var(--muted); stroke-opacity:.55; stroke-width:1.5; }</style>')
+    # The connector pairs the two observations for each model; it is not a fit.
+    p.legend("Raw","Distiller",lines=True)
+    p.text(24 if mobile else 42,73 if mobile else 31,"Score (%) ↑",18,"muted")
+    left,right,top,bottom=(55,445,109,383) if mobile else (88,1024,80,370)
+    xp=lambda v: left+(v-70)/35*(right-left)
+    yp=lambda v: bottom-(v-50)/15*(bottom-top)
+    for tick in [50,55,60,65]:
+        p.line(left,yp(tick),right,yp(tick))
+        p.text(left-11,yp(tick)+5,tick,14 if mobile else 17,"muted","end")
+    for tick in [75,85,100]:
+        p.line(xp(tick),top,xp(tick),bottom)
+        p.text(xp(tick),bottom+27,tick,15 if mobile else 18,"muted","middle")
+    for i,(name,rc,dc,rs,ds) in enumerate(DISTILLER):
+        cost=100*dc/rc
+        raw_x,raw_y=xp(100),yp(rs)
+        dist_x,dist_y=xp(cost),yp(ds)
+        p.line(raw_x,raw_y,dist_x,dist_y,"cost-link")
+        p.point(raw_x,raw_y,"raw")
+        p.point(dist_x,dist_y,"bello")
+        p.text(raw_x,raw_y-17,f"{rs:.2f}",18 if mobile else 22,"raw halo","middle",600)
+        p.text(dist_x,dist_y+29,f"{ds:.2f}",18 if mobile else 22,"bello halo","middle",600)
+        mid_x=(raw_x+dist_x)/2-(14 if mobile else 0)
+        mid_y=(raw_y+dist_y)/2
+        p.text(mid_x,mid_y-(27 if i==0 else 50),
+               f"{name} · −{100-cost:.2f}% cost",16 if mobile else 22,"halo","middle",500)
+        if i==1:
+            p.text(mid_x,mid_y-22,"runtime included",14 if mobile else 17,"muted halo","middle")
+    p.text((left+right)/2,bottom+65,"← Estimated cost (Raw = 100 per model)",
+           16 if mobile else 20,"muted","middle")
     p.save()
 
 

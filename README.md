@@ -171,7 +171,7 @@ runtime supervision.
 
 <picture>
   <source media="(max-width: 600px)" srcset="./docs/assets/readme-distiller-mobile.svg">
-  <img src="./docs/assets/readme-distiller.svg" alt="Estimated usage reduction: Astra XHigh 22.02%; Luna Max 14.78% including runtime, or 25.28% after subtracting recorded runtime cost. Scores: Astra 62.22% to 60.57%; Luna 56.75% to 55.45%." width="100%">
+  <img src="./docs/assets/readme-distiller.svg" alt="Cost versus quality: each model's Raw cost is normalized to 100. Astra XHigh changes from cost 100 and score 62.22% to cost 77.98 and score 60.57%. Luna Max changes from cost 100 and score 56.75% to cost 85.22 and score 55.45%, including runtime." width="100%">
 </picture>
 
 | Coder | Runs per arm | Score, off → on | Mean solution time, off → on |
