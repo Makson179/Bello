@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="415" viewBox="0 0 1000 415" role="img" aria-labelledby="title description">
+  <title id="title">Distiller estimated usage reduction relative to no-distiller runs</title>
+  <desc id="description">Estimated usage reduction, expressed as a percentage relative to the no-distiller baseline. Astra XHigh 22.02%, from three distiller runs and three no-distiller runs, with runtime off in both groups. Luna Max 14.78%, from six runs in each group, with runtime included in the distiller group. An outlined marker shows 25.28% for Luna when runtime usage is excluded from the accounting. This is a recalculation, not a measured runtime-disabled experiment. The axis begins at zero and ends at 30%.</desc>
+  <defs>
+    <linearGradient id="bar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#37b6a6"/>
+      <stop offset="1" stop-color="#078b80"/>
+    </linearGradient>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+      .ink { fill: #172c38; }
+      .muted { fill: #637785; }
+      .number { font-variant-numeric: tabular-nums; font-weight: 650; }
+    </style>
+  </defs>
+  <rect x=".5" y=".5" width="999" height="414" rx="20" fill="#fff" stroke="#dce6ea"/>
+  <rect x="36" y="31" width="5" height="26" rx="2.5" fill="#078b80"/>
+  <text x="54" y="53" class="ink" font-size="29" font-weight="700" letter-spacing="-.7">Distiller usage savings</text>
+  <text x="54" y="81" class="muted" font-size="18">Estimated usage reduction (%) · baseline: no distiller</text>
+  <g stroke="#e6edf0" stroke-width="1">
+    <path d="M290 113V287 M500 113V287 M710 113V287 M920 113V287"/>
+  </g>
+  <g class="ink" font-size="25" font-weight="650" letter-spacing="-.4">
+    <text x="40" y="163">Astra XHigh</text>
+    <text x="40" y="245">Luna Max</text>
+  </g>
+  <g class="muted" font-size="17">
+    <text x="40" y="189">3 + 3 runs · runtime off</text>
+    <text x="40" y="271">6 + 6 runs · runtime on</text>
+  </g>
+  <rect x="290" y="146" width="630" height="20" rx="10" fill="#f1f5f6"/>
+  <rect x="290" y="228" width="630" height="20" rx="10" fill="#f1f5f6"/>
+  <rect x="290" y="146" width="462.42" height="20" rx="10" fill="url(#bar)"/>
+  <rect x="290" y="228" width="310.38" height="20" rx="10" fill="url(#bar)"/>
+  <g fill="#087e74" class="number" font-size="26">
+    <text x="768" y="166">22.02%</text>
+    <text x="616" y="248">14.78%</text>
+  </g>
+  <path d="M820.88 222V208H872" fill="none" stroke="#8194a2" stroke-width="1.5"/>
+  <circle cx="820.88" cy="238" r="10" fill="#fff" stroke="#6b8198" stroke-width="2.5"/>
+  <text x="928" y="201" class="number" fill="#526b83" font-size="22" text-anchor="end">25.28%*</text>
+  <g class="muted number" text-anchor="middle" font-size="16">
+    <text x="290" y="311">0</text>
+    <text x="500" y="311">10</text>
+    <text x="710" y="311">20</text>
+    <text x="920" y="311">30</text>
+  </g>
+  <path d="M36 330H964" stroke="#e6edf0"/>
+  <circle cx="48" cy="355" r="6" fill="#fff" stroke="#6b8198" stroke-width="2"/>
+  <text x="64" y="361" class="muted" font-size="17">* Luna recalculated excluding runtime usage; no runtime-off experiment.</text>
+  <text x="40" y="390" class="muted" font-size="17">Run counts: distiller + no distiller</text>
+</svg>
