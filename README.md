@@ -32,8 +32,7 @@ Bello runs a coding task through a coder and four optional parts: a runtime
 supervisor, a completion reviewer, an adversary, and a local log distiller.
 The coder, the supervisor, the reviewer, and the adversary each have their own
 model and reasoning effort, from a Codex or Claude Code subscription or from
-an API provider. Turn on the parts you need: a cheap coder with a strong
-reviewer, one expensive model everywhere, or runtime supervision alone.
+an API provider. The four components can be enabled or disabled independently.
 
 In our [tests](#results), the Efficient Budget configuration used 66.3% less
 of the weekly Codex limit than Raw GPT-5.6 Sol XHigh without lowering average
