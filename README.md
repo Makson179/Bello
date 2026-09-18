@@ -1,7 +1,7 @@
 <h1 align="center">Bello</h1>
 
 <p align="center">
-  <strong>Build a cheaper, more reliable, better coding agent from the models you already have.</strong><br>
+  <strong>Build a cheaper, more reliable, better coding team from the models you already have.</strong><br>
   Codex, Claude Code, OpenAI, Anthropic, OpenRouter, in any mix. Bello puts a supervisor, a reviewer, an adversary, and a local log distiller around the coder, each optional, each on its own model. In our tests, one of the configurations used 66% less Codex usage at the same quality.
 </p>
 
