@@ -1,8 +1,8 @@
 <h1 align="center">Bello</h1>
 
 <p align="center">
-  <strong>Run coding tasks with the models and checks you choose.</strong><br>
-  A coder plus four optional parts: a runtime supervisor, a completion reviewer, an adversary, and a local log distiller. Each has its own switch and its own model, so a run can be set up for quality, cost, or time.
+  <strong>Build a cheaper, more reliable, better coding agent from the models you already have.</strong><br>
+  Codex, Claude Code, OpenAI, Anthropic, OpenRouter, in any mix. Bello puts a supervisor, a reviewer, an adversary, and a local log distiller around the coder, each optional, each on its own model. In our tests, one of the configurations used 66% less Codex usage at the same quality.
 </p>
 
 <p align="center">
@@ -245,15 +245,18 @@ average gain was about 2%.
 ### Log distiller: less tool output for the coder
 
 The distiller is a ModernBERT-base encoder with a small token-selection head,
-about 149 million parameters. It keeps the original text that matches what the
-coder says it is looking for instead of writing a summary. It runs on your CPU,
-so logs stay on your machine and no paid model call is added. The task file,
-reads of instruction files such as README or AGENTS.md, and command help pass
-through unchanged.
+about 149 million parameters. In the coder pipeline, each tool call carries a
+short focus written by the coder, what it wants from the result, and the
+distiller uses that focus to decide which parts of the output to keep and
+which to drop. It keeps original text and writes no summary. It runs on your
+CPU, so logs stay on your machine and no paid model call is added. The task
+file, reads of instruction files such as README or AGENTS.md, and command help
+pass through unchanged.
 
 We measured it on the JSON Schema task with the same coder model, with and
-without distillation. Usage is estimated from recorded input, cached input, and
-output tokens at API rates.
+without distillation, on a weaker model (GPT-5.6 Luna) and on a frontier model
+(GPT-6 Astra). Usage fell with both, so the selector works for weak and strong
+coders alike.
 
 <picture>
   <source media="(max-width: 600px)" srcset="./docs/assets/readme-distiller-mobile.svg">
