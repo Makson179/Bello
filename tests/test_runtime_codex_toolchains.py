@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import stat
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -144,7 +146,8 @@ def test_narrow_runtime_and_exact_alias_not_path_parent(host, monkeypatch):
     alias.symlink_to(binary)
     monkeypatch.setenv("PATH", str(aliases))
     result = tools.native_toolchain_read_paths(work)
-    assert set(result) == {runtime, binary, alias}
+    expected = {runtime, alias} if tools._IS_LINUX else {runtime, binary, alias}
+    assert set(result) == expected
     rules = native_permission_params({"cwd": str(work)}, runtime_read_paths=result)
     filesystem = rules["config"]["permissions"][PROFILE_ID]["filesystem"]
     assert all(filesystem[str(path)] == "read" for path in result)
@@ -216,6 +219,75 @@ def test_current_venv_keeps_base_and_lexical_interpreter(tmp_path, monkeypatch):
     monkeypatch.setattr(tools.sys, "base_prefix", str(base))
     monkeypatch.setattr(tools.sys, "executable", str(alias))
     assert tools._current_python_paths() == (alias, base, venv)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX virtualenv symlink layout")
+@pytest.mark.parametrize("platform", ["linux", "macos"])
+def test_venv_descendants_are_redundant_only_on_linux(host, monkeypatch, platform):
+    home, work = host
+    venv = home / "venv"
+    binary = executable(home / "base-python" / "bin" / "python3")
+    (venv / "bin").mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = ../base-python/bin\n")
+    python3 = venv / "bin" / "python3"
+    python3.symlink_to(binary)
+    python = venv / "bin" / "python"
+    python.symlink_to("python3")
+    pip = executable(venv / "bin" / "pip")
+    monkeypatch.setattr(tools, "_IS_LINUX", platform == "linux")
+    monkeypatch.setattr(tools, "_IS_MACOS", platform == "macos")
+    monkeypatch.setattr(tools, "_IS_WINDOWS", False)
+    monkeypatch.setattr(tools.sandbox, "_discover_toolchain", lambda policy: tools.sandbox._Toolchain(
+        (("pip", pip),), (venv / "bin", venv),
+    ))
+    # The external canonical target has no directory grant and must survive.
+    monkeypatch.setattr(tools, "_current_python_paths", lambda: (python, python3, venv))
+    result = tools.native_toolchain_read_paths(work)
+    assert binary in result
+    if platform == "linux":
+        assert set(result) == {venv, binary}
+    else:
+        assert set(result) == {venv, venv / "bin", pip, python, python3, binary}
+    filesystem = native_permission_params({"cwd": str(work)}, runtime_read_paths=result)[
+        "config"]["permissions"][PROFILE_ID]["filesystem"]
+    assert all(filesystem[str(path)] == "read" for path in result)
+    assert str(home) not in filesystem
+    assert str(binary.parent) not in filesystem
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux") or not Path("/usr/bin/bwrap").exists(),
+                    reason="Linux bubblewrap regression")
+def test_linux_native_grants_execute_symlinked_venv_python(host, monkeypatch):
+    home, work = host
+    venv = home / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    python3 = venv / "bin" / "python3"
+    python3.symlink_to("/usr/bin/python3")
+    python = venv / "bin" / "python"
+    python.symlink_to("python3")
+    monkeypatch.setattr(tools, "_current_python_paths", lambda: (python, Path("/usr"), venv))
+    monkeypatch.setenv("PATH", str(venv / "bin"))
+    grants = tools.native_toolchain_read_paths(work)
+    base = ["/usr/bin/bwrap", "--die-with-parent", "--unshare-all"]
+    for path in (Path("/usr"), Path("/lib"), Path("/lib64")):
+        if path.is_dir():
+            base.extend(("--ro-bind", str(path), str(path)))
+    probe = subprocess.run([*base, "/usr/bin/true"], capture_output=True, text=True, timeout=10)
+    if probe.returncode:
+        if os.environ.get("BELLO_REQUIRE_NATIVE_SANDBOX") == "1":
+            pytest.fail(probe.stderr)
+        pytest.skip(f"bubblewrap unavailable in this environment: {probe.stderr}")
+    command = list(base)
+    for path in grants:
+        if path != Path("/usr"):
+            command.extend(("--ro-bind", str(path), str(path)))
+    completed = subprocess.run(
+        [*command, str(python), "-I", "-c", "print('venv-ok')"],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "venv-ok"
 
 
 def test_windows_unknown_tool_does_not_grant_generic_path_directory(host, monkeypatch):

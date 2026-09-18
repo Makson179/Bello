@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -328,6 +329,9 @@ class StatelessSupervisorAgent:
                             writable=persistent_completion_thread
                             and self.completion_workspace_write,
                             runtime_workspace_roots=runtime_workspace_roots,
+                            scratch_root=(self.completion_workspace_snapshot.scratch_root
+                                          if persistent_completion_thread and self.completion_workspace_snapshot
+                                          else None),
                             multi_agent=(
                                 self.completion_multi_agent
                                 if persistent_completion_thread
@@ -794,6 +798,7 @@ class StatelessSupervisorAgent:
         writable: bool = False,
         runtime_workspace_roots: list[Path] | None = None,
         multi_agent: MultiAgentConfig | None = None,
+        scratch_root: Path | None = None,
     ) -> dict[str, Any]:
         active_root = (workspace_root or self.workspace_root).resolve()
         active_runtime_roots = runtime_workspace_roots or [active_root]
@@ -814,6 +819,18 @@ class StatelessSupervisorAgent:
             multi_agent or MultiAgentConfig(),
             role="completion_review",
         )
+        if scratch_root is not None:
+            params["runtimeScratchRoot"] = str(scratch_root)
+            temp_guidance = "TMPDIR points here. " if os.name != "nt" else "Use this explicit path for temporary files. "
+            scratch_instruction = (
+                f"Review scratch directory: {scratch_root}. {temp_guidance}"
+                "Keep temporary test inputs, outputs, and probe files only here; "
+                "they persist between commands in this review and are deleted when it ends. "
+                "Do not change submitted source or tests. Give this path to any reviewer subagents."
+            )
+            params["developerInstructions"] = (
+                params.get("developerInstructions", "") + "\n" + scratch_instruction
+            ).strip()
         if self.model:
             params["model"] = self.model
         return apply_intelligence(params, self.intelligence)

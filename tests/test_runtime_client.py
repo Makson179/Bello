@@ -572,14 +572,23 @@ async def test_public_thread_list_keeps_identity_activity_and_effort_without_pri
 @pytest.mark.asyncio
 async def test_reviewer_children_cannot_delegate_but_idle_children_do_not_exhaust_concurrency(tmp_path):
     client, workspace, _, _ = await make_client(tmp_path)
+    scratch = workspace / ".cache" / "review"
+    scratch.mkdir(parents=True)
     try:
-        parent = await start(client, workspace, config={"agents": {"enabled": True, "role": "completion_review",
+        parent = await start(client, workspace, runtimeScratchRoot=str(scratch),
+            developerInstructions=f"Temporary review data: {scratch}",
+            config={"agents": {"enabled": True, "role": "completion_review",
             "max_concurrent_threads_per_session": 1, "allowed_profiles": {"gpt-5.6-luna": ["high"]}}})
         turn = (await client.turn_start({"threadId": parent}))["turn"]["id"]
         args = {"model": "gpt-5.6-luna", "effort": "high", "message": "inspect"}
         first = await client._delegate("spawn_agent", args, parent, turn)
         child = json.loads(first["content"][0]["text"])["agent_id"]
         child_turn = client._threads[child]["activeTurnId"]
+        assert client._threads[child]["runtimeScratchRoot"] == str(scratch.resolve())
+        assert str(scratch) in client._threads[child]["developerInstructions"]
+        assert client._scope_for(child, child_turn).temp_root == scratch.resolve()
+        with pytest.raises(AppServerError, match="temporary directory"):
+            client._validate_scope_overrides(client._threads[child], {"runtimeScratchRoot": str(workspace)})
         assert not client._threads[child]["config"]["agents"]["enabled"]
         with pytest.raises(AppServerError, match="disabled"):
             await client._delegate("spawn_agent", args, child, child_turn)

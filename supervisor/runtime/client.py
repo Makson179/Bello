@@ -21,6 +21,7 @@ from supervisor.approvals import ApprovalManager, normalize_approval_request
 from supervisor.runtime.cleanup import finish_cleanup
 from supervisor.runtime.journal import RuntimeJournal
 from supervisor.runtime.models import parse_model_selection
+from supervisor.runtime.sandbox import SandboxPolicy
 from supervisor.runtime.tools import ToolHost, ToolScope, tool_result, tool_definitions
 from supervisor.runtime.transport import WorkerTransport
 
@@ -211,6 +212,7 @@ class RuntimeClient(AppServerClient):
                          network_access=record.get("networkAccess", False),
                          distiller_enabled=record.get("distillerEnabled", False),
                          runtime_enabled=self.runtime_enabled,
+                         temp_root=Path(record["runtimeScratchRoot"]) if record.get("runtimeScratchRoot") else None,
                          task_path=Path(record["runtimeTaskPath"]) if record.get("runtimeTaskPath") else None)
 
     async def reconcile_terminal_turn(self, thread_id: str, turn_id: str,
@@ -411,6 +413,9 @@ class RuntimeClient(AppServerClient):
         mode = params.get("sandbox", "read-only")
         if mode not in {"read-only", "workspace-write", "danger-full-access"}:
             raise AppServerError(f"unsupported sandbox mode: {mode}")
+        if params.get("runtimeScratchRoot") is not None:
+            scratch_policy = SandboxPolicy(root=root, mode=mode, temp_root=Path(params["runtimeScratchRoot"]))
+            params["runtimeScratchRoot"] = str(scratch_policy.temp_root)
         if self.state_dir.resolve().is_relative_to(root):
             # The model must receive a disposable workspace, not the trusted
             # controller directory that stores its sessions and approvals.
@@ -489,6 +494,8 @@ class RuntimeClient(AppServerClient):
             raise AppServerError("a resumed thread cannot change network authority")
         if "belloRole" in params and params["belloRole"] != record.get("belloRole"):
             raise AppServerError("a resumed thread cannot change its role")
+        if "runtimeScratchRoot" in params and params["runtimeScratchRoot"] != record.get("runtimeScratchRoot"):
+            raise AppServerError("a resumed thread cannot change its temporary directory")
         if policy.get("writableRoots") is not None and {str(Path(p).resolve()) for p in policy["writableRoots"]} != {record["cwd"]}:
             raise AppServerError("a turn cannot add writable roots")
         roots = params.get("runtimeWorkspaceRoots")
@@ -625,7 +632,7 @@ class RuntimeClient(AppServerClient):
                 if len(children) >= agents.get("max_concurrent_threads_per_session", 1):
                     raise AppServerError("subagent concurrency limit reached; wait for an active child first")
                 child_params = {key: deepcopy(record[key]) for key in (
-                    "cwd", "sandbox", "approvalPolicy", "runtimeWorkspaceRoots", "runtimeTaskPath", "serviceTier", "belloRole"
+                    "cwd", "sandbox", "approvalPolicy", "runtimeWorkspaceRoots", "runtimeTaskPath", "runtimeScratchRoot", "serviceTier", "belloRole"
                 ) if key in record}
                 child_params.update(model=selected.qualified, effort=args["effort"], parentThreadId=parent,
                                     rootThreadId=family, depth=depth + 1,

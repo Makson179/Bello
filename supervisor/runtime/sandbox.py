@@ -126,6 +126,7 @@ class SandboxPolicy:
     mode: SandboxMode = "workspace-write"
     network_access: bool = False
     readable_roots: tuple[Path, ...] = ()
+    temp_root: Path | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in _MODES:
@@ -163,6 +164,11 @@ class SandboxPolicy:
 
         object.__setattr__(self, "root", root)
         object.__setattr__(self, "readable_roots", tuple(readable))
+        if self.temp_root is not None:
+            temp = _resolve_existing(Path(self.temp_root), directory=True, label="temporary directory")
+            if self.mode == "read-only" or temp == root or not temp.is_relative_to(root):
+                raise SandboxPolicyError("temporary directory must be inside the writable workspace")
+            object.__setattr__(self, "temp_root", temp)
 
 
 @dataclass(frozen=True, slots=True)
@@ -782,6 +788,8 @@ def _mac_invocation(
         *_existing(("/usr/bin", "/bin", "/usr/sbin", "/sbin")),
     )
     env = _clean_environment(str(scratch / "home"), str(scratch / "tmp"), paths)
+    if policy.temp_root is not None:
+        env.update({key: str(policy.temp_root) for key in ("TMPDIR", "TMP", "TEMP")})
     return _Invocation(tuple(argv), env, cwd, "sandbox-exec")
 
 
@@ -920,7 +928,7 @@ def _linux_invocation(
         "--cap-drop", "ALL",
         "--clearenv",
         "--setenv", "HOME", "/home/bello",
-        "--setenv", "TMPDIR", "/tmp",
+        "--setenv", "TMPDIR", str(policy.temp_root) if policy.temp_root is not None else "/tmp",
         "--setenv", "XDG_CACHE_HOME", "/tmp/cache",
         "--setenv", "XDG_CONFIG_HOME", "/home/bello/.config",
         "--setenv", "XDG_DATA_HOME", "/home/bello/.local/share",
@@ -934,6 +942,9 @@ def _linux_invocation(
         "--dir", "/home",
         "--perms", "0700", "--dir", "/home/bello",
     ))
+    if policy.temp_root is not None:
+        for key in ("TMP", "TEMP"):
+            argv.extend(("--setenv", key, str(policy.temp_root)))
     system_mounts = _linux_system_mounts()
     internal_roots = tuple(
         root for root in toolchain.readable_roots

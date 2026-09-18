@@ -42,6 +42,54 @@ def test_policy_rejects_unknown_modes(tmp_path: Path, mode: str) -> None:
         SandboxPolicy(tmp_path, mode=mode)  # type: ignore[arg-type]
 
 
+def test_review_temp_requires_existing_contained_writable_directory(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    temp = root / ".cache" / "review"
+    temp.mkdir(parents=True)
+    assert SandboxPolicy(root, temp_root=temp).temp_root == temp.resolve()
+    for outside in (tmp_path, root):
+        with pytest.raises(SandboxPolicyError, match="inside the writable workspace"):
+            SandboxPolicy(root, temp_root=outside)
+    with pytest.raises(SandboxPolicyError, match="inside the writable workspace"):
+        SandboxPolicy(root, mode="read-only", temp_root=temp)
+
+
+def test_review_temp_environment_linux_and_mac(monkeypatch, tmp_path):
+    root = tmp_path / "workspace"
+    temp = root / ".cache" / "review"
+    temp.mkdir(parents=True)
+    policy = SandboxPolicy(root, temp_root=temp)
+    monkeypatch.setattr(sandbox, "_linux_launcher", lambda: Path("/usr/bin/bwrap"))
+    invocation = sandbox._linux_invocation(policy, root, ("/usr/bin/true",))
+    pairs = _argument_pairs(invocation.argv, "--setenv")
+    for key in ("TMPDIR", "TMP", "TEMP"):
+        assert (key, str(temp.resolve())) in pairs
+    monkeypatch.setattr(sandbox, "_trusted_launcher", lambda path, label: path)
+    monkeypatch.setattr(sandbox, "_mac_profile", lambda *args: ("profile", ()))
+    mac = sandbox._mac_invocation(policy, root, ("/usr/bin/true",), tmp_path)
+    for key in ("TMPDIR", "TMP", "TEMP"):
+        assert mac.env[key] == str(temp.resolve())
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform not in {"darwin", "linux"}, reason="POSIX sandbox integration")
+async def test_review_temp_persists_across_sandbox_commands(tmp_path):
+    root = tmp_path / "workspace"
+    temp = root / ".cache" / "review"
+    temp.mkdir(parents=True)
+    runner = SandboxRunner(SandboxPolicy(root, temp_root=temp))
+    try:
+        first = await runner.run('printf review-ok > "$TMPDIR/probe.txt"', root, 10)
+    except SandboxUnavailableError as exc:
+        if os.environ.get("BELLO_REQUIRE_NATIVE_SANDBOX") == "1":
+            raise
+        pytest.skip(str(exc))
+    assert first.exit_code == 0, first.output
+    second = await runner.run('cat "$TMPDIR/probe.txt"', root, 10)
+    assert second.exit_code == 0 and second.output == "review-ok"
+    assert (temp / "probe.txt").exists()
+
+
 def test_policy_rejects_nonexistent_or_overbroad_authority(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()

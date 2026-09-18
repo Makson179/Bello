@@ -187,6 +187,7 @@ class VerificationWorkspaceSnapshot:
     git_manifest: tuple[tuple[str, str], ...] = ()
     git_control_manifest: tuple[tuple[str, SnapshotPathState], ...] = ()
     mutable_submitted_paths: tuple[str, ...] = ()
+    scratch_root: Path | None = None
 
     def cleanup(self) -> None:
         if self.temp_root.exists() or self.temp_root.is_symlink():
@@ -1312,6 +1313,13 @@ def create_verification_workspace_snapshot(
                 "git_control_manifest",
                 _verification_git_control_manifest(verification.snapshot_root),
             )
+        # Allocate review inputs only after capturing the submitted state. Existing
+        # files, including submitted files under .cache, retain their usual protection.
+        object.__setattr__(
+            verification,
+            "scratch_root",
+            _create_verification_scratch(verification.snapshot_root),
+        )
         return verification
     except WorkspaceSnapshotError:
         _cleanup_path_best_effort(temp_root)
@@ -1321,6 +1329,23 @@ def create_verification_workspace_snapshot(
         raise WorkspaceSnapshotError(
             f"failed to create verification workspace snapshot: {exc}"
         ) from exc
+
+
+def _create_verification_scratch(snapshot_root: Path) -> Path:
+    """Allocate a private persistent scratch directory before exposing the snapshot."""
+
+    cache_root = snapshot_root / ".cache"
+    # Never replace a submitted path or follow a copied link into another location.
+    # No reviewer has access to this newly created snapshot yet.
+    if is_link_or_reparse(cache_root):
+        raise WorkspaceSnapshotError("verification scratch .cache must not be a link")
+    if cache_root.exists() and not cache_root.is_dir():
+        raise WorkspaceSnapshotError("verification scratch .cache must be a real directory")
+    cache_root.mkdir(mode=0o700, exist_ok=True)
+    if not cache_root.is_dir() or cache_root.resolve() != cache_root:
+        raise WorkspaceSnapshotError("verification scratch .cache must be a real directory")
+    # mkdtemp uses exclusive creation and retries name collisions without modifying them.
+    return Path(tempfile.mkdtemp(prefix="bello-review-", dir=cache_root)).resolve()
 
 
 def copy_isolated_workspace_tree(

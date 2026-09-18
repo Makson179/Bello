@@ -79,6 +79,7 @@ class ToolScope:
     distiller_enabled: bool = False
     runtime_enabled: bool = True
     task_path: Path | None = None
+    temp_root: Path | None = None
 
 
 def tool_result(text: str, *, details: dict[str, Any] | None = None, error: bool = False) -> dict[str, Any]:
@@ -296,6 +297,7 @@ class ToolHost:
                 root=scope.root, mode="danger-full-access" if escalation else scope.mode,
                 network_access=scope.network_access,
                 readable_roots=(*scope.readable_roots, helper),
+                temp_root=scope.temp_root,
             ))
 
             async def output_delta(chunk: str) -> None:

@@ -67,6 +67,16 @@ async def test_normal_commands_remain_contained_without_new_approval_round_trip(
 
 
 @pytest.mark.asyncio
+async def test_review_scratch_is_passed_to_every_command(host):
+    scratch = host[1] / ".cache" / "review"
+    scratch.mkdir(parents=True)
+    host[2][("thread", "turn")] = ToolScope(host[1], "workspace-write", temp_root=scratch)
+    await call(host, call_id="first")
+    await call(host, call_id="second")
+    assert [execution[0].temp_root for execution in host[4]] == [scratch.resolve()] * 2
+
+
+@pytest.mark.asyncio
 async def test_provider_call_id_can_repeat_in_another_turn_without_replaying_first(host):
     first = await call(host, call_id="provider-local-id")
     assert await call(host, call_id="provider-local-id") == first

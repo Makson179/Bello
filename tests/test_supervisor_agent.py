@@ -90,6 +90,9 @@ async def test_completion_review_uses_disposable_workspace_write_snapshot(
             self.turn_params = params
             review_root = Path(params["cwd"])
             assert review_root != tmp_path.resolve()
+            scratch = Path(self.thread_params["runtimeScratchRoot"])
+            assert scratch.is_dir() and scratch.is_relative_to(review_root / ".cache")
+            (scratch / "input.json").write_text('{"review": true}', encoding="utf-8")
             completed = subprocess.run(
                 [sys.executable, "-m", "unittest", "-v"],
                 cwd=review_root,
@@ -172,6 +175,9 @@ async def test_completion_review_uses_disposable_workspace_write_snapshot(
         "role": "completion_review",
     }
     developer_instructions = client.thread_params["developerInstructions"]
+    assert client.thread_params["runtimeScratchRoot"] in developer_instructions
+    assert "TMPDIR" in developer_instructions or "explicit path" in developer_instructions
+    assert "Do not change submitted source or tests" in developer_instructions
     assert "distinct requirements, modules, or validation questions" in developer_instructions
     assert "do not delegate the final judgment or final output" in developer_instructions
     assert client.turn_params is not None
@@ -187,6 +193,7 @@ async def test_completion_review_uses_disposable_workspace_write_snapshot(
     assert source.read_text(encoding="utf-8") == "candidate\n"
     assert not (tmp_path / ".pytest_cache").exists()
     assert review_root.exists()
+    assert (Path(client.thread_params["runtimeScratchRoot"]) / "input.json").exists()
 
     await agent.close_completion_review()
 

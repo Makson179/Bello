@@ -219,7 +219,7 @@
   },
   {
     "name": "wait_agent",
-    "description": "Wait for a child to finish and return its result.",
+    "description": "Wait for a child to finish and return its result. timeout is in seconds, not milliseconds (default 60, maximum 3600). A wait timeout does not stop the child; wait again for the same child if it is still working.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -229,7 +229,8 @@
         "timeout": {
           "type": "number",
           "minimum": 0,
-          "maximum": 3600
+          "maximum": 3600,
+          "description": "Seconds to wait, not milliseconds. Default 60; use 120 for two minutes. Range 0 to 3600."
         }
       },
       "required": [

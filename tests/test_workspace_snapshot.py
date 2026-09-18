@@ -533,6 +533,114 @@ def test_verification_snapshot_preserves_production_runtime_mounts_without_state
         coder.cleanup()
 
 
+def test_verification_scratch_persists_without_changing_submitted_state(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("submitted\n", encoding="utf-8")
+    cache = tmp_path / ".cache"
+    cache.mkdir()
+    (cache / "original.json").write_text('{"original": true}\n', encoding="utf-8")
+    _init_repo(tmp_path)
+
+    snapshot = create_verification_workspace_snapshot(tmp_path)
+    scratch = snapshot.scratch_root
+    assert scratch is not None
+    try:
+        assert scratch.parent == snapshot.snapshot_root / ".cache"
+        assert scratch.name.startswith("bello-review-")
+        assert scratch.is_dir() and not scratch.is_symlink()
+        assert not any(path.startswith(scratch.relative_to(snapshot.snapshot_root).as_posix())
+                       for path, _ in snapshot.submitted_manifest)
+        artifact = scratch / "test_snapshot.json"
+        artifact.write_text('{"value": 9}\n', encoding="utf-8")
+        snapshot.assert_submission_unchanged()
+        assert artifact.read_text(encoding="utf-8") == '{"value": 9}\n'
+        (scratch / "ev9.jsonl").write_text('{"event": 9}\n', encoding="utf-8")
+        snapshot.assert_submission_unchanged()
+        assert (tmp_path / "app.py").read_text(encoding="utf-8") == "submitted\n"
+        assert sorted(path.name for path in cache.iterdir()) == ["original.json"]
+        assert (cache / "original.json").read_text(encoding="utf-8") == '{"original": true}\n'
+    finally:
+        snapshot.cleanup()
+    assert not scratch.exists()
+    assert not snapshot.temp_root.exists()
+
+
+@pytest.mark.parametrize("changed_path", ["app.py", "test_snapshot.json", ".cache/original.json"])
+def test_verification_scratch_does_not_weaken_submission_guard(
+    tmp_path: Path, changed_path: str,
+) -> None:
+    (tmp_path / "app.py").write_text("submitted\n", encoding="utf-8")
+    (tmp_path / ".cache").mkdir()
+    (tmp_path / ".cache/original.json").write_text("submitted\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    snapshot = create_verification_workspace_snapshot(tmp_path)
+    try:
+        assert snapshot.scratch_root is not None
+        (snapshot.scratch_root / "probe.json").write_text("scratch\n", encoding="utf-8")
+        (snapshot.snapshot_root / changed_path).write_text("review mutation\n", encoding="utf-8")
+        with pytest.raises(WorkspaceSnapshotError, match="modified submitted workspace paths") as error:
+            snapshot.assert_submission_unchanged()
+        assert changed_path in str(error.value)
+        assert (tmp_path / "app.py").read_text(encoding="utf-8") == "submitted\n"
+        assert (tmp_path / ".cache/original.json").read_text(encoding="utf-8") == "submitted\n"
+        assert not (tmp_path / "test_snapshot.json").exists()
+    finally:
+        snapshot.cleanup()
+
+
+def test_verification_scratch_retries_name_collision_without_overwriting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = tmp_path / ".cache"
+    collision = cache / "bello-review-collision"
+    collision.mkdir(parents=True)
+    sentinel = collision / "preserve.txt"
+    sentinel.write_text("preserve\n", encoding="utf-8")
+    monkeypatch.setattr(workspace_snapshot_module.tempfile, "_get_candidate_names",
+                        lambda: iter(("collision", "unused")))
+    scratch = workspace_snapshot_module._create_verification_scratch(tmp_path.resolve())
+    assert scratch == cache.resolve() / "bello-review-unused"
+    assert sentinel.read_text(encoding="utf-8") == "preserve\n"
+
+
+def test_verification_scratch_rejects_cache_file_without_modifying_original(tmp_path: Path) -> None:
+    (tmp_path / ".cache").write_text("submitted file\n", encoding="utf-8")
+    with pytest.raises(WorkspaceSnapshotError, match=r"scratch \.cache must be a real directory"):
+        create_verification_workspace_snapshot(tmp_path)
+    assert (tmp_path / ".cache").read_text(encoding="utf-8") == "submitted file\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink creation")
+def test_verification_scratch_rejects_internal_cache_symlink(tmp_path: Path) -> None:
+    (tmp_path / "existing").mkdir()
+    (tmp_path / "existing/keep.txt").write_text("preserve\n", encoding="utf-8")
+    (tmp_path / ".cache").symlink_to("existing", target_is_directory=True)
+    with pytest.raises(WorkspaceSnapshotError, match=r"scratch \.cache must not be a link"):
+        create_verification_workspace_snapshot(tmp_path)
+    assert (tmp_path / ".cache").is_symlink()
+    assert sorted(path.name for path in (tmp_path / "existing").iterdir()) == ["keep.txt"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink sanitization")
+def test_verification_scratch_does_not_follow_external_cache_symlink(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("preserve\n", encoding="utf-8")
+    (workspace / ".cache").symlink_to(outside, target_is_directory=True)
+    snapshot = create_verification_workspace_snapshot(workspace)
+    try:
+        assert snapshot.scratch_root is not None
+        assert snapshot.scratch_root.is_relative_to(snapshot.snapshot_root)
+        assert not (snapshot.snapshot_root / ".cache").is_symlink()
+        (snapshot.scratch_root / "probe.json").write_text("scratch\n", encoding="utf-8")
+        snapshot.assert_submission_unchanged()
+        assert sorted(path.name for path in outside.iterdir()) == ["keep.txt"]
+        assert (workspace / ".cache").is_symlink()
+    finally:
+        snapshot.cleanup()
+
+
 def test_verification_snapshot_preserves_info_exclude_and_filemode_semantics(
     tmp_path: Path,
 ) -> None:

@@ -17,6 +17,8 @@ import shutil
 from typing import Any
 from uuid import uuid4
 
+from jsonschema import ValidationError
+
 from supervisor.appserver import (AppServerClient, AppServerError, AppServerMessage,
     AppServerTimeoutError, _private_owned_directory)
 from supervisor.runtime.journal import RuntimeJournal
@@ -32,6 +34,12 @@ _TURN_FIELDS = frozenset({"input", "cwd", "approvalPolicy", "approvalsReviewer",
 _APPROVALS = frozenset({"item/commandExecution/requestApproval", "item/fileChange/requestApproval",
     "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval"})
 _IDENTITY_FIELDS = {"threadId", "parentThreadId", "senderThreadId", "receiverThreadId"}
+
+
+def _delegation_tools(params: dict[str, Any]) -> list[dict[str, Any]]:
+    if not (params.get("config") or {}).get("agents", {}).get("enabled"):
+        return []
+    return [tool for tool in params.get("tools", []) if tool.get("name") in _DELEGATION]
 
 
 def _identifier(value: Any, name: str) -> str:
@@ -151,7 +159,8 @@ class CodexBackend:
                 environment.update(self._bridge.environment)
             # Overrides apply only to the child, never the user's global config.
             command = [*command, "-c", 'forced_login_method="chatgpt"', "-c", 'model_provider="openai"',
-                       "-c", "features.multi_agent=false"]
+                       "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false",
+                       "-c", "agents.enabled=false"]
             self._client = self._factory(command=command, cwd=self.state_dir,
                 notification_handler=self._receive, server_request_handler=self._receive,
                 transport_error_handler=self._transport_error, environment_overrides=environment,
@@ -300,9 +309,50 @@ class CodexBackend:
         for key in list(config):
             if key == "model_providers" or key.startswith("model_providers."):
                 raise AppServerError("native Codex provider overrides are not permitted")
-        config.update({"model_provider": "openai", "forced_login_method": "chatgpt", "features.multi_agent": False})
+            if key.startswith("agents.") or key.startswith("features.multi_agent_v2."):
+                config.pop(key)
+        # In Codex 0.153, multi_agent=false only disables the legacy fallback:
+        # model metadata can still select native collaboration. agents.enabled
+        # is the hard off switch, provided multi_agent_v2 is also disabled.
+        # Delegation stays exclusively in Bello's policy-checked dynamic tools.
+        config.update({"model_provider": "openai", "forced_login_method": "chatgpt",
+                       "features.multi_agent": False, "features.multi_agent_v2": False,
+                       "agents": {"enabled": False}})
         if isinstance(config.get("features"), dict):
             config["features"]["multi_agent"] = False
+            config["features"]["multi_agent_v2"] = False
+        tool_tmp = self._tool_tmp
+        if params.get("runtimeScratchRoot") is not None:
+            # The app-server is shared by every role. Assign review scratch in
+            # this thread's shell policy, never in its process-wide environment.
+            raw_scratch = params["runtimeScratchRoot"]
+            try:
+                if not isinstance(raw_scratch, str) or not Path(raw_scratch).is_absolute():
+                    raise ValueError("scratch must be an absolute path")
+                scratch = Path(raw_scratch).resolve(strict=True)
+                workspace = Path(params["cwd"]).resolve(strict=True)
+                if (params.get("sandbox", "workspace-write") != "workspace-write"
+                        or not scratch.is_dir() or scratch == workspace or not scratch.is_relative_to(workspace)):
+                    raise ValueError("scratch must be inside the writable workspace")
+            except (KeyError, ValueError, OSError, RuntimeError) as error:
+                raise AppServerError("native Codex scratch must be an existing directory inside its writable workspace") from error
+            tool_tmp = scratch
+            shell_policy = config.setdefault("shell_environment_policy", {})
+            if not isinstance(shell_policy, dict):
+                raise AppServerError("native Codex shell environment policy must be an object")
+            environment = shell_policy.setdefault("set", {})
+            if not isinstance(environment, dict):
+                raise AppServerError("native Codex shell environment values must be an object")
+            # Normalize the equivalent dotted representation before assigning
+            # the trusted scratch values; preserve unrelated explicit values.
+            dotted = config.pop("shell_environment_policy.set", {})
+            if not isinstance(dotted, dict):
+                raise AppServerError("native Codex shell environment values must be an object")
+            environment.update(dotted)
+            for key in list(config):
+                if key.startswith("shell_environment_policy.set."):
+                    environment[key.removeprefix("shell_environment_policy.set.")] = config.pop(key)
+            environment.update({key: str(scratch) for key in ("TMPDIR", "TMP", "TEMP")})
         if _effort(params) is not None:
             config["model_reasoning_effort"] = _effort(params)
         if params.get("distillerEnabled"):
@@ -316,10 +366,7 @@ class CodexBackend:
             config.pop("features.bello_native_selection", None)
             if isinstance(config.get("features"), dict):
                 config["features"].pop("bello_native_selection", None)
-        allowed = [t for t in params.get("tools", []) if t.get("name") in _DELEGATION]
-        agents_enabled = bool((params.get("config") or {}).get("agents", {}).get("enabled"))
-        if not agents_enabled:
-            allowed = []
+        allowed = _delegation_tools(params)
         dynamic = [{"name": "bello_" + t["name"], "description": t["description"], "inputSchema": deepcopy(t["parameters"])} for t in allowed]
         native = {key: deepcopy(params[key]) for key in _THREAD_FIELDS if key in params}
         # Null means native default; use explicit default for usual/non-Fast runs.
@@ -335,7 +382,7 @@ class CodexBackend:
                 if cwd not in self._toolchain_read_paths:
                     self._toolchain_read_paths[cwd] = native_toolchain_read_paths(Path(cwd))
                 toolchain_paths = self._toolchain_read_paths[cwd]
-        permissions = native_permission_params(params, temp_dir=self._tool_tmp,
+        permissions = native_permission_params(params, temp_dir=tool_tmp,
             runtime_read_paths=(*self._runtime_read_paths, *toolchain_paths))
         if "permissions" in permissions:
             native.pop("sandbox", None)
@@ -581,7 +628,7 @@ class CodexBackend:
         if raw.get("method") == "item/tool/call":
             params = mapped.get("params", {})
             name = params.get("tool", "")
-            allowed = {"bello_" + t["name"] for t in (record or {}).get("params", {}).get("tools", []) if t.get("name") in _DELEGATION}
+            allowed = {"bello_" + t["name"] for t in _delegation_tools((record or {}).get("params", {}))}
             if not record or name not in allowed or not self.tool_handler:
                 result = {"contentItems": [{"type": "inputText", "text": "Bello rejected an unconfigured delegation tool."}], "success": False}
             else:
@@ -591,6 +638,19 @@ class CodexBackend:
                         "name": name.removeprefix("bello_"), "arguments": params.get("arguments", {})})
                     result = {"contentItems": [{"type": "inputText", "text": c["text"]} for c in result.get("content", []) if c.get("type") == "text"],
                               "success": not result.get("isError", False)}
+                except ValidationError as error:
+                    # Do not expose rejected argument values or schema internals.
+                    # A common milliseconds/seconds mistake is recoverable by
+                    # waiting on the same child with valid arguments, not by
+                    # stopping it and starting the work again.
+                    text = "Bello delegation failed."
+                    if name == "bello_wait_agent" and list(error.path) == ["timeout"]:
+                        text = (
+                            "Invalid wait_agent timeout. Use seconds from 0 to 3600 "
+                            "(default 60); use 120 for two minutes, not 120000. "
+                            "The wait was not executed; this argument error did not stop the child."
+                        )
+                    result = {"contentItems": [{"type": "inputText", "text": text}], "success": False}
                 except Exception:
                     result = {"contentItems": [{"type": "inputText", "text": "Bello delegation failed."}], "success": False}
             await self._client.respond(raw["id"], result)

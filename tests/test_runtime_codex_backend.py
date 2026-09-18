@@ -141,7 +141,8 @@ async def test_native_prompt_tools_and_subscription_are_preserved(tmp_path):
         assert native["dynamicTools"] == []
         assert native["modelProvider"] == "openai"
         assert native["config"]["features.multi_agent"] is False
-        assert "agents" not in native["config"]
+        assert native["config"]["features.multi_agent_v2"] is False
+        assert native["config"]["agents"] == {"enabled": False}
         assert native["config"]["model_reasoning_effort"] == "xhigh"
         assert native["permissions"] == "bello-native" and "sandbox" not in native
         profile = native["config"]["permissions"]["bello-native"]
@@ -156,12 +157,103 @@ async def test_native_prompt_tools_and_subscription_are_preserved(tmp_path):
         command = client.options["command"]
         assert command[1:4] == ["app-server", "--listen", "stdio://"]
         assert 'forced_login_method="chatgpt"' in command
+        assert "features.multi_agent=false" in command
+        assert "features.multi_agent_v2=false" in command
+        assert "agents.enabled=false" in command
         assert client.options["environment_overrides"]["OPENAI_API_KEY"] is None
         assert client.options["environment_overrides"]["GIT_CONFIG_GLOBAL"] == os.devnull
         assert client.options["environment_overrides"]["GIT_CONFIG_NOSYSTEM"] == "1"
         assert {client.options["environment_overrides"][key] for key in ("TMPDIR", "TMP", "TEMP")} == {str(backend._tool_tmp)}
         await drain(backend)
         assert events[0]["params"]["thread"]["id"] == "host-thread"
+    finally:
+        await backend.stop()
+
+
+async def test_review_scratch_is_thread_scoped_preserved_on_resume_and_used_by_native_child(tmp_path):
+    workspace = tmp_path / "review-copy"
+    scratch = workspace / "review-scratch"
+    scratch.mkdir(parents=True)
+    other_workspace = tmp_path / "other-review-copy"
+    other_scratch = other_workspace / "review-scratch"
+    other_scratch.mkdir(parents=True)
+    backend, _, clients = make_backend(tmp_path)
+    try:
+        params = thread_params(workspace, runtimeScratchRoot=str(scratch), belloRole="completion_review")
+        await backend.request("thread/start", params)
+        await backend.request("thread/start", thread_params(workspace, host="review-child",
+            runtimeScratchRoot=str(scratch), belloRole="completion_review", parentThreadId="host-thread"))
+        await backend.request("thread/start", thread_params(other_workspace, host="other-review",
+            runtimeScratchRoot=str(other_scratch), belloRole="completion_review"))
+        starts = [p for method, p in clients[0].calls if method == "thread/start"]
+        assert len(starts) == 3
+        for native, expected in zip(starts, (scratch, scratch, other_scratch)):
+            assert "runtimeScratchRoot" not in native
+            assert native["config"]["shell_environment_policy"]["set"] == {
+                key: str(expected) for key in ("TMPDIR", "TMP", "TEMP")}
+            fs = native["config"]["permissions"]["bello-native"]["filesystem"]
+            assert fs[str(expected)] == "write"
+            assert str(backend._tool_tmp) not in fs
+        # Reviewer scratch never becomes a shared app-server environment setting.
+        assert {clients[0].options["environment_overrides"][key] for key in ("TMPDIR", "TMP", "TEMP")} == {str(backend._tool_tmp)}
+        await backend.request("thread/resume", {"threadId": "host-thread"})
+        resumed = next(p for method, p in reversed(clients[0].calls) if method == "thread/resume")
+        assert resumed["config"]["shell_environment_policy"]["set"] == starts[0]["config"]["shell_environment_policy"]["set"]
+    finally:
+        await backend.stop()
+
+
+async def test_review_scratch_preserves_unrelated_shell_settings_and_normalizes_temp_overrides(tmp_path):
+    scratch = tmp_path / "review-scratch"
+    scratch.mkdir()
+    config = {
+        "shell_environment_policy": {"inherit": "core", "set": {"MY_FLAG": "keep", "TMPDIR": "/wrong"}},
+        "shell_environment_policy.set": {"OTHER_FLAG": "also-keep"},
+        "shell_environment_policy.set.TEMP": "/also-wrong",
+    }
+    backend, _, _ = make_backend(tmp_path)
+    try:
+        native = backend._thread_params(thread_params(tmp_path,
+            runtimeScratchRoot=str(scratch), config=config))
+        policy = native["config"]["shell_environment_policy"]
+        assert policy["inherit"] == "core"
+        assert policy["set"] == {"MY_FLAG": "keep", "OTHER_FLAG": "also-keep",
+                                 **{key: str(scratch) for key in ("TMPDIR", "TMP", "TEMP")}}
+        assert not any(key.startswith("shell_environment_policy.set") for key in native["config"])
+        assert config["shell_environment_policy"]["set"]["TMPDIR"] == "/wrong"
+    finally:
+        await backend.stop()
+
+
+@pytest.mark.parametrize("kind", ["relative", "workspace", "outside", "missing", "file", "symlink_escape", "read_only"])
+async def test_native_review_scratch_rejects_invalid_or_outside_paths(tmp_path, kind):
+    workspace = tmp_path / "review-copy"
+    workspace.mkdir()
+    scratch = workspace / "scratch"
+    scratch.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if kind == "relative":
+        supplied = "scratch"
+    elif kind == "workspace":
+        supplied = str(workspace)
+    elif kind == "outside":
+        supplied = str(outside)
+    elif kind == "missing":
+        supplied = str(workspace / "missing")
+    elif kind == "file":
+        (workspace / "file").write_text("not a directory")
+        supplied = str(workspace / "file")
+    elif kind == "symlink_escape":
+        (workspace / "link").symlink_to(outside, target_is_directory=True)
+        supplied = str(workspace / "link")
+    else:
+        supplied = str(scratch)
+    backend, _, _ = make_backend(tmp_path)
+    try:
+        with pytest.raises(AppServerError, match="scratch must be an existing directory inside its writable workspace"):
+            backend._thread_params(thread_params(workspace, runtimeScratchRoot=supplied,
+                sandbox="read-only" if kind == "read_only" else "workspace-write"))
     finally:
         await backend.stop()
 
@@ -173,8 +265,45 @@ async def test_only_configured_delegation_is_dynamic(tmp_path):
         native = next(p for m, p in clients[0].calls if m == "thread/start")
         assert [tool["name"] for tool in native["dynamicTools"]] == ["bello_spawn_agent", "bello_wait_agent"]
         assert native["config"]["features.multi_agent"] is False
+        assert native["config"]["features.multi_agent_v2"] is False
+        assert native["config"]["agents"] == {"enabled": False}
         assert all("inputSchema" in tool for tool in native["dynamicTools"])
         assert "bello_spawn_agent" in native["developerInstructions"]
+    finally:
+        await backend.stop()
+
+
+@pytest.mark.parametrize("bello_enabled", [False, True])
+async def test_native_collaboration_hard_disabled_on_start_and_resume(tmp_path, bello_enabled):
+    backend, _, clients = make_backend(tmp_path)
+    requested = {
+        "agents": {"enabled": bello_enabled, "allowed": {"claude-code/claude-sonnet-5": ["high"]}},
+        "agents.enabled": True,
+        "features.multi_agent": True,
+        "features.multi_agent_v2": True,
+        "features.multi_agent_v2.enabled": True,
+        "features": {"multi_agent": True, "multi_agent_v2": {"enabled": True}, "other": True},
+    }
+    original = deepcopy(requested)
+    try:
+        await backend.request("thread/start", thread_params(tmp_path, config=requested))
+        await backend.request("thread/resume", {"threadId": "host-thread", "config": requested})
+        for method, native in clients[0].calls:
+            if method not in {"thread/start", "thread/resume"}:
+                continue
+            config = native["config"]
+            # A model-advertised multi-agent version takes precedence over the
+            # old features.multi_agent=false flag. Both of these are required.
+            assert config["agents"] == {"enabled": False}
+            assert config["features.multi_agent_v2"] is False
+            assert config["features"]["multi_agent_v2"] is False
+            assert config["features.multi_agent"] is False
+            assert config["features"]["multi_agent"] is False
+            assert config["features"]["other"] is True
+            assert not any(key.startswith("agents.") or key.startswith("features.multi_agent_v2.") for key in config)
+            if method == "thread/start":
+                assert bool(native["dynamicTools"]) is bello_enabled
+        assert requested == original
     finally:
         await backend.stop()
 
@@ -403,6 +532,109 @@ async def test_dynamic_delegation_goes_through_host_with_stable_identity(tmp_pat
         assert called["name"] == "spawn_agent"
         assert called["callId"] == "codex:host-thread:call-1"
         assert clients[0].responses[-1][1] == {"contentItems": [{"type": "inputText", "text": "child-id"}], "success": True}
+    finally:
+        await backend.stop()
+
+
+async def test_disabled_delegation_rejects_unadvertised_dynamic_call(tmp_path):
+    handler = AsyncMock()
+    backend, _, clients = make_backend(tmp_path, tool_handler=handler)
+    try:
+        await backend.request("thread/start", thread_params(tmp_path))
+        await backend.request("turn/start", {"threadId": "host-thread", "turnId": "host-turn", "input": "a"})
+        await clients[0].notify_event("item/tool/call", {"threadId": "native-thread-1", "turnId": "native-turn-1",
+            "tool": "bello_spawn_agent", "arguments": {"task": "Inspect"}, "callId": "disabled-call"}, 22)
+        await drain(backend)
+        handler.assert_not_awaited()
+        assert clients[0].responses[-1][0] == 22
+        assert clients[0].responses[-1][1]["success"] is False
+    finally:
+        await backend.stop()
+
+
+@pytest.mark.parametrize("timeout", [120000, -1, "private-value-must-not-leak"])
+async def test_invalid_wait_timeout_explains_seconds_without_replay_or_argument_leak(tmp_path, timeout):
+    from supervisor.runtime.tools import _SCHEMAS, tool_definitions
+
+    executed = []
+
+    async def handler(request):
+        _SCHEMAS[request["name"]].validate(request["arguments"])
+        executed.append(request)
+        raise AssertionError("invalid wait must not reach delegation")
+
+    backend, _, clients = make_backend(tmp_path, tool_handler=handler)
+    try:
+        await backend.request("thread/start", thread_params(tmp_path,
+            tools=tool_definitions(), config={"agents": {"enabled": True}}))
+        await backend.request("turn/start", {"threadId": "host-thread", "turnId": "host-turn", "input": "a"})
+        await clients[0].notify_event("item/tool/call", {"threadId": "native-thread-1", "turnId": "native-turn-1",
+            "tool": "bello_wait_agent", "arguments": {"agent_id": "owned-child", "timeout": timeout},
+            "callId": "bad-timeout"}, 23)
+        await drain(backend)
+        reply = clients[0].responses[-1][1]
+        assert reply["success"] is False
+        text = reply["contentItems"][0]["text"]
+        assert "seconds from 0 to 3600" in text and "default 60" in text
+        assert "120 for two minutes" in text and "did not stop the child" in text
+        assert "private-value-must-not-leak" not in text and "owned-child" not in text
+        assert executed == []
+        assert not any(method in {"thread/archive", "turn/interrupt"} for method, _ in clients[0].calls)
+        advertised = next(
+            tool for method, params in clients[0].calls if method == "thread/start"
+            for tool in params["dynamicTools"] if tool["name"] == "bello_wait_agent")
+        assert "seconds, not milliseconds" in advertised["description"]
+        assert "Default 60" in advertised["inputSchema"]["properties"]["timeout"]["description"]
+    finally:
+        await backend.stop()
+
+
+@pytest.mark.parametrize("arguments", [{"agent_id": "owned-child", "timeout": 120}, {"agent_id": "owned-child"}])
+async def test_valid_wait_seconds_and_default_preserve_arguments_and_returned_report(tmp_path, arguments):
+    from supervisor.runtime.tools import _SCHEMAS, tool_definitions
+
+    executed = []
+
+    async def handler(request):
+        _SCHEMAS[request["name"]].validate(request["arguments"])
+        executed.append(request)
+        return {"content": [{"type": "text", "text": "child report"}], "isError": False}
+
+    backend, _, clients = make_backend(tmp_path, tool_handler=handler)
+    try:
+        await backend.request("thread/start", thread_params(tmp_path,
+            tools=tool_definitions(), config={"agents": {"enabled": True}}))
+        await backend.request("turn/start", {"threadId": "host-thread", "turnId": "host-turn", "input": "a"})
+        await clients[0].notify_event("item/tool/call", {"threadId": "native-thread-1", "turnId": "native-turn-1",
+            "tool": "bello_wait_agent", "arguments": arguments, "callId": "valid-wait"}, 24)
+        await drain(backend)
+        assert len(executed) == 1
+        assert executed[0]["arguments"] == arguments
+        assert executed[0]["threadId"] == "host-thread" and executed[0]["turnId"] == "host-turn"
+        assert clients[0].responses[-1][1] == {
+            "contentItems": [{"type": "inputText", "text": "child report"}], "success": True}
+    finally:
+        await backend.stop()
+
+
+@pytest.mark.parametrize("validation_error", [False, True])
+async def test_unrelated_delegation_errors_still_redact_internal_details(tmp_path, validation_error):
+    from supervisor.runtime.tools import _SCHEMAS
+
+    async def handler(request):
+        if validation_error:
+            _SCHEMAS["wait_agent"].validate({"agent_id": ["private-internal-value"]})
+        raise RuntimeError("private-internal-value")
+
+    backend, _, clients = make_backend(tmp_path, tool_handler=handler)
+    try:
+        await backend.request("thread/start", thread_params(tmp_path, config={"agents": {"enabled": True}}))
+        await backend.request("turn/start", {"threadId": "host-thread", "turnId": "host-turn", "input": "a"})
+        await clients[0].notify_event("item/tool/call", {"threadId": "native-thread-1", "turnId": "native-turn-1",
+            "tool": "bello_wait_agent", "arguments": {"agent_id": "owned-child"}, "callId": "other-error"}, 25)
+        await drain(backend)
+        assert clients[0].responses[-1][1] == {
+            "contentItems": [{"type": "inputText", "text": "Bello delegation failed."}], "success": False}
     finally:
         await backend.stop()
 

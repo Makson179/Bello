@@ -19,6 +19,7 @@ from supervisor.runtime import sandbox
 
 _IS_MACOS = sys.platform == "darwin"
 _IS_WINDOWS = sys.platform == "win32"
+_IS_LINUX = sys.platform.startswith("linux")
 _XCODE_SELECT = Path("/usr/bin/xcode-select")
 _COMMAND_LINE_TOOLS = Path("/Library/Developer/CommandLineTools")
 _APPLICATIONS = Path("/Applications")
@@ -187,4 +188,14 @@ def native_toolchain_read_paths(workspace: Path) -> tuple[Path, ...]:
         cryptex_aliases = _mac_cryptex_alias_directory()
         if cryptex_aliases is not None:
             append(cryptex_aliases)
+    if _IS_LINUX and not (_IS_MACOS or _IS_WINDOWS):
+        # Native bubblewrap cannot bind a venv's python symlink again after
+        # mounting the containing venv directory. These descendants already
+        # have the same read authority; retain canonical targets outside the
+        # directory, but avoid redundant mounts inside it. Seatbelt's lexical
+        # alias grants are intentionally unchanged.
+        directories = tuple(path for path in selected if path.is_dir())
+        selected = [path for path in selected if not any(
+            path != root and path.is_relative_to(root) for root in directories
+        )]
     return tuple(selected)
