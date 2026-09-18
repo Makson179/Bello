@@ -37,7 +37,7 @@ an API provider. The four components can be enabled or disabled independently.
 In our [tests](#results), the Efficient Budget configuration used 66.3% less
 of the weekly Codex limit than Raw GPT-5.6 Sol XHigh without lowering average
 quality, and its mean score was 1.45% higher. Sol Ultra C+A raised the mean
-score over Raw Codex by 26.4%. The log distiller cut estimated usage by 22% on
+score over Raw Codex by 26.4%. The log distiller cut subscription usage by 22% on
 Astra and by 14.8% on Luna.
 
 ## Install
@@ -173,7 +173,7 @@ Terra, 6.5 on Sol, and 6.0 on Astra.
 Efficient Budget uses GPT-5.6 Luna at `xhigh` for the coder, the completion
 reviewer, and the adversary, and Luna at `high` for runtime supervision with
 cheap triage on. It allows one completion return before one adversary pass.
-The baseline is Raw GPT-5.6 Sol XHigh, a stronger model than Luna.
+The baseline is Raw GPT-5.6 Sol XHigh.
 
 Across four tasks with three runs per task and system, Budget used 5.27% of a
 weekly Codex limit against 15.63% for Raw, which is 66.3% less. Its mean score
