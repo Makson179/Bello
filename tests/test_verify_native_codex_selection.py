@@ -109,6 +109,8 @@ def test_windows_invocations_preserve_exit_code_focus_and_polling(case):
         assert "tools.write_stdin" in tool["input"]
     if case.protected == "help":
         assert "--help" in command
+        assert "fixture-help --help" in command and ".ps1" not in command
+        assert "[Console]::Out.Write" in command
 
 
 def test_bridge_environment_cannot_smuggle_credentials(tmp_path):

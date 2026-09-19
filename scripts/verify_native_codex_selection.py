@@ -104,7 +104,9 @@ def invocation(case: Case, *, windows: bool | None = None) -> tuple[dict[str, An
     if windows:
         command = {
             "task": "[Console]::Out.Write((Get-Content -Raw -LiteralPath 'fixture-requirements.data')); exit 7",
-            "help": "& ./fixture-help.ps1 --help; exit 7",
+            # Inline fixture: independent of .ps1 execution policy and native
+            # child-output newline conversion by Windows PowerShell.
+            "help": "function fixture-help { [Console]::Out.Write([IO.File]::ReadAllText('diagnostic.log')) }; fixture-help --help; exit 7",
         }.get(case.protected, "[Console]::Out.Write((Get-Content -Raw -LiteralPath 'diagnostic.log')); exit 7")
         if case.mode == "poll":
             command = "Start-Sleep -Seconds 2; " + command
@@ -342,8 +344,6 @@ async def run_case(binary: Path, case: Case, output: Path) -> dict[str, Any]:
     for name in ("diagnostic.log", "fixture-requirements.data"):
         (work / name).write_text(RAW, encoding="utf-8", newline="\n")
     (work / "fixture-help.sh").write_text("#!/bin/bash\ncat diagnostic.log\n")
-    (work / "fixture-help.ps1").write_text(
-        "[Console]::Out.Write([IO.File]::ReadAllText('diagnostic.log'))\n", encoding="utf-8")
     selections = []
 
     class SelectorDouble:

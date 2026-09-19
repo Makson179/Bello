@@ -69,7 +69,8 @@ jobs:
       - uses: ./native-source/.github/actions/setup-msvc-env
         with:
           target: x86_64-pc-windows-msvc
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: native_cache
         with:
           path: |
             ${{ runner.temp }}/bello-cargo/registry
@@ -96,6 +97,18 @@ jobs:
       - name: Build four native Windows executables
         working-directory: native-source/codex-rs
         run: cargo build --locked --release --timings --target x86_64-pc-windows-msvc --bin codex --bin codex-code-mode-host --bin codex-command-runner --bin codex-windows-sandbox-setup
+      # Persist the successful expensive build before any later proof failure.
+      # Only public dependency sources and target outputs, never Cargo credentials.
+      - name: Save successful native build cache
+        if: steps.native_cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ runner.temp }}/bello-cargo/registry
+            ${{ runner.temp }}/bello-cargo/git
+            ${{ runner.temp }}/bello-native-target
+          key: ${{ steps.native_cache.outputs.cache-primary-key }}
       - name: Verify real native direct, code-mode and poll provider boundaries
         run: python scripts/verify_native_codex_selection.py --codex "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/codex.exe" --output-dir native-proof
       - name: Package only after all nine proof cases pass

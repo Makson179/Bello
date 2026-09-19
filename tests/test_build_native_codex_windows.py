@@ -46,6 +46,33 @@ def test_prepare_rejects_wrong_or_dirty_source(tmp_path, monkeypatch, revision, 
         build.prepare(tmp_path, tmp_path / "patch")
 
 
+@pytest.mark.parametrize("autocrlf", ["false", "true"])
+def test_prepare_accepts_crlf_patch_with_empty_context_on_real_git(tmp_path, monkeypatch, autocrlf):
+    source = tmp_path / "source"
+    source.mkdir()
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(source), *args], text=True)
+    git("init", "--quiet")
+    git("config", "core.autocrlf", autocrlf)
+    (source / "codex-rs").mkdir()
+    (source / "codex-rs/Cargo.lock").write_text('version = 4\n', newline="\n")
+    original = b"before\n\ncontext\n"
+    if autocrlf == "true":
+        original = original.replace(b"\n", b"\r\n")
+    (source / "file.txt").write_bytes(original)
+    git("add", ".")
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        "commit", "--quiet", "-m", "fixture")
+    monkeypatch.setattr(build, "UPSTREAM_REVISION", git("rev-parse", "HEAD").strip())
+    patch = tmp_path / "fixture.patch"
+    payload = (b"diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n"
+               b"@@ -1,3 +1,3 @@\n-before\n+after\n\n context\n").replace(b"\n", b"\r\n")
+    patch.write_bytes(payload)
+    build.prepare(source, patch)
+    assert (source / "file.txt").read_text() == "after\n\ncontext\n"
+    assert patch.read_bytes() == payload
+
+
 @pytest.mark.parametrize("change", ["hash", "platform", "paid", "failed", "missing", "duplicate", "bad_case"])
 def test_proof_gate_rejects_incomplete_or_unrelated_evidence(tmp_path, change):
     binary = tmp_path / "codex.exe"

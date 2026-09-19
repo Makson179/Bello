@@ -61,8 +61,12 @@ def prepare(source: Path, patch: Path) -> None:
     dirty = subprocess.check_output(["git", "-C", str(source), "status", "--porcelain"], text=True)
     if dirty.strip():
         raise ValueError("Preparation requires a fresh upstream checkout")
-    subprocess.run(["git", "-C", str(source), "apply", "--check", str(patch.resolve())], check=True)
-    subprocess.run(["git", "-C", str(source), "apply", str(patch.resolve())], check=True)
+    # Git for Windows may check the patch itself out as CRLF. A bare context
+    # blank then becomes "\r", which git apply rejects as corrupt syntax.
+    # Normalize the transport bytes only; keep the distributed patch untouched.
+    patch_bytes = patch.read_bytes().replace(b"\r\n", b"\n")
+    subprocess.run(["git", "-C", str(source), "apply", "--check", "-"], input=patch_bytes, check=True)
+    subprocess.run(["git", "-C", str(source), "apply", "-"], input=patch_bytes, check=True)
     lock = source / "codex-rs" / "Cargo.lock"
     lock.write_text(normalize_workspace_versions(lock.read_text(encoding="utf-8")), encoding="utf-8", newline="\n")
 
