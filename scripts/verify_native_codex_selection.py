@@ -499,8 +499,8 @@ class NativeSession:
         finally:
             self.pending.pop(request_id, None)
 
-    async def complete(self, thread_id: str):
-        async with asyncio.timeout(60):
+    async def complete(self, thread_id: str, *, timeout: float = 60):
+        async with asyncio.timeout(timeout):
             while True:
                 event = await self.notifications.get()
                 if event.get("method") == "fixture/error":
@@ -562,7 +562,8 @@ def output_packets(request: dict[str, Any], mode: str) -> list[dict[str, Any]]:
     return packets
 
 
-async def run_case(binary: Path, case: Case, output: Path) -> dict[str, Any]:
+async def run_case(binary: Path, case: Case, output: Path, *, selector=None,
+                   raw_output: str = RAW, turn_timeout: float = 60) -> dict[str, Any]:
     from supervisor.runtime.codex_distiller import CodexDistillerBridge
 
     output.mkdir(parents=True, exist_ok=False)
@@ -571,7 +572,7 @@ async def run_case(binary: Path, case: Case, output: Path) -> dict[str, Any]:
     home.mkdir(mode=0o700)
     (home / "tmp").mkdir()
     for name in ("diagnostic.log", "fixture-requirements.data"):
-        (work / name).write_text(RAW, encoding="utf-8", newline="\n")
+        (work / name).write_text(raw_output, encoding="utf-8", newline="\n")
     (work / "fixture-help.sh").write_text("#!/bin/bash\ncat diagnostic.log\n")
     outside = output / "outside-workspace"
     private = output / "private-outside-workspace"
@@ -582,16 +583,19 @@ async def run_case(binary: Path, case: Case, output: Path) -> dict[str, Any]:
         private_before_sha256 = create_windows_private_canary(private)
     selections = []
 
-    class SelectorDouble:
+    class RecordingSelector:
         async def distill(self, log, focus, command):
-            selections.append({"log": log, "focus": focus, "command": command, "selected": SELECTED})
-            if log != RAW:
+            record = {"log": log, "focus": focus, "command": command}
+            selections.append(record)
+            if log != raw_output:
                 raise ValueError("Unexpected synthetic input")
-            return SELECTED
+            result = SELECTED if selector is None else await selector.distill(log, focus, command)
+            record["selected"] = result
+            return result
 
     # A custom filename ensures this tests exact registered task scope, not just
     # the generic TASK.md/README name exclusion.
-    bridge = CodexDistillerBridge(SelectorDouble(), output / "bridge", work, work / "fixture-requirements.data")
+    bridge = CodexDistillerBridge(RecordingSelector(), output / "bridge", work, work / "fixture-requirements.data")
     await bridge.start()
     tool, command = invocation(case, command_prefix=windows_filesystem_probe(outside, private) if os.name == "nt" else "")
     provider = Provider(tool)
@@ -629,7 +633,7 @@ async def run_case(binary: Path, case: Case, output: Path) -> dict[str, Any]:
         thread_id = reply["thread"]["id"]
         await session.request("turn/start", {"threadId": thread_id,
             "input": [{"type": "text", "text": "Run the synthetic local fixture.", "text_elements": []}]})
-        await session.complete(thread_id)
+        await session.complete(thread_id, timeout=turn_timeout)
     except Exception as exc:
         failure = type(exc).__name__ + ": " + str(exc)
     finally:
@@ -645,8 +649,11 @@ async def run_case(binary: Path, case: Case, output: Path) -> dict[str, Any]:
     (output / "selector-inputs.json").write_text(json.dumps(selections, indent=2) + "\n")
     packets = output_packets(provider.requests[1], case.mode) if len(provider.requests) == 2 else []
     selected = case.enabled and case.focus and not case.protected
-    expected = SELECTED if selected else RAW
-    exact = len(packets) == 1 and packets[0].get("output") == expected and packets[0].get("exit_code") == 7
+    expected = SELECTED if selected else raw_output
+    if selected and selector is not None:
+        expected = selections[0].get("selected") if len(selections) == 1 else None
+    exact = (isinstance(expected, str) and len(packets) == 1
+             and packets[0].get("output") == expected and packets[0].get("exit_code") == 7)
     windows_isolated = None
     windows_probe_result = {}
     if os.name == "nt":
@@ -664,7 +671,7 @@ async def run_case(binary: Path, case: Case, output: Path) -> dict[str, Any]:
         "provider_errors": provider.errors, "external_proxy_requests_forwarded": 0,
         "windows_filesystem_sandbox_enforced": windows_isolated,
         "windows_fixture_acls": windows_acls,
-        "expected_output_bytes": len(expected.encode()),
+        "expected_output_bytes": len(expected.encode()) if isinstance(expected, str) else None,
         "actual_output_bytes": [len(str(p.get("output", "")).encode()) for p in packets]}
     result.update(windows_probe_result)
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")

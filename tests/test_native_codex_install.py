@@ -25,7 +25,7 @@ def release(tmp_path, monkeypatch, request):
     monkeypatch.delenv("BELLO_CODEX_SELECTION_MANIFEST", raising=False)
     monkeypatch.setenv("BELLO_RUNTIME_DIR", str(tmp_path / "runtime"))
     system = getattr(request, "param", "Darwin")
-    machine = "AMD64" if system == "Windows" else "arm64"
+    machine = {"Windows": "AMD64", "Linux": "x86_64"}.get(system, "arm64")
     executable = "bin/codex.exe" if system == "Windows" else "bin/codex"
     monkeypatch.setattr(install.platform, "system", lambda: system)
     monkeypatch.setattr(install.platform, "machine", lambda: machine)
@@ -84,6 +84,37 @@ def test_windows_fixture_installs_exe_and_all_native_helpers_then_reuses_cache(r
     install._verify(manifest.parent, bundle, system="Windows")
     assert install.ensure_native_selection() == (command, manifest)
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("release", ["Linux"], indirect=True)
+def test_linux_fixture_installs_hash_verified_bundled_bwrap(release):
+    bundle, _, calls = release
+    command, manifest = install.ensure_native_selection()
+    helper = manifest.parent / "bin/codex-resources/bwrap"
+    assert helper.is_file() and install.os.access(helper, install.os.X_OK)
+    install._verify(manifest.parent, bundle, system="Linux")
+    assert install.ensure_native_selection() == (command, manifest)
+    assert len(calls) == 1
+    helper.write_bytes(b"changed sandbox helper")
+    with pytest.raises(ValueError, match="checksum.*bwrap"):
+        install.ensure_native_selection()
+
+
+@pytest.mark.parametrize("release", ["Linux"], indirect=True)
+def test_linux_sandbox_resource_directory_rejects_extra_files(release):
+    _, manifest = install.ensure_native_selection()
+    (manifest.parent / "bin/codex-resources/injected.so").write_bytes(b"unexpected")
+    with pytest.raises(ValueError, match="unexpected bundled files"):
+        install.ensure_native_selection()
+
+
+@pytest.mark.parametrize("release", ["Linux"], indirect=True)
+def test_linux_layout_cannot_be_installed_as_macos(release, tmp_path):
+    _, archive, _ = release
+    target = tmp_path / "wrong-platform"
+    target.mkdir(mode=0o700)
+    with pytest.raises(ValueError, match="Unexpected entry"):
+        install._unpack(archive, target, system="Darwin")
 
 
 @pytest.mark.parametrize("release", ["Windows"], indirect=True)

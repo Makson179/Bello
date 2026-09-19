@@ -1,52 +1,53 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="430" viewBox="0 0 1100 430" role="img" aria-labelledby="runtime-title runtime-desc">
-<title id="runtime-title">Runtime-only results on large, contradictory specifications</title>
-<desc id="runtime-desc">Grouped horizontal bars compare Raw Codex and runtime-only scores for Marl, Slab, and Pinch. Runtime-only is higher on all three measures.</desc>
-<rect width="1100" height="430" fill="#FFFFFF"/>
-
-<text x="48" y="38" font-family="Georgia, 'Times New Roman', serif" font-size="22" font-weight="bold" fill="#1B1B1B">Runtime-only on large, contradictory specifications</text>
-<text x="48" y="62" font-family="Georgia, 'Times New Roman', serif" font-size="12" fill="#5B5B5B">Comparable task-specific evaluator scores · common 0–100 scale</text>
-
-<rect x="758" y="28" width="24" height="17" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.5"/>
-<text x="792" y="41" font-family="Georgia, 'Times New Roman', serif" font-size="11" fill="#1B1B1B">Raw Codex</text>
-<rect x="895" y="28" width="24" height="17" fill="#C7654D" stroke="#B24A33" stroke-width="1.5"/>
-<text x="929" y="41" font-family="Georgia, 'Times New Roman', serif" font-size="11" fill="#1B1B1B">runtime-only</text>
-
-<line x1="230" y1="88" x2="230" y2="362" stroke="#1B1B1B" stroke-width="1.2"/>
-<line x1="230" y1="362" x2="950" y2="362" stroke="#1B1B1B" stroke-width="1.2"/>
-
-<line x1="374" y1="88" x2="374" y2="362" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<line x1="518" y1="88" x2="518" y2="362" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<line x1="662" y1="88" x2="662" y2="362" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<line x1="806" y1="88" x2="806" y2="362" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-<line x1="950" y1="88" x2="950" y2="362" stroke="#D7D7D7" stroke-width="1" stroke-dasharray="3 4"/>
-
-<text x="230" y="383" font-family="Georgia, 'Times New Roman', serif" font-size="11" text-anchor="middle" fill="#5B5B5B">0</text>
-<text x="374" y="383" font-family="Georgia, 'Times New Roman', serif" font-size="11" text-anchor="middle" fill="#5B5B5B">20</text>
-<text x="518" y="383" font-family="Georgia, 'Times New Roman', serif" font-size="11" text-anchor="middle" fill="#5B5B5B">40</text>
-<text x="662" y="383" font-family="Georgia, 'Times New Roman', serif" font-size="11" text-anchor="middle" fill="#5B5B5B">60</text>
-<text x="806" y="383" font-family="Georgia, 'Times New Roman', serif" font-size="11" text-anchor="middle" fill="#5B5B5B">80</text>
-<text x="950" y="383" font-family="Georgia, 'Times New Roman', serif" font-size="11" text-anchor="middle" fill="#5B5B5B">100</text>
-
-<text x="208" y="140" font-family="Georgia, 'Times New Roman', serif" font-size="13" font-weight="bold" text-anchor="end" fill="#1B1B1B">Marl</text>
-<rect x="230" y="108" width="236.95" height="24" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.5"/>
-<text x="458.95" y="125" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" text-anchor="end" fill="#355F8A">32.91%</text>
-<rect x="230" y="138" width="272.95" height="24" fill="#C7654D" stroke="#B24A33" stroke-width="1.5"/>
-<text x="494.95" y="155" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" text-anchor="end" fill="#FFFFFF">37.91%</text>
-<text x="980" y="139" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" fill="#B24A33">+15.19%</text>
-
-<text x="208" y="235" font-family="Georgia, 'Times New Roman', serif" font-size="13" font-weight="bold" text-anchor="end" fill="#1B1B1B">Slab</text>
-<rect x="230" y="203" width="583.79" height="24" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.5"/>
-<text x="805.79" y="220" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" text-anchor="end" fill="#355F8A">81.08%</text>
-<rect x="230" y="233" width="617.00" height="24" fill="#C7654D" stroke="#B24A33" stroke-width="1.5"/>
-<text x="839.00" y="250" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" text-anchor="end" fill="#FFFFFF">85.69%</text>
-<text x="980" y="234" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" fill="#B24A33">+5.69%</text>
-
-<text x="208" y="330" font-family="Georgia, 'Times New Roman', serif" font-size="13" font-weight="bold" text-anchor="end" fill="#1B1B1B">Pinch</text>
-<rect x="230" y="298" width="642.60" height="24" fill="#E7EEF5" stroke="#355F8A" stroke-width="1.5"/>
-<text x="864.60" y="315" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" text-anchor="end" fill="#355F8A">89.25%</text>
-<rect x="230" y="328" width="705.60" height="24" fill="#C7654D" stroke="#B24A33" stroke-width="1.5"/>
-<text x="927.60" y="345" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" text-anchor="end" fill="#FFFFFF">98.00%</text>
-<text x="980" y="329" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" fill="#B24A33">+9.80%</text>
-
-<text x="590" y="414" font-family="Georgia, 'Times New Roman', serif" font-size="12" font-weight="bold" text-anchor="middle" fill="#1B1B1B">Evaluator score</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="448" viewBox="0 0 1080 448" role="img" aria-labelledby="runtime-only-custom-task-results-title runtime-only-custom-task-results-desc">
+<title id="runtime-only-custom-task-results-title">Raw versus runtime-only</title>
+<desc id="runtime-only-custom-task-results-desc">Marl: Raw 32.91%, runtime-only 37.91%; Slab: Raw 81.08%, runtime-only 85.69%; Pinch: Raw 89.25%, runtime-only 98.00%. Each task has its own scoring criteria.</desc>
+<style>
+svg { --bg:#fff; --ink:#26323e; --muted:#64707c; --grid:#e4e9ee;
+  --raw:#557ca6; --bello:#c84b32; }
+@media (prefers-color-scheme:dark) {
+  svg { --bg:#0d1117; --ink:#edf2f7; --muted:#a6b2bf; --grid:#2b3542;
+    --raw:#8dadd2; --bello:#ef987e; }
+}
+.paper { fill:var(--bg); }
+text { font-family:Arial,Helvetica,sans-serif; fill:var(--ink);
+  font-variant-numeric:tabular-nums; }
+.muted { fill:var(--muted); }
+.raw { fill:var(--raw); }
+.bello { fill:var(--bello); }
+.halo { paint-order:stroke; stroke:var(--bg); stroke-width:5; stroke-linejoin:round; }
+.grid { stroke:var(--grid); stroke-width:1; }
+.raw-line { stroke:var(--raw); fill:none; stroke-width:2.5; stroke-dasharray:7 5; }
+.bello-line { stroke:var(--bello); fill:none; stroke-width:3; }
+.raw-point { fill:var(--bg); stroke:var(--raw); stroke-width:2; }
+.bello-point { fill:var(--bello); }
+.raw-bar { fill:var(--raw); fill-opacity:.22; stroke:var(--raw); stroke-width:1.3; }
+.bello-bar { fill:var(--bello); }
+</style>
+<rect class="paper" width="1080" height="448"/>
+<rect x="650.00" y="16.00" width="16.00" height="13.00" class="raw-bar"/>
+<text x="680.00" y="30.00" font-size="19" font-weight="400" class="raw" text-anchor="start">Raw</text>
+<rect x="850.00" y="16.00" width="16.00" height="13.00" class="bello-bar"/>
+<text x="880.00" y="30.00" font-size="19" font-weight="400" class="bello" text-anchor="start">Runtime on</text>
+<text x="76.00" y="80.00" font-size="21" font-weight="400" class="" text-anchor="start">Score (%)</text>
+<line x1="76.00" y1="390.00" x2="1016.00" y2="390.00" class="grid"/>
+<text x="66.00" y="395.00" font-size="16" font-weight="400" class="muted" text-anchor="end">0</text>
+<line x1="76.00" y1="256.00" x2="1016.00" y2="256.00" class="grid"/>
+<text x="66.00" y="261.00" font-size="16" font-weight="400" class="muted" text-anchor="end">50</text>
+<line x1="76.00" y1="122.00" x2="1016.00" y2="122.00" class="grid"/>
+<text x="66.00" y="127.00" font-size="16" font-weight="400" class="muted" text-anchor="end">100</text>
+<rect x="180.67" y="301.80" width="38.00" height="88.20" class="raw-bar"/>
+<text x="199.67" y="291.80" font-size="21" font-weight="500" class="raw" text-anchor="middle">32.91</text>
+<rect x="246.67" y="288.40" width="38.00" height="101.60" class="bello-bar"/>
+<text x="265.67" y="278.40" font-size="21" font-weight="500" class="bello" text-anchor="middle">37.91</text>
+<text x="232.67" y="421.00" font-size="18" font-weight="400" class="" text-anchor="middle">Marl</text>
+<rect x="494.00" y="172.71" width="38.00" height="217.29" class="raw-bar"/>
+<text x="513.00" y="162.71" font-size="21" font-weight="500" class="raw" text-anchor="middle">81.08</text>
+<rect x="560.00" y="160.35" width="38.00" height="229.65" class="bello-bar"/>
+<text x="579.00" y="150.35" font-size="21" font-weight="500" class="bello" text-anchor="middle">85.69</text>
+<text x="546.00" y="421.00" font-size="18" font-weight="400" class="" text-anchor="middle">Slab</text>
+<rect x="807.33" y="150.81" width="38.00" height="239.19" class="raw-bar"/>
+<text x="826.33" y="140.81" font-size="21" font-weight="500" class="raw" text-anchor="middle">89.25</text>
+<rect x="873.33" y="127.36" width="38.00" height="262.64" class="bello-bar"/>
+<text x="892.33" y="117.36" font-size="21" font-weight="500" class="bello" text-anchor="middle">98.00</text>
+<text x="859.33" y="421.00" font-size="18" font-weight="400" class="" text-anchor="middle">Pinch</text>
 </svg>

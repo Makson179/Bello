@@ -1,6 +1,6 @@
 # Multi-provider runtime
 
-This document describes the `0.6.0.dev0` development branch. It is not an
+This document describes the `0.6.0` release candidate. It is not an
 announcement of a published release. Platform and live-account verification is
 tracked in [the implementation record](implementation-0.6.0.md).
 
@@ -46,13 +46,14 @@ the selection hook must replace the native tool result before it enters the
 conversation, including Code Mode. Stock Codex is supported with distillation
 off. With distillation on, missing native selection support fails before a
 model turn; Bello never silently falls back to Pi or pretends to compress.
-Select the tested Codex 0.153.4 build with `BELLO_CODEX_BINARY`; its binary hash is
-pinned in Bello. An alternate compatible build requires an explicitly trusted
-local `BELLO_CODEX_SELECTION_MANIFEST`. Bello verifies the hash, selection
-protocol and bridge deadline before use. The bridge allows at least 315 seconds
-around the selector's 300-second limit. Native distillation is Unix-only; this
-build was tested on Linux, not macOS. The patched executable is not bundled or
-installed automatically; see [native selection setup](native-codex-selection.md).
+On macOS Apple Silicon and Windows x86-64, Bello automatically downloads and
+verifies a pinned Codex 0.153.4 helper before the first distilled native run.
+Linux currently uses an explicit compatible build selected with
+`BELLO_CODEX_BINARY`. An alternate build requires an explicitly trusted local
+`BELLO_CODEX_SELECTION_MANIFEST`. Bello verifies the hash, selection protocol
+and bridge deadline before use. The bridge allows at least 315 seconds around
+the selector's 300-second limit. The helper is cached separately; it does not
+replace the user's global Codex. See [native selection setup](native-codex-selection.md).
 Both arms of a comparison must use the same native binary.
 The verified hook covers native command and polling text results; it does not
 claim to compress images or every native tool type. Existing native output

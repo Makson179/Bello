@@ -59,10 +59,18 @@ _WINDOWS_FILES = (_FILES - {"bin/codex", "bin/codex-code-mode-host"}) | frozense
     "bin/codex.exe", "bin/codex-code-mode-host.exe", "bin/codex-command-runner.exe",
     "bin/codex-windows-sandbox-setup.exe",
 })
+_LINUX_FILES = _FILES | frozenset({"bin/codex-resources/bwrap"})
 
 
 def _bundle_files(system: str) -> frozenset[str]:
-    return _WINDOWS_FILES if system == "Windows" else _FILES
+    if system == "Windows":
+        return _WINDOWS_FILES
+    return _LINUX_FILES if system == "Linux" else _FILES
+
+
+def _bundle_directories(system: str) -> frozenset[str]:
+    return frozenset(str(parent) for name in _bundle_files(system)
+                     for parent in PurePosixPath(name).parents)
 
 
 def _windows_parent_readonly_rights(rights: str) -> bool:
@@ -285,12 +293,14 @@ def _verify(directory: Path, bundle: NativeBundle, *, system: str = "Darwin") ->
     expected_files = _bundle_files(system)
     executable = "bin/codex.exe" if system == "Windows" else "bin/codex"
     _owned(directory, directory=True, private=True)
-    _owned(directory / "bin", directory=True, private=True)
-    if ({path.name for path in directory.iterdir()}
-            != {name.split("/")[0] for name in expected_files}
-            or {path.name for path in (directory / "bin").iterdir()}
-            != {name.removeprefix("bin/") for name in expected_files if name.startswith("bin/")}):
-        raise ValueError("Native Codex cache contains unexpected bundled files")
+    expected_directories = _bundle_directories(system)
+    for relative in sorted(expected_directories, key=lambda value: (len(PurePosixPath(value).parts), value)):
+        current = directory / relative
+        _owned(current, directory=True, private=True)
+        expected_children = {PurePosixPath(name).name for name in expected_files | expected_directories
+                             if name != "." and str(PurePosixPath(name).parent) == relative}
+        if {path.name for path in current.iterdir()} != expected_children:
+            raise ValueError("Native Codex cache contains unexpected bundled files")
     manifest_path = directory / "selection-manifest.json"
     if not _regular(manifest_path) or manifest_path.stat().st_size > 64 * 1024:
         raise ValueError("Native Codex capability manifest is missing or invalid")
@@ -351,11 +361,12 @@ def _unpack(archive: Path, destination: Path, *, system: str = "Darwin") -> None
     seen = set()
     size = 0
     expected_files = _bundle_files(system)
+    expected_directories = _bundle_directories(system)
     _owned(destination, directory=True)
     with tarfile.open(archive, "r:gz") as source:
         for member in source:
             name = member.name.removeprefix("./")
-            if member.isdir() and name.rstrip("/") in {".", "bin"}:
+            if member.isdir() and name.rstrip("/") in expected_directories:
                 continue
             if (name not in expected_files or name in seen or not member.isfile()
                     or PurePosixPath(name).is_absolute() or member.size < 0):

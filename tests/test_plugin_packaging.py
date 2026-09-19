@@ -32,7 +32,7 @@ def test_codex_and_claude_manifests_share_one_versioned_skill() -> None:
 
     assert codex["name"] == claude["name"] == "bello"
     assert codex["version"] == claude["version"]
-    assert re.fullmatch(r"0\.6\.0-dev\.0(?:\+codex\.[a-z0-9-]+)?", codex["version"])
+    assert codex["version"] == "0.6.0"
     assert codex["skills"] == claude["skills"] == "./skills/"
     assert (PLUGIN / "skills" / "bello-delegate" / "SKILL.md").is_file()
     assert SCRIPT.is_file()
