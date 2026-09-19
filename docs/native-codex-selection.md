@@ -67,16 +67,19 @@ distilled coder turn starts. D-off does not read this manifest or run these chec
 
 The tested Linux x86-64 Codex 0.153.4 executable has SHA-256
 `49f183a9cbd91a7e87d0f44c27d1aa60f150359c44eab69084127888bd32dc6c`.
-The bridge uses Unix sockets. Automatic native selection is available for macOS
-Apple Silicon (arm64); the archive contains both native executables and their
-license notices. The macOS executable has SHA-256
+The bridge uses Unix sockets on Unix platforms. Automatic native selection is
+available for macOS Apple Silicon (arm64) and Windows x86-64; the archives contain
+the required native executables and license notices. The macOS executable has SHA-256
 `e01aceea077958b9d9bc3645f3dbd6ab8d86f4b45e6e0a5391a20f67175a5656`.
 Linux currently uses the explicit compatible-build option above. The Windows
 implementation uses an authenticated loopback transport instead of Unix sockets;
 its manifest must additionally declare `"transports": ["tcp-hmac-v1"]`.
-The Windows build/provider-proof workflow below must pass before a Windows
-archive is added to the automatic-download table. This is not a universal
-prebuilt package, and an unverified Windows binary is not a supported release.
+The Windows executable has SHA-256
+`f6ccb090b699ae1bdb3f657cbc6b1967917373184cea7f2a9e1a8442d969ad8c`.
+Its [Windows provider-boundary proof](https://github.com/Makson179/Bello/actions/runs/35423667824)
+passed all nine cases before and after installation, plus post-run cache reuse.
+This is not a universal prebuilt package: Windows ARM64 and macOS Intel are not
+included in the automatic-download table.
 
 ### Windows build and verification
 

@@ -39,6 +39,13 @@ BUNDLES: dict[tuple[str, str], NativeBundle] = {
         archive_sha256="587bdeb27a9d6896252238805b2057e15b6d196cbec1411f76d5e2563e81ced2",
         manifest_sha256="cc16402a699eba247b6fe34fd7f71328d318f8d5a83ef836498d8dbadd0e136e",
     ),
+    ("Windows", "x86_64"): NativeBundle(
+        url=("https://github.com/Makson179/Bello/releases/download/"
+             "native-codex-0.153.4-selection-v1/"
+             "bello-native-codex-0.153.4-x86_64-pc-windows-msvc.tar.gz"),
+        archive_sha256="dc9628bda906e259b2838e801ebd12a061b3f6949362102c3d556eded4768d4e",
+        manifest_sha256="533450f5c62f89bda3fa228089184e08709f0172b324d44543a14a0c73036723",
+    ),
 }
 _MAX_DOWNLOAD = 1024 * 1024 * 1024
 _MAX_UNPACKED = 2 * _MAX_DOWNLOAD

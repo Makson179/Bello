@@ -10,6 +10,7 @@ on:
       - 'scripts/prepare_native_codex_windows.py'
       - 'scripts/build_native_codex_windows.py'
       - 'scripts/verify_native_codex_selection.py'
+      - 'scripts/verify_native_codex_download.py'
       - 'supervisor/appserver.py'
       - 'supervisor/runtime/codex.py'
       - 'supervisor/runtime/codex_permissions.py'
@@ -74,6 +75,11 @@ jobs:
             Copy-Item -LiteralPath $receipt -Destination native-artifact/installed-cache.json
           }
           exit $proofExit
+      - name: Verify published HTTPS cold install and unchanged cache reuse
+        run: |
+          $downloadRoot = Join-Path $env:LOCALAPPDATA "bello-https-proof-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          python scripts/verify_native_codex_download.py --runtime-root "$downloadRoot" --report native-https-installed.json
+          exit $LASTEXITCODE
       - name: Upload verified unsigned bundle (no release publication)
         uses: actions/upload-artifact@v4
         with:
@@ -85,6 +91,7 @@ jobs:
             native-artifact/bundle/BUILD-INFO
             native-artifact/installed-cache.json
             native-installed-proof/report.json
+            native-https-installed.json
           if-no-files-found: error
       - name: Upload synthetic diagnostics even on failure
         if: always()
@@ -109,4 +116,5 @@ jobs:
             native-installed-proof/*/windows-setup-stderr.txt
             native-installed-proof/*/rpc.jsonl
             native-artifact/installed-cache.json
+            native-https-installed.json
           if-no-files-found: warn

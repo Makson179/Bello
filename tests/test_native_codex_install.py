@@ -609,6 +609,7 @@ def test_unsupported_platform_fails_explicitly(release, monkeypatch):
 
 
 def test_windows_without_verified_bundle_requests_explicit_build_without_downloading(release, monkeypatch):
+    monkeypatch.setattr(install, "BUNDLES", {})
     monkeypatch.setattr(install.platform, "system", lambda: "Windows")
     monkeypatch.setattr(install.platform, "machine", lambda: "AMD64")
     with pytest.raises(RuntimeError, match="No verified.*Windows/x86_64.*BELLO_CODEX_BINARY"):
@@ -616,9 +617,17 @@ def test_windows_without_verified_bundle_requests_explicit_build_without_downloa
     assert release[2] == []
 
 
-def test_no_unverified_windows_bundle_is_published():
-    # Pinning a real Windows release is a separate action after native boundary proof.
-    assert not any(system == "Windows" for system, _ in install.BUNDLES)
+def test_windows_x64_bundle_pins_verified_native_artifact():
+    # Native provider proof and installed-cache proof both passed for this exact
+    # archive; Windows ARM and other builds still require separate verification.
+    assert {machine for system, machine in install.BUNDLES if system == "Windows"} == {"x86_64"}
+    assert install.BUNDLES[("Windows", "x86_64")] == install.NativeBundle(
+        url=("https://github.com/Makson179/Bello/releases/download/"
+             "native-codex-0.153.4-selection-v1/"
+             "bello-native-codex-0.153.4-x86_64-pc-windows-msvc.tar.gz"),
+        archive_sha256="dc9628bda906e259b2838e801ebd12a061b3f6949362102c3d556eded4768d4e",
+        manifest_sha256="533450f5c62f89bda3fa228089184e08709f0172b324d44543a14a0c73036723",
+    )
 
 
 @pytest.mark.asyncio

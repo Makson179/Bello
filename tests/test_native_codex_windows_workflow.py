@@ -7,6 +7,8 @@ commands and data dependencies rather than presentation names or whole-file text
 from __future__ import annotations
 
 from pathlib import Path
+import ast
+import importlib.util
 import re
 
 import pytest
@@ -173,3 +175,37 @@ def test_proof_failures_and_python_changes_do_not_cancel_or_gate_the_native_buil
     saves = [step for step in _steps(build) if _action(step) == "actions/cache/save"
              and _field(_block(step, "with"), "path") == "native-candidate"]
     assert len(saves) == 1 and _miss_required(saves[0])
+
+
+def test_proof_checks_published_https_pin_after_installed_proof_and_retains_receipt(workflows):
+    _, _, proof, _ = workflows
+    steps = _steps(proof)
+    local = next(index for index, step in enumerate(steps) if " install-local " in (_field(step, "run") or ""))
+    delivery = next(index for index, step in enumerate(steps) if "verify_native_codex_download.py" in (_field(step, "run") or ""))
+    assert delivery > local
+    command = _field(steps[delivery], "run")
+    assert '$env:LOCALAPPDATA' in command and 'bello-https-proof-' in command
+    assert '--report native-https-installed.json' in command
+    assert _field(steps[delivery], "if") is None
+    assert _field(steps[delivery], "continue-on-error") != "true"
+    assert 'exit $LASTEXITCODE' in command
+    uploads = [step for step in steps if _action(step) == "actions/upload-artifact"]
+    assert all('native-https-installed.json' in (_field(_block(step, "with"), "path") or "") for step in uploads)
+
+
+def test_published_delivery_helper_skips_explicitly_without_pin_and_uses_real_installer(tmp_path, monkeypatch):
+    path = ROOT / "scripts/verify_native_codex_download.py"
+    source = path.read_text(encoding="utf-8")
+    ast.parse(source)
+    spec = importlib.util.spec_from_file_location("native_download_proof", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module.installer, "BUNDLES", {})
+    result = module.verify(tmp_path / "new-cache")
+    assert result == {"status": "skipped_no_windows_pin", "passed": None, "published_pin": False}
+    assert not (tmp_path / "new-cache").exists()
+    assert "installer.ensure_native_selection()" in source
+    assert source.count("validate_native_selection(command, manifest)") == 2
+    assert "snapshot(manifest.parent) != before" in source
+    assert "mtime_ns" in source and '"sha256"' in source
+    assert "_download =" not in source and "replace.object" not in source and "monkeypatch" not in source
