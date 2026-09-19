@@ -265,6 +265,34 @@ def test_windows_cache_accepts_owner_rights_only_after_validating_actual_owner(o
                 f"O:{owner}D:P(A;OICI;FA;;;{owner_rights})", _USER_SID)
 
 
+def test_windows_cache_matches_os_derived_current_user_alias_not_global_alias_allowlist():
+    descriptor = "O:LAD:P(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+    sid = "S-1-5-21-3699639565-2515463329-295617607-500"
+    install._validate_windows_security_descriptor(descriptor, sid, user_alias="LA")
+    # A normal user must not trust LA merely because it is a recognized alias.
+    with pytest.raises(ValueError, match="trusted Windows owner"):
+        install._validate_windows_security_descriptor(descriptor, _USER_SID)
+    for owner in ("LG", "BU", "WD", "S-1-5-21-123-456-789-1002"):
+        with pytest.raises(ValueError, match="trusted Windows owner"):
+            install._validate_windows_security_descriptor(
+                f"O:{owner}D:P(A;OICI;FA;;;OW)", sid, user_alias="LA")
+    with pytest.raises(ValueError, match="other Windows accounts"):
+        install._validate_windows_security_descriptor(
+            "O:LAD:P(A;OICI;FA;;;LG)", sid, user_alias="LA")
+
+
+def test_windows_cache_accepts_unabbreviated_os_current_user_owner():
+    descriptor = f"O:{_USER_SID}D:P(A;OICI;FA;;;{_USER_SID})"
+    install._validate_windows_security_descriptor(descriptor, _USER_SID, user_alias=_USER_SID)
+
+
+@pytest.mark.parametrize("alias", ["", "O:LA", "LAD:", "LA;BU", "S-1-5-21-foreign-500"])
+def test_windows_cache_rejects_invalid_os_owner_alias(alias):
+    with pytest.raises(ValueError, match="current-user owner alias"):
+        install._validate_windows_security_descriptor(
+            f"O:{_USER_SID}D:P(A;OICI;FA;;;{_USER_SID})", _USER_SID, user_alias=alias)
+
+
 @pytest.mark.parametrize("descriptor", [
     f"O:{_USER_SID}D:NO_ACCESS_CONTROL", f"O:{_USER_SID}D:P",
     f"O:{_USER_SID}D:P(A;OICI;FA;;;WD)",

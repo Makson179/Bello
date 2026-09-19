@@ -68,7 +68,8 @@ def _windows_parent_readonly_rights(rights: str) -> bool:
     return bool(re.fullmatch(r"(?:FR|FX|GR|GX|RC|SY|CC|SW|WP|LO)+", rights))
 
 
-def _validate_windows_security_descriptor(descriptor: str, user_sid: str, *, parent: bool = False) -> None:
+def _validate_windows_security_descriptor(descriptor: str, user_sid: str, *, parent: bool = False,
+                                          user_alias: str | None = None) -> None:
     """Fail closed on any grant outside the user, SYSTEM and administrators.
 
     These are private executable caches, not shared installation directories.
@@ -80,6 +81,12 @@ def _validate_windows_security_descriptor(descriptor: str, user_sid: str, *, par
     """
     owner, separator, dacl = descriptor.partition("D:")
     trusted = {user_sid, "SY", "BA", "S-1-5-18", "S-1-5-32-544"}
+    if user_alias is not None:
+        # Supplied only by the OS round-trip of this process token's user SID.
+        # Do not assume aliases such as LA belong to an arbitrary current user.
+        if user_alias != user_sid and not re.fullmatch(r"[A-Z]{2}", user_alias):
+            raise ValueError("Invalid Windows current-user owner alias")
+        trusted.add(user_alias)
     if not separator or owner.removeprefix("O:") not in trusted or not owner.startswith("O:"):
         raise ValueError("Native Codex cache must have a trusted Windows owner and private DACL")
     # Windows/Python may express the trusted owner's grant as OWNER RIGHTS.
@@ -153,6 +160,23 @@ def _windows_private_acl(path: Path, *, create: bool = False, parent: bool = Fal
             raise ctypes.WinError(ctypes.get_last_error())
         allocated.append(sid_string)
         user_sid = ctypes.wstring_at(sid_string)
+        # Windows can render this SID as LA (local Administrator), or another
+        # SDDL alias. Derive its exact spelling from the OS rather than adding
+        # account aliases to a global allowlist.
+        owner_descriptor = pointer()
+        if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                f"O:{user_sid}", 1, ctypes.byref(owner_descriptor), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        allocated.append(owner_descriptor)
+        owner_sddl = pointer()
+        if not advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                owner_descriptor, 1, 0x00000001, ctypes.byref(owner_sddl), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        allocated.append(owner_sddl)
+        owner_text = ctypes.wstring_at(owner_sddl)
+        if not owner_text.startswith("O:"):
+            raise ValueError("Windows did not return the current user's owner identity")
+        user_alias = owner_text[2:]
         if create:
             descriptor = pointer()
             sddl = f"O:{user_sid}D:P(A;OICI;FA;;;{user_sid})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
@@ -178,7 +202,8 @@ def _windows_private_acl(path: Path, *, create: bool = False, parent: bool = Fal
                                                                           ctypes.byref(sddl), None):
             raise ctypes.WinError(ctypes.get_last_error())
         allocated.append(sddl)
-        _validate_windows_security_descriptor(ctypes.wstring_at(sddl), user_sid, parent=parent)
+        _validate_windows_security_descriptor(ctypes.wstring_at(sddl), user_sid,
+                                               parent=parent, user_alias=user_alias)
     finally:
         for allocation in reversed(allocated):
             kernel.LocalFree(allocation)
