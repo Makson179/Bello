@@ -2,6 +2,11 @@ name: Windows real ModernBERT integration
 
 on:
   workflow_dispatch:
+    inputs:
+      run_live:
+        description: 'One authorized Luna low subscription task; requires the dedicated temporary auth secret'
+        type: boolean
+        default: false
   push:
     branches: ['codex/release-0.6.0-readiness']
     paths:
@@ -44,8 +49,24 @@ jobs:
       - name: Run real published ModernBERT and native provider-boundary smoke
         run: |
           $modelRoot = Join-Path $env:LOCALAPPDATA "bello-modernbert-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          python scripts/verify_windows_modernbert.py --runtime-root "$modelRoot" --output-dir windows-modernbert-proof
+          python scripts/verify_windows_modernbert.py --runtime-root "$modelRoot" --output-dir windows-modernbert-proof --native-regressions
           exit $LASTEXITCODE
+      - name: Optional single live Codex and ModernBERT task
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_live }}
+        env:
+          BELLO_WINDOWS_SMOKE_AUTH_20260919: ${{ secrets.BELLO_WINDOWS_SMOKE_AUTH_20260919 }}
+        run: |
+          $modelRoot = Join-Path $env:LOCALAPPDATA "bello-modernbert-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $authHome = Join-Path $env:RUNNER_TEMP "bello-windows-live-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          python scripts/verify_windows_modernbert_live.py --runtime-root "$modelRoot" --auth-home "$authHome" --output-dir windows-modernbert-live
+          exit $LASTEXITCODE
+      - name: Always remove the dedicated live auth home
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.run_live }}
+        run: |
+          $authHome = Join-Path $env:RUNNER_TEMP "bello-windows-live-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if (Test-Path -LiteralPath $authHome) {
+            Remove-Item -LiteralPath $authHome -Recurse -Force -ErrorAction Stop
+          }
       - name: Upload synthetic reports and exact provider-delivery evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -59,4 +80,11 @@ jobs:
             windows-modernbert-proof/*/native-stderr.txt
             windows-modernbert-proof/*/windows-setup-*.txt
             windows-modernbert-proof/*/rpc.jsonl
+            windows-modernbert-proof/native-regressions/report.json
+            windows-modernbert-proof/native-regressions/*/result.json
+            windows-modernbert-proof/native-regressions/*/provider-request-*.json
+            windows-modernbert-proof/native-regressions/*/selector-inputs.json
+            windows-modernbert-proof/native-regressions/*/native-stderr.txt
+            windows-modernbert-proof/native-regressions/*/rpc.jsonl
+            windows-modernbert-live/report.json
           if-no-files-found: warn

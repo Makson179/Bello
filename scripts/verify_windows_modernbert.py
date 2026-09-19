@@ -135,6 +135,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--native-regressions", action="store_true",
+                        help="Run all nine offline provider fixtures on this same published helper first")
     args = parser.parse_args()
     if os.name != "nt":
         raise RuntimeError("This smoke requires native Windows")
@@ -156,6 +158,16 @@ def main() -> int:
     command, manifest_path = ensure_native_selection()
     capability = asyncio.run(validate_native_selection(command, manifest_path))
     native_download = time.perf_counter() - download_start
+    native_regressions = None
+    if args.native_regressions:
+        regression_output = output / "native-regressions"
+        code = asyncio.run(native.main_async(argparse.Namespace(
+            codex=Path(command[0]), output_dir=regression_output, cases=None)))
+        native_regressions = json.loads((regression_output / "report.json").read_text(encoding="utf-8"))
+        if code != 0 or native_regressions.get("passed") is not True or len(native_regressions.get("cases", [])) != 9:
+            raise RuntimeError("Published helper failed the nine native provider regressions")
+        if ensure_native_selection() != (command, manifest_path):
+            raise RuntimeError("Published helper cache changed after native provider regressions")
     download_start = time.perf_counter()
     bundle = ensure_default_bundle()
     model_download = time.perf_counter() - download_start
@@ -171,6 +183,8 @@ def main() -> int:
               "logical_cpus": os.cpu_count(), "torch": importlib.metadata.version("torch"),
               "transformers": importlib.metadata.version("transformers"), "model_download_seconds": model_download,
               "native_download_seconds": native_download, "cases": results,
+              "native_provider_regressions_passed": native_regressions["passed"] if native_regressions else None,
+              "native_provider_regression_cases": len(native_regressions["cases"]) if native_regressions else 0,
               "not_covered": ["live coder task quality", "recall", "billing savings", "GPU inference"]}
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"passed": report["passed"], "cases": len(results)}), flush=True)
