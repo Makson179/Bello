@@ -336,6 +336,7 @@ def install_local(artifact: Path, runtime_root: Path, proof_output: Path) -> Non
                    "archive_sha256": bundle.archive_sha256, "manifest_sha256": bundle.manifest_sha256,
                    "binary_sha256": capability["binary_sha256"], "binary": command[0],
                    "local_archive_transfers": len(copies), "cache_hit": True,
+                   "post_proof_cache_reusable": False,
                    "offline_feature_validation": True, "published_pin": False}
         receipt_path = runtime_root / "installed-cache.json"
         receipt_path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
@@ -343,7 +344,13 @@ def install_local(artifact: Path, runtime_root: Path, proof_output: Path) -> Non
                         "--codex", command[0], "--output-dir", str(proof_output)], check=True)
         report_path = proof_output / "report.json"
         validate_proof(json.loads(report_path.read_text(encoding="utf-8")), Path(command[0]))
-        receipt.update({"passed": True, "provider_proof_sha256": sha256(report_path)})
+        # Windows sandbox setup may change read ACLs on runtime executables.
+        # Re-enter the actual installer after execution: the next Bello launch
+        # must accept the same protected cache, with no repair or new transfer.
+        if installer.ensure_native_selection() != (command, manifest) or len(copies) != 1:
+            raise ValueError("Native installed cache was not reusable after provider proof")
+        receipt.update({"passed": True, "post_proof_cache_reusable": True,
+                        "provider_proof_sha256": sha256(report_path)})
         receipt_path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(receipt), flush=True)
 

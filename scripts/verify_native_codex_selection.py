@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import stat
 import sys
 import threading
 from typing import Any
@@ -78,8 +79,77 @@ def windows_filesystem_probe(outside: Path) -> str:
         "[IO.File]::WriteAllText((Join-Path (Get-Location).Path 'inside-write.txt'), 'allowed'); "
         "$readable=$false; try { [void][IO.File]::ReadAllText(" + denied_read + "); $readable=$true } " + catch +
         "$writable=$false; try { [IO.File]::WriteAllText(" + denied_write + ", 'forbidden'); $writable=$true } " + catch +
-        "if ($readable -or $writable) { throw 'Windows filesystem sandbox did not enforce the profile' }; "
+        "if ($readable -or $writable) { throw ('Windows filesystem sandbox did not enforce the profile: "
+        "outside_read_succeeded={0}; outside_write_succeeded={1}' -f $readable,$writable) }; "
     )
+
+
+def _windows_fixture_sddl(path: Path) -> str:
+    """Read owner, group and DACL only; never read file data or request SACL."""
+    import ctypes
+    from ctypes import wintypes
+
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    pointer = ctypes.c_void_p
+    advapi.GetNamedSecurityInfoW.argtypes = [wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD,
+        pointer, pointer, pointer, pointer, ctypes.POINTER(pointer)]
+    advapi.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [pointer, wintypes.DWORD,
+        wintypes.DWORD, ctypes.POINTER(pointer), pointer]
+    advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW.restype = wintypes.BOOL
+    kernel.LocalFree.argtypes = [pointer]
+    kernel.LocalFree.restype = pointer
+    descriptor, text = pointer(), pointer()
+    try:
+        status = advapi.GetNamedSecurityInfoW(str(path), 1, 0x00000007, None, None, None, None,
+                                             ctypes.byref(descriptor))
+        if status:
+            raise ctypes.WinError(status)
+        if not advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor, 1, 0x00000007, ctypes.byref(text), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return ctypes.wstring_at(text)
+    finally:
+        if text:
+            kernel.LocalFree(text)
+        if descriptor:
+            kernel.LocalFree(descriptor)
+
+
+def windows_fixture_acls(output: Path) -> dict[str, Any]:
+    """Host-only diagnostics of fixed synthetic fixtures, never Codex home/auth."""
+    fixtures = ("work", "work/diagnostic.log", "work/inside-write.txt",
+                "outside-workspace", "outside-workspace/secret.txt", "outside-workspace/forbidden.txt")
+    def redirected(status) -> bool:
+        return bool(stat.S_ISLNK(status.st_mode) or getattr(status, "st_file_attributes", 0)
+                    & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    def error_details(error: OSError) -> dict[str, Any]:
+        # Error text can include paths; these diagnostic fields never do.
+        return {"error": type(error).__name__, "winerror": getattr(error, "winerror", None),
+                "errno": error.errno}
+    # Do not follow a redirected container to a non-fixture object's ACL.
+    try:
+        for label in (".", "work", "outside-workspace"):
+            status = (output / label).lstat()
+            if redirected(status) or not stat.S_ISDIR(status.st_mode):
+                return {"error": "redirected_fixture_container", "fixture": label}
+    except OSError as error:
+        return error_details(error)
+    result = {}
+    for label in fixtures:
+        path = output / label
+        try:
+            status = path.lstat()
+            if redirected(status):
+                result[label] = {"exists": True, "error": "redirected_fixture"}
+            else:
+                result[label] = {"exists": True, "sddl": _windows_fixture_sddl(path)}
+        except FileNotFoundError:
+            result[label] = {"exists": False}
+        except OSError as error:
+            result[label] = error_details(error)
+    return result
 
 
 def windows_permission_params(work: Path, home: Path, binary: Path) -> dict[str, Any]:
@@ -460,8 +530,10 @@ async def run_case(binary: Path, case: Case, output: Path) -> dict[str, Any]:
         'request_max_retries = 0\nstream_max_retries = 0\n')
     session = NativeSession(binary, home, isolated_environment(home, binary, port, bridge.environment))
     failure = None
+    windows_acls = None
     try:
         if os.name == "nt":
+            windows_acls = {"before": windows_fixture_acls(output)}
             await provision_windows_sandbox(binary, home, session.env, output)
         await session.start()
         params = {"model": "gpt-5.5" if case.mode == "direct" else "gpt-6-astra",
@@ -483,6 +555,8 @@ async def run_case(binary: Path, case: Case, output: Path) -> dict[str, Any]:
         failure = type(exc).__name__ + ": " + str(exc)
     finally:
         await session.close(output)
+        if os.name == "nt" and windows_acls is not None:
+            windows_acls["after"] = windows_fixture_acls(output)
         await asyncio.to_thread(server.shutdown)
         server.server_close()
         serving.join(timeout=5)
@@ -511,6 +585,7 @@ async def run_case(binary: Path, case: Case, output: Path) -> dict[str, Any]:
         "bridge_outcomes": dict(bridge.metrics), "rejected_network_requests": provider.rejected,
         "provider_errors": provider.errors, "external_proxy_requests_forwarded": 0,
         "windows_filesystem_sandbox_enforced": windows_isolated,
+        "windows_fixture_acls": windows_acls,
         "expected_output_bytes": len(expected.encode()),
         "actual_output_bytes": [len(str(p.get("output", "")).encode()) for p in packets]}
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")

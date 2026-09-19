@@ -119,9 +119,71 @@ def test_windows_probe_requires_actual_access_denial_and_preserves_original_comm
     assert "inside-write.txt" in prefix and "secret.txt" in prefix and "forbidden.txt" in prefix
     assert prefix.count("[UnauthorizedAccessException]") == 2
     assert "if ($readable -or $writable)" in prefix
+    assert "outside_read_succeeded={0}; outside_write_succeeded={1}" in prefix
+    assert "-f $readable,$writable" in prefix
+    assert "[void][IO.File]::ReadAllText" in prefix
+    assert "Write-Output" not in prefix and "Console]::Out" not in prefix
     tool, command = proof.invocation(proof.Case("probe"), windows=True, command_prefix=prefix)
     assert command.startswith(prefix) and command.endswith("exit 7")
     assert json.loads(tool["arguments"])["cmd"] == command
+
+
+def _diagnostic_fixtures(root):
+    (root / "work").mkdir()
+    (root / "outside-workspace").mkdir()
+    (root / "work/diagnostic.log").write_text("synthetic log")
+    (root / "outside-workspace/secret.txt").write_text("synthetic denied read")
+
+
+def test_windows_acl_diagnostics_are_limited_to_fixed_synthetic_fixtures(tmp_path, monkeypatch):
+    _diagnostic_fixtures(tmp_path)
+    (tmp_path / "empty-home").mkdir()
+    (tmp_path / "empty-home/auth.json").write_text("synthetic excluded sentinel")
+    read_acl = Mock(return_value="O:SYG:SYD:(A;;FR;;;SY)")
+    monkeypatch.setattr(proof, "_windows_fixture_sddl", read_acl)
+    before = proof.windows_fixture_acls(tmp_path)
+    assert set(before) == {"work", "work/diagnostic.log", "work/inside-write.txt",
+                           "outside-workspace", "outside-workspace/secret.txt", "outside-workspace/forbidden.txt"}
+    assert {call.args[0].relative_to(tmp_path).as_posix() for call in read_acl.call_args_list} == {
+        "work", "work/diagnostic.log", "outside-workspace", "outside-workspace/secret.txt"}
+    assert before["work/inside-write.txt"] == {"exists": False}
+    assert before["outside-workspace/forbidden.txt"] == {"exists": False}
+    assert "auth" not in json.dumps(before) and str(tmp_path) not in json.dumps(before)
+    (tmp_path / "work/inside-write.txt").write_text("allowed")
+    after = proof.windows_fixture_acls(tmp_path)
+    assert after["work/inside-write.txt"]["exists"] is True
+    assert before["work/inside-write.txt"] == {"exists": False}
+    assert (tmp_path / "outside-workspace/secret.txt").read_text() == "synthetic denied read"
+
+
+def test_windows_acl_diagnostic_errors_do_not_disclose_error_text_or_paths(tmp_path, monkeypatch):
+    _diagnostic_fixtures(tmp_path)
+    monkeypatch.setattr(proof, "_windows_fixture_sddl", Mock(side_effect=PermissionError(13, "private diagnostic message", str(tmp_path))))
+    result = proof.windows_fixture_acls(tmp_path)
+    assert result["work"] == {"error": "PermissionError", "winerror": None, "errno": 13}
+    assert "private diagnostic message" not in json.dumps(result)
+    assert str(tmp_path) not in json.dumps(result)
+
+
+@pytest.mark.parametrize("label", ["work", "outside-workspace", "outside-workspace/secret.txt"])
+def test_windows_acl_diagnostics_never_follow_redirected_fixtures(tmp_path, monkeypatch, label):
+    _diagnostic_fixtures(tmp_path)
+    original = Path.lstat
+    def redirected(path):
+        info = original(path)
+        if path == tmp_path / label:
+            return SimpleNamespace(st_mode=info.st_mode, st_file_attributes=0x400)
+        return info
+    monkeypatch.setattr(Path, "lstat", redirected)
+    read_acl = Mock(return_value="O:SY")
+    monkeypatch.setattr(proof, "_windows_fixture_sddl", read_acl)
+    result = proof.windows_fixture_acls(tmp_path)
+    if "/" not in label:
+        assert result == {"error": "redirected_fixture_container", "fixture": label}
+        read_acl.assert_not_called()
+    else:
+        assert result[label] == {"exists": True, "error": "redirected_fixture"}
+        assert tmp_path / label not in [call.args[0] for call in read_acl.call_args_list]
 
 
 async def test_windows_provisioning_uses_only_current_runner_and_no_selection_secret(tmp_path, monkeypatch):

@@ -7,7 +7,7 @@ import struct
 import subprocess
 import tarfile
 import tomllib
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -165,8 +165,11 @@ def test_installed_proof_uses_real_cache_and_rejects_failed_second_proof(package
     monkeypatch.setattr(codex_distiller, "validate_native_selection", validation)
     proof_output = tmp_path / "installed-proof"
     calls = []
+    ensure = Mock(wraps=installer.ensure_native_selection)
+    monkeypatch.setattr(installer, "ensure_native_selection", ensure)
 
     def fake_provider_proof(command, *, check):
+        assert ensure.call_count == 2  # The final cache check must follow execution.
         assert check is True and command[2] == "--codex"
         installed = Path(command[3])
         assert installed.is_relative_to(tmp_path / "private-cache")
@@ -183,12 +186,52 @@ def test_installed_proof_uses_real_cache_and_rejects_failed_second_proof(package
     build.install_local(packaged_artifact["output"], tmp_path / "private-cache", proof_output)
     receipt = json.loads((tmp_path / "private-cache/installed-cache.json").read_text())
     assert receipt["passed"] is True and receipt["cache_hit"] is True
+    assert receipt["post_proof_cache_reusable"] is True and ensure.call_count == 3
     assert receipt["local_archive_transfers"] == 1 and len(calls) == 1
     validation.assert_awaited_once()
     assert installer.BUNDLES == original_bundles
     assert build.os.environ["BELLO_CODEX_BINARY"] == "must-not-bypass-the-installer"
     with pytest.raises(ValueError, match="new child directory"):
         build.install_local(packaged_artifact["output"], tmp_path / "private-cache", proof_output)
+
+
+@pytest.mark.parametrize("change", ["payload", "acl"])
+def test_installed_proof_rejects_cache_changes_after_successful_execution(packaged_artifact, tmp_path, monkeypatch, change):
+    from supervisor.runtime import codex_distiller, native_codex_install as installer
+
+    monkeypatch.setattr(build.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(build.platform, "machine", lambda: "AMD64")
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    expected_hash = build.sha256(packaged_artifact["release"] / "codex.exe")
+    monkeypatch.setattr(codex_distiller, "validate_native_selection",
+                        AsyncMock(return_value={"binary_sha256": expected_hash}))
+    proof_output = tmp_path / "proof"
+
+    def proof_then_change_cache(command, *, check):
+        assert check is True
+        installed = Path(command[3])
+        proof_output.mkdir()
+        (proof_output / "report.json").write_text(json.dumps(passing_report(installed)))
+        if change == "payload":
+            (installed.parent.parent / "NOTICE").write_text("changed by a child process")
+        else:
+            # Exercise the installer's unchanged ACL validation path after the
+            # proof, without pretending a POSIX host can mutate Windows ACLs.
+            owned = installer._owned
+
+            def reject_changed_acl(path, **kwargs):
+                if path == installed:
+                    raise ValueError("Native Codex cache must not grant access to other Windows accounts")
+                return owned(path, **kwargs)
+
+            monkeypatch.setattr(installer, "_owned", reject_changed_acl)
+
+    monkeypatch.setattr(subprocess, "run", proof_then_change_cache)
+    with pytest.raises(ValueError, match="checksum mismatch|must not grant access"):
+        build.install_local(packaged_artifact["output"], tmp_path / "private-cache", proof_output)
+    receipt = json.loads((tmp_path / "private-cache/installed-cache.json").read_text())
+    assert receipt["passed"] is False and receipt["post_proof_cache_reusable"] is False
+    assert json.loads((proof_output / "report.json").read_text())["passed"] is True
 
 
 @pytest.mark.parametrize("failure", ["archive", "proof"])
