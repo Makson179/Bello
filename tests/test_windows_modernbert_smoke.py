@@ -185,7 +185,7 @@ def test_live_history_parses_actual_native_wait_array_only_after_tool_correlatio
     ]}
     assert live.history_output_texts(packet) == []
     assert live.history_output_texts(packet, "exec_command") == []
-    assert live.history_output_texts(packet, "wait") == ["KEEP_SENTINEL failure: expected 3, received 4\n"]
+    assert live.history_output_texts(packet, "wait") == [packet["output"][1]["text"], "KEEP_SENTINEL failure: expected 3, received 4\n"]
     path = tmp_path / "sessions" / "owned.jsonl"
     path.parent.mkdir()
     records = [{"type": "session_meta", "payload": {"id": "owned"}},
@@ -193,11 +193,32 @@ def test_live_history_parses_actual_native_wait_array_only_after_tool_correlatio
                {"type": "response_item", "payload": packet}]
     path.write_text("".join(json.dumps(record) + "\n" for record in records))
     hashes, counts = live.selected_history_evidence(tmp_path, "owned", str(path))
-    assert hashes == {live.digest("KEEP_SENTINEL failure: expected 3, received 4\n")}
-    assert counts["parsed_outputs"] == 1 and counts["unparsed_tool_outputs"] == 0
+    assert hashes == {live.digest(packet["output"][1]["text"]), live.digest("KEEP_SENTINEL failure: expected 3, received 4\n")}
+    assert counts["parsed_outputs"] == 2 and counts["unparsed_tool_outputs"] == 0
     shape = counts["tool_output_shapes"][0]["shape"]
     assert shape["tool_name"] == "wait" and shape["output_type"] == "array"
     assert shape["input_text_shapes"][1]["string_json_type"] == "object"
+
+
+@pytest.mark.parametrize("tool,kind", [("exec", "custom_tool_call_output"), ("wait", "function_call_output")])
+def test_live_history_parses_raw_code_mode_emissions_with_exact_bytes(tool, kind):
+    from scripts import verify_windows_modernbert_live as live
+    header = "Script completed\nWall time 0.6 seconds\nOutput:\n"
+    # Preserve CRLF, Unicode, literal Output markers and separate text leaves.
+    leaves = ["FAIL λ\r\nOutput:\r\nexpected 3", "second\n", '{"output":"a log value"}']
+    packet = {"type": kind, "output": [{"type": "input_text", "text": header}]
+              + [{"type": "input_text", "text": leaf} for leaf in leaves]}
+    parsed = live.history_output_texts(packet, tool)
+    assert all(leaf in parsed for leaf in leaves)
+    assert header not in parsed and "".join(leaves) not in parsed
+    no_json = {**packet, "output": packet["output"][:3]}
+    assert live.history_output_texts(no_json, tool) == leaves[:2]
+    for unrelated in ("other", "apply_patch", "exec_command", "shell_command"):
+        assert live.history_output_texts(no_json, unrelated) == []
+    for bad_header in ("Output:\n", header + "not-only-header", header.replace("Wall time", "Untrusted time")):
+        assert live.history_output_texts({**no_json, "output": [
+            {"type": "input_text", "text": bad_header}, *no_json["output"][1:]]}, tool) == []
+    assert live.history_output_texts({**no_json, "output": no_json["output"][1:]}, tool) == []
 
 
 def test_live_history_uses_explicit_owned_rollout_path_and_reports_counts(tmp_path):

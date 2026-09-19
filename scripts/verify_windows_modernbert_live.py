@@ -61,6 +61,19 @@ def history_output_texts(payload: dict, tool_name: str = "other") -> list[str]:
               and item.get("type") == "input_text" and isinstance(item.get("text"), str)]
              if isinstance(value, list) else [])
     outputs = []
+    # Code mode preserves each text(...) emission as its own input_text item.
+    # text(result.output) therefore has no JSON/exit metadata around that leaf.
+    # Recognize it only after an exact native status header and a correlated
+    # exec/wait call. Do not join leaves, normalize newlines, or hash the header.
+    correlated_code = ((tool_name == "exec" and payload.get("type") == "custom_tool_call_output")
+                       or (tool_name == "wait" and payload.get("type") == "function_call_output"))
+    if (correlated_code and isinstance(value, list) and len(value) > 1
+            and isinstance(value[0], dict) and value[0].get("type") == "input_text"
+            and isinstance(value[0].get("text"), str)
+            and re.fullmatch(r"Script (?:completed|failed|terminated|running with cell ID [^\s]+)\n"
+                             r"Wall time \d+\.\d seconds\nOutput:\n", value[0]["text"])):
+        outputs.extend(item["text"] for item in value[1:] if isinstance(item, dict)
+                       and item.get("type") == "input_text" and isinstance(item.get("text"), str))
     for text in texts:
         header, separator, content = text.partition("\nOutput:\n")
         # Unified exec can return selected partial output with a live session,
@@ -78,7 +91,7 @@ def history_output_texts(payload: dict, tool_name: str = "other") -> list[str]:
             for item in native.output_packets({"input": [packet]}, "code"):
                 if isinstance(item.get("output"), str):
                     outputs.append(item["output"])
-    return outputs
+    return list(dict.fromkeys(outputs))
 
 
 def history_output_shape(payload: dict, tool_name: str = "other") -> dict:
