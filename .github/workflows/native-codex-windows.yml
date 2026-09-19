@@ -34,8 +34,6 @@ jobs:
       run:
         shell: pwsh
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/bello-native-target
-      CARGO_HOME: ${{ runner.temp }}/bello-cargo
       CARGO_BUILD_JOBS: '3'
       CARGO_PROFILE_RELEASE_DEBUG: '0'
       CARGO_PROFILE_RELEASE_LTO: 'false'
@@ -49,6 +47,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+      - name: Configure native build paths
+        run: |
+          "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'bello-native-target')" >> $env:GITHUB_ENV
+          "CARGO_HOME=$(Join-Path $env:RUNNER_TEMP 'bello-cargo')" >> $env:GITHUB_ENV
       - name: Install host and offline test dependencies, without optional models
         run: python -c "import pathlib, subprocess, sys, tomllib; deps = tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['dependencies']; subprocess.run([sys.executable, '-m', 'pip', 'install', 'pytest', 'pytest-asyncio', *deps], check=True)"
       - name: Run installer ACL, native bridge, backend and proof regressions
@@ -70,9 +72,9 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: |
-            ${{ env.CARGO_HOME }}/registry
-            ${{ env.CARGO_HOME }}/git
-            ${{ env.CARGO_TARGET_DIR }}
+            ${{ runner.temp }}/bello-cargo/registry
+            ${{ runner.temp }}/bello-cargo/git
+            ${{ runner.temp }}/bello-native-target
           key: native-codex-windows-1.95.0-v1-${{ hashFiles('scripts/native-codex-selection.patch', 'scripts/build_native_codex_windows.py', '.github/workflows/native-codex-windows.yml') }}
           restore-keys: native-codex-windows-1.95.0-v1-
       - name: Prepare exact upstream source and patch
@@ -120,5 +122,5 @@ jobs:
             native-proof/*/selector-inputs.json
             native-proof/*/native-stderr.txt
             native-proof/*/rpc.jsonl
-            ${{ env.CARGO_TARGET_DIR }}/cargo-timings/*.html
+            ${{ runner.temp }}/bello-native-target/cargo-timings/*.html
           if-no-files-found: warn
