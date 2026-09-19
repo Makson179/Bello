@@ -97,9 +97,10 @@ async def provision_windows_sandbox(binary: Path, home: Path, env: dict[str, str
     username = os.environ.get("USERNAME", "").strip()
     if not username:
         raise RuntimeError("Windows proof requires the runner's USERNAME for native sandbox setup")
+    setup_env = {key: value for key, value in env.items() if not key.upper().startswith("BELLO_SELECTOR_")}
     process = await asyncio.create_subprocess_exec(
         str(binary), "sandbox", "setup", "--elevated", "--current-user", "--codex-home", str(home),
-        cwd=home, env={**env, "USERNAME": username},
+        cwd=home, env={**setup_env, "USERNAME": username},
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), 180)

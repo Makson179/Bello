@@ -5,6 +5,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -119,6 +120,28 @@ def test_windows_probe_requires_actual_access_denial_and_preserves_original_comm
     tool, command = proof.invocation(proof.Case("probe"), windows=True, command_prefix=prefix)
     assert command.startswith(prefix) and command.endswith("exit 7")
     assert json.loads(tool["arguments"])["cmd"] == command
+
+
+async def test_windows_provisioning_uses_only_current_runner_and_no_selection_secret(tmp_path, monkeypatch):
+    monkeypatch.setenv("USERNAME", "fixture-runner")
+    process = type("FixtureProcess", (), {"returncode": 0, "communicate": AsyncMock(return_value=(b"ok", b""))})()
+    spawn = AsyncMock(return_value=process)
+    monkeypatch.setattr(proof.asyncio, "create_subprocess_exec", spawn)
+    env = {"SystemRoot": "C:\\Windows", "BELLO_SELECTOR_TOKEN": "never-in-setup", "bello_selector_tcp": "never-in-setup"}
+    await proof.provision_windows_sandbox(tmp_path / "codex.exe", tmp_path, env, tmp_path)
+    args, kwargs = spawn.call_args
+    assert args[1:] == ("sandbox", "setup", "--elevated", "--current-user", "--codex-home", str(tmp_path))
+    assert kwargs["env"] == {"SystemRoot": "C:\\Windows", "USERNAME": "fixture-runner"}
+    assert (tmp_path / "windows-setup-stdout.txt").read_bytes() == b"ok"
+
+
+async def test_windows_provisioning_refuses_an_unspecified_account(tmp_path, monkeypatch):
+    monkeypatch.delenv("USERNAME", raising=False)
+    spawn = AsyncMock()
+    monkeypatch.setattr(proof.asyncio, "create_subprocess_exec", spawn)
+    with pytest.raises(RuntimeError, match="USERNAME"):
+        await proof.provision_windows_sandbox(tmp_path / "codex.exe", tmp_path, {}, tmp_path)
+    spawn.assert_not_called()
 
 
 @pytest.mark.parametrize("case", proof.CASES)
