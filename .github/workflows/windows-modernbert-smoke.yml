@@ -47,6 +47,7 @@ jobs:
       - name: Check fixture and real-model observation regressions
         run: python -m pytest -q tests/test_windows_modernbert_smoke.py tests/test_verify_native_codex_selection.py
       - name: Run real published ModernBERT and native provider-boundary smoke
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.run_live) }}
         run: |
           $modelRoot = Join-Path $env:LOCALAPPDATA "bello-modernbert-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           python scripts/verify_windows_modernbert.py --runtime-root "$modelRoot" --output-dir windows-modernbert-proof --native-regressions
@@ -57,13 +58,14 @@ jobs:
           BELLO_WINDOWS_SMOKE_AUTH_20260919: ${{ secrets.BELLO_WINDOWS_SMOKE_AUTH_20260919 }}
         run: |
           $modelRoot = Join-Path $env:LOCALAPPDATA "bello-modernbert-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          $authHome = Join-Path $env:RUNNER_TEMP "bello-windows-live-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $authHome = Join-Path $modelRoot "live-auth"
           python scripts/verify_windows_modernbert_live.py --runtime-root "$modelRoot" --auth-home "$authHome" --output-dir windows-modernbert-live
           exit $LASTEXITCODE
       - name: Always remove the dedicated live auth home
         if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.run_live }}
         run: |
-          $authHome = Join-Path $env:RUNNER_TEMP "bello-windows-live-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $modelRoot = Join-Path $env:LOCALAPPDATA "bello-modernbert-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $authHome = Join-Path $modelRoot "live-auth"
           if (Test-Path -LiteralPath $authHome) {
             Remove-Item -LiteralPath $authHome -Recurse -Force -ErrorAction Stop
           }

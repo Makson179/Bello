@@ -159,16 +159,24 @@ def main() -> int:
     args = parser.parse_args()
     payload = os.environ.pop(SECRET_ENV, "")
     runtime, home, output = args.runtime_root.absolute(), args.auth_home.absolute(), args.output_dir.absolute()
-    result = {"passed": False, "paid_turns_started": 0, "auth_removed": False}
+    checkpoints = {"windows": os.name == "nt", "secret_present": bool(payload),
+                   "auth_home_fresh": not os.path.lexists(home)}
+    result = {"passed": False, "paid_turns_started": 0, "auth_removed": False,
+              "phase": "preconditions", "checkpoints": checkpoints}
     owned_home = False
+    auth = None
     try:
-        if os.name != "nt" or not payload or os.path.lexists(home):
+        if not all(checkpoints.values()):
             raise ValueError("Live smoke requires Windows, a secret and a fresh auth home")
+        result["phase"] = "parse_auth"
         auth = json.loads(payload)
         payload = ""
         if not isinstance(auth, dict) or not auth:
             raise ValueError("Invalid auth payload")
+        checkpoints["auth_parsed"] = True
+        result["phase"] = "prepare_output"
         output.mkdir(parents=True, exist_ok=False)
+        result["phase"] = "isolate_environment"
         clean = {key: value for key, value in os.environ.items() if key.upper() in {
             "SYSTEMROOT", "WINDIR", "PATH", "PATHEXT", "COMSPEC", "TEMP", "TMP", "LOCALAPPDATA", "USERNAME"}}
         clean.update(HOME=str(home), USERPROFILE=str(home), CODEX_HOME=str(home), APPDATA=str(home / "appdata"),
@@ -176,10 +184,21 @@ def main() -> int:
                      HF_HUB_DISABLE_IMPLICIT_TOKEN="1", HF_HUB_DISABLE_TELEMETRY="1", TOKENIZERS_PARALLELISM="false")
         os.environ.clear()
         os.environ.update(clean)
-        _private_directory(home, parents=True)
+        checkpoints["environment_isolated"] = True
+        # LOCALAPPDATA is the same validated private anchor as the offline
+        # smoke. RUNNER_TEMP can grant other accounts directory replacement.
+        result["phase"] = "prepare_private_runtime"
+        _private_directory(runtime, parents=True)
+        checkpoints["runtime_private"] = True
+        result["phase"] = "prepare_private_auth_home"
+        _private_directory(home)
         owned_home = True
+        checkpoints["auth_home_private"] = True
+        result["phase"] = "write_auth"
         (home / "auth.json").write_text(json.dumps(auth), encoding="utf-8")
+        checkpoints["auth_written"] = True
         auth.clear()
+        result["phase"] = "prepare_workspace"
         (home / "config.toml").write_text('cli_auth_credentials_store = "file"\nweb_search = "disabled"\n', encoding="utf-8")
         _private_directory(home / "tmp")
         _private_directory(home / "private-logs")
@@ -187,17 +206,30 @@ def main() -> int:
         _private_directory(work)
         (work / "solution.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
         (work / "check.py").write_text(CHECKER, encoding="utf-8")
+        checkpoints["workspace_ready"] = True
+        result["phase"] = "download_native_helper"
         command, manifest = ensure_native_selection()
+        result["phase"] = "validate_native_helper"
         asyncio.run(validate_native_selection(command, manifest))
+        checkpoints["native_ready"] = True
+        result["phase"] = "download_model"
         bundle = ensure_default_bundle()
+        checkpoints["model_ready"] = True
         os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
-        result = asyncio.run(live_turn(Path(command[0]), bundle, home, work, home / "private-logs"))
+        result["phase"] = "live_turn"
+        result.update(asyncio.run(live_turn(Path(command[0]), bundle, home, work, home / "private-logs")))
     except Exception as exc:
         result["error_type"] = type(exc).__name__
     finally:
+        payload = ""
+        if isinstance(auth, dict):
+            auth.clear()
         if owned_home:
-            remove_path_tree(home)
-        result["auth_removed"] = owned_home and not os.path.lexists(home)
+            try:
+                remove_path_tree(home)
+            except Exception as exc:
+                result["cleanup_error_type"] = type(exc).__name__
+        result["auth_removed"] = not os.path.lexists(home)
         result["passed"] = result["passed"] and result["auth_removed"]
         if output.is_dir():
             (output / "report.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")

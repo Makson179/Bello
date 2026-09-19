@@ -96,6 +96,7 @@ def test_candidate_rejects_changed_artifacts(candidate, change):
         build.verify_build(candidate)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable mode bits; exercised on Linux delivery CI")
 def test_executable_mode_recovery_happens_only_after_all_hashes_valid(candidate):
     for name in build.EXECUTABLES:
         (candidate / name).chmod(0o644)
@@ -233,3 +234,39 @@ def test_native_build_key_excludes_packaging_and_proof_only_sources():
     assert ".github/workflows/native-codex-linux-build.yml" in prepare.NATIVE_INPUTS
     assert all("build_native_codex_linux.py" not in name and "verify_native" not in name for name in prepare.NATIVE_INPUTS)
     assert len(prepare.build_key()) == 64
+
+
+@pytest.mark.parametrize("tampered_exit", [8, 0])
+def test_sandbox_probe_uses_bundled_bwrap_and_requires_digest_denial(candidate, tmp_path, monkeypatch, tampered_exit):
+    monkeypatch.setattr(build.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(build.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(os, "readlink", lambda path: "user:[synthetic-parent]")
+    calls = []
+    binary = candidate / "bin/codex"
+    before = build.sha256(candidate / "bin/codex-resources/bwrap")
+    def execute(command, *, cwd, env, text, capture_output, timeout):
+        calls.append(command)
+        assert text and capture_output and timeout == 60
+        assert "OPENAI_API_KEY" not in env and env["PATH"] == str(Path(command[0]).parent)
+        assert 'sandbox_mode="workspace-write"' in command
+        assert "features.use_legacy_landlock=false" in command
+        assert "sandbox_workspace_write.exclude_slash_tmp=true" in command
+        assert command[-4:-2] == ["--", build.sys.executable]
+        compile(command[-1], "synthetic-probe", "exec")
+        if len(calls) == 1:
+            (cwd / "inside.txt").write_text("allowed")
+            return subprocess.CompletedProcess(command, 0, json.dumps({
+                "inside_write_succeeded": True, "outside_write_denied": True, "new_user_namespace": True}), "")
+        copied_bwrap = Path(command[0]).parent / "codex-resources/bwrap"
+        assert copied_bwrap.read_bytes().endswith(b"synthetic digest tamper")
+        return subprocess.CompletedProcess(command, tampered_exit, "", "synthetic digest mismatch")
+    monkeypatch.setattr(subprocess, "run", execute)
+    output = tmp_path / "sandbox-proof"
+    if tampered_exit != 8:
+        with pytest.raises(ValueError, match="sandbox proof"):
+            build.sandbox_proof(binary, output)
+        assert not (output / "report.json").exists()
+    else:
+        report = build.sandbox_proof(binary, output)
+        build.validate_sandbox_proof(report, binary)
+    assert len(calls) == 2 and build.sha256(candidate / "bin/codex-resources/bwrap") == before

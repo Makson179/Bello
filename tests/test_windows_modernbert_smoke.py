@@ -83,7 +83,9 @@ def test_live_workflow_is_opt_in_and_only_exports_sanitized_receipt():
     assert "github.event_name == 'workflow_dispatch' && inputs.run_live" in workflow
     assert "always() && github.event_name == 'workflow_dispatch' && inputs.run_live" in workflow
     assert "secrets.BELLO_WINDOWS_SMOKE_AUTH_20260919" in workflow
-    assert "Join-Path $env:RUNNER_TEMP" in workflow
+    assert 'Join-Path $modelRoot "live-auth"' in workflow
+    assert "Join-Path $env:RUNNER_TEMP" not in workflow
+    assert "if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.run_live) }}" in workflow
     artifacts = workflow.split("path: |", 1)[1]
     assert "windows-modernbert-live/report.json" in artifacts
     assert "auth.json" not in artifacts and "RUNNER_TEMP" not in artifacts and "live/*" not in artifacts
@@ -111,3 +113,53 @@ def test_live_history_check_uses_only_exact_owned_thread_and_model_facing_packet
     payload["output"] = payload["output"].replace("selected diagnostic", "unrelated")
     (sessions / "rollout-other.jsonl").write_text(json.dumps({"type": "response_item", "payload": payload}) + "\n")
     assert live.selected_history_hashes(tmp_path, "owned") == {live.digest("selected diagnostic")}
+
+
+@pytest.mark.parametrize("failure_phase", [None, "prepare_private_runtime", "prepare_private_auth_home", "download_model"])
+def test_live_bootstrap_records_safe_phases_and_cleans_owned_auth(tmp_path, monkeypatch, capsys, failure_phase):
+    from scripts import verify_windows_modernbert_live as live
+    runtime = tmp_path / "local-appdata" / "model-runtime"
+    home = runtime / "live-auth"
+    output = tmp_path / "receipt"
+    payload = json.dumps({"tokens": {"access_token": "synthetic-never-export-this"}})
+    environment = {live.SECRET_ENV: payload, "LOCALAPPDATA": str(runtime.parent),
+                   "UNRELATED_SECRET": "also-never-export"}
+    # Replace only this script's environment, not pytest's process/platform.
+    monkeypatch.setattr(live, "os", SimpleNamespace(name="nt", environ=environment, path=live.os.path))
+    monkeypatch.setattr(live.sys, "argv", ["smoke", "--runtime-root", str(runtime),
+                                           "--auth-home", str(home), "--output-dir", str(output)])
+    private_paths = []
+    def private_directory(path, *, parents=False):
+        private_paths.append(path)
+        if (failure_phase == "prepare_private_runtime" and path == runtime
+                or failure_phase == "prepare_private_auth_home" and path == home):
+            raise ValueError("synthetic-sensitive-error-never-export")
+        path.mkdir(parents=parents, exist_ok=True)
+    monkeypatch.setattr(live, "_private_directory", private_directory)
+    monkeypatch.setattr(live, "ensure_native_selection", lambda: ([str(runtime / "codex.exe")], runtime / "manifest"))
+    monkeypatch.setattr(live, "validate_native_selection", AsyncMock())
+    def bundle():
+        if failure_phase == "download_model":
+            raise ValueError("synthetic-sensitive-error-never-export")
+        return runtime / "model"
+    monkeypatch.setattr(live, "ensure_default_bundle", bundle)
+    async def turn(*args):
+        assert json.loads((home / "auth.json").read_text()) == json.loads(payload)
+        assert live.SECRET_ENV not in environment and "UNRELATED_SECRET" not in environment
+        return {"passed": True, "paid_turns_started": 1, "phase": "complete"}
+    turn_mock = AsyncMock(side_effect=turn)
+    monkeypatch.setattr(live, "live_turn", turn_mock)
+    assert live.main() == (0 if failure_phase is None else 1)
+    receipt = json.loads((output / "report.json").read_text())
+    assert receipt["phase"] == (failure_phase or "complete")
+    assert receipt["auth_removed"] is True and not home.exists()
+    assert private_paths[0] == runtime
+    assert receipt["checkpoints"]["environment_isolated"] is True
+    assert receipt["paid_turns_started"] == (0 if failure_phase else 1)
+    if failure_phase:
+        assert receipt["error_type"] == "ValueError"
+        turn_mock.assert_not_called()
+    exported = (output / "report.json").read_text() + capsys.readouterr().out
+    assert "synthetic-never-export-this" not in exported
+    assert "synthetic-sensitive-error-never-export" not in exported
+    assert "also-never-export" not in exported
