@@ -100,6 +100,8 @@ jobs:
         run: python scripts/verify_native_codex_selection.py --codex "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/codex.exe" --output-dir native-proof
       - name: Package only after all nine proof cases pass
         run: python scripts/build_native_codex_windows.py package --source native-source --patch scripts/native-codex-selection.patch --release "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release" --proof native-proof/report.json --cargo-home "$env:CARGO_HOME" --output native-artifact
+      - name: Install local artifact into private cache and repeat all nine proof cases
+        run: python scripts/build_native_codex_windows.py install-local --artifact native-artifact --runtime-root "$env:RUNNER_TEMP/bello-install-proof" --proof-output native-installed-proof
       - name: Upload verified unsigned bundle (no release publication)
         uses: actions/upload-artifact@v4
         with:
@@ -109,6 +111,8 @@ jobs:
             native-artifact/checksums.json
             native-artifact/bundle/selection-manifest.json
             native-artifact/bundle/BUILD-INFO
+            ${{ runner.temp }}/bello-install-proof/installed-cache.json
+            native-installed-proof/report.json
           if-no-files-found: error
       - name: Upload synthetic diagnostics even on failure
         if: always()
@@ -122,5 +126,12 @@ jobs:
             native-proof/*/selector-inputs.json
             native-proof/*/native-stderr.txt
             native-proof/*/rpc.jsonl
+            native-installed-proof/report.json
+            native-installed-proof/*/result.json
+            native-installed-proof/*/provider-request-*.json
+            native-installed-proof/*/selector-inputs.json
+            native-installed-proof/*/native-stderr.txt
+            native-installed-proof/*/rpc.jsonl
+            ${{ runner.temp }}/bello-install-proof/installed-cache.json
             ${{ runner.temp }}/bello-native-target/cargo-timings/*.html
           if-no-files-found: warn

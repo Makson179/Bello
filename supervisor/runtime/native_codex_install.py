@@ -58,18 +58,34 @@ def _bundle_files(system: str) -> frozenset[str]:
     return _WINDOWS_FILES if system == "Windows" else _FILES
 
 
-def _validate_windows_security_descriptor(descriptor: str, user_sid: str) -> None:
+def _windows_parent_readonly_rights(rights: str) -> bool:
+    # FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, plus their generic equivalents.
+    # No WRITE_*, DELETE, FILE_DELETE_CHILD, WRITE_DAC or WRITE_OWNER bits.
+    allowed = 0xA01200A9
+    if re.fullmatch(r"0x[0-9a-fA-F]+", rights):
+        return not int(rights, 16) & ~allowed
+    # SDDL can render individual file bits using the shared two-letter aliases.
+    return bool(re.fullmatch(r"(?:FR|FX|GR|GX|RC|SY|CC|SW|WP|LO)+", rights))
+
+
+def _validate_windows_security_descriptor(descriptor: str, user_sid: str, *, parent: bool = False) -> None:
     """Fail closed on any grant outside the user, SYSTEM and administrators.
 
     These are private executable caches, not shared installation directories.
     Parsing the OS-produced SDDL permits only simple allow ACEs; unfamiliar ACLs
     are rejected rather than interpreted optimistically. Existing ACLs are never
     repaired. Administrators/SYSTEM remain trusted as on a normal user profile.
+    A containing directory may allow others to read/traverse it. Its inherit-only
+    ACEs do not apply to that directory, and the new cache has a protected DACL.
     """
     owner, separator, dacl = descriptor.partition("D:")
     trusted = {user_sid, "SY", "BA", "S-1-5-18", "S-1-5-32-544"}
     if not separator or owner.removeprefix("O:") not in trusted or not owner.startswith("O:"):
         raise ValueError("Native Codex cache must have a trusted Windows owner and private DACL")
+    # Windows/Python may express the trusted owner's grant as OWNER RIGHTS.
+    # This trustee is safe only after validating the actual owner above; OW is
+    # not itself an acceptable owner identity.
+    trusted_grants = trusted | {"OW", "S-1-3-4"}
     flags, _, entries = dacl.partition("(")
     if not re.fullmatch(r"(?:P|AI|AR)*", flags) or not entries:
         raise ValueError("Native Codex cache must have a private Windows DACL")
@@ -78,13 +94,18 @@ def _validate_windows_security_descriptor(descriptor: str, user_sid: str) -> Non
         raise ValueError("Native Codex cache has an unsupported Windows DACL")
     for ace in aces:
         fields = ace[1:-1].split(";")
-        if (len(fields) != 6 or fields[0] != "A" or fields[3] or fields[4]
-                or fields[5] not in trusted or not fields[2]
+        if (len(fields) != 6 or fields[0] != "A" or fields[3] or fields[4] or not fields[2]
                 or not re.fullmatch(r"(?:OI|CI|NP|IO|ID)*", fields[1])):
             raise ValueError("Native Codex cache must not grant access to other Windows accounts")
+        ace_flags = {fields[1][index:index + 2] for index in range(0, len(fields[1]), 2)}
+        if fields[5] in trusted_grants or parent and "IO" in ace_flags:
+            continue
+        if parent and _windows_parent_readonly_rights(fields[2]):
+            continue
+        raise ValueError("Native Codex cache must not grant access to other Windows accounts")
 
 
-def _windows_private_acl(path: Path, *, create: bool = False) -> None:
+def _windows_private_acl(path: Path, *, create: bool = False, parent: bool = False) -> None:
     """Atomically create a private directory, or validate an existing entry.
 
     chmod(0700) does not establish a Windows DACL on supported Python 3.11.
@@ -157,7 +178,7 @@ def _windows_private_acl(path: Path, *, create: bool = False) -> None:
                                                                           ctypes.byref(sddl), None):
             raise ctypes.WinError(ctypes.get_last_error())
         allocated.append(sddl)
-        _validate_windows_security_descriptor(ctypes.wstring_at(sddl), user_sid)
+        _validate_windows_security_descriptor(ctypes.wstring_at(sddl), user_sid, parent=parent)
     finally:
         for allocation in reversed(allocated):
             kernel.LocalFree(allocation)
@@ -179,7 +200,7 @@ def _private_directory(path: Path, *, parents: bool = False) -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
         _reject_windows_reparse_ancestors(path)
         # A public parent could replace a private child using DELETE_CHILD.
-        _windows_private_acl(path.parent)
+        _windows_private_acl(path.parent, parent=True)
         _windows_private_acl(path, create=True)
     else:
         path.mkdir(parents=parents, exist_ok=True, mode=0o700)

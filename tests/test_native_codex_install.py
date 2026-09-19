@@ -253,6 +253,18 @@ def test_windows_cache_accepts_only_private_current_user_system_admin_acl(dacl):
     install._validate_windows_security_descriptor(f"O:{_USER_SID}D:{dacl}", _USER_SID)
 
 
+@pytest.mark.parametrize("owner_rights", ["OW", "S-1-3-4"])
+def test_windows_cache_accepts_owner_rights_only_after_validating_actual_owner(owner_rights):
+    # Exact Windows CI/Python 3.13 private-directory shape, plus numeric SID form.
+    descriptor = f"O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{owner_rights})"
+    install._validate_windows_security_descriptor(
+        descriptor, "S-1-5-21-3699639565-2515463329-295617607-500")
+    for owner in ("BU", "WD", "OW", "S-1-3-4", "S-1-5-21-123-456-789-1002"):
+        with pytest.raises(ValueError, match="trusted Windows owner"):
+            install._validate_windows_security_descriptor(
+                f"O:{owner}D:P(A;OICI;FA;;;{owner_rights})", _USER_SID)
+
+
 @pytest.mark.parametrize("descriptor", [
     f"O:{_USER_SID}D:NO_ACCESS_CONTROL", f"O:{_USER_SID}D:P",
     f"O:{_USER_SID}D:P(A;OICI;FA;;;WD)",
@@ -266,6 +278,51 @@ def test_windows_cache_accepts_only_private_current_user_system_admin_acl(dacl):
 def test_windows_cache_rejects_public_null_foreign_and_unknown_dacls(descriptor):
     with pytest.raises(ValueError, match="Windows"):
         install._validate_windows_security_descriptor(descriptor, _USER_SID)
+
+
+@pytest.mark.parametrize("extra", [
+    "(A;OICI;FRFX;;;BU)", "(A;ID;GRGX;;;BU)", "(A;;0x1200a9;;;BU)",
+    "(A;;CCSWWPLO;;;BU)", "(A;OICIIO;GA;;;CO)", "(A;OICIIO;FA;;;WD)",
+])
+def test_windows_parent_allows_read_traverse_or_inherit_only_but_cache_stays_private(extra):
+    descriptor = f"O:{_USER_SID}D:AI(A;OICI;FA;;;{_USER_SID}){extra}"
+    install._validate_windows_security_descriptor(descriptor, _USER_SID, parent=True)
+    with pytest.raises(ValueError, match="other Windows accounts"):
+        install._validate_windows_security_descriptor(descriptor, _USER_SID)
+
+
+@pytest.mark.parametrize("rights", [
+    "FA", "GA", "FW", "GW", "SD", "WD", "WO", "DC", "LC", "DT", "RP", "CR",
+    "FRFW", "0x40", "0x10000", "0x40000", "0x80000", "0x1200eb", "0xffffffff",
+])
+def test_windows_parent_rejects_effective_write_delete_child_or_acl_change(rights):
+    descriptor = f"O:{_USER_SID}D:AI(A;OICI;FA;;;{_USER_SID})(A;OICI;{rights};;;BU)"
+    with pytest.raises(ValueError, match="other Windows accounts"):
+        install._validate_windows_security_descriptor(descriptor, _USER_SID, parent=True)
+
+
+def test_windows_parent_still_requires_trusted_owner():
+    with pytest.raises(ValueError, match="trusted Windows owner"):
+        install._validate_windows_security_descriptor("O:BUD:AI(A;OICI;FRFX;;;BU)", _USER_SID, parent=True)
+
+
+def test_windows_parent_does_not_confuse_ci_oi_with_inherit_only():
+    descriptor = f"O:{_USER_SID}D:AI(A;CIOI;GA;;;BU)"
+    with pytest.raises(ValueError, match="other Windows accounts"):
+        install._validate_windows_security_descriptor(descriptor, _USER_SID, parent=True)
+
+
+def test_private_directory_uses_readonly_parent_policy_only_for_parent(tmp_path, monkeypatch):
+    directory = tmp_path / "private-cache"
+    calls = []
+    def acl(path, *, create=False, parent=False):
+        calls.append((path, create, parent))
+        if create:
+            path.mkdir()
+    monkeypatch.setattr(install, "_IS_WINDOWS", True)
+    monkeypatch.setattr(install, "_windows_private_acl", acl)
+    install._private_directory(directory)
+    assert calls == [(tmp_path, False, True), (directory, True, False), (directory, False, False)]
 
 
 @pytest.mark.skipif(not install._IS_WINDOWS, reason="Native Windows DACL APIs")

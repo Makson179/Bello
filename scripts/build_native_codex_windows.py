@@ -8,17 +8,23 @@ Packaging requires the real nine-case, zero-paid-call provider-boundary proof.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
+import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tomllib
+from unittest.mock import patch as replace
 
 
 UPSTREAM_REVISION = "3d2ee51ca2d5db578f328aa75e20aa22c0197c9a"
+ROOT = Path(__file__).resolve().parents[1]
 VERSION = "0.153.4"
 TARGET = "x86_64-pc-windows-msvc"
 BINARIES = ("codex", "codex-code-mode-host", "codex-command-runner", "codex-windows-sandbox-setup")
@@ -155,6 +161,68 @@ def package(source: Path, patch: Path, release: Path, proof: Path, cargo_home: P
     return archive
 
 
+def install_local(artifact: Path, runtime_root: Path, proof_output: Path) -> None:
+    """Exercise the real private-cache installer, without publishing a bundle pin."""
+    sys.path.insert(0, str(ROOT))
+    from supervisor.runtime import native_codex_install as installer
+    from supervisor.runtime.codex_distiller import validate_native_selection
+
+    if platform.system() != "Windows" or platform.machine().lower() not in {"amd64", "x86_64"}:
+        raise ValueError("Installed-artifact proof requires Windows x64")
+    runner_temp = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
+    runtime_root = runtime_root.resolve()
+    if (runtime_root == runner_temp or not runtime_root.is_relative_to(runner_temp)
+            or runtime_root.exists()):
+        raise ValueError("Installer proof requires a new child directory of RUNNER_TEMP")
+    archive = artifact / f"bello-native-codex-{VERSION}-{TARGET}.tar.gz"
+    checksums = json.loads((artifact / "checksums.json").read_text(encoding="utf-8"))
+    if checksums.get("archive") != archive.name or checksums.get("archive_sha256") != sha256(archive):
+        raise ValueError("Local artifact archive checksum mismatch")
+    bundle = installer.NativeBundle(
+        "https://github.com/Makson179/Bello/releases/download/ci-local-only/" + archive.name,
+        checksums["archive_sha256"], checksums["manifest_sha256"])
+    copies = []
+
+    def local_download(spec, destination):
+        if spec != bundle or copies:
+            raise ValueError("Private cache unexpectedly requested another transfer")
+        with archive.open("rb") as source, destination.open("xb") as output:
+            shutil.copyfileobj(source, output)
+        if sha256(destination) != spec.archive_sha256:
+            raise ValueError("Copied artifact checksum mismatch")
+        copies.append(destination)
+
+    environment = dict(os.environ)
+    for name in ("BELLO_CODEX_BINARY", "BELLO_CODEX_SELECTION_MANIFEST", "OPENAI_API_KEY",
+                 "CODEX_API_KEY", "ANTHROPIC_API_KEY"):
+        environment.pop(name, None)
+    environment.update({"BELLO_RUNTIME_DIR": str(runtime_root), "HOME": str(runtime_root / "empty-home"),
+                        "USERPROFILE": str(runtime_root / "empty-home"),
+                        "CODEX_HOME": str(runtime_root / "empty-home")})
+    with replace.dict(os.environ, environment, clear=True), replace.dict(
+            installer.BUNDLES, {("Windows", "x86_64"): bundle}, clear=True), replace.object(
+            installer, "_download", local_download):
+        command, manifest = installer.ensure_native_selection()
+        if installer.ensure_native_selection() != (command, manifest) or len(copies) != 1:
+            raise ValueError("Native installed cache was not reused unchanged")
+        installer._private_directory(runtime_root / "empty-home")
+        capability = asyncio.run(validate_native_selection(command, manifest))
+        receipt = {"schema": "bello.native-selection-installed-proof.v1", "passed": False,
+                   "archive_sha256": bundle.archive_sha256, "manifest_sha256": bundle.manifest_sha256,
+                   "binary_sha256": capability["binary_sha256"], "binary": command[0],
+                   "local_archive_transfers": len(copies), "cache_hit": True,
+                   "offline_feature_validation": True, "published_pin": False}
+        receipt_path = runtime_root / "installed-cache.json"
+        receipt_path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        subprocess.run([sys.executable, str(ROOT / "scripts" / "verify_native_codex_selection.py"),
+                        "--codex", command[0], "--output-dir", str(proof_output)], check=True)
+        report_path = proof_output / "report.json"
+        validate_proof(json.loads(report_path.read_text(encoding="utf-8")), Path(command[0]))
+        receipt.update({"passed": True, "provider_proof_sha256": sha256(report_path)})
+        receipt_path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(receipt), flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -166,9 +234,13 @@ def main() -> None:
             for name in ("release", "proof", "cargo-home", "output"):
                 stage.add_argument(f"--{name}", type=Path, required=True)
     sub.add_parser("verify-v8").add_argument("--directory", type=Path, required=True)
+    installed = sub.add_parser("install-local")
+    for name in ("artifact", "runtime-root", "proof-output"):
+        installed.add_argument(f"--{name}", type=Path, required=True)
     args = vars(parser.parse_args())
     command = args.pop("command")
-    {"prepare": prepare, "package": package, "verify-v8": verify_v8}[command](**args)
+    {"prepare": prepare, "package": package, "verify-v8": verify_v8,
+     "install-local": install_local}[command](**args)
 
 
 if __name__ == "__main__":

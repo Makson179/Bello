@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import tarfile
 import tomllib
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -78,7 +79,8 @@ def test_v8_hash_mismatch_fails_before_build(tmp_path, monkeypatch):
         build.verify_v8(tmp_path)
 
 
-def test_package_binds_four_executables_licenses_manifest_and_proof(tmp_path):
+@pytest.fixture
+def packaged_artifact(tmp_path):
     source, release, cargo = [tmp_path / name for name in ("source", "release", "cargo")]
     (source / "codex-rs").mkdir(parents=True)
     (source / "codex-rs" / "Cargo.lock").write_text("lock")
@@ -95,6 +97,12 @@ def test_package_binds_four_executables_licenses_manifest_and_proof(tmp_path):
     proof.write_text(json.dumps(passing_report(release / "codex.exe")))
     output = tmp_path / "artifact"
     archive = build.package(source, patch, release, proof, cargo, output)
+    return {"output": output, "archive": archive, "source": source, "patch": patch,
+            "release": release, "proof": proof, "cargo_home": cargo}
+
+
+def test_package_binds_four_executables_licenses_manifest_and_proof(packaged_artifact):
+    output, archive, release = [packaged_artifact[name] for name in ("output", "archive", "release")]
     with tarfile.open(archive) as stream:
         entries = stream.getmembers()
         assert all(entry.isfile() for entry in entries)
@@ -110,7 +118,65 @@ def test_package_binds_four_executables_licenses_manifest_and_proof(tmp_path):
     assert checksums["archive_sha256"] == build.sha256(archive)
     assert checksums["published"] is False
     with pytest.raises(FileExistsError):
-        build.package(source, patch, release, proof, cargo, output)
+        build.package(**{name: value for name, value in packaged_artifact.items() if name != "archive"})
+
+
+def test_installed_proof_uses_real_cache_and_rejects_failed_second_proof(packaged_artifact, tmp_path, monkeypatch):
+    from supervisor.runtime import codex_distiller, native_codex_install as installer
+
+    monkeypatch.setattr(build.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(build.platform, "machine", lambda: "AMD64")
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    monkeypatch.setenv("BELLO_CODEX_BINARY", "must-not-bypass-the-installer")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-parent-secret")
+    expected_hash = build.sha256(packaged_artifact["release"] / "codex.exe")
+    validation = AsyncMock(return_value={"binary_sha256": expected_hash})
+    monkeypatch.setattr(codex_distiller, "validate_native_selection", validation)
+    proof_output = tmp_path / "installed-proof"
+    calls = []
+
+    def fake_provider_proof(command, *, check):
+        assert check is True and command[2] == "--codex"
+        installed = Path(command[3])
+        assert installed.is_relative_to(tmp_path / "private-cache")
+        assert installed.read_bytes().startswith(b"MZ")
+        assert "OPENAI_API_KEY" not in build.os.environ
+        assert "BELLO_CODEX_BINARY" not in build.os.environ
+        report = passing_report(installed)
+        calls.append(command)
+        proof_output.mkdir()
+        (proof_output / "report.json").write_text(json.dumps(report))
+
+    monkeypatch.setattr(subprocess, "run", fake_provider_proof)
+    original_bundles = dict(installer.BUNDLES)
+    build.install_local(packaged_artifact["output"], tmp_path / "private-cache", proof_output)
+    receipt = json.loads((tmp_path / "private-cache/installed-cache.json").read_text())
+    assert receipt["passed"] is True and receipt["cache_hit"] is True
+    assert receipt["local_archive_transfers"] == 1 and len(calls) == 1
+    validation.assert_awaited_once()
+    assert installer.BUNDLES == original_bundles
+    assert build.os.environ["BELLO_CODEX_BINARY"] == "must-not-bypass-the-installer"
+    with pytest.raises(ValueError, match="new child directory"):
+        build.install_local(packaged_artifact["output"], tmp_path / "private-cache", proof_output)
+
+
+@pytest.mark.parametrize("failure", ["archive", "proof"])
+def test_installed_artifact_failures_do_not_produce_success_receipt(packaged_artifact, tmp_path, monkeypatch, failure):
+    from supervisor.runtime import codex_distiller
+
+    monkeypatch.setattr(build.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(build.platform, "machine", lambda: "AMD64")
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    monkeypatch.setattr(codex_distiller, "validate_native_selection", AsyncMock(return_value={"binary_sha256": "fake"}))
+    def fail_proof(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, args[0])
+    monkeypatch.setattr(subprocess, "run", fail_proof)
+    if failure == "archive":
+        packaged_artifact["archive"].write_bytes(b"corrupt")
+    with pytest.raises((ValueError, subprocess.CalledProcessError)):
+        build.install_local(packaged_artifact["output"], tmp_path / "private-cache", tmp_path / "proof")
+    receipt = tmp_path / "private-cache/installed-cache.json"
+    assert not receipt.exists() or json.loads(receipt.read_text())["passed"] is False
 
 
 def test_missing_notices_cannot_create_bundle(tmp_path):
