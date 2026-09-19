@@ -3,7 +3,9 @@ name: Native Codex Windows proof
 on:
   workflow_dispatch:
   push:
-    branches: [mystery, 'codex/**']
+    # Readiness tests the already published, pinned helper in its ModernBERT
+    # workflow. A new branch cannot reuse another branch's native build cache.
+    branches: [mystery, 'codex/**', '!codex/release-0.6.0-readiness']
     paths:
       - '.github/workflows/native-codex-windows*.yml'
       - 'scripts/native-codex-selection.patch'

@@ -1,0 +1,139 @@
+name: Native Codex Linux build
+
+on:
+  workflow_call:
+    outputs:
+      artifact-name:
+        description: CI-only Linux build candidate; not a verified release
+        value: ${{ jobs.build.outputs.artifact-name }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    outputs:
+      artifact-name: ${{ steps.identity.outputs.artifact-name }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: '3'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      CARGO_PROFILE_RELEASE_LTO: 'false'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Identify exact native inputs
+        id: identity
+        run: |
+          key=$(python scripts/prepare_native_codex_linux.py build-key)
+          [[ "$key" =~ ^[0-9a-f]{64}$ ]]
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          echo "artifact-name=bello-native-linux-candidate-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        id: candidate
+        with:
+          path: native-candidate
+          key: native-codex-linux-ready-v1-${{ steps.identity.outputs.key }}
+      - name: Verify exact ready candidate before reuse
+        if: steps.candidate.outputs.cache-hit == 'true'
+        run: python scripts/build_native_codex_linux.py verify-build --candidate native-candidate
+      - name: Configure native build paths
+        if: steps.candidate.outputs.cache-hit != 'true'
+        run: |
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/bello-native-target" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$RUNNER_TEMP/bello-cargo" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        if: steps.candidate.outputs.cache-hit != 'true'
+        with:
+          repository: openai/codex
+          ref: 3d2ee51ca2d5db578f328aa75e20aa22c0197c9a
+          path: native-source
+          persist-credentials: false
+      - name: Install Linux native build dependencies
+        if: steps.candidate.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends binutils pkg-config libcap-dev libssl-dev clang cmake
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        if: steps.candidate.outputs.cache-hit != 'true'
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: actions/cache/restore@v4
+        if: steps.candidate.outputs.cache-hit != 'true'
+        id: cargo_cache
+        with:
+          path: |
+            ${{ runner.temp }}/bello-cargo/registry
+            ${{ runner.temp }}/bello-cargo/git
+            ${{ runner.temp }}/bello-native-target
+          key: native-codex-linux-1.95.0-v1-${{ steps.identity.outputs.key }}
+          restore-keys: native-codex-linux-1.95.0-v1-
+      - name: Prepare pinned source and exact selection patch
+        if: steps.candidate.outputs.cache-hit != 'true'
+        run: python scripts/prepare_native_codex_linux.py prepare --source native-source --patch scripts/native-codex-selection.patch
+      - name: Download and verify pinned upstream V8 artifacts
+        if: steps.candidate.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/bello-v8"
+          base=https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0
+          archive=librusty_v8_ptrcomp_sandbox_release_x86_64-unknown-linux-gnu.a.gz
+          binding=src_binding_ptrcomp_sandbox_release_x86_64-unknown-linux-gnu.rs
+          for name in "$archive" "$binding"; do
+            curl --fail --location --retry 3 "$base/$name" -o "$RUNNER_TEMP/bello-v8/$name"
+          done
+          python scripts/prepare_native_codex_linux.py verify-v8 --directory "$RUNNER_TEMP/bello-v8"
+          echo "RUSTY_V8_ARCHIVE=$RUNNER_TEMP/bello-v8/$archive" >> "$GITHUB_ENV"
+          echo "RUSTY_V8_SRC_BINDING_PATH=$RUNNER_TEMP/bello-v8/$binding" >> "$GITHUB_ENV"
+      - name: Build and finalize bwrap before compiling its digest into Codex
+        if: steps.candidate.outputs.cache-hit != 'true'
+        working-directory: native-source/codex-rs
+        run: |
+          cargo build --locked --release --timings --target x86_64-unknown-linux-gnu --bin bwrap
+          bwrap="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/bwrap"
+          strip --strip-debug --strip-unneeded "$bwrap"
+          digest=$(sha256sum "$bwrap" | cut -d ' ' -f 1)
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          echo "CODEX_BWRAP_SHA256=$digest" >> "$GITHUB_ENV"
+      - name: Build native Codex and code-mode host
+        if: steps.candidate.outputs.cache-hit != 'true'
+        working-directory: native-source/codex-rs
+        run: cargo build --locked --release --timings --target x86_64-unknown-linux-gnu --bin codex --bin codex-code-mode-host
+      - name: Preserve successful Cargo build cache
+        if: steps.candidate.outputs.cache-hit != 'true' && steps.cargo_cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ runner.temp }}/bello-cargo/registry
+            ${{ runner.temp }}/bello-cargo/git
+            ${{ runner.temp }}/bello-native-target
+          key: ${{ steps.cargo_cache.outputs.cache-primary-key }}
+      - name: Save compiled candidate independently of proof success
+        if: steps.candidate.outputs.cache-hit != 'true'
+        run: python scripts/build_native_codex_linux.py snapshot-build --source native-source --patch scripts/native-codex-selection.patch --release "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release" --cargo-home "$CARGO_HOME" --output native-candidate
+      - name: Verify all candidate hashes and native identity
+        run: python scripts/build_native_codex_linux.py verify-build --candidate native-candidate
+      - name: Cache exact ready candidate
+        if: steps.candidate.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: native-candidate
+          key: ${{ steps.candidate.outputs.cache-primary-key }}
+      - name: Upload CI-only build candidate before any proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.identity.outputs.artifact-name }}
+          path: native-candidate/
+          if-no-files-found: error
+          retention-days: 14

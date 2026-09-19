@@ -363,6 +363,12 @@ def _unpack(archive: Path, destination: Path, *, system: str = "Darwin") -> None
     expected_files = _bundle_files(system)
     expected_directories = _bundle_directories(system)
     _owned(destination, directory=True)
+    # Create every allowlisted directory explicitly: mkdir(parents=True) only
+    # applies mode=0700 to the leaf, leaving a nested archive's bin/ public when
+    # its first member is bin/codex-resources/bwrap.
+    for relative in sorted(expected_directories - {"."},
+                           key=lambda value: (len(PurePosixPath(value).parts), value)):
+        _private_directory(destination / relative)
     with tarfile.open(archive, "r:gz") as source:
         for member in source:
             name = member.name.removeprefix("./")
@@ -376,7 +382,6 @@ def _unpack(archive: Path, destination: Path, *, system: str = "Darwin") -> None
             if size > _MAX_UNPACKED:
                 raise ValueError("Native Codex archive expands beyond its size limit")
             target = destination / name
-            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             _owned(target.parent, directory=True)
             stream = source.extractfile(member)
             if stream is None:

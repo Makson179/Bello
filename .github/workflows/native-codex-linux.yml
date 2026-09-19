@@ -1,0 +1,109 @@
+name: Native Codex Linux proof
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [mystery, 'codex/**']
+    paths:
+      - '.github/workflows/native-codex-linux*.yml'
+      - 'scripts/*native_codex_linux.py'
+      - 'scripts/prepare_native_codex_windows.py'
+      - 'scripts/build_native_codex_windows.py'
+      - 'scripts/native-codex-selection.patch'
+      - 'scripts/verify_native_codex_selection.py'
+      - 'supervisor/runtime/native_codex_install.py'
+      - 'supervisor/runtime/codex_distiller.py'
+      - 'supervisor/runtime/distiller_policy.py'
+      - 'tests/test_build_native_codex_linux.py'
+      - 'tests/test_native_codex_linux_workflow.py'
+      - 'tests/test_native_codex_install.py'
+      - 'pyproject.toml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-codex-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-build:
+    uses: ./.github/workflows/native-codex-linux-build.yml
+
+  native-proof:
+    needs: native-build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.native-build.outputs.artifact-name }}
+          path: native-candidate
+      - name: Validate hashes before restoring archive-lost executable modes
+        run: python scripts/build_native_codex_linux.py verify-build --candidate native-candidate --restore-executable-modes
+      - name: Install offline host/test dependencies without optional models
+        run: python -c "import pathlib, subprocess, sys, tomllib; deps = tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['dependencies']; subprocess.run([sys.executable, '-m', 'pip', 'install', 'pytest', 'pytest-asyncio', *deps], check=True)"
+      - name: Run packaging, installer and bridge regressions
+        run: python -m pytest -q tests/test_build_native_codex_linux.py tests/test_native_codex_linux_workflow.py tests/test_native_codex_install.py tests/test_native_codex_download_transport.py tests/test_verify_native_codex_selection.py tests/test_runtime_codex_distiller.py
+      - name: Prove bundled Linux sandbox and bwrap digest enforcement
+        run: python scripts/build_native_codex_linux.py sandbox-proof --binary native-candidate/bin/codex --output native-sandbox-proof
+      - name: Prove all nine direct, code-mode and poll provider boundaries
+        run: python scripts/verify_native_codex_selection.py --codex native-candidate/bin/codex --output-dir native-proof
+      - name: Package only after sandbox and all nine cases pass
+        run: python scripts/build_native_codex_linux.py package-candidate --candidate native-candidate --proof native-proof/report.json --sandbox-proof native-sandbox-proof/report.json --output native-artifact
+      - name: Install archive through actual cache and repeat native proofs
+        run: |
+          proof_root="$RUNNER_TEMP/bello-install-proof-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          result=0
+          python scripts/build_native_codex_linux.py install-local --artifact native-artifact --runtime-root "$proof_root" --proof-output native-installed-proof || result=$?
+          if [[ -f "$proof_root/installed-cache.json" ]]; then
+            cp "$proof_root/installed-cache.json" native-artifact/installed-cache.json
+          fi
+          exit "$result"
+      - name: Upload verified bundle without publishing it
+        uses: actions/upload-artifact@v4
+        with:
+          name: bello-native-codex-linux-x64-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            native-artifact/*.tar.gz
+            native-artifact/checksums.json
+            native-artifact/bundle/selection-manifest.json
+            native-artifact/bundle/BUILD-INFO
+            native-artifact/installed-cache.json
+            native-installed-proof/report.json
+            native-sandbox-proof/report.json
+            native-installed-proof-sandbox/report.json
+          if-no-files-found: error
+      - name: Retain synthetic diagnostics on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-codex-linux-proof-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            native-proof/report.json
+            native-proof/*/result.json
+            native-proof/*/provider-request-*.json
+            native-proof/*/selector-inputs.json
+            native-proof/*/native-stderr.txt
+            native-proof/*/rpc.jsonl
+            native-installed-proof/report.json
+            native-installed-proof/*/result.json
+            native-installed-proof/*/provider-request-*.json
+            native-installed-proof/*/selector-inputs.json
+            native-installed-proof/*/native-stderr.txt
+            native-installed-proof/*/rpc.jsonl
+            native-sandbox-proof/*.json
+            native-sandbox-proof/*.txt
+            native-installed-proof-sandbox/*.json
+            native-installed-proof-sandbox/*.txt
+            native-artifact/installed-cache.json
+          if-no-files-found: warn

@@ -29,7 +29,8 @@ def release(tmp_path, monkeypatch, request):
     executable = "bin/codex.exe" if system == "Windows" else "bin/codex"
     monkeypatch.setattr(install.platform, "system", lambda: system)
     monkeypatch.setattr(install.platform, "machine", lambda: machine)
-    contents = {name: f"fixture {name}".encode() for name in install._bundle_files(system)
+    # Nested files deliberately come first to catch unsafe implicit parent modes.
+    contents = {name: f"fixture {name}".encode() for name in sorted(install._bundle_files(system), reverse=True)
                 if name != "selection-manifest.json"}
     files = {name: hashlib.sha256(value).hexdigest() for name, value in contents.items()}
     contents["selection-manifest.json"] = json.dumps({
