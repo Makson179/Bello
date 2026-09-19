@@ -2,6 +2,11 @@ name: Native Codex persistent history diagnostic
 
 on:
   workflow_dispatch:
+  push:
+    branches: ['codex/release-0.6.0-readiness']
+    paths:
+      - '.github/workflows/native-codex-history-smoke.yml'
+      - 'scripts/verify_native_codex_history.py'
 
 permissions:
   contents: read

@@ -2,6 +2,12 @@ name: Published Native Codex Linux smoke
 
 on:
   workflow_dispatch:
+  push:
+    branches: ['codex/release-0.6.0-readiness']
+    paths:
+      - '.github/workflows/native-codex-published-linux.yml'
+      - 'scripts/verify_native_codex_linux_download.py'
+      - 'supervisor/runtime/native_codex_install.py'
 
 permissions:
   contents: read

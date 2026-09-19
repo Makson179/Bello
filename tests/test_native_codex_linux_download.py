@@ -113,9 +113,9 @@ async def test_existing_runtime_cannot_be_presented_as_cold(fixture):
     assert fixture.calls == []
 
 
-def test_dispatch_only_workflow_uses_real_production_download_without_build_or_auth():
+def test_scoped_workflow_uses_real_production_download_without_build_or_auth():
     workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/native-codex-published-linux.yml").read_text()
-    assert "workflow_dispatch:" in workflow and "push:" not in workflow
+    assert "workflow_dispatch:" in workflow and "branches: ['codex/release-0.6.0-readiness']" in workflow
     assert "ubuntu-22.04" in workflow and "persist-credentials: false" in workflow
     assert "verify_native_codex_linux_download.py" in workflow
     assert "linux-published-proof/provider/*/provider-request-*.json" in workflow
