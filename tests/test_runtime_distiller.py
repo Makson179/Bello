@@ -1,14 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import sys
 
 import pytest
 
 from supervisor.runtime import distiller as module
+from supervisor.runtime import distiller_worker as worker
 from supervisor.runtime.distiller import LogDistiller, require_dependencies
 from supervisor.runtime.distiller_worker import make_entry
+
+
+@pytest.mark.parametrize("text", ["plain ASCII", "café \u2014 résumé", "Ошибка: 文件 😀\r\nnext line"])
+def test_worker_emits_utf8_json_independent_of_stdout_encoding(monkeypatch, text):
+    pipe = io.BytesIO()
+    stdout = io.TextIOWrapper(pipe, encoding="cp1252", errors="strict", newline="\r\n")
+    response = {"id": 1, "ok": True, "text": text}
+    with monkeypatch.context() as patch:
+        patch.setattr(worker.sys, "stdout", stdout)
+        worker.emit(response)
+    payload = pipe.getvalue()
+    assert payload == (json.dumps(response, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+    assert json.loads(payload) == response
 
 
 def test_dependency_preflight_checks_presence_without_importing(monkeypatch):
@@ -95,6 +110,30 @@ async def test_lazy_persistent_worker_and_close(tmp_path, fake_worker):
     assert processes[0].returncode is not None
     assert await distiller.distill("after close", "focus", "cmd") == "after close"
     await distiller.close()
+
+
+async def test_real_worker_protocol_preserves_unicode_with_cp1252_stdio(tmp_path, fake_worker):
+    processes = fake_worker(r'''
+import sys
+from supervisor.runtime import distiller_worker as worker
+sys.stdin.reconfigure(encoding="cp1252", errors="strict")
+sys.stdout.reconfigure(encoding="cp1252", errors="strict", newline="\r\n")
+class Selector:
+    def select(self, text, focus, command):
+        assert focus == "проверка 文件"
+        assert command == "Get-Content café.txt"
+        return text.split("\nignored", 1)[0]
+worker.load_selector = lambda directory: Selector()
+raise SystemExit(worker.main(["--model-path", "."]))
+''')
+    distiller = LogDistiller(tmp_path)
+    try:
+        for selected in ("café \u2014 résumé", "Ошибка: 文件 😀", "next ASCII result"):
+            original = selected + "\nignored repeated diagnostic text"
+            assert await distiller.distill(original, "проверка 文件", "Get-Content café.txt") == selected
+        assert len(processes) == 1 and processes[0].returncode is None
+    finally:
+        await distiller.close()
 
 
 async def test_parallel_calls_are_serialized_and_all_selected(tmp_path, fake_worker):

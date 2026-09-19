@@ -39,6 +39,8 @@ async def test_observation_requires_successful_real_worker_exchange_and_preserve
     assert first["cold"] is True and second["cold"] is False
     assert first["worker_pid"] == second["worker_pid"] == 123
     assert first["worker_response_ok"] and first["returned_worker_output"] and first["strictly_reduced"]
+    assert first["worker_exchange_attempted"] is True and first["worker_error_type"] is None
+    assert selector.worker_failure_types == []
     assert first["original_bytes"] == len(raw) and first["selected_bytes"] == len(selected)
     assert first["selected_sha256"] == smoke.digest(selected)
 
@@ -55,6 +57,50 @@ async def test_fail_open_original_is_not_counted_as_model_success(tmp_path, monk
     assert observed["worker_response_ok"] is False
     assert observed["returned_worker_output"] is False
     assert observed["strictly_reduced"] is False
+    assert observed["worker_exchange_attempted"] is False and observed["worker_error_type"] is None
+    assert selector.worker_failure_types == []
+
+
+@pytest.mark.asyncio
+async def test_real_exchange_exception_is_recorded_without_error_text_or_payload(tmp_path, monkeypatch, caplog):
+    error = ValueError("never-export-worker-payload-or-secret")
+    exchange = AsyncMock(side_effect=error)
+    monkeypatch.setattr(smoke.LogDistiller, "_exchange", exchange)
+    monkeypatch.setattr(smoke.LogDistiller, "_finish_cleanup", AsyncMock())
+    monkeypatch.setattr(smoke, "make_entry", lambda *args: ([{}], []))
+    selector = smoke.ObservedDistiller(tmp_path, CharacterTokenizer())
+    assert await selector.distill("original private log", "focus", "command") == "original private log"
+    measurement = selector.measurements[0]
+    assert measurement["worker_exchange_attempted"] is True
+    assert measurement["worker_response_ok"] is False
+    assert measurement["worker_error_type"] == "ValueError"
+    assert selector.worker_failure_types == ["ValueError"]
+    exported = json.dumps(measurement) + json.dumps(selector.worker_failure_types) + caplog.text
+    assert "never-export" not in exported and "original private log" not in exported
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text,focus", [("", "focus"), ("log", "  ")])
+async def test_ineligible_requests_are_not_worker_failures(tmp_path, monkeypatch, text, focus):
+    exchange = AsyncMock(side_effect=AssertionError("must not run"))
+    monkeypatch.setattr(smoke.LogDistiller, "_exchange", exchange)
+    monkeypatch.setattr(smoke, "make_entry", lambda *args: ([], []))
+    selector = smoke.ObservedDistiller(tmp_path, CharacterTokenizer())
+    assert await selector.distill(text, focus, "command") == text
+    exchange.assert_not_called()
+    assert selector.worker_failure_types == []
+    assert selector.measurements[0]["worker_exchange_attempted"] is False
+    assert selector.measurements[0]["worker_error_type"] is None
+
+
+def test_live_pass_gate_requires_zero_worker_failures_even_when_task_and_delivery_pass():
+    from scripts import verify_windows_modernbert_live as live
+    result = {"task_passed": True, "successful_native_check": True, "reduced_logs": 3,
+              "exact_selected_native_history_matches": 3, "bridge_outcomes": {"changed": 3},
+              "worker_failures": 0}
+    assert live.live_checks_pass(result)
+    assert not live.live_checks_pass({**result, "worker_failures": 1})
+    assert not live.live_checks_pass({**result, "exact_selected_native_history_matches": 0})
 
 
 def test_workflow_uses_published_downloads_without_training_or_auth_by_default():
@@ -109,10 +155,54 @@ def test_live_history_check_uses_only_exact_owned_thread_and_model_facing_packet
     sessions.mkdir()
     payload = {"type": "function_call_output", "call_id": "actual-native-call", "output":
                "Chunk ID: fixture\nProcess exited with code 1\nOutput:\nselected diagnostic"}
-    (sessions / "rollout-owned.jsonl").write_text(json.dumps({"type": "response_item", "payload": payload}) + "\n")
+    (sessions / "rollout-owned.jsonl").write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": "owned"}}) + "\n" +
+        json.dumps({"type": "response_item", "payload": payload}) + "\n")
     payload["output"] = payload["output"].replace("selected diagnostic", "unrelated")
     (sessions / "rollout-other.jsonl").write_text(json.dumps({"type": "response_item", "payload": payload}) + "\n")
     assert live.selected_history_hashes(tmp_path, "owned") == {live.digest("selected diagnostic")}
+
+
+@pytest.mark.parametrize("kind,value,expected", [
+    ("function_call_output", "Chunk ID: a\nProcess running with session ID 19\nOutput:\npartial\r\n", ["partial\r\n"]),
+    ("function_call_output", [{"type": "input_text", "text": "Process exited with code 0\nOutput:\nkept\n"}], ["kept\n"]),
+    ("custom_tool_call_output", 'Wall time 1 seconds\nOutput:\n{"output":"code\\n","exit_code":0}', ["code\n"]),
+    ("function_call_output", {"body": "Process exited with code 0\nOutput:\nnot-native"}, []),
+    ("function_call_output", "log itself mentions\nOutput:\nnot-a-native-packet", []),
+])
+def test_live_history_parser_uses_native_wire_formats_without_fuzzy_matching(kind, value, expected):
+    from scripts import verify_windows_modernbert_live as live
+    assert live.history_output_texts({"type": kind, "output": value}) == expected
+
+
+def test_live_history_uses_explicit_owned_rollout_path_and_reports_counts(tmp_path):
+    from scripts import verify_windows_modernbert_live as live
+    path = tmp_path / "sessions" / "rollout-different-file-id.jsonl"
+    path.parent.mkdir()
+    records = [
+        {"type": "session_meta", "payload": {"id": "owned"}},
+        {"type": "event_msg", "payload": {"aggregatedOutput": "never-use-this"}},
+        {"type": "response_item", "payload": {"type": "function_call_output", "output":
+            "Process exited with code 0\nOutput:\nexact\r\n"}},
+        {"type": "response_item", "payload": {"type": "function_call_output", "output": "unrecognized tool"}},
+    ]
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    hashes, counts = live.selected_history_evidence(tmp_path, "owned", str(path))
+    assert hashes == {live.digest("exact\r\n")}
+    assert counts == {"path_from_server": True, "files_found": 1, "owned_files": 1,
+                      "records": 4, "response_items": 2, "tool_outputs": 2,
+                      "parsed_outputs": 1, "unparsed_tool_outputs": 1}
+    records[0]["payload"]["id"] = "another-thread"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    with pytest.raises(ValueError, match="exact smoke thread"):
+        live.selected_history_evidence(tmp_path, "owned", str(path))
+    path.write_text("malformed json\n")
+    with pytest.raises(ValueError):
+        live.selected_history_evidence(tmp_path, "owned", str(path))
+    with pytest.raises(ValueError, match="outside"):
+        live.selected_history_evidence(tmp_path, "owned", str(tmp_path.parent / "unrelated.jsonl"))
+    hashes, counts = live.selected_history_evidence(tmp_path, "owned", str(tmp_path / "missing.jsonl"))
+    assert not hashes and counts["files_found"] == counts["owned_files"] == counts["records"] == 0
 
 
 @pytest.mark.parametrize("failure_phase", [None, "prepare_private_runtime", "prepare_private_auth_home", "download_model"])

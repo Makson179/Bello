@@ -251,8 +251,11 @@ def load_selector(directory: Path) -> CPUSelector:
 
 
 def emit(value):
-    sys.stdout.write(json.dumps(value, ensure_ascii=False, allow_nan=False) + "\n")
-    sys.stdout.flush()
+    # The parent reads JSON bytes, independent of the platform's text encoding.
+    # Windows pipes can otherwise encode output as cp1252 or reject Unicode.
+    payload = json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8") + b"\n"
+    sys.stdout.buffer.write(payload)
+    sys.stdout.buffer.flush()
 
 
 def main(argv=None):

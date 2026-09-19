@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextvars import ContextVar
 import hashlib
 import importlib.metadata
 import json
@@ -60,26 +61,47 @@ class ObservedDistiller(LogDistiller):
         self.tokenizer = tokenizer
         self.exchanges: list[str] = []
         self.measurements: list[dict] = []
+        self.worker_failure_types: list[str] = []
+        self._observation: ContextVar[dict | None] = ContextVar("distiller_smoke_observation", default=None)
 
     async def _exchange(self, request):
-        result = await super()._exchange(request)
+        observation = self._observation.get()
+        if observation is not None:
+            observation["attempted"] = True
+        try:
+            result = await super()._exchange(request)
+        except (Exception, asyncio.CancelledError) as exc:
+            # Never retain/export str(exc), request contents or worker payloads.
+            error_type = type(exc).__name__
+            self.worker_failure_types.append(error_type)
+            if observation is not None:
+                observation["error_type"] = error_type
+            raise
         self.exchanges.append(result)  # Only a valid worker id/ok/text reaches here.
+        if observation is not None:
+            observation.update(response_ok=True, output=result)
         return result
 
     async def distill(self, text, focus, command):
         cold = self._process is None
-        count = len(self.exchanges)
+        observation = {"attempted": False, "response_ok": False, "error_type": None}
+        context_token = self._observation.set(observation)
         started = time.perf_counter()
-        selected = await super().distill(text, focus, command)
+        try:
+            selected = await super().distill(text, focus, command)
+        finally:
+            self._observation.reset(context_token)
         elapsed = time.perf_counter() - started
-        completed = len(self.exchanges) == count + 1
-        same_worker_output = completed and self.exchanges[-1] == selected
+        completed = observation["response_ok"]
+        same_worker_output = completed and observation["output"] == selected
         windows, _ = make_entry(text, focus, command, self.tokenizer)
         self.measurements.append({
             "cold": cold, "latency_seconds": elapsed,
             "latency_scope": "worker startup + model load + inference" if cold else "warm inference",
             "worker_pid": self._process.pid if self._process else None,
             "worker_response_ok": completed, "returned_worker_output": same_worker_output,
+            "worker_exchange_attempted": observation["attempted"],
+            "worker_error_type": observation["error_type"],
             "original_bytes": len(text.encode("utf-8")), "selected_bytes": len(selected.encode("utf-8")),
             "original_tokens": token_count(self.tokenizer, text),
             "selected_tokens": token_count(self.tokenizer, selected),

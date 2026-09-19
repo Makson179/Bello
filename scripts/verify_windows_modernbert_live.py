@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import time
 
@@ -52,24 +53,83 @@ def solution_passes(work: Path) -> bool:
         return False
 
 
+def history_output_texts(payload: dict) -> list[str]:
+    """Pinned native wire output is text or input_text content, never {body: ...}."""
+    value = payload.get("output")
+    texts = ([value] if isinstance(value, str) else
+             [item["text"] for item in value if isinstance(item, dict)
+              and item.get("type") == "input_text" and isinstance(item.get("text"), str)]
+             if isinstance(value, list) else [])
+    outputs = []
+    for text in texts:
+        header, separator, content = text.partition("\nOutput:\n")
+        # Unified exec can return selected partial output with a live session,
+        # before exit_code exists. This is still a model-facing tool response.
+        if separator and re.search(
+                r"(?m)^(?:Process exited with code -?\d+|Process running with session ID \d+|Exit code: -?\d+)$",
+                header):
+            outputs.append(content)
+        elif payload.get("type") == "custom_tool_call_output":
+            packet = {**payload, "call_id": native.CALL_ID, "output": text}
+            for item in native.output_packets({"input": [packet]}, "code"):
+                if isinstance(item.get("output"), str):
+                    outputs.append(item["output"])
+    return outputs
+
+
+def selected_history_evidence(home: Path, thread_id: str, rollout_path: str | None = None) -> tuple[set[str], dict]:
+    hashes: set[str] = set()
+    counts = {"path_from_server": rollout_path is not None, "files_found": 0, "owned_files": 0,
+              "records": 0, "response_items": 0, "tool_outputs": 0, "parsed_outputs": 0,
+              "unparsed_tool_outputs": 0}
+    if rollout_path is not None:
+        candidate = Path(rollout_path).resolve()
+        if not candidate.is_relative_to(home.resolve()) or candidate.suffix != ".jsonl":
+            raise ValueError("Native rollout path is outside the private smoke home or unsupported")
+        paths = [candidate] if candidate.is_file() else []
+    else:
+        paths = [path for root in (home / "sessions", home / "archived_sessions")
+                 for path in root.rglob(f"*{thread_id}.jsonl")]
+    for path in dict.fromkeys(path.resolve() for path in paths):
+        if not path.is_relative_to(home.resolve()):
+            raise ValueError("Native rollout escaped the private smoke home")
+        counts["files_found"] += 1
+        # Metadata, not the filename, establishes exact ownership. Neither UI
+        # aggregatedOutput nor SQLite's presentation projection is evidence.
+        with path.open(encoding="utf-8", newline="") as stream:
+            records = [json.loads(line) for line in stream if line.strip()]
+        if not records or any(not isinstance(record, dict) for record in records):
+            raise ValueError("Malformed native rollout")
+        metadata = [record.get("payload") for record in records if record.get("type") == "session_meta"]
+        if not metadata or any(not isinstance(meta, dict) or meta.get("id") != thread_id for meta in metadata):
+            raise ValueError("Native rollout does not belong to the exact smoke thread")
+        counts["owned_files"] += 1
+        counts["records"] += len(records)
+        for record in records:
+            payload = record.get("payload", {})
+            if record.get("type") != "response_item" or not isinstance(payload, dict):
+                continue
+            counts["response_items"] += 1
+            if payload.get("type") not in {"function_call_output", "custom_tool_call_output"}:
+                continue
+            counts["tool_outputs"] += 1
+            outputs = history_output_texts(payload)
+            counts["parsed_outputs"] += len(outputs)
+            counts["unparsed_tool_outputs"] += int(not outputs)
+            hashes.update(digest(text) for text in outputs)
+    return hashes, counts
+
+
 def selected_history_hashes(home: Path, thread_id: str) -> set[str]:
-    hashes = set()
-    # The fresh home has only this run; still bind every read to its exact ID.
-    for root in (home / "sessions", home / "archived_sessions"):
-        for path in root.rglob(f"*{thread_id}.jsonl"):
-            with path.open(encoding="utf-8") as stream:
-                for line in stream:
-                    record = json.loads(line)
-                    payload = record.get("payload", {})
-                    if record.get("type") != "response_item" or not isinstance(payload, dict):
-                        continue
-                    if payload.get("type") not in {"function_call_output", "custom_tool_call_output"}:
-                        continue
-                    packet = {**payload, "call_id": native.CALL_ID}
-                    mode = "direct" if payload["type"] == "function_call_output" else "code"
-                    for item in native.output_packets({"input": [packet]}, mode):
-                        hashes.add(digest(item["output"]))
-    return hashes
+    return selected_history_evidence(home, thread_id)[0]
+
+
+def live_checks_pass(result: dict) -> bool:
+    reduced = result["reduced_logs"]
+    return bool(result["task_passed"] and result["successful_native_check"] and reduced > 0
+                and result["exact_selected_native_history_matches"] == reduced
+                and result["bridge_outcomes"]["changed"] >= reduced
+                and result["worker_failures"] == 0)
 
 
 async def live_turn(binary: Path, bundle: Path, home: Path, work: Path, private_logs: Path) -> dict:
@@ -107,6 +167,7 @@ async def live_turn(binary: Path, bundle: Path, home: Path, work: Path, private_
         if reply.get("model") not in (None, MODEL) or reply.get("reasoningEffort") not in (None, "low"):
             raise ValueError("Native execution profile differs from the requested smoke")
         thread_id = reply["thread"]["id"]
+        rollout_path = reply["thread"].get("path")
         task = ("This is a tiny isolated coding smoke. First run `python check.py` with exec_command and a short focus "
                 "to identify the failing assertion. Then fix only solution.py so add(a, b) returns a + b. "
                 "Run `python check.py` again and finish with a brief result. Do not edit check.py, read it directly, "
@@ -124,20 +185,31 @@ async def live_turn(binary: Path, bundle: Path, home: Path, work: Path, private_
         result["successful_native_check"] = any(item.get("type") == "commandExecution"
             and item.get("exitCode") == 0 and "SMOKE_TESTS_PASSED" in (item.get("aggregatedOutput") or "")
             for item in completed)
-        # Stop and flush the exact owned native history before inspecting it.
+        # In the pinned paginated implementation includeTurns persists the
+        # loaded thread before returning. Read its authoritative path instead
+        # of assuming filenames are permanently identical to thread IDs.
+        result["phase"] = "history_persist"
+        history_reply = await session.request("thread/read", {"threadId": thread_id, "includeTurns": True})
+        history_thread = history_reply.get("thread", {})
+        if history_thread.get("id") != thread_id:
+            raise ValueError("Native history reply belongs to a different thread")
+        rollout_path = history_thread.get("path") or rollout_path
+        result["history_read_completed"] = True
+        result["history_rollout_path_available"] = isinstance(rollout_path, str)
+        # Stop and flush before reading. Raw RPC and histories remain private
+        # and are deleted with the auth home; export only counts and hashes.
         await session.close(private_logs)
         session = None
         result["phase"] = "history_check"
-        hashes = selected_history_hashes(home, thread_id)
+        hashes, counts = selected_history_evidence(home, thread_id, rollout_path)
+        result["native_history_counts"] = counts
         measurements = selector.measurements
         reduced = [m for m in measurements if m["worker_response_ok"] and m["returned_worker_output"] and m["strictly_reduced"]]
         matched = [m for m in reduced if m["selected_sha256"] in hashes]
         result.update(measurements=measurements, distiller_invocations=len(measurements),
                       reduced_logs=len(reduced), exact_selected_native_history_matches=len(matched),
-                      bridge_outcomes=dict(bridge.metrics))
-        result["passed"] = bool(result["task_passed"] and result["successful_native_check"]
-                                and reduced and len(matched) == len(reduced)
-                                and bridge.metrics["changed"] >= len(reduced))
+                      bridge_outcomes=dict(bridge.metrics), worker_failures=len(selector.worker_failure_types))
+        result["passed"] = live_checks_pass(result)
         result["phase"] = "complete"
     except Exception as exc:
         # RPC/auth errors can contain sensitive provider details. Export type only.
@@ -147,6 +219,10 @@ async def live_turn(binary: Path, bundle: Path, home: Path, work: Path, private_
             await session.close(private_logs)
         await bridge.close()
         await selector.close()
+        # Keep these safe counters even if history collection itself failed.
+        result["worker_failures"] = len(selector.worker_failure_types)
+        result["worker_error_types"] = sorted(set(selector.worker_failure_types))
+        result["passed"] = result["passed"] and result["worker_failures"] == 0
         result["elapsed_seconds"] = time.perf_counter() - started
     return result
 
