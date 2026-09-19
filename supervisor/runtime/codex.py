@@ -398,10 +398,11 @@ class CodexBackend:
             config.update(permissions.pop("config"))
             if _IS_WINDOWS:
                 # A permission profile does not enable the native Windows OS
-                # sandbox. Its default is Disabled, while unelevated cannot
-                # enforce this profile's limited read roots. Require elevated
-                # enforcement per thread, never broaden the profile or fall
-                # back to unrestricted execution if native setup fails.
+                # sandbox. Its default is Disabled. Require the elevated
+                # dedicated-user boundary per thread; unelevated does not
+                # support this restricted profile. Windows read access still
+                # depends on host ACLs: public files may remain readable.
+                # Never fall back to unrestricted execution if setup fails.
                 windows = config.setdefault("windows", {})
                 if not isinstance(windows, dict):
                     raise AppServerError("native Codex Windows settings must be an object; restricted runs require the elevated Windows sandbox")

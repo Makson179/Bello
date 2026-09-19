@@ -66,22 +66,91 @@ def windows_shell() -> str:
                "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
 
 
-def windows_filesystem_probe(outside: Path) -> str:
+WINDOWS_PRIVATE_CANARY = b"synthetic private denied read"
+WINDOWS_PROBE_SCHEMA = "bello.windows-native-acl-probe.v1"
+WINDOWS_PROBE_FIELDS = {"inside_write_succeeded", "outside_public_read_succeeded",
+                        "outside_write_succeeded", "outside_private_read_succeeded"}
+
+
+def create_windows_private_canary(path: Path) -> str:
+    """Create only a fresh private fixture; never repair existing/parent ACLs."""
+    from supervisor.runtime.native_codex_install import _windows_private_acl
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        raise ValueError("Private Windows fixture must be new")
+    _windows_private_acl(path, create=True)
+    secret = path / "secret.txt"
+    with secret.open("xb") as stream:
+        stream.write(WINDOWS_PRIVATE_CANARY)
+    _windows_private_acl(secret)
+    return file_sha256(secret)
+
+
+def windows_filesystem_probe(outside: Path, private: Path) -> str:
     """Emit no output unless a real allowed/denied filesystem probe fails."""
     def literal(path: Path) -> str:
         return "'" + str(path).replace("'", "''") + "'"
-    denied_read = literal(outside / "secret.txt")
+    public_read = literal(outside / "secret.txt")
+    private_read = literal(private / "secret.txt")
     denied_write = literal(outside / "forbidden.txt")
     # Only AccessDenied counts: a missing/bad fixture path must fail the proof.
     catch = "catch { if (-not ($_.Exception.GetBaseException() -is [UnauthorizedAccessException])) { throw } }; "
     return (
         "$ErrorActionPreference='Stop'; "
         "[IO.File]::WriteAllText((Join-Path (Get-Location).Path 'inside-write.txt'), 'allowed'); "
-        "$readable=$false; try { [void][IO.File]::ReadAllText(" + denied_read + "); $readable=$true } " + catch +
+        "$publicReadable=$false; try { [void][IO.File]::ReadAllText(" + public_read + "); $publicReadable=$true } " + catch +
         "$writable=$false; try { [IO.File]::WriteAllText(" + denied_write + ", 'forbidden'); $writable=$true } " + catch +
-        "if ($readable -or $writable) { throw ('Windows filesystem sandbox did not enforce the profile: "
-        "outside_read_succeeded={0}; outside_write_succeeded={1}' -f $readable,$writable) }; "
+        "$privateReadable=$false; try { [void][IO.File]::ReadAllText(" + private_read + "); $privateReadable=$true } " + catch +
+        "$probe=@{schema='" + WINDOWS_PROBE_SCHEMA + "'; inside_write_succeeded=$true; "
+        "outside_public_read_succeeded=$publicReadable; outside_write_succeeded=$writable; "
+        "outside_private_read_succeeded=$privateReadable}; "
+        "[IO.File]::WriteAllText((Join-Path (Get-Location).Path 'windows-filesystem-probe.json'), "
+        "($probe | ConvertTo-Json -Compress)); "
+        "if ($privateReadable -or $writable) { throw ('Windows native ACL sandbox probe failed: "
+        "outside_public_read_succeeded={0}; outside_write_succeeded={1}; "
+        "outside_private_read_succeeded={2}' -f $publicReadable,$writable,$privateReadable) }; "
     )
+
+
+def windows_filesystem_result(output: Path, private_before_sha256: str, *, exact: bool) -> dict[str, Any]:
+    """Validate the recorded probe, without claiming public-path read isolation."""
+    result = {"windows_filesystem_contract": "native-acl-private-file-isolation-v1",
+              "windows_arbitrary_public_path_read_confinement": "not-covered",
+              "windows_filesystem_probe": None, "windows_filesystem_probe_error": None,
+              "windows_private_fixture_sha256": {"before": private_before_sha256, "after": None},
+              "windows_filesystem_sandbox_enforced": False}
+    try:
+        def fixture(path: str) -> bytes:
+            target = output / path
+            info = target.lstat()
+            if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                raise ValueError("Invalid Windows probe fixture")
+            return target.read_bytes()
+        raw = fixture("work/windows-filesystem-probe.json")
+        if len(raw) > 4096:
+            raise ValueError("Oversized Windows probe JSON")
+        probe = json.loads(raw.decode("utf-8-sig"))
+        if (not isinstance(probe, dict) or set(probe) != WINDOWS_PROBE_FIELDS | {"schema"}
+                or probe["schema"] != WINDOWS_PROBE_SCHEMA
+                or any(type(probe[key]) is not bool for key in WINDOWS_PROBE_FIELDS)):
+            raise ValueError("Malformed Windows probe JSON")
+        result["windows_filesystem_probe"] = probe
+        private = fixture("private-outside-workspace/secret.txt")
+        private_after_sha256 = hashlib.sha256(private).hexdigest()
+        result["windows_private_fixture_sha256"]["after"] = private_after_sha256
+        result["windows_filesystem_sandbox_enforced"] = bool(
+            exact and probe["inside_write_succeeded"]
+            and not probe["outside_write_succeeded"] and not probe["outside_private_read_succeeded"]
+            and fixture("work/inside-write.txt") == b"allowed"
+            and fixture("outside-workspace/secret.txt") == b"synthetic denied read"
+            and not os.path.lexists(output / "outside-workspace/forbidden.txt")
+            and private == WINDOWS_PRIVATE_CANARY and private_after_sha256 == private_before_sha256)
+    except (OSError, ValueError, UnicodeError) as exc:
+        result["windows_filesystem_probe_error"] = type(exc).__name__ + ": invalid or missing synthetic probe/fixture"
+    return result
 
 
 def _windows_fixture_sddl(path: Path) -> str:
@@ -120,7 +189,8 @@ def _windows_fixture_sddl(path: Path) -> str:
 def windows_fixture_acls(output: Path) -> dict[str, Any]:
     """Host-only diagnostics of fixed synthetic fixtures, never Codex home/auth."""
     fixtures = ("work", "work/diagnostic.log", "work/inside-write.txt",
-                "outside-workspace", "outside-workspace/secret.txt", "outside-workspace/forbidden.txt")
+                "outside-workspace", "outside-workspace/secret.txt", "outside-workspace/forbidden.txt",
+                "private-outside-workspace", "private-outside-workspace/secret.txt")
     def redirected(status) -> bool:
         return bool(stat.S_ISLNK(status.st_mode) or getattr(status, "st_file_attributes", 0)
                     & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
@@ -130,7 +200,7 @@ def windows_fixture_acls(output: Path) -> dict[str, Any]:
                 "errno": error.errno}
     # Do not follow a redirected container to a non-fixture object's ACL.
     try:
-        for label in (".", "work", "outside-workspace"):
+        for label in (".", "work", "outside-workspace", "private-outside-workspace"):
             status = (output / label).lstat()
             if redirected(status) or not stat.S_ISDIR(status.st_mode):
                 return {"error": "redirected_fixture_container", "fixture": label}
@@ -498,9 +568,12 @@ async def run_case(binary: Path, case: Case, output: Path) -> dict[str, Any]:
         (work / name).write_text(RAW, encoding="utf-8", newline="\n")
     (work / "fixture-help.sh").write_text("#!/bin/bash\ncat diagnostic.log\n")
     outside = output / "outside-workspace"
+    private = output / "private-outside-workspace"
+    private_before_sha256 = None
     if os.name == "nt":
         outside.mkdir()
         (outside / "secret.txt").write_text("synthetic denied read", encoding="ascii")
+        private_before_sha256 = create_windows_private_canary(private)
     selections = []
 
     class SelectorDouble:
@@ -514,7 +587,7 @@ async def run_case(binary: Path, case: Case, output: Path) -> dict[str, Any]:
     # the generic TASK.md/README name exclusion.
     bridge = CodexDistillerBridge(SelectorDouble(), output / "bridge", work, work / "fixture-requirements.data")
     await bridge.start()
-    tool, command = invocation(case, command_prefix=windows_filesystem_probe(outside) if os.name == "nt" else "")
+    tool, command = invocation(case, command_prefix=windows_filesystem_probe(outside, private) if os.name == "nt" else "")
     provider = Provider(tool)
     server = ThreadingHTTPServer(("127.0.0.1", 0), provider.handler())
     server.daemon_threads = True
@@ -569,11 +642,10 @@ async def run_case(binary: Path, case: Case, output: Path) -> dict[str, Any]:
     expected = SELECTED if selected else RAW
     exact = len(packets) == 1 and packets[0].get("output") == expected and packets[0].get("exit_code") == 7
     windows_isolated = None
+    windows_probe_result = {}
     if os.name == "nt":
-        inside = work / "inside-write.txt"
-        windows_isolated = (exact and inside.is_file() and inside.read_text() == "allowed"
-                            and (outside / "secret.txt").read_text() == "synthetic denied read"
-                            and not (outside / "forbidden.txt").exists())
+        windows_probe_result = windows_filesystem_result(output, private_before_sha256, exact=exact)
+        windows_isolated = windows_probe_result["windows_filesystem_sandbox_enforced"]
     focus_ok = (len(selections) == 1 and selections[0]["focus"] == (POLL_FOCUS if case.mode == "poll" else FOCUS)
                 and selections[0]["command"] == command) if selected else not selections
     # Native startup may attempt update/catalog discovery. The loopback proxy
@@ -588,6 +660,7 @@ async def run_case(binary: Path, case: Case, output: Path) -> dict[str, Any]:
         "windows_fixture_acls": windows_acls,
         "expected_output_bytes": len(expected.encode()),
         "actual_output_bytes": [len(str(p.get("output", "")).encode()) for p in packets]}
+    result.update(windows_probe_result)
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
 
@@ -611,7 +684,8 @@ async def main_async(args) -> int:
         "source_files": {name: file_sha256(ROOT / "supervisor" / "runtime" / name)
                          for name in ("codex_distiller.py", "distiller_policy.py")},
         "cases": results, "passed": all(result["passed"] for result in results),
-        "not_covered": ["learned selector quality/latency", "automatic native child-agent inheritance"]}
+        "not_covered": ["learned selector quality/latency", "automatic native child-agent inheritance",
+                        "Windows arbitrary public-path read confinement"]}
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     return 0 if report["passed"] else 1
 

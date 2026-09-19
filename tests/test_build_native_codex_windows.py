@@ -24,6 +24,14 @@ def passing_report(binary):
             "cases": [{"case": name, "passed": True, "error": None,
                        "exact_model_visible_output": True, "focus_and_command_correct": True,
                        "windows_filesystem_sandbox_enforced": True,
+                       "windows_filesystem_contract": "native-acl-private-file-isolation-v1",
+                       "windows_arbitrary_public_path_read_confinement": "not-covered",
+                       "windows_filesystem_probe": {
+                           "schema": "bello.windows-native-acl-probe.v1", "inside_write_succeeded": True,
+                           "outside_public_read_succeeded": True, "outside_write_succeeded": False,
+                           "outside_private_read_succeeded": False},
+                       "windows_filesystem_probe_error": None,
+                       "windows_private_fixture_sha256": {"before": "a" * 64, "after": "a" * 64},
                        "provider_requests": 2, "provider_errors": [], "external_proxy_requests_forwarded": 0}
                       for name in sorted(build.PROOF_CASES)]}
 
@@ -97,6 +105,48 @@ def test_proof_gate_rejects_incomplete_or_unrelated_evidence(tmp_path, change):
     else:
         report["cases"][0]["exact_model_visible_output"] = False
     with pytest.raises(ValueError):
+        build.validate_proof(report, binary)
+
+
+@pytest.mark.parametrize("public_read", [True, False])
+def test_windows_proof_records_public_read_without_claiming_universal_confinement(tmp_path, public_read):
+    binary = tmp_path / "codex.exe"
+    binary.write_bytes(b"MZsynthetic")
+    report = passing_report(binary)
+    for case in report["cases"]:
+        case["windows_filesystem_probe"]["outside_public_read_succeeded"] = public_read
+    build.validate_proof(report, binary)
+
+
+@pytest.mark.parametrize("path,value", [
+    (("windows_filesystem_contract",), "universal-default-deny"),
+    (("windows_arbitrary_public_path_read_confinement",), "passed"),
+    (("windows_filesystem_probe",), []),
+    (("windows_filesystem_probe", "schema"), "old-probe"),
+    (("windows_filesystem_probe", "inside_write_succeeded"), False),
+    (("windows_filesystem_probe", "outside_public_read_succeeded"), None),
+    (("windows_filesystem_probe", "outside_public_read_succeeded"), 1),
+    (("windows_filesystem_probe", "outside_write_succeeded"), True),
+    (("windows_filesystem_probe", "outside_private_read_succeeded"), True),
+    (("windows_filesystem_probe_error",), "AccessDenied before probe completed"),
+    (("windows_private_fixture_sha256",), {}),
+    (("windows_private_fixture_sha256", "before"), "not-sha256"),
+    (("windows_private_fixture_sha256", "after"), "b" * 64),
+])
+def test_windows_proof_refuses_missing_or_failed_acl_evidence(tmp_path, path, value):
+    binary = tmp_path / "codex.exe"
+    binary.write_bytes(b"MZsynthetic")
+    report = passing_report(binary)
+    target = report["cases"][0]
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(ValueError, match="Windows filesystem proof"):
+        build.validate_proof(report, binary)
+    # Every required observation must also be present, even if the old summary
+    # `windows_filesystem_sandbox_enforced` claims success.
+    del target[path[-1]]
+    with pytest.raises(ValueError, match="Windows filesystem proof"):
         build.validate_proof(report, binary)
 
 

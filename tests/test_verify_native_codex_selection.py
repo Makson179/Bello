@@ -4,6 +4,8 @@ import asyncio
 import gzip
 import importlib.util
 import json
+import hashlib
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -114,13 +116,17 @@ def test_windows_native_proof_preserves_exact_production_filesystem_scope(tmp_pa
 
 
 def test_windows_probe_requires_actual_access_denial_and_preserves_original_command(tmp_path):
-    prefix = proof.windows_filesystem_probe(tmp_path / "outside's folder")
+    prefix = proof.windows_filesystem_probe(tmp_path / "outside's folder", tmp_path / "private's folder")
     assert "outside''s folder" in prefix
     assert "inside-write.txt" in prefix and "secret.txt" in prefix and "forbidden.txt" in prefix
-    assert prefix.count("[UnauthorizedAccessException]") == 2
-    assert "if ($readable -or $writable)" in prefix
-    assert "outside_read_succeeded={0}; outside_write_succeeded={1}" in prefix
-    assert "-f $readable,$writable" in prefix
+    assert prefix.count("[UnauthorizedAccessException]") == 3
+    assert "if ($privateReadable -or $writable)" in prefix
+    assert "if ($publicReadable" not in prefix
+    assert "outside_public_read_succeeded={0}; outside_write_succeeded={1}" in prefix
+    assert "outside_private_read_succeeded={2}" in prefix
+    assert "-f $publicReadable,$writable,$privateReadable" in prefix
+    assert "windows-filesystem-probe.json" in prefix and "ConvertTo-Json -Compress" in prefix
+    assert "private''s folder" in prefix
     assert "[void][IO.File]::ReadAllText" in prefix
     assert "Write-Output" not in prefix and "Console]::Out" not in prefix
     tool, command = proof.invocation(proof.Case("probe"), windows=True, command_prefix=prefix)
@@ -133,6 +139,8 @@ def _diagnostic_fixtures(root):
     (root / "outside-workspace").mkdir()
     (root / "work/diagnostic.log").write_text("synthetic log")
     (root / "outside-workspace/secret.txt").write_text("synthetic denied read")
+    (root / "private-outside-workspace").mkdir()
+    (root / "private-outside-workspace/secret.txt").write_bytes(proof.WINDOWS_PRIVATE_CANARY)
 
 
 def test_windows_acl_diagnostics_are_limited_to_fixed_synthetic_fixtures(tmp_path, monkeypatch):
@@ -143,9 +151,11 @@ def test_windows_acl_diagnostics_are_limited_to_fixed_synthetic_fixtures(tmp_pat
     monkeypatch.setattr(proof, "_windows_fixture_sddl", read_acl)
     before = proof.windows_fixture_acls(tmp_path)
     assert set(before) == {"work", "work/diagnostic.log", "work/inside-write.txt",
-                           "outside-workspace", "outside-workspace/secret.txt", "outside-workspace/forbidden.txt"}
+                           "outside-workspace", "outside-workspace/secret.txt", "outside-workspace/forbidden.txt",
+                           "private-outside-workspace", "private-outside-workspace/secret.txt"}
     assert {call.args[0].relative_to(tmp_path).as_posix() for call in read_acl.call_args_list} == {
-        "work", "work/diagnostic.log", "outside-workspace", "outside-workspace/secret.txt"}
+        "work", "work/diagnostic.log", "outside-workspace", "outside-workspace/secret.txt",
+        "private-outside-workspace", "private-outside-workspace/secret.txt"}
     assert before["work/inside-write.txt"] == {"exists": False}
     assert before["outside-workspace/forbidden.txt"] == {"exists": False}
     assert "auth" not in json.dumps(before) and str(tmp_path) not in json.dumps(before)
@@ -165,7 +175,8 @@ def test_windows_acl_diagnostic_errors_do_not_disclose_error_text_or_paths(tmp_p
     assert str(tmp_path) not in json.dumps(result)
 
 
-@pytest.mark.parametrize("label", ["work", "outside-workspace", "outside-workspace/secret.txt"])
+@pytest.mark.parametrize("label", ["work", "outside-workspace", "outside-workspace/secret.txt",
+                                  "private-outside-workspace", "private-outside-workspace/secret.txt"])
 def test_windows_acl_diagnostics_never_follow_redirected_fixtures(tmp_path, monkeypatch, label):
     _diagnostic_fixtures(tmp_path)
     original = Path.lstat
@@ -184,6 +195,107 @@ def test_windows_acl_diagnostics_never_follow_redirected_fixtures(tmp_path, monk
     else:
         assert result[label] == {"exists": True, "error": "redirected_fixture"}
         assert tmp_path / label not in [call.args[0] for call in read_acl.call_args_list]
+
+
+def _windows_probe_artifacts(root, *, public=True):
+    _diagnostic_fixtures(root)
+    (root / "work/inside-write.txt").write_text("allowed")
+    probe = {"schema": proof.WINDOWS_PROBE_SCHEMA, "inside_write_succeeded": True,
+             "outside_public_read_succeeded": public, "outside_write_succeeded": False,
+             "outside_private_read_succeeded": False}
+    (root / "work/windows-filesystem-probe.json").write_text(json.dumps(probe))
+    return probe, hashlib.sha256(proof.WINDOWS_PRIVATE_CANARY).hexdigest()
+
+
+@pytest.mark.parametrize("public", [True, False])
+def test_windows_probe_gates_native_acl_contract_but_records_public_read(tmp_path, public):
+    probe, digest = _windows_probe_artifacts(tmp_path, public=public)
+    result = proof.windows_filesystem_result(tmp_path, digest, exact=True)
+    assert result["windows_filesystem_sandbox_enforced"] is True
+    assert result["windows_filesystem_contract"] == "native-acl-private-file-isolation-v1"
+    assert result["windows_arbitrary_public_path_read_confinement"] == "not-covered"
+    assert result["windows_filesystem_probe"] == probe
+    assert result["windows_filesystem_probe_error"] is None
+    assert result["windows_private_fixture_sha256"] == {"before": digest, "after": digest}
+    assert proof.windows_filesystem_result(tmp_path, digest, exact=False)["windows_filesystem_sandbox_enforced"] is False
+
+
+@pytest.mark.parametrize("flag,value", [("inside_write_succeeded", False),
+                                      ("outside_write_succeeded", True),
+                                      ("outside_private_read_succeeded", True)])
+def test_windows_probe_never_waives_required_access_checks(tmp_path, flag, value):
+    probe, digest = _windows_probe_artifacts(tmp_path)
+    probe[flag] = value
+    (tmp_path / "work/windows-filesystem-probe.json").write_text(json.dumps(probe))
+    result = proof.windows_filesystem_result(tmp_path, digest, exact=True)
+    assert result["windows_filesystem_sandbox_enforced"] is False
+    assert result["windows_filesystem_probe"][flag] is value
+
+
+@pytest.mark.parametrize("bad", [None, "{", "[]", "{}", "x" * 4097, "wrong_schema", "missing_flag", "numeric_flag", "extra_field"])
+def test_windows_probe_rejects_missing_or_malformed_json(tmp_path, bad):
+    probe, digest = _windows_probe_artifacts(tmp_path)
+    path = tmp_path / "work/windows-filesystem-probe.json"
+    if bad is None:
+        path.unlink()
+    else:
+        if bad == "wrong_schema":
+            probe["schema"] = "other"
+        elif bad == "missing_flag":
+            del probe["outside_private_read_succeeded"]
+        elif bad == "numeric_flag":
+            probe["outside_public_read_succeeded"] = 1
+        elif bad == "extra_field":
+            probe["extra"] = True
+        path.write_text(json.dumps(probe) if bad in {"wrong_schema", "missing_flag", "numeric_flag", "extra_field"} else bad)
+    result = proof.windows_filesystem_result(tmp_path, digest, exact=True)
+    assert result["windows_filesystem_sandbox_enforced"] is False
+    assert result["windows_filesystem_probe_error"] is not None
+
+
+@pytest.mark.parametrize("path", ["work/inside-write.txt", "outside-workspace/secret.txt",
+                                  "outside-workspace/forbidden.txt", "private-outside-workspace/secret.txt"])
+def test_windows_probe_validates_persisted_fixtures_too(tmp_path, path):
+    _, digest = _windows_probe_artifacts(tmp_path)
+    (tmp_path / path).write_bytes(b"modified")
+    assert proof.windows_filesystem_result(tmp_path, digest, exact=True)["windows_filesystem_sandbox_enforced"] is False
+
+
+def test_private_canary_is_created_with_acl_before_secret_and_never_touches_parents(tmp_path, monkeypatch):
+    from supervisor.runtime import native_codex_install
+    target = tmp_path / "fresh-private"
+    calls = []
+    def acl(path, **kwargs):
+        calls.append((path, kwargs))
+        if kwargs.get("create"):
+            assert not path.exists()
+            path.mkdir()
+            assert not (path / "secret.txt").exists()
+        else:
+            assert path.read_bytes() == proof.WINDOWS_PRIVATE_CANARY
+    monkeypatch.setattr(native_codex_install, "_windows_private_acl", acl)
+    digest = proof.create_windows_private_canary(target)
+    assert calls == [(target, {"create": True}), (target / "secret.txt", {})]
+    assert digest == hashlib.sha256(proof.WINDOWS_PRIVATE_CANARY).hexdigest()
+    with pytest.raises(ValueError, match="must be new"):
+        proof.create_windows_private_canary(target)
+    assert len(calls) == 2
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires actual Windows DACL APIs")
+def test_real_windows_private_canary_has_private_dacl_without_changing_ambient_fixture(tmp_path):
+    from supervisor.runtime.native_codex_install import _windows_private_acl
+    ambient = tmp_path / "outside-workspace"
+    ambient.mkdir()
+    (ambient / "secret.txt").write_bytes(b"unchanged ambient fixture")
+    before = {path: proof._windows_fixture_sddl(path) for path in (tmp_path, ambient, ambient / "secret.txt")}
+    private = tmp_path / "private-outside-workspace"
+    digest = proof.create_windows_private_canary(private)
+    _windows_private_acl(private)
+    _windows_private_acl(private / "secret.txt")
+    assert digest == hashlib.sha256(proof.WINDOWS_PRIVATE_CANARY).hexdigest()
+    assert (ambient / "secret.txt").read_bytes() == b"unchanged ambient fixture"
+    assert before == {path: proof._windows_fixture_sddl(path) for path in before}
 
 
 async def test_windows_provisioning_uses_only_current_runner_and_no_selection_secret(tmp_path, monkeypatch):

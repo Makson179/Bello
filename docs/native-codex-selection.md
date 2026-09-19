@@ -92,6 +92,17 @@ supported release. Neither workflow publishes a release or modifies the user's
 global Codex. The Windows archive includes `codex.exe`, `codex-code-mode-host.exe`,
 `codex-command-runner.exe`, and `codex-windows-sandbox-setup.exe` together.
 
+Windows proofs use Codex's elevated, dedicated-user sandbox. They check that
+commands can write inside the workspace, cannot write to the outside fixture,
+and cannot read an owner-private outside file. A separate outside file retains
+its inherited ACLs, and the report records whether it remains readable. Native
+Windows read grants are ACL-based: files already readable by ordinary Windows
+users may remain readable even outside the configured roots. These checks do
+not establish a universal read allowlist. No host permissions are broadened to
+make the proof pass; only a new synthetic private fixture receives a private ACL.
+See the [native Windows sandbox documentation](https://learn.chatgpt.com/docs/windows/windows-sandbox)
+for host ACL requirements and the warning about Everyone-writable directories.
+
 For a verified Windows artifact, the explicit-build configuration is:
 
 ```powershell

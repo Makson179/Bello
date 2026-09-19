@@ -65,6 +65,12 @@ workspace and a private tool scratch directory, with native protection for
 `.git`, `.agents` and `.codex`. Subsequent turns inherit that profile rather than
 replacing it with a broader legacy sandbox policy. Exact system/runtime readable
 paths are native-platform behavior, not a promise of identical Pi isolation.
+On native Windows this uses the elevated, dedicated-user sandbox. Read roots
+grant access through Windows ACLs; they do not revoke existing access to files
+that ordinary Windows users can already read. The outside-write and private-file
+checks therefore do not claim that every public file outside the workspace is
+unreadable. Host directories writable by Everyone are also an upstream sandbox
+limitation, not something log distillation fixes.
 
 The native Codex home is retained under private run state so persisted rollout
 paths remain valid after stopping and restarting Bello. It is outside the tool

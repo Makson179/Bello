@@ -69,6 +69,25 @@ def validate_proof(report: dict, binary: Path) -> None:
                 or case.get("provider_requests") != 2 or case.get("provider_errors") != []
                 or case.get("external_proxy_requests_forwarded") != 0):
             raise ValueError(f"Incomplete native provider proof: {case.get('case')}")
+        # Native Windows uses ACL-backed private-file isolation. Public files
+        # may already be readable by the sandbox account; do not claim a
+        # universal default-deny read boundary from this narrower proof.
+        probe = case.get("windows_filesystem_probe")
+        private_hashes = case.get("windows_private_fixture_sha256")
+        if (case.get("windows_filesystem_contract") != "native-acl-private-file-isolation-v1"
+                or case.get("windows_arbitrary_public_path_read_confinement") != "not-covered"
+                or not isinstance(probe, dict)
+                or probe.get("schema") != "bello.windows-native-acl-probe.v1"
+                or probe.get("inside_write_succeeded") is not True
+                or type(probe.get("outside_public_read_succeeded")) is not bool
+                or probe.get("outside_write_succeeded") is not False
+                or probe.get("outside_private_read_succeeded") is not False
+                or case.get("windows_filesystem_probe_error", "missing") is not None
+                or not isinstance(private_hashes, dict)
+                or not isinstance(private_hashes.get("before"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", private_hashes["before"])
+                or private_hashes.get("after") != private_hashes["before"]):
+            raise ValueError(f"Incomplete Windows filesystem proof: {case.get('case')}")
 
 
 def dependency_notices(cargo_home: Path) -> str:
