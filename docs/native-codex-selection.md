@@ -21,6 +21,11 @@ code-mode host and license files are cached under `~/.bello/runtime/native-codex
 version has its own private directory; changed or unsafe cached files cause an
 error rather than replacement underneath a running process.
 
+On Windows, native sandbox setup can grant its sandbox users read/execute access
+to the public `codex.exe` launcher. Cache validation accepts these non-mutating
+grants only on that checksum-verified file. Cache directories, manifests and
+other bundled files still require private ACLs; write/delete grants are rejected.
+
 The first download finishes before app-server starts, outside model-RPC timeouts.
 Codex runs without distiller use the ordinary executable. Claude/Pi-only runs do
 not download this helper. Unsupported platforms require an explicit compatible

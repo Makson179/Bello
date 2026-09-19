@@ -69,7 +69,8 @@ def _windows_parent_readonly_rights(rights: str) -> bool:
 
 
 def _validate_windows_security_descriptor(descriptor: str, user_sid: str, *, parent: bool = False,
-                                          user_alias: str | None = None) -> None:
+                                          user_alias: str | None = None,
+                                          verified_public_executable: bool = False) -> None:
     """Fail closed on any grant outside the user, SYSTEM and administrators.
 
     These are private executable caches, not shared installation directories.
@@ -78,6 +79,8 @@ def _validate_windows_security_descriptor(descriptor: str, user_sid: str, *, par
     repaired. Administrators/SYSTEM remain trusted as on a normal user profile.
     A containing directory may allow others to read/traverse it. Its inherit-only
     ACEs do not apply to that directory, and the new cache has a protected DACL.
+    Only a checksum-verified public launcher may retain simple read/execute ACEs
+    added by native sandbox setup. No write, delete or ACL-changing grant is allowed.
     """
     owner, separator, dacl = descriptor.partition("D:")
     trusted = {user_sid, "SY", "BA", "S-1-5-18", "S-1-5-32-544"}
@@ -107,17 +110,20 @@ def _validate_windows_security_descriptor(descriptor: str, user_sid: str, *, par
         ace_flags = {fields[1][index:index + 2] for index in range(0, len(fields[1]), 2)}
         if fields[5] in trusted_grants or parent and "IO" in ace_flags:
             continue
-        if parent and _windows_parent_readonly_rights(fields[2]):
+        if (parent or verified_public_executable) and _windows_parent_readonly_rights(fields[2]):
             continue
         raise ValueError("Native Codex cache must not grant access to other Windows accounts")
 
 
-def _windows_private_acl(path: Path, *, create: bool = False, parent: bool = False) -> None:
+def _windows_private_acl(path: Path, *, create: bool = False, parent: bool = False,
+                         verified_public_executable: bool = False) -> None:
     """Atomically create a private directory, or validate an existing entry.
 
     chmod(0700) does not establish a Windows DACL on supported Python 3.11.
     Use OS APIs, without shell commands, account-name localization or pywin32.
     """
+    if verified_public_executable and (create or parent or path.name != "codex.exe"):
+        raise ValueError("Public read/execute ACL allowance is only for the verified codex.exe file")
     import ctypes
     from ctypes import wintypes
 
@@ -191,6 +197,8 @@ def _windows_private_acl(path: Path, *, create: bool = False, parent: bool = Fal
         metadata = path.lstat()
         if is_link_or_reparse(path, stat_result=metadata):
             raise ValueError("Native Codex cache must not use Windows reparse points")
+        if verified_public_executable and not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("Public read/execute ACL allowance is only for the verified codex.exe file")
         descriptor = pointer()
         error = advapi.GetNamedSecurityInfoW(str(path), 1, 0x00000005, None, None, None, None,
                                            ctypes.byref(descriptor))
@@ -203,7 +211,8 @@ def _windows_private_acl(path: Path, *, create: bool = False, parent: bool = Fal
             raise ctypes.WinError(ctypes.get_last_error())
         allocated.append(sddl)
         _validate_windows_security_descriptor(ctypes.wstring_at(sddl), user_sid,
-                                               parent=parent, user_alias=user_alias)
+                                               parent=parent, user_alias=user_alias,
+                                               verified_public_executable=verified_public_executable)
     finally:
         for allocation in reversed(allocated):
             kernel.LocalFree(allocation)
@@ -249,13 +258,17 @@ def _regular(path: Path) -> bool:
     return path.is_file() and not is_link_or_reparse(path)
 
 
-def _owned(path: Path, *, directory: bool = False, private: bool = False) -> None:
+def _owned(path: Path, *, directory: bool = False, private: bool = False,
+           verified_public_executable: bool = False) -> None:
     metadata = path.lstat()
     valid_type = stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(metadata.st_mode)
     if is_link_or_reparse(path, stat_result=metadata) or not valid_type:
         raise ValueError(f"Native Codex cache path must be a real {'directory' if directory else 'file'}: {path}")
     if _IS_WINDOWS:
-        _windows_private_acl(path)
+        if verified_public_executable:
+            _windows_private_acl(path, verified_public_executable=True)
+        else:
+            _windows_private_acl(path)
     elif (metadata.st_uid != os.getuid()
           or stat.S_IMODE(metadata.st_mode) & (0o077 if private else 0o022)):
         raise ValueError(f"Native Codex cache path must be owned by this user and not writable by others: {path}")
@@ -285,7 +298,13 @@ def _verify(directory: Path, bundle: NativeBundle, *, system: str = "Darwin") ->
         path = directory / name
         if not _regular(path) or _sha256(path) != digest:
             raise ValueError(f"Native Codex bundled file checksum mismatch: {name}")
-        _owned(path)
+        try:
+            # Sandbox setup grants RX on the explicit launcher read root. The
+            # file is public, but only this exact hash-verified file may retain
+            # such grants; directories, helpers and manifests stay private.
+            _owned(path, verified_public_executable=system == "Windows" and name == "bin/codex.exe")
+        except ValueError as error:
+            raise ValueError(f"Native Codex bundled file security validation failed ({name}): {error}") from error
     if (manifest.get("binary_sha256") != files[executable]
             or type(manifest.get("protocol")) is not int or manifest["protocol"] != 1
             or manifest.get("feature") != "bello_native_selection"

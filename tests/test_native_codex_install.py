@@ -308,6 +308,88 @@ def test_windows_cache_rejects_public_null_foreign_and_unknown_dacls(descriptor)
         install._validate_windows_security_descriptor(descriptor, _USER_SID)
 
 
+@pytest.mark.parametrize("rights", ["0x1200a9", "0xA01200A9", "FRFX", "GRGX"])
+def test_verified_public_launcher_accepts_only_simple_rx_grants(rights):
+    descriptor = f"O:{_USER_SID}D:P(A;OICI;FA;;;{_USER_SID})(A;OICI;{rights};;;S-1-5-21-123-456-789-1002)"
+    install._validate_windows_security_descriptor(descriptor, _USER_SID, verified_public_executable=True)
+    with pytest.raises(ValueError, match="other Windows accounts"):
+        install._validate_windows_security_descriptor(descriptor, _USER_SID)
+
+
+@pytest.mark.parametrize("rights", [
+    "FA", "GA", "FW", "GW", "SD", "WD", "WO", "DC", "FRFW",
+    "0x1200ab", "0x1200ad", "0x1200b9", "0x1200e9", "0x1201a9",  # data/append/EA/delete-child/attributes
+    "0x1300a9", "0x1600a9", "0x1a00a9", "0x401200a9",  # delete/DACL/owner/generic write
+])
+def test_verified_public_launcher_still_rejects_every_mutating_grant(rights):
+    for flags in ("OICI", "OICIIO"):
+        descriptor = f"O:{_USER_SID}D:P(A;OICI;FA;;;{_USER_SID})(A;{flags};{rights};;;BU)"
+        with pytest.raises(ValueError, match="other Windows accounts"):
+            install._validate_windows_security_descriptor(descriptor, _USER_SID, verified_public_executable=True)
+
+
+@pytest.mark.parametrize("descriptor", [
+    "O:BUD:P(A;;0x1200a9;;;BU)",
+    f"O:{_USER_SID}D:P(OA;;0x1200a9;guid;;BU)",
+    f"O:{_USER_SID}D:P(XA;;0x1200a9;;;BU;(@User.foo == 1))",
+])
+def test_verified_public_launcher_does_not_relax_owner_or_unknown_ace_checks(descriptor):
+    with pytest.raises(ValueError, match="Windows"):
+        install._validate_windows_security_descriptor(descriptor, _USER_SID, verified_public_executable=True)
+
+
+@pytest.mark.parametrize("name,options", [("codex.exe", {"create": True}),
+                                        ("codex.exe", {"parent": True}), ("auth.json", {})])
+def test_public_launcher_acl_allowance_rejects_wrong_scope_before_creation(tmp_path, name, options):
+    path = tmp_path / name
+    with pytest.raises(ValueError, match="only for the verified codex.exe file"):
+        install._windows_private_acl(path, verified_public_executable=True, **options)
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("release", ["Windows"], indirect=True)
+def test_only_hash_verified_codex_exe_receives_rx_acl_allowance(release, monkeypatch):
+    bundle, _, _ = release
+    command, manifest = install.ensure_native_selection()
+    owned = install._owned
+    allowances = []
+
+    def checked(path, **kwargs):
+        if kwargs.get("verified_public_executable"):
+            allowances.append(path)
+        return owned(path, **kwargs)
+
+    monkeypatch.setattr(install, "_owned", checked)
+    install._verify(manifest.parent, bundle, system="Windows")
+    assert allowances == [Path(command[0])]
+    allowances.clear()
+    Path(command[0]).write_bytes(b"changed launcher")
+    with pytest.raises(ValueError, match="checksum mismatch: bin/codex.exe"):
+        install._verify(manifest.parent, bundle, system="Windows")
+    assert not allowances
+
+
+@pytest.mark.parametrize("release", ["Windows"], indirect=True)
+@pytest.mark.parametrize("target", ["bin", "selection-manifest.json", "bin/codex-code-mode-host.exe", "NOTICE"])
+def test_launcher_rx_exception_does_not_spread_to_other_bundle_entries(release, monkeypatch, target):
+    bundle, _, _ = release
+    _, manifest = install.ensure_native_selection()
+    forbidden = manifest.parent / target
+    owned = install._owned
+
+    def reject_public_entry(path, **kwargs):
+        if path == forbidden:
+            assert not kwargs.get("verified_public_executable")
+            raise ValueError("Native Codex cache must not grant access to other Windows accounts")
+        return owned(path, **kwargs)
+
+    monkeypatch.setattr(install, "_owned", reject_public_entry)
+    with pytest.raises(ValueError, match="other Windows accounts") as caught:
+        install._verify(manifest.parent, bundle, system="Windows")
+    if target in {"NOTICE", "bin/codex-code-mode-host.exe"}:
+        assert target in str(caught.value)
+
+
 @pytest.mark.parametrize("extra", [
     "(A;OICI;FRFX;;;BU)", "(A;ID;GRGX;;;BU)", "(A;;0x1200a9;;;BU)",
     "(A;;CCSWWPLO;;;BU)", "(A;OICIIO;GA;;;CO)", "(A;OICIIO;FA;;;WD)",
@@ -435,13 +517,10 @@ def test_windows_private_directory_has_real_private_dacl_and_is_reusable(tmp_pat
     install._windows_private_acl(child)  # Restrictive directory ACL is inherited.
 
 
-@pytest.mark.skipif(not install._IS_WINDOWS, reason="Native Windows DACL APIs")
-def test_windows_existing_public_acl_is_rejected_without_repair(tmp_path):
+def _set_windows_fixture_dacl(path, sddl):
     import ctypes
     from ctypes import wintypes
 
-    directory = tmp_path / "public-cache"
-    install._private_directory(directory)
     advapi = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     pointer = ctypes.c_void_p
@@ -453,11 +532,38 @@ def test_windows_existing_public_acl_is_rejected_without_repair(tmp_path):
     kernel.LocalFree.argtypes, kernel.LocalFree.restype = [pointer], pointer
     descriptor = pointer()
     assert advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        "D:P(A;OICI;FA;;;WD)", 1, ctypes.byref(descriptor), None)
+        sddl, 1, ctypes.byref(descriptor), None)
     try:
-        assert advapi.SetFileSecurityW(str(directory), 0x80000004, descriptor)
+        assert advapi.SetFileSecurityW(str(path), 0x80000004, descriptor)
     finally:
         kernel.LocalFree(descriptor)
+
+
+@pytest.mark.skipif(not install._IS_WINDOWS, reason="Native Windows DACL APIs")
+@pytest.mark.parametrize("release", ["Windows"], indirect=True)
+@pytest.mark.parametrize("rights,accepted", [("0x1200a9", True), ("0x1300a9", False)])
+def test_windows_real_launcher_rx_acl_reuse_and_delete_rejection(release, rights, accepted):
+    command, manifest = install.ensure_native_selection()
+    executable = Path(command[0])
+    before = install._sha256(executable)
+    _set_windows_fixture_dacl(executable,
+        f"D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;{rights};;;WD)")
+    if accepted:
+        assert install.ensure_native_selection() == (command, manifest)
+    else:
+        with pytest.raises(ValueError, match=r"bin/codex\.exe.*other Windows accounts"):
+            install.ensure_native_selection()
+    assert install._sha256(executable) == before
+    assert len(release[2]) == 1
+    with pytest.raises(ValueError, match="other Windows accounts"):
+        install._windows_private_acl(executable)  # Unverified/private use stays strict.
+
+
+@pytest.mark.skipif(not install._IS_WINDOWS, reason="Native Windows DACL APIs")
+def test_windows_existing_public_acl_is_rejected_without_repair(tmp_path):
+    directory = tmp_path / "public-cache"
+    install._private_directory(directory)
+    _set_windows_fixture_dacl(directory, "D:P(A;OICI;FA;;;WD)")
     with pytest.raises(ValueError, match="other Windows accounts"):
         install._private_directory(directory)
     with pytest.raises(ValueError, match="other Windows accounts"):
