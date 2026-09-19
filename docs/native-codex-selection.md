@@ -75,10 +75,20 @@ prebuilt package, and an unverified Windows binary is not a supported release.
 
 ### Windows build and verification
 
-The `Native Codex Windows proof` workflow builds the pinned upstream source on
-Windows Server 2025, runs the installer and bridge regressions, and checks all
-nine offline provider-boundary cases. It creates a downloadable CI artifact only
-after those checks pass; it does not publish a release or modify the user's
+The `Native Codex Windows proof` workflow has separate build and proof jobs on
+Windows Server 2025. The reusable build workflow saves a **CI-only, unverified
+candidate** before any proof runs. Its exact cache key covers the upstream build
+recipe, source preparation and native patch, not Python runtime code or tests.
+On a matching ready-binary cache hit, source checkout, Rust setup and compilation
+are skipped. Missing/evicted caches or changed native inputs require a build.
+Every restored candidate's input identity and file hashes are checked before use.
+
+The proof job downloads that run's candidate, runs the installer and bridge
+regressions, checks all nine offline provider-boundary cases, then installs the
+packaged bundle and repeats those cases. A failed proof can be rerun using
+GitHub's **Re-run failed jobs** without repeating the successful build job.
+Only successful proofs produce the verified bundle; a cached candidate is not a
+supported release. Neither workflow publishes a release or modifies the user's
 global Codex. The Windows archive includes `codex.exe`, `codex-code-mode-host.exe`,
 `codex-command-runner.exe`, and `codex-windows-sandbox-setup.exe` together.
 

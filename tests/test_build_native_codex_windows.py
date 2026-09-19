@@ -3,6 +3,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import struct
 import subprocess
 import tarfile
 import tomllib
@@ -212,3 +213,233 @@ def test_installed_artifact_failures_do_not_produce_success_receipt(packaged_art
 def test_missing_notices_cannot_create_bundle(tmp_path):
     with pytest.raises(ValueError, match="license notices"):
         build.dependency_notices(tmp_path)
+
+
+def synthetic_pe(name: str) -> bytes:
+    data = bytearray(1024)
+    data[:2] = b"MZ"
+    struct.pack_into("<I", data, 60, 128)
+    data[128:132] = b"PE\0\0"
+    struct.pack_into("<HH", data, 132, 0x8664, 1)
+    struct.pack_into("<HH", data, 148, 240, 0x0022)
+    struct.pack_into("<H", data, 152, 0x020b)
+    struct.pack_into("<II", data, 128 + 24 + 240 + 16, 512, 512)
+    data[512:512 + len(name)] = name.encode()
+    return bytes(data)
+
+
+@pytest.fixture
+def native_inputs_root(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    for name in build.native_prepare.NATIVE_INPUTS:
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes((name + "\nfixture native input\n").encode())
+    monkeypatch.setattr(build, "ROOT", root)
+    return root
+
+
+@pytest.mark.parametrize("name", build.native_prepare.NATIVE_INPUTS)
+def test_native_build_key_changes_for_each_native_input_but_not_line_endings(native_inputs_root, name):
+    prep = build.native_prepare
+    before = prep.build_key(native_inputs_root)
+    path = native_inputs_root / name
+    path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+    assert prep.build_key(native_inputs_root) == before
+    path.write_bytes(path.read_bytes() + b"different\r\n")
+    assert prep.build_key(native_inputs_root) != before
+
+
+def test_native_key_ignores_python_runtime_proof_packaging_and_main_workflow(native_inputs_root):
+    prep = build.native_prepare
+    before = prep.build_key(native_inputs_root)
+    for name in ("supervisor/runtime/codex.py", "scripts/verify_native_codex_selection.py",
+                 "scripts/build_native_codex_windows.py", ".github/workflows/native-codex-windows.yml",
+                 "pyproject.toml", "README.md"):
+        path = native_inputs_root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("Python or proof changes must not recompile Rust\n")
+    assert prep.build_key(native_inputs_root) == before
+    assert set(prep.native_inputs(native_inputs_root)) == {
+        "scripts/native-codex-selection.patch", "scripts/prepare_native_codex_windows.py",
+        ".github/workflows/native-codex-windows-build.yml"}
+
+
+@pytest.fixture
+def native_candidate(tmp_path, native_inputs_root, monkeypatch):
+    source, release, cargo = [tmp_path / name for name in ("native-source", "native-release", "native-cargo")]
+    (source / "codex-rs").mkdir(parents=True)
+    (source / "codex-rs/Cargo.lock").write_text("pinned normalized lockfile\n")
+    for name in ("LICENSE", "NOTICE"):
+        (source / name).write_text(name + "\n")
+    dependency = cargo / "registry/src/example/dep-1"
+    dependency.mkdir(parents=True)
+    (dependency / "LICENSE").write_text("fixture attribution\n")
+    release.mkdir()
+    for name in build.BINARIES:
+        (release / f"{name}.exe").write_bytes(synthetic_pe(name))
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw: build.UPSTREAM_REVISION + "\n")
+    patch = native_inputs_root / "scripts/native-codex-selection.patch"
+    candidate = tmp_path / "candidate"
+    build.snapshot_build(source, patch, release, cargo, candidate)
+    return {"candidate": candidate, "source": source, "release": release, "patch": patch,
+            "cargo_home": cargo, "root": native_inputs_root}
+
+
+def test_native_snapshot_binds_exact_files_but_does_not_claim_proof(native_candidate):
+    candidate = native_candidate["candidate"]
+    receipt = build.verify_build(candidate)
+    assert receipt["proof_status"] == "not-run" and "passed" not in receipt
+    expected = {*(f"bin/{name}.exe" for name in build.BINARIES), "LICENSE", "NOTICE",
+                "native-codex-selection.patch", "THIRD-PARTY-NOTICES", "BUILD-INFO"}
+    assert set(receipt["files"]) == expected
+    assert {p.relative_to(candidate).as_posix() for p in candidate.rglob("*") if p.is_file()} == (
+        expected | {"native-build-receipt.json"})
+    for name, digest in receipt["files"].items():
+        assert build.sha256(candidate / name) == digest
+    assert receipt["identity"]["build_key"] == build.native_prepare.build_key(native_candidate["root"])
+    info = json.loads((candidate / "BUILD-INFO").read_text())
+    assert info["native_build_identity"] == receipt["identity"]
+    assert "provider_proof_sha256" not in info
+
+
+@pytest.mark.parametrize("name", sorted(build._PAYLOAD_FILES))
+def test_native_candidate_corruption_is_refused(native_candidate, name):
+    candidate = native_candidate["candidate"]
+    path = candidate / name
+    path.write_bytes(path.read_bytes() + b"corrupted")
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        build.verify_build(candidate)
+
+
+@pytest.mark.parametrize("name", build.native_prepare.NATIVE_INPUTS)
+def test_native_candidate_refuses_changed_current_native_inputs(native_candidate, name, tmp_path):
+    candidate = native_candidate["candidate"]
+    path = native_candidate["root"] / name
+    path.write_bytes(path.read_bytes() + b"changed native build")
+    with pytest.raises(ValueError, match="identity"):
+        build.verify_build(candidate)
+    with pytest.raises(ValueError, match="identity"):
+        build.package_candidate(candidate, tmp_path / "no-proof.json", tmp_path / "no-package")
+    assert not (tmp_path / "no-package").exists()
+
+
+@pytest.mark.parametrize("change", ["extra", "directory", "missing", "identity", "proof_claim", "bad_hash_list"])
+def test_native_candidate_refuses_unexpected_contents_or_receipt(native_candidate, change):
+    candidate = native_candidate["candidate"]
+    receipt_path = candidate / "native-build-receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    if change == "extra":
+        (candidate / "unlisted.txt").write_text("unlisted")
+    elif change == "directory":
+        (candidate / "unlisted").mkdir()
+    elif change == "missing":
+        (candidate / "NOTICE").unlink()
+    elif change == "identity":
+        receipt["identity"]["target"] = "aarch64-pc-windows-msvc"
+    elif change == "proof_claim":
+        receipt["proof_status"] = "passed"
+    else:
+        receipt["files"].pop("NOTICE")
+    receipt_path.write_text(json.dumps(receipt))
+    with pytest.raises(ValueError):
+        build.verify_build(candidate)
+
+
+def test_native_candidate_rejects_symlink_even_when_target_hash_matches(native_candidate):
+    candidate = native_candidate["candidate"]
+    (candidate / "NOTICE").unlink()
+    try:
+        (candidate / "NOTICE").symlink_to(native_candidate["source"] / "NOTICE")
+    except OSError as error:
+        pytest.skip(f"Host cannot create a fixture symlink: {error}")
+    with pytest.raises(ValueError, match="regular file"):
+        build.verify_build(candidate)
+
+
+@pytest.mark.parametrize("change", ["dos_only", "bad_offset", "bad_signature", "wrong_machine", "pe32", "dll", "section_bounds"])
+def test_native_candidate_pe_headers_are_checked_even_with_updated_receipt(native_candidate, change):
+    candidate = native_candidate["candidate"]
+    binary = candidate / "bin/codex.exe"
+    data = bytearray(binary.read_bytes())
+    if change == "dos_only":
+        data = bytearray(b"MZnot-a-PE")
+    elif change == "bad_offset":
+        struct.pack_into("<I", data, 60, len(data) + 1)
+    elif change == "bad_signature":
+        data[128:132] = b"NOPE"
+    elif change == "wrong_machine":
+        struct.pack_into("<H", data, 132, 0xaa64)
+    elif change == "pe32":
+        struct.pack_into("<H", data, 152, 0x010b)
+    elif change == "dll":
+        struct.pack_into("<H", data, 150, 0x2022)
+    else:
+        struct.pack_into("<I", data, 128 + 24 + 240 + 16, len(data) + 1)
+    binary.write_bytes(data)
+    receipt_path = candidate / "native-build-receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt["files"]["bin/codex.exe"] = build.sha256(binary)
+    receipt_path.write_text(json.dumps(receipt))
+    with pytest.raises(ValueError, match="PE"):
+        build.verify_build(candidate)
+
+
+def test_snapshot_requires_current_patch_and_pinned_revision(native_candidate, tmp_path, monkeypatch):
+    args = {name: native_candidate[name] for name in ("source", "patch", "release", "cargo_home")}
+    args["output"] = tmp_path / "no-snapshot"
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw: "wrong-revision\n")
+    with pytest.raises(ValueError, match="pinned upstream"):
+        build.snapshot_build(**args)
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw: build.UPSTREAM_REVISION + "\n")
+    args["patch"] = tmp_path / "different.patch"
+    args["patch"].write_text("not the current patch")
+    with pytest.raises(ValueError, match="current native build inputs"):
+        build.snapshot_build(**args)
+    assert not args["output"].exists()
+
+
+@pytest.mark.parametrize("change", ["missing", "incomplete", "failed", "sandbox", "binary"])
+def test_candidate_packaging_refuses_missing_failed_or_unrelated_proof(native_candidate, tmp_path, change):
+    candidate = native_candidate["candidate"]
+    proof = tmp_path / "candidate-proof.json"
+    report = passing_report(candidate / "bin/codex.exe")
+    if change == "incomplete":
+        report["cases"].pop()
+    elif change == "failed":
+        report["passed"] = False
+    elif change == "sandbox":
+        report["cases"][0]["windows_filesystem_sandbox_enforced"] = False
+    elif change == "binary":
+        report["binary_sha256"] = "0" * 64
+    if change != "missing":
+        proof.write_text(json.dumps(report))
+    output = tmp_path / "no-package"
+    with pytest.raises((ValueError, FileNotFoundError)):
+        build.package_candidate(candidate, proof, output)
+    assert not output.exists()
+
+
+def test_candidate_can_be_reproved_after_python_changes_without_native_rebuild(native_candidate, tmp_path):
+    candidate, root = native_candidate["candidate"], native_candidate["root"]
+    original = build.verify_build(candidate)
+    for name in ("scripts/build_native_codex_windows.py", "scripts/verify_native_codex_selection.py",
+                 ".github/workflows/native-codex-windows.yml", "supervisor/runtime/codex.py"):
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("Updated Python-only behavior\n")
+    assert build.verify_build(candidate) == original
+    proof = tmp_path / "new-proof.json"
+    proof.write_text(json.dumps(passing_report(candidate / "bin/codex.exe")))
+    output = tmp_path / "candidate-package"
+    archive = build.package_candidate(candidate, proof, output)
+    with tarfile.open(archive) as stream:
+        names = set(stream.getnames())
+        assert names == build._PAYLOAD_FILES | {"selection-manifest.json"}
+        assert "native-build-receipt.json" not in names
+        info = json.load(stream.extractfile("BUILD-INFO"))
+        assert info["native_build_identity"] == original["identity"]
+        assert info["provider_proof_sha256"] == build.sha256(proof)
+        manifest = json.load(stream.extractfile("selection-manifest.json"))
+        assert manifest["binary_sha256"] == original["files"]["bin/codex.exe"]
+    assert build.verify_build(candidate) == original  # Packaging never rewrites the candidate.

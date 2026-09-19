@@ -1,80 +1,56 @@
 #!/usr/bin/env python3
-"""Prepare and package the pinned Windows native helper; never publish it.
+"""Capture, verify and package the pinned Windows native helper; never publish it.
 
-The workflow builds the four executables between ``prepare`` and ``package``.
-Packaging requires the real nine-case, zero-paid-call provider-boundary proof.
+An unproved build candidate survives Python/proof fixes without recompilation.
+Packaging still requires all nine real zero-paid-call provider-boundary cases.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import os
 from pathlib import Path
 import platform
 import re
 import shutil
+import stat
+import struct
 import subprocess
 import sys
 import tarfile
-import tomllib
 from unittest.mock import patch as replace
 
 
-UPSTREAM_REVISION = "3d2ee51ca2d5db578f328aa75e20aa22c0197c9a"
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.153.4"
-TARGET = "x86_64-pc-windows-msvc"
-BINARIES = ("codex", "codex-code-mode-host", "codex-command-runner", "codex-windows-sandbox-setup")
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from scripts import prepare_native_codex_windows as native_prepare
+
+UPSTREAM_REVISION = native_prepare.UPSTREAM_REVISION
+VERSION = native_prepare.VERSION
+TARGET = native_prepare.TARGET
+BINARIES = native_prepare.BINARIES
+V8_HASHES = native_prepare.V8_HASHES
+normalize_workspace_versions = native_prepare.normalize_workspace_versions
+sha256 = native_prepare.sha256
 PROOF_CASES = frozenset({"direct_off", "direct_on", "code_off", "code_on", "poll_off", "poll_on",
                          "missing_focus", "task_protected", "help_protected"})
-V8_HASHES = {
-    f"rusty_v8_ptrcomp_sandbox_release_{TARGET}.lib.gz":
-        "732ec5da4243aa166799780c8519a5eea6f32f6e47657a323342794dc3c239d6",
-    f"src_binding_ptrcomp_sandbox_release_{TARGET}.rs":
-        "dabf78ba1faac127660db9862b1d0354175c71b8db2d4fcb5bacbd9c93576b16",
-}
-
-
-def sha256(path: Path) -> str:
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
-
-
-def normalize_workspace_versions(text: str) -> str:
-    """Repair upstream tag's source-less versions without resolving dependencies."""
-    sections = text.split("[[package]]")
-    for index, section in enumerate(sections[1:], 1):
-        package = tomllib.loads("[[package]]" + section)["package"][0]
-        if "source" not in package and package.get("version") == "0.0.0":
-            sections[index] = re.sub(r'(?m)^version = "0\.0\.0"$',
-                                     f'version = "{VERSION}"', section, count=1)
-    return "[[package]]".join(sections)
+_PAYLOAD_FILES = frozenset({*(f"bin/{name}.exe" for name in BINARIES),
+    "LICENSE", "NOTICE", "native-codex-selection.patch", "THIRD-PARTY-NOTICES", "BUILD-INFO"})
+_RECEIPT_NAME = "native-build-receipt.json"
+_RECEIPT_SCHEMA = "bello.native-codex-windows-build.v1"
 
 
 def prepare(source: Path, patch: Path) -> None:
-    revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
-    if revision != UPSTREAM_REVISION:
-        raise ValueError("Native Codex source is not the pinned upstream revision")
-    dirty = subprocess.check_output(["git", "-C", str(source), "status", "--porcelain"], text=True)
-    if dirty.strip():
-        raise ValueError("Preparation requires a fresh upstream checkout")
-    # Git for Windows may check the patch itself out as CRLF. A bare context
-    # blank then becomes "\r", which git apply rejects as corrupt syntax.
-    # Normalize the transport bytes only; keep the distributed patch untouched.
-    patch_bytes = patch.read_bytes().replace(b"\r\n", b"\n")
-    subprocess.run(["git", "-C", str(source), "apply", "--check", "-"], input=patch_bytes, check=True)
-    subprocess.run(["git", "-C", str(source), "apply", "-"], input=patch_bytes, check=True)
-    lock = source / "codex-rs" / "Cargo.lock"
-    lock.write_text(normalize_workspace_versions(lock.read_text(encoding="utf-8")), encoding="utf-8", newline="\n")
+    # Compatibility for existing callers; the build workflow uses the small
+    # stdlib-only preparation script directly.
+    native_prepare.prepare(source, patch, expected_revision=UPSTREAM_REVISION)
 
 
 def verify_v8(directory: Path) -> None:
-    for name, expected in V8_HASHES.items():
-        if sha256(directory / name) != expected:
-            raise ValueError(f"Pinned V8 checksum mismatch: {name}")
+    native_prepare.verify_v8(directory, expected_hashes=V8_HASHES)
 
 
 def validate_proof(report: dict, binary: Path) -> None:
@@ -113,6 +89,153 @@ def dependency_notices(cargo_home: Path) -> str:
             "Dependencies retain their respective licenses.\n" + "".join(notices))
 
 
+def _regular(path: Path, *, directory: bool = False) -> None:
+    status = path.lstat()
+    if (stat.S_ISLNK(status.st_mode)
+            or getattr(status, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            or not (stat.S_ISDIR(status.st_mode) if directory else stat.S_ISREG(status.st_mode))):
+        raise ValueError(f"Native build requires a regular {'directory' if directory else 'file'}: {path.name}")
+
+
+def validate_pe(path: Path) -> None:
+    """Validate the x64 executable header, not merely the DOS 'MZ' prefix."""
+    _regular(path)
+    size = path.stat().st_size
+    with path.open("rb") as stream:
+        dos = stream.read(64)
+        if len(dos) != 64 or dos[:2] != b"MZ":
+            raise ValueError(f"Invalid Windows PE executable: {path.name}")
+        offset = struct.unpack_from("<I", dos, 60)[0]
+        if offset < 64 or offset + 24 > size:
+            raise ValueError(f"Invalid Windows PE header offset: {path.name}")
+        stream.seek(offset)
+        header = stream.read(24)
+        machine, sections = struct.unpack_from("<HH", header, 4)
+        optional_size, characteristics = struct.unpack_from("<HH", header, 20)
+        optional = stream.read(optional_size)
+        if (header[:4] != b"PE\x00\x00" or machine != 0x8664 or not 0 < sections <= 96
+                or optional_size < 112 or len(optional) != optional_size or optional[:2] != b"\x0b\x02"
+                or not characteristics & 0x0002 or characteristics & 0x2000
+                or offset + 24 + optional_size + sections * 40 > size):
+            raise ValueError(f"Invalid Windows x64 PE executable: {path.name}")
+        for _ in range(sections):
+            section = stream.read(40)
+            raw_size, raw_offset = struct.unpack_from("<II", section, 16)
+            if raw_size and (not raw_offset or raw_offset + raw_size > size):
+                raise ValueError(f"Invalid Windows PE section bounds: {path.name}")
+
+
+def native_build_identity() -> dict:
+    return {"build_key": native_prepare.build_key(ROOT), "inputs": native_prepare.native_inputs(ROOT),
+            "upstream_revision": UPSTREAM_REVISION, "version": VERSION, "target": TARGET}
+
+
+def _build_info(patch: Path, cargo_lock_sha256: str) -> dict:
+    return {"upstream_repository": "https://github.com/openai/codex",
+            "upstream_revision": UPSTREAM_REVISION, "upstream_tag": f"rust-v{VERSION}",
+            "target": TARGET, "rust_version": native_prepare.RUST_VERSION, "patch_sha256": sha256(patch),
+            "cargo_lock_sha256": cargo_lock_sha256,
+            "cargo_lock_adjustment": f"Only source-less 0.0.0 workspace versions normalized to {VERSION}",
+            "v8_release": native_prepare.V8_RELEASE, "v8_artifact_sha256": V8_HASHES,
+            "profile": native_prepare.BUILD_PROFILE, "signed": False}
+
+
+def _write_json(path: Path, value: dict) -> None:
+    path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+
+def snapshot_build(source: Path, patch: Path, release: Path, cargo_home: Path, output: Path) -> Path:
+    """Capture compiled files now; this receipt deliberately makes no proof claim."""
+    identity = native_build_identity()
+    revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+    if revision != UPSTREAM_REVISION:
+        raise ValueError("Native Codex source is not the pinned upstream revision")
+    _regular(patch)
+    if native_prepare.normalized_sha256(patch) != identity["inputs"]["scripts/native-codex-selection.patch"]:
+        raise ValueError("Snapshot patch differs from the current native build inputs")
+    _regular(release, directory=True)
+    for name in BINARIES:
+        validate_pe(release / f"{name}.exe")
+    for name in ("LICENSE", "NOTICE", "codex-rs/Cargo.lock"):
+        _regular(source / name)
+    notices = dependency_notices(cargo_home)
+    output.mkdir(parents=True, exist_ok=False)
+    (output / "bin").mkdir()
+    for name in BINARIES:
+        shutil.copyfile(release / f"{name}.exe", output / "bin" / f"{name}.exe")
+    for name in ("LICENSE", "NOTICE"):
+        shutil.copyfile(source / name, output / name)
+    shutil.copyfile(patch, output / "native-codex-selection.patch")
+    (output / "THIRD-PARTY-NOTICES").write_text(notices, encoding="utf-8", newline="\n")
+    info = _build_info(output / "native-codex-selection.patch", sha256(source / "codex-rs/Cargo.lock"))
+    info["native_build_identity"] = identity
+    _write_json(output / "BUILD-INFO", info)
+    receipt = {"schema": _RECEIPT_SCHEMA, "identity": identity, "proof_status": "not-run",
+               "files": {name: sha256(output / name) for name in sorted(_PAYLOAD_FILES)}}
+    _write_json(output / _RECEIPT_NAME, receipt)
+    verify_build(output)
+    print(json.dumps({"candidate": str(output), "build_key": identity["build_key"], "proof_status": "not-run"}), flush=True)
+    return output
+
+
+def verify_build(candidate: Path) -> dict:
+    """Reject changed native inputs, extra files, links, bad PE headers or hashes."""
+    _regular(candidate, directory=True)
+    found = set()
+    for path in candidate.iterdir():
+        if path.name == "bin":
+            _regular(path, directory=True)
+            for executable in path.iterdir():
+                _regular(executable)
+                found.add("bin/" + executable.name)
+        else:
+            _regular(path)
+            found.add(path.name)
+    if found != _PAYLOAD_FILES | {_RECEIPT_NAME}:
+        raise ValueError("Native build candidate must contain exactly its expected files")
+    receipt = json.loads((candidate / _RECEIPT_NAME).read_text(encoding="utf-8"))
+    expected_identity = native_build_identity()
+    if (not isinstance(receipt, dict) or set(receipt) != {"schema", "identity", "proof_status", "files"}
+            or receipt["schema"] != _RECEIPT_SCHEMA or receipt["proof_status"] != "not-run"
+            or receipt["identity"] != expected_identity):
+        raise ValueError("Native build identity does not match the current native inputs")
+    hashes = receipt["files"]
+    if not isinstance(hashes, dict) or set(hashes) != _PAYLOAD_FILES:
+        raise ValueError("Native build receipt must hash every expected payload file")
+    for name, expected in hashes.items():
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected) or sha256(candidate / name) != expected:
+            raise ValueError(f"Native build candidate checksum mismatch: {name}")
+    for name in BINARIES:
+        validate_pe(candidate / "bin" / f"{name}.exe")
+    patch = candidate / "native-codex-selection.patch"
+    if native_prepare.normalized_sha256(patch) != expected_identity["inputs"]["scripts/native-codex-selection.patch"]:
+        raise ValueError("Native candidate patch differs from the current native build inputs")
+    info = json.loads((candidate / "BUILD-INFO").read_text(encoding="utf-8"))
+    lock_hash = info.get("cargo_lock_sha256") if isinstance(info, dict) else None
+    if not isinstance(lock_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", lock_hash):
+        raise ValueError("Invalid native build lockfile identity")
+    expected_info = {**_build_info(patch, lock_hash), "native_build_identity": expected_identity}
+    if info != expected_info:
+        raise ValueError("Native BUILD-INFO does not match its build identity")
+    return receipt
+
+
+def package_candidate(candidate: Path, proof: Path, output: Path) -> Path:
+    receipt = verify_build(candidate)
+    validate_proof(json.loads(proof.read_text(encoding="utf-8")), candidate / "bin/codex.exe")
+    output.mkdir(parents=True, exist_ok=False)
+    bundle = output / "bundle"
+    (bundle / "bin").mkdir(parents=True)
+    for name in sorted(_PAYLOAD_FILES):
+        shutil.copyfile(candidate / name, bundle / name)
+        if sha256(bundle / name) != receipt["files"][name]:
+            raise ValueError(f"Native candidate changed while packaging: {name}")
+    info = json.loads((bundle / "BUILD-INFO").read_text(encoding="utf-8"))
+    info["provider_proof_sha256"] = sha256(proof)
+    _write_json(bundle / "BUILD-INFO", info)
+    return _archive_bundle(bundle, proof, output)
+
+
 def package(source: Path, patch: Path, release: Path, proof: Path, cargo_home: Path, output: Path) -> Path:
     report = json.loads(proof.read_text(encoding="utf-8"))
     validate_proof(report, release / "codex.exe")
@@ -133,15 +256,12 @@ def package(source: Path, patch: Path, release: Path, proof: Path, cargo_home: P
         shutil.copyfile(source / name, bundle / name)
     shutil.copyfile(patch, bundle / "native-codex-selection.patch")
     (bundle / "THIRD-PARTY-NOTICES").write_text(notices, encoding="utf-8", newline="\n")
-    build_info = {"upstream_repository": "https://github.com/openai/codex",
-                  "upstream_revision": UPSTREAM_REVISION, "upstream_tag": f"rust-v{VERSION}",
-                  "target": TARGET, "rust_version": "1.95.0", "patch_sha256": sha256(patch),
-                  "cargo_lock_sha256": sha256(source / "codex-rs" / "Cargo.lock"),
-                  "cargo_lock_adjustment": "Only source-less 0.0.0 workspace versions normalized to 0.153.4",
-                  "v8_release": "rusty-v8-v150.4.0", "v8_artifact_sha256": V8_HASHES,
-                  "profile": {"release": True, "lto": False, "debug": 0, "codegen_units": 16},
-                  "provider_proof_sha256": sha256(proof), "signed": False}
+    build_info = {**_build_info(patch, sha256(source / "codex-rs/Cargo.lock")), "provider_proof_sha256": sha256(proof)}
     (bundle / "BUILD-INFO").write_text(json.dumps(build_info, indent=2) + "\n", encoding="utf-8")
+    return _archive_bundle(bundle, proof, output)
+
+
+def _archive_bundle(bundle: Path, proof: Path, output: Path) -> Path:
     files = {path.relative_to(bundle).as_posix(): sha256(path) for path in sorted(bundle.rglob("*"))
              if path.is_file()}
     manifest = {"binary_sha256": files["bin/codex.exe"], "files": files, "version": VERSION,
@@ -242,10 +362,18 @@ def main() -> None:
     installed = sub.add_parser("install-local")
     for name in ("artifact", "runtime-root", "proof-output"):
         installed.add_argument(f"--{name}", type=Path, required=True)
+    snapshot = sub.add_parser("snapshot-build")
+    for name in ("source", "patch", "release", "cargo-home", "output"):
+        snapshot.add_argument(f"--{name}", type=Path, required=True)
+    sub.add_parser("verify-build").add_argument("--candidate", type=Path, required=True)
+    candidate = sub.add_parser("package-candidate")
+    for name in ("candidate", "proof", "output"):
+        candidate.add_argument(f"--{name}", type=Path, required=True)
     args = vars(parser.parse_args())
     command = args.pop("command")
     {"prepare": prepare, "package": package, "verify-v8": verify_v8,
-     "install-local": install_local}[command](**args)
+     "install-local": install_local, "snapshot-build": snapshot_build,
+     "verify-build": verify_build, "package-candidate": package_candidate}[command](**args)
 
 
 if __name__ == "__main__":

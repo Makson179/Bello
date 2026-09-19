@@ -5,14 +5,20 @@ on:
   push:
     branches: [mystery, 'codex/**']
     paths:
-      - '.github/workflows/native-codex-windows.yml'
+      - '.github/workflows/native-codex-windows*.yml'
       - 'scripts/native-codex-selection.patch'
+      - 'scripts/prepare_native_codex_windows.py'
       - 'scripts/build_native_codex_windows.py'
       - 'scripts/verify_native_codex_selection.py'
+      - 'supervisor/appserver.py'
+      - 'supervisor/runtime/codex.py'
+      - 'supervisor/runtime/codex_permissions.py'
       - 'supervisor/runtime/codex_distiller.py'
       - 'supervisor/runtime/distiller_policy.py'
       - 'supervisor/runtime/native_codex_install.py'
+      - 'pyproject.toml'
       - 'tests/test_build_native_codex_windows.py'
+      - 'tests/test_native_codex_windows_workflow.py'
       - 'tests/test_verify_native_codex_selection.py'
       - 'tests/test_native_codex_install.py'
       - 'tests/test_native_codex_download_transport.py'
@@ -24,22 +30,19 @@ permissions:
 
 concurrency:
   group: native-codex-windows-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
+  native-build:
+    uses: ./.github/workflows/native-codex-windows-build.yml
+
   native-proof:
+    needs: native-build
     runs-on: windows-2025
-    timeout-minutes: 120
+    timeout-minutes: 40
     defaults:
       run:
         shell: pwsh
-    env:
-      CARGO_BUILD_JOBS: '3'
-      CARGO_PROFILE_RELEASE_DEBUG: '0'
-      CARGO_PROFILE_RELEASE_LTO: 'false'
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
-      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
-      LIBSQLITE3_FLAGS: SQLITE_DISABLE_INTRINSIC
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,78 +50,26 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Configure native build paths
-        run: |
-          "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'bello-native-target')" >> $env:GITHUB_ENV
-          "CARGO_HOME=$(Join-Path $env:RUNNER_TEMP 'bello-cargo')" >> $env:GITHUB_ENV
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.native-build.outputs.artifact-name }}
+          path: native-candidate
+      - name: Validate cached native build before executing it
+        run: python scripts/build_native_codex_windows.py verify-build --candidate native-candidate
       - name: Install host and offline test dependencies, without optional models
         run: python -c "import pathlib, subprocess, sys, tomllib; deps = tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['dependencies']; subprocess.run([sys.executable, '-m', 'pip', 'install', 'pytest', 'pytest-asyncio', *deps], check=True)"
       - name: Run installer ACL, native bridge, backend and proof regressions
-        run: python -m pytest -q tests/test_build_native_codex_windows.py tests/test_verify_native_codex_selection.py tests/test_native_codex_install.py tests/test_native_codex_download_transport.py tests/test_runtime_codex_distiller.py tests/test_runtime_codex_backend.py
-      - name: Enable long checkout paths
-        run: git config --global core.longpaths true
-      - uses: actions/checkout@v4
-        with:
-          repository: openai/codex
-          ref: 3d2ee51ca2d5db578f328aa75e20aa22c0197c9a
-          path: native-source
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-        with:
-          targets: x86_64-pc-windows-msvc
-      - uses: ./native-source/.github/actions/setup-msvc-env
-        with:
-          target: x86_64-pc-windows-msvc
-      - uses: actions/cache/restore@v4
-        id: native_cache
-        with:
-          path: |
-            ${{ runner.temp }}/bello-cargo/registry
-            ${{ runner.temp }}/bello-cargo/git
-            ${{ runner.temp }}/bello-native-target
-          key: native-codex-windows-1.95.0-v1-${{ hashFiles('scripts/native-codex-selection.patch', 'scripts/build_native_codex_windows.py', '.github/workflows/native-codex-windows.yml') }}
-          restore-keys: native-codex-windows-1.95.0-v1-
-      - name: Prepare exact upstream source and patch
-        run: python scripts/build_native_codex_windows.py prepare --source native-source --patch scripts/native-codex-selection.patch
-      - name: Download checksum-pinned upstream V8 library and bindings
-        run: |
-          $v8 = Join-Path $env:RUNNER_TEMP 'bello-v8'
-          New-Item -ItemType Directory -Path $v8 -Force | Out-Null
-          $base = 'https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0'
-          $archive = 'rusty_v8_ptrcomp_sandbox_release_x86_64-pc-windows-msvc.lib.gz'
-          $binding = 'src_binding_ptrcomp_sandbox_release_x86_64-pc-windows-msvc.rs'
-          foreach ($name in @($archive, $binding)) {
-            Invoke-WebRequest "$base/$name" -OutFile (Join-Path $v8 $name)
-          }
-          python scripts/build_native_codex_windows.py verify-v8 --directory $v8
-          if ($LASTEXITCODE -ne 0) { throw 'Pinned V8 verification failed' }
-          "RUSTY_V8_ARCHIVE=$(Join-Path $v8 $archive)" >> $env:GITHUB_ENV
-          "RUSTY_V8_SRC_BINDING_PATH=$(Join-Path $v8 $binding)" >> $env:GITHUB_ENV
-      - name: Build four native Windows executables
-        working-directory: native-source/codex-rs
-        run: cargo build --locked --release --timings --target x86_64-pc-windows-msvc --bin codex --bin codex-code-mode-host --bin codex-command-runner --bin codex-windows-sandbox-setup
-      # Persist the successful expensive build before any later proof failure.
-      # Only public dependency sources and target outputs, never Cargo credentials.
-      - name: Save successful native build cache
-        if: steps.native_cache.outputs.cache-hit != 'true'
-        continue-on-error: true
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ${{ runner.temp }}/bello-cargo/registry
-            ${{ runner.temp }}/bello-cargo/git
-            ${{ runner.temp }}/bello-native-target
-          key: ${{ steps.native_cache.outputs.cache-primary-key }}
+        run: python -m pytest -q tests/test_build_native_codex_windows.py tests/test_native_codex_windows_workflow.py tests/test_verify_native_codex_selection.py tests/test_native_codex_install.py tests/test_native_codex_download_transport.py tests/test_runtime_codex_distiller.py tests/test_runtime_codex_backend.py
       - name: Verify real native direct, code-mode and poll provider boundaries
-        run: python scripts/verify_native_codex_selection.py --codex "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/codex.exe" --output-dir native-proof
+        run: python scripts/verify_native_codex_selection.py --codex native-candidate/bin/codex.exe --output-dir native-proof
       - name: Package only after all nine proof cases pass
-        run: python scripts/build_native_codex_windows.py package --source native-source --patch scripts/native-codex-selection.patch --release "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release" --proof native-proof/report.json --cargo-home "$env:CARGO_HOME" --output native-artifact
+        run: python scripts/build_native_codex_windows.py package-candidate --candidate native-candidate --proof native-proof/report.json --output native-artifact
       - name: Install local artifact into private cache and repeat all nine proof cases
         run: python scripts/build_native_codex_windows.py install-local --artifact native-artifact --runtime-root "$env:RUNNER_TEMP/bello-install-proof" --proof-output native-installed-proof
       - name: Upload verified unsigned bundle (no release publication)
         uses: actions/upload-artifact@v4
         with:
-          name: bello-native-codex-windows-x64-${{ github.sha }}
+          name: bello-native-codex-windows-x64-${{ github.sha }}-${{ github.run_attempt }}
           path: |
             native-artifact/*.tar.gz
             native-artifact/checksums.json
@@ -131,7 +82,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: native-codex-windows-proof-${{ github.sha }}
+          name: native-codex-windows-proof-${{ github.sha }}-${{ github.run_attempt }}
           path: |
             native-proof/report.json
             native-proof/*/result.json
@@ -150,5 +101,4 @@ jobs:
             native-installed-proof/*/windows-setup-stderr.txt
             native-installed-proof/*/rpc.jsonl
             ${{ runner.temp }}/bello-install-proof/installed-cache.json
-            ${{ runner.temp }}/bello-native-target/cargo-timings/*.html
           if-no-files-found: warn
