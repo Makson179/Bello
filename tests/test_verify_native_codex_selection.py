@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import gzip
 import importlib.util
 import json
 from pathlib import Path
 import sys
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -142,6 +144,71 @@ async def test_windows_provisioning_refuses_an_unspecified_account(tmp_path, mon
     with pytest.raises(RuntimeError, match="USERNAME"):
         await proof.provision_windows_sandbox(tmp_path / "codex.exe", tmp_path, {}, tmp_path)
     spawn.assert_not_called()
+
+
+@pytest.mark.parametrize("exception_type", [TimeoutError, asyncio.CancelledError])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+async def test_windows_provisioning_stops_only_its_setup_tree_and_preserves_error(tmp_path, monkeypatch, exception_type, cleanup_fails):
+    monkeypatch.setenv("USERNAME", "fixture-runner")
+    original = exception_type("synthetic setup interruption")
+    process = SimpleNamespace(pid=17001, returncode=None, kill=Mock(), wait=AsyncMock(return_value=1),
+                              communicate=AsyncMock(side_effect=original))
+    killer = SimpleNamespace(returncode=0, wait=AsyncMock(return_value=0), kill=Mock())
+    spawn = AsyncMock(side_effect=[process, OSError("synthetic taskkill failure") if cleanup_fails else killer])
+    monkeypatch.setattr(proof.asyncio, "create_subprocess_exec", spawn)
+    env = {"SystemRoot": str(tmp_path / "Windows"), "BELLO_SELECTOR_TOKEN": "not-for-cleanup"}
+    expected_type = RuntimeError if exception_type is TimeoutError else asyncio.CancelledError
+    with pytest.raises(expected_type) as caught:
+        await proof.provision_windows_sandbox(tmp_path / "codex.exe", tmp_path, env, tmp_path)
+    if exception_type is TimeoutError:
+        assert str(caught.value) == "Native Windows sandbox setup timed out"
+        assert caught.value.__cause__ is original
+    else:
+        assert caught.value is original
+    if cleanup_fails:
+        assert "synthetic taskkill failure" in " ".join(original.__notes__)
+    args, kwargs = spawn.call_args_list[1]
+    assert args == (str(tmp_path / "Windows/System32/taskkill.exe"), "/T", "/F", "/PID", "17001")
+    assert kwargs["env"] == {"SystemRoot": str(tmp_path / "Windows")}
+    assert kwargs["stdout"] == kwargs["stderr"] == asyncio.subprocess.DEVNULL
+    assert spawn.call_count == 2
+    process.kill.assert_called_once_with()
+    process.wait.assert_awaited_once_with()
+
+
+async def test_windows_setup_cleanup_skips_an_already_finished_process(monkeypatch):
+    spawn = AsyncMock()
+    monkeypatch.setattr(proof.asyncio, "create_subprocess_exec", spawn)
+    process = SimpleNamespace(returncode=0, kill=Mock(), wait=AsyncMock())
+    await proof.terminate_windows_setup(process, {})
+    spawn.assert_not_called()
+    process.kill.assert_not_called()
+    process.wait.assert_not_awaited()
+
+
+async def test_windows_setup_cleanup_bounds_a_hung_taskkill_and_still_reaps_setup(tmp_path, monkeypatch):
+    process = SimpleNamespace(pid=17002, returncode=None, kill=Mock(), wait=AsyncMock(return_value=1))
+    killer = SimpleNamespace(returncode=None, kill=Mock(), wait=AsyncMock(side_effect=[TimeoutError(), 1]))
+    spawn = AsyncMock(return_value=killer)
+    monkeypatch.setattr(proof.asyncio, "create_subprocess_exec", spawn)
+    with pytest.raises(TimeoutError):
+        await proof.terminate_windows_setup(process, {"SystemRoot": str(tmp_path / "Windows")})
+    killer.kill.assert_called_once_with()
+    assert killer.wait.await_count == 2
+    process.kill.assert_called_once_with()
+    process.wait.assert_awaited_once_with()
+    assert spawn.call_count == 1
+
+
+async def test_windows_setup_cleanup_does_not_search_path_for_taskkill(monkeypatch):
+    spawn = AsyncMock()
+    monkeypatch.setattr(proof.asyncio, "create_subprocess_exec", spawn)
+    process = SimpleNamespace(pid=17003, returncode=None, kill=Mock(), wait=AsyncMock(return_value=1))
+    with pytest.raises(RuntimeError, match="SystemRoot is not absolute"):
+        await proof.terminate_windows_setup(process, {"SystemRoot": "relative-Windows"})
+    spawn.assert_not_called()
+    process.kill.assert_called_once_with()
+    process.wait.assert_awaited_once_with()
 
 
 @pytest.mark.parametrize("case", proof.CASES)

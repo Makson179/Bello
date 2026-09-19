@@ -91,6 +91,33 @@ def windows_permission_params(work: Path, home: Path, binary: Path) -> dict[str,
     return result
 
 
+async def terminate_windows_setup(process, env: dict[str, str]) -> None:
+    """Boundedly stop this live setup process and its Windows helper children."""
+    if process.returncode is not None:
+        return
+    killer = None
+    try:
+        system_root = Path(env.get("SystemRoot", r"C:\Windows"))
+        if not system_root.is_absolute():
+            raise RuntimeError("Cannot stop Windows setup tree: SystemRoot is not absolute")
+        async with asyncio.timeout(5):
+            killer = await asyncio.create_subprocess_exec(
+                str(system_root / "System32" / "taskkill.exe"), "/T", "/F", "/PID", str(process.pid),
+                env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            status = await killer.wait()
+        if status != 0:
+            raise RuntimeError(f"Windows setup tree cleanup failed with exit code {status}")
+    finally:
+        try:
+            if killer is not None and killer.returncode is None:
+                killer.kill()
+                await asyncio.wait_for(killer.wait(), 1)
+        finally:
+            if process.returncode is None:
+                process.kill()
+            await asyncio.wait_for(process.wait(), 5)
+
+
 async def provision_windows_sandbox(binary: Path, home: Path, env: dict[str, str], output: Path) -> None:
     # CI only, on its disposable elevated runner. No automatic UAC or inherited
     # account credentials. The setup state stays outside uploaded diagnostics.
@@ -104,10 +131,14 @@ async def provision_windows_sandbox(binary: Path, home: Path, env: dict[str, str
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), 180)
-    except TimeoutError:
-        process.kill()
-        await asyncio.wait_for(process.wait(), 5)
-        raise RuntimeError("Native Windows sandbox setup timed out") from None
+    except (TimeoutError, asyncio.CancelledError) as error:
+        try:
+            await terminate_windows_setup(process, setup_env)
+        except (Exception, asyncio.CancelledError) as cleanup_error:
+            error.add_note(f"Windows setup cleanup also failed: {type(cleanup_error).__name__}: {cleanup_error}")
+        if isinstance(error, TimeoutError):
+            raise RuntimeError("Native Windows sandbox setup timed out") from error
+        raise
     (output / "windows-setup-stdout.txt").write_bytes(stdout)
     (output / "windows-setup-stderr.txt").write_bytes(stderr)
     if process.returncode != 0:
