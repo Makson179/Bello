@@ -84,6 +84,7 @@ def test_wire_invocations_use_optional_focus_and_real_poll_command():
     poll, command = proof.invocation(proof.Case("poll", mode="poll"), windows=False)
     assert poll["type"] == "custom_tool_call" and poll["name"] == "exec"
     assert command.startswith("sleep 2;")
+    assert not poll["input"].startswith("// @exec:")
     assert "tools.write_stdin" in poll["input"] and proof.POLL_FOCUS in poll["input"]
     assert 'Missing live session' in poll["input"]
 
@@ -395,8 +396,15 @@ def test_windows_invocations_preserve_exit_code_focus_and_polling(case):
         assert args["shell"].endswith("powershell.exe")
         assert ("focus" in args) == case.focus
     if case.mode == "poll":
-        assert command.startswith("Start-Sleep -Seconds 2;")
+        assert command.startswith("Start-Sleep -Seconds 15;")
         assert "tools.write_stdin" in tool["input"]
+        first_line, body = tool["input"].split("\n", 1)
+        assert first_line.startswith("// @exec:")
+        assert json.loads(first_line.removeprefix("// @exec:")) == {"yield_time_ms": 30000}
+        assert "n<10 && r.session_id" in body
+        assert 'Missing live session' in body and 'Polling did not finish' in body
+    elif case.mode != "direct":
+        assert not tool["input"].startswith("// @exec:")
     if case.protected == "help":
         assert "--help" in command
         assert "fixture-help --help" in command and ".ps1" not in command

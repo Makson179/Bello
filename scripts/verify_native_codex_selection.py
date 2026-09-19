@@ -331,7 +331,9 @@ def invocation(case: Case, *, windows: bool | None = None, command_prefix: str =
             "help": "function fixture-help { [Console]::Out.Write([IO.File]::ReadAllText('diagnostic.log')) }; fixture-help --help; exit 7",
         }.get(case.protected, "[Console]::Out.Write((Get-Content -Raw -LiteralPath 'diagnostic.log')); exit 7")
         if case.mode == "poll":
-            command = "Start-Sleep -Seconds 2; " + command
+            # Pinned native Windows exec clamps the initial yield to 10s.
+            # Keep the fixture alive beyond that floor to exercise write_stdin.
+            command = "Start-Sleep -Seconds 15; " + command
     command = command_prefix + command
     args: dict[str, Any] = {"cmd": command, "yield_time_ms": 250 if case.mode == "poll" else 1000,
                            "max_output_tokens": 10000, "login": False}
@@ -354,6 +356,10 @@ def invocation(case: Case, *, windows: bool | None = None, command_prefix: str =
         code += 'if(r.session_id) throw new Error("Polling did not finish");'
     else:
         code += "text(r);"
+    if windows and case.mode == "poll":
+        # Code mode itself otherwise yields after 10s, before this fixture can
+        # finish. The fake provider intentionally has only one tool turn.
+        code = '// @exec: {"yield_time_ms":30000}\n' + code
     return {"type": "custom_tool_call", "call_id": CALL_ID, "name": "exec", "input": code}, command
 
 
