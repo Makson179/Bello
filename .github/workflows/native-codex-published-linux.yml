@@ -1,0 +1,44 @@
+name: Published Native Codex Linux smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  published-helper:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install host and test dependencies without optional models
+        run: python -c "import pathlib, subprocess, sys, tomllib; deps = tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['dependencies']; subprocess.run([sys.executable, '-m', 'pip', 'install', 'pytest', 'pytest-asyncio', *deps], check=True)"
+      - name: Check published-download smoke regressions
+        run: python -m pytest -q tests/test_native_codex_linux_download.py tests/test_native_codex_download_transport.py
+      - name: Cold HTTPS install, nine provider cases and bundled sandbox
+        run: |
+          python scripts/verify_native_codex_linux_download.py \
+            --runtime-root "$RUNNER_TEMP/bello-linux-published-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --output-dir linux-published-proof
+      - name: Upload synthetic receipts and provider evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-codex-linux-published-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            linux-published-proof/report.json
+            linux-published-proof/provider/report.json
+            linux-published-proof/provider/*/result.json
+            linux-published-proof/provider/*/provider-request-*.json
+            linux-published-proof/provider/*/selector-inputs.json
+            linux-published-proof/provider/*/native-stderr.txt
+            linux-published-proof/provider/*/rpc.jsonl
+            linux-published-proof/sandbox/*.json
+            linux-published-proof/sandbox/*.txt
+          if-no-files-found: warn
