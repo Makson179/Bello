@@ -89,6 +89,7 @@ def validate_proof(report: dict, binary: Path) -> None:
     for case in cases:
         if (case.get("passed") is not True or case.get("exact_model_visible_output") is not True
                 or case.get("focus_and_command_correct") is not True or case.get("error") is not None
+                or case.get("windows_filesystem_sandbox_enforced") is not True
                 or case.get("provider_requests") != 2 or case.get("provider_errors") != []
                 or case.get("external_proxy_requests_forwarded") != 0):
             raise ValueError(f"Incomplete native provider proof: {case.get('case')}")

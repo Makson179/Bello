@@ -86,6 +86,7 @@ def test_wire_invocations_use_optional_focus_and_real_poll_command():
 def test_windows_environment_only_inherits_required_os_paths(tmp_path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "never-copy")
     monkeypatch.setenv("PATH", "untrusted-parent-directory")
+    monkeypatch.setenv("USERNAME", "fixture-runner")
     bridge_env = {"BELLO_SELECTOR_TCP": "127.0.0.1:9999", "BELLO_SELECTOR_TOKEN": "a" * 64}
     env = proof.isolated_environment(tmp_path, tmp_path / "bin/codex.exe", 9123, bridge_env, windows=True)
     assert env["USERPROFILE"] == env["CODEX_HOME"] == str(tmp_path)
@@ -93,6 +94,31 @@ def test_windows_environment_only_inherits_required_os_paths(tmp_path, monkeypat
     assert "SHELL" not in env and "ANTHROPIC_API_KEY" not in env
     assert "untrusted-parent-directory" not in env["PATH"]
     assert all(env[k] == v for k, v in bridge_env.items())
+    assert env["USERNAME"] == "fixture-runner"
+
+
+def test_windows_native_proof_preserves_exact_production_filesystem_scope(tmp_path):
+    work, home, binary = tmp_path / "work", tmp_path / "home", tmp_path / "bin/codex.exe"
+    params = proof.windows_permission_params(work, home, binary)
+    assert params["permissions"] == "bello-native"
+    assert params["config"]["windows"] == {"sandbox": "elevated"}
+    profile = params["config"]["permissions"]["bello-native"]
+    assert profile["network"] == {"enabled": False}
+    assert profile["filesystem"][str(work)] == "write"
+    assert profile["filesystem"][str(work / ".git")] == "read"
+    assert ":root" not in profile["filesystem"]
+    assert str(home) not in profile["filesystem"]
+
+
+def test_windows_probe_requires_actual_access_denial_and_preserves_original_command(tmp_path):
+    prefix = proof.windows_filesystem_probe(tmp_path / "outside's folder")
+    assert "outside''s folder" in prefix
+    assert "inside-write.txt" in prefix and "secret.txt" in prefix and "forbidden.txt" in prefix
+    assert prefix.count("[UnauthorizedAccessException]") == 2
+    assert "if ($readable -or $writable)" in prefix
+    tool, command = proof.invocation(proof.Case("probe"), windows=True, command_prefix=prefix)
+    assert command.startswith(prefix) and command.endswith("exit 7")
+    assert json.loads(tool["arguments"])["cmd"] == command
 
 
 @pytest.mark.parametrize("case", proof.CASES)

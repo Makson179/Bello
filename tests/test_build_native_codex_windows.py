@@ -22,6 +22,7 @@ def passing_report(binary):
             "paid_model_calls": 0, "binary_sha256": build.sha256(binary), "platform": "Windows-11",
             "cases": [{"case": name, "passed": True, "error": None,
                        "exact_model_visible_output": True, "focus_and_command_correct": True,
+                       "windows_filesystem_sandbox_enforced": True,
                        "provider_requests": 2, "provider_errors": [], "external_proxy_requests_forwarded": 0}
                       for name in sorted(build.PROOF_CASES)]}
 
@@ -73,7 +74,7 @@ def test_prepare_accepts_crlf_patch_with_empty_context_on_real_git(tmp_path, mon
     assert patch.read_bytes() == payload
 
 
-@pytest.mark.parametrize("change", ["hash", "platform", "paid", "failed", "missing", "duplicate", "bad_case"])
+@pytest.mark.parametrize("change", ["hash", "platform", "paid", "failed", "missing", "duplicate", "bad_case", "sandbox"])
 def test_proof_gate_rejects_incomplete_or_unrelated_evidence(tmp_path, change):
     binary = tmp_path / "codex.exe"
     binary.write_bytes(b"MZsynthetic")
@@ -90,6 +91,8 @@ def test_proof_gate_rejects_incomplete_or_unrelated_evidence(tmp_path, change):
         report["cases"].pop()
     elif change == "duplicate":
         report["cases"][0] = report["cases"][1]
+    elif change == "sandbox":
+        report["cases"][0].pop("windows_filesystem_sandbox_enforced")
     else:
         report["cases"][0]["exact_model_visible_output"] = False
     with pytest.raises(ValueError):

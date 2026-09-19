@@ -138,12 +138,16 @@ jobs:
             native-proof/*/provider-request-*.json
             native-proof/*/selector-inputs.json
             native-proof/*/native-stderr.txt
+            native-proof/*/windows-setup-stdout.txt
+            native-proof/*/windows-setup-stderr.txt
             native-proof/*/rpc.jsonl
             native-installed-proof/report.json
             native-installed-proof/*/result.json
             native-installed-proof/*/provider-request-*.json
             native-installed-proof/*/selector-inputs.json
             native-installed-proof/*/native-stderr.txt
+            native-installed-proof/*/windows-setup-stdout.txt
+            native-installed-proof/*/windows-setup-stderr.txt
             native-installed-proof/*/rpc.jsonl
             ${{ runner.temp }}/bello-install-proof/installed-cache.json
             ${{ runner.temp }}/bello-native-target/cargo-timings/*.html

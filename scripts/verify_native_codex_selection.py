@@ -65,6 +65,54 @@ def windows_shell() -> str:
                "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
 
 
+def windows_filesystem_probe(outside: Path) -> str:
+    """Emit no output unless a real allowed/denied filesystem probe fails."""
+    def literal(path: Path) -> str:
+        return "'" + str(path).replace("'", "''") + "'"
+    denied_read = literal(outside / "secret.txt")
+    denied_write = literal(outside / "forbidden.txt")
+    # Only AccessDenied counts: a missing/bad fixture path must fail the proof.
+    catch = "catch { if (-not ($_.Exception.GetBaseException() -is [UnauthorizedAccessException])) { throw } }; "
+    return (
+        "$ErrorActionPreference='Stop'; "
+        "[IO.File]::WriteAllText((Join-Path (Get-Location).Path 'inside-write.txt'), 'allowed'); "
+        "$readable=$false; try { [void][IO.File]::ReadAllText(" + denied_read + "); $readable=$true } " + catch +
+        "$writable=$false; try { [IO.File]::WriteAllText(" + denied_write + ", 'forbidden'); $writable=$true } " + catch +
+        "if ($readable -or $writable) { throw 'Windows filesystem sandbox did not enforce the profile' }; "
+    )
+
+
+def windows_permission_params(work: Path, home: Path, binary: Path) -> dict[str, Any]:
+    from supervisor.runtime.codex_permissions import native_permission_params
+    result = native_permission_params(
+        {"cwd": str(work), "sandbox": "workspace-write", "networkAccess": False},
+        temp_dir=home / "tmp", runtime_read_paths=(binary,))
+    result["config"]["windows"] = {"sandbox": "elevated"}
+    return result
+
+
+async def provision_windows_sandbox(binary: Path, home: Path, env: dict[str, str], output: Path) -> None:
+    # CI only, on its disposable elevated runner. No automatic UAC or inherited
+    # account credentials. The setup state stays outside uploaded diagnostics.
+    username = os.environ.get("USERNAME", "").strip()
+    if not username:
+        raise RuntimeError("Windows proof requires the runner's USERNAME for native sandbox setup")
+    process = await asyncio.create_subprocess_exec(
+        str(binary), "sandbox", "setup", "--elevated", "--current-user", "--codex-home", str(home),
+        cwd=home, env={**env, "USERNAME": username},
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), 180)
+    except TimeoutError:
+        process.kill()
+        await asyncio.wait_for(process.wait(), 5)
+        raise RuntimeError("Native Windows sandbox setup timed out") from None
+    (output / "windows-setup-stdout.txt").write_bytes(stdout)
+    (output / "windows-setup-stderr.txt").write_bytes(stderr)
+    if process.returncode != 0:
+        raise RuntimeError(f"Native Windows sandbox setup failed with exit code {process.returncode}")
+
+
 def isolated_environment(home: Path, binary: Path, port: int,
                          bridge_environment: dict[str, str], *, windows: bool | None = None) -> dict[str, str]:
     windows = os.name == "nt" if windows is None else windows
@@ -86,6 +134,8 @@ def isolated_environment(home: Path, binary: Path, port: int,
                     "PATHEXT": ".COM;.EXE;.BAT;.CMD",
                     "PATH": ";".join(map(str, (binary.parent, system / "System32", Path(windows_shell()).parent)))})
         env.pop("SHELL")
+        if os.environ.get("USERNAME", "").strip():
+            env["USERNAME"] = os.environ["USERNAME"]
     allowed = {"BELLO_SELECTOR_SOCKET", "BELLO_SELECTOR_TCP", "BELLO_SELECTOR_TOKEN"}
     if set(bridge_environment) - allowed:
         raise ValueError("Unexpected native bridge environment")
@@ -95,7 +145,7 @@ def isolated_environment(home: Path, binary: Path, port: int,
     return env
 
 
-def invocation(case: Case, *, windows: bool | None = None) -> tuple[dict[str, Any], str]:
+def invocation(case: Case, *, windows: bool | None = None, command_prefix: str = "") -> tuple[dict[str, Any], str]:
     windows = os.name == "nt" if windows is None else windows
     command = {"task": "cat fixture-requirements.data; exit 7", "help": "bash fixture-help.sh --help; exit 7"}.get(
         case.protected, "cat diagnostic.log; exit 7")
@@ -110,6 +160,7 @@ def invocation(case: Case, *, windows: bool | None = None) -> tuple[dict[str, An
         }.get(case.protected, "[Console]::Out.Write((Get-Content -Raw -LiteralPath 'diagnostic.log')); exit 7")
         if case.mode == "poll":
             command = "Start-Sleep -Seconds 2; " + command
+    command = command_prefix + command
     args: dict[str, Any] = {"cmd": command, "yield_time_ms": 250 if case.mode == "poll" else 1000,
                            "max_output_tokens": 10000, "login": False}
     if windows:
@@ -344,6 +395,10 @@ async def run_case(binary: Path, case: Case, output: Path) -> dict[str, Any]:
     for name in ("diagnostic.log", "fixture-requirements.data"):
         (work / name).write_text(RAW, encoding="utf-8", newline="\n")
     (work / "fixture-help.sh").write_text("#!/bin/bash\ncat diagnostic.log\n")
+    outside = output / "outside-workspace"
+    if os.name == "nt":
+        outside.mkdir()
+        (outside / "secret.txt").write_text("synthetic denied read", encoding="ascii")
     selections = []
 
     class SelectorDouble:
@@ -357,7 +412,7 @@ async def run_case(binary: Path, case: Case, output: Path) -> dict[str, Any]:
     # the generic TASK.md/README name exclusion.
     bridge = CodexDistillerBridge(SelectorDouble(), output / "bridge", work, work / "fixture-requirements.data")
     await bridge.start()
-    tool, command = invocation(case)
+    tool, command = invocation(case, command_prefix=windows_filesystem_probe(outside) if os.name == "nt" else "")
     provider = Provider(tool)
     server = ThreadingHTTPServer(("127.0.0.1", 0), provider.handler())
     server.daemon_threads = True
@@ -374,12 +429,20 @@ async def run_case(binary: Path, case: Case, output: Path) -> dict[str, Any]:
     session = NativeSession(binary, home, isolated_environment(home, binary, port, bridge.environment))
     failure = None
     try:
+        if os.name == "nt":
+            await provision_windows_sandbox(binary, home, session.env, output)
         await session.start()
-        reply = await session.request("thread/start", {"model": "gpt-5.5" if case.mode == "direct" else "gpt-6-astra",
+        params = {"model": "gpt-5.5" if case.mode == "direct" else "gpt-6-astra",
             "modelProvider": "bello_fixture", "cwd": str(work), "approvalPolicy": "never", "sandbox": "read-only",
             "ephemeral": True, "developerInstructions": "Add a short focus to each command or poll call.",
             "config": {"features.bello_native_selection": case.enabled, "features.code_mode": case.mode != "direct",
-                       "features.code_mode_only": case.mode != "direct", "features.shell_zsh_fork": False}})
+                       "features.code_mode_only": case.mode != "direct", "features.shell_zsh_fork": False}}
+        if os.name == "nt":
+            permissions = windows_permission_params(work, home, binary)
+            params["config"].update(permissions.pop("config"))
+            params.update(permissions)
+            params.pop("sandbox")
+        reply = await session.request("thread/start", params)
         thread_id = reply["thread"]["id"]
         await session.request("turn/start", {"threadId": thread_id,
             "input": [{"type": "text", "text": "Run the synthetic local fixture.", "text_elements": []}]})
@@ -399,16 +462,23 @@ async def run_case(binary: Path, case: Case, output: Path) -> dict[str, Any]:
     selected = case.enabled and case.focus and not case.protected
     expected = SELECTED if selected else RAW
     exact = len(packets) == 1 and packets[0].get("output") == expected and packets[0].get("exit_code") == 7
+    windows_isolated = None
+    if os.name == "nt":
+        inside = work / "inside-write.txt"
+        windows_isolated = (exact and inside.is_file() and inside.read_text() == "allowed"
+                            and (outside / "secret.txt").read_text() == "synthetic denied read"
+                            and not (outside / "forbidden.txt").exists())
     focus_ok = (len(selections) == 1 and selections[0]["focus"] == (POLL_FOCUS if case.mode == "poll" else FOCUS)
                 and selections[0]["command"] == command) if selected else not selections
     # Native startup may attempt update/catalog discovery. The loopback proxy
     # rejects and records these; a blocked attempt is not an external request
     # succeeding, and is not evidence of output selection failing.
-    result = {"case": case.name, "passed": not failure and exact and focus_ok and not provider.errors,
+    result = {"case": case.name, "passed": not failure and exact and focus_ok and not provider.errors and windows_isolated is not False,
         "error": failure, "exact_model_visible_output": exact, "focus_and_command_correct": focus_ok,
         "provider_requests": len(provider.requests), "selector_calls": len(selections),
         "bridge_outcomes": dict(bridge.metrics), "rejected_network_requests": provider.rejected,
         "provider_errors": provider.errors, "external_proxy_requests_forwarded": 0,
+        "windows_filesystem_sandbox_enforced": windows_isolated,
         "expected_output_bytes": len(expected.encode()),
         "actual_output_bytes": [len(str(p.get("output", "")).encode()) for p in packets]}
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")

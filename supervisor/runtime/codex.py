@@ -34,6 +34,7 @@ _TURN_FIELDS = frozenset({"input", "cwd", "approvalPolicy", "approvalsReviewer",
 _APPROVALS = frozenset({"item/commandExecution/requestApproval", "item/fileChange/requestApproval",
     "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval"})
 _IDENTITY_FIELDS = {"threadId", "parentThreadId", "senderThreadId", "receiverThreadId"}
+_IS_WINDOWS = os.name == "nt"
 
 
 def _delegation_tools(params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -395,6 +396,22 @@ class CodexBackend:
             if isinstance(config.get("sandbox_workspace_write"), dict):
                 config["sandbox_workspace_write"].pop("network_access", None)
             config.update(permissions.pop("config"))
+            if _IS_WINDOWS:
+                # A permission profile does not enable the native Windows OS
+                # sandbox. Its default is Disabled, while unelevated cannot
+                # enforce this profile's limited read roots. Require elevated
+                # enforcement per thread, never broaden the profile or fall
+                # back to unrestricted execution if native setup fails.
+                windows = config.setdefault("windows", {})
+                if not isinstance(windows, dict):
+                    raise AppServerError("native Codex Windows settings must be an object; restricted runs require the elevated Windows sandbox")
+                for key in list(config):
+                    if key == "windows.sandbox" or key.startswith("windows.sandbox."):
+                        config.pop(key)
+                for key in list(windows):
+                    if key.startswith("sandbox."):
+                        windows.pop(key)
+                windows["sandbox"] = "elevated"
         native.update(permissions)
         return native
 

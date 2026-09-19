@@ -172,6 +172,144 @@ async def test_native_prompt_tools_and_subscription_are_preserved(tmp_path):
         await backend.stop()
 
 
+@pytest.mark.parametrize("mode", ["read-only", "workspace-write"])
+@pytest.mark.parametrize("network", [False, True])
+async def test_windows_restricted_threads_require_elevated_sandbox_on_start_and_resume(tmp_path, monkeypatch, mode, network):
+    monkeypatch.setattr("supervisor.runtime.codex._IS_WINDOWS", True)
+    backend, _, clients = make_backend(tmp_path)
+    requested = {
+        "windows": {"sandbox": "unelevated", "sandbox.mode": "disabled", "sandbox_private_desktop": False},
+        "windows.sandbox": "unelevated",
+        "windows.sandbox.enabled": False,
+        "windows.sandbox_private_desktop": True,
+        "features": {"experimental_windows_sandbox": False},
+    }
+    original = deepcopy(requested)
+    try:
+        await backend.request("thread/start", thread_params(tmp_path, sandbox=mode, networkAccess=network, config=requested))
+        await backend.request("thread/resume", {"threadId": "host-thread", "config": requested})
+        for method, native in clients[0].calls:
+            if method not in {"thread/start", "thread/resume"}:
+                continue
+            config = native["config"]
+            assert config["windows"] == {"sandbox": "elevated", "sandbox_private_desktop": False}
+            assert config["windows.sandbox_private_desktop"] is True
+            assert not any(key == "windows.sandbox" or key.startswith("windows.sandbox.") for key in config)
+            assert config["features"]["experimental_windows_sandbox"] is False
+            profile = config["permissions"]["bello-native"]
+            assert profile["network"] == {"enabled": network}
+            expected_fs = {":minimal": "read", ":workspace_roots": "read"}
+            if mode == "workspace-write":
+                expected_fs.update({str(tmp_path): "write", str(backend._tool_tmp): "write",
+                    **{str(tmp_path / name): "read" for name in (".git", ".agents", ".codex")}})
+            for path in (*backend._runtime_read_paths, *backend._toolchain_read_paths[str(tmp_path)]):
+                expected_fs[str(path)] = "read"
+            assert profile["filesystem"] == expected_fs
+            assert native["permissions"] == "bello-native" and "sandbox" not in native
+        assert requested == original
+        # The shared app-server must not change full-access threads or user config.
+        assert not any("windows.sandbox" in arg for arg in clients[0].options["command"])
+    finally:
+        await backend.stop()
+
+
+async def test_windows_fresh_config_enables_elevated_sandbox_without_user_setup_setting(tmp_path, monkeypatch):
+    monkeypatch.setattr("supervisor.runtime.codex._IS_WINDOWS", True)
+    backend, _, clients = make_backend(tmp_path)
+    try:
+        params = thread_params(tmp_path, config={})
+        params.pop("sandbox")  # The normal default is also a restricted scope.
+        await backend.request("thread/start", params)
+        native = next(params for method, params in clients[0].calls if method == "thread/start")
+        assert native["config"]["windows"] == {"sandbox": "elevated"}
+        assert native["permissions"] == "bello-native"
+        assert ":root" not in native["config"]["permissions"]["bello-native"]["filesystem"]
+        assert params["config"] == {}
+    finally:
+        await backend.stop()
+
+
+@pytest.mark.parametrize("windows,mode", [
+    (False, "read-only"), (False, "workspace-write"), (False, "danger-full-access"),
+    (True, "danger-full-access"),
+])
+async def test_windows_sandbox_override_does_not_change_other_modes(tmp_path, monkeypatch, windows, mode):
+    monkeypatch.setattr("supervisor.runtime.codex._IS_WINDOWS", windows)
+    backend, _, clients = make_backend(tmp_path)
+    requested = {"windows": {"sandbox": "unelevated", "sandbox_private_desktop": False},
+                 "windows.sandbox": "unelevated"}
+    try:
+        await backend.request("thread/start", thread_params(tmp_path, sandbox=mode, config=requested))
+        await backend.request("thread/resume", {"threadId": "host-thread"})
+        for method, native in clients[0].calls:
+            if method in {"thread/start", "thread/resume"}:
+                assert native["config"]["windows"] == requested["windows"]
+                assert native["config"]["windows.sandbox"] == "unelevated"
+                if mode == "danger-full-access":
+                    assert native["sandbox"] == mode and "permissions" not in native
+    finally:
+        await backend.stop()
+
+
+@pytest.mark.parametrize("settings", [None, False, "unelevated", []])
+async def test_windows_restricted_sandbox_rejects_malformed_settings_before_dispatch(tmp_path, monkeypatch, settings):
+    monkeypatch.setattr("supervisor.runtime.codex._IS_WINDOWS", True)
+    backend, _, clients = make_backend(tmp_path)
+    try:
+        with pytest.raises(AppServerError, match="restricted runs require the elevated Windows sandbox"):
+            await backend.request("thread/start", thread_params(tmp_path, config={"windows": settings}))
+        assert not any(method in {"thread/start", "turn/start"} for method, _ in clients[0].calls)
+    finally:
+        await backend.stop()
+
+
+@pytest.mark.parametrize("method", ["thread/start", "thread/resume"])
+async def test_windows_sandbox_setup_rpc_error_is_not_retried_unsandboxed(tmp_path, monkeypatch, method):
+    monkeypatch.setattr("supervisor.runtime.codex._IS_WINDOWS", True)
+    backend, _, clients = make_backend(tmp_path)
+    try:
+        await backend.request("initialize")
+        if method == "thread/resume":
+            await backend.request("thread/start", thread_params(tmp_path))
+        original_request = clients[0].request
+        setup_error = AppServerError("Windows sandbox setup is missing or out of date; rerun the sandbox setup with elevation")
+        async def fail_setup(request_method, params=None, timeout=30):
+            if request_method == method:
+                clients[0].calls.append((request_method, deepcopy(params)))
+                raise setup_error
+            return await original_request(request_method, params, timeout)
+        clients[0].request = fail_setup
+        with pytest.raises(AppServerError, match="rerun the sandbox setup with elevation") as caught:
+            await backend.request(method, thread_params(tmp_path) if method == "thread/start" else {"threadId": "host-thread"})
+        assert caught.value is setup_error
+        dispatched = [params for name, params in clients[0].calls if name == method]
+        assert len(dispatched) == 1
+        assert dispatched[0]["config"]["windows"]["sandbox"] == "elevated"
+        assert not any(name == "turn/start" for name, _ in clients[0].calls)
+    finally:
+        await backend.stop()
+
+
+async def test_windows_sandbox_bootstrap_failure_notification_reaches_host_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setattr("supervisor.runtime.codex._IS_WINDOWS", True)
+    backend, events, clients = make_backend(tmp_path)
+    try:
+        await backend.request("thread/start", thread_params(tmp_path))
+        await backend.request("turn/start", {"threadId": "host-thread", "turnId": "host-turn", "input": "Check workspace"})
+        setup_error = {"message": "Windows sandbox setup is missing or out of date; rerun the sandbox setup with elevation"}
+        await clients[0].notify_event("turn/completed", {"threadId": "native-thread-1",
+            "turn": {"id": "native-turn-1", "status": "failed", "error": setup_error}})
+        await drain(backend)
+        failure = next(event for event in events if event.get("method") == "turn/completed")
+        assert failure["params"]["threadId"] == "host-thread"
+        assert failure["params"]["turn"] == {"id": "host-turn", "status": "failed", "error": setup_error}
+        assert "activeTurnId" not in backend._threads["host-thread"]
+        assert sum(method == "turn/start" for method, _ in clients[0].calls) == 1
+        assert sum(method == "thread/start" for method, _ in clients[0].calls) == 1
+    finally:
+        await backend.stop()
+
+
 async def test_review_scratch_is_thread_scoped_preserved_on_resume_and_used_by_native_child(tmp_path):
     workspace = tmp_path / "review-copy"
     scratch = workspace / "review-scratch"
