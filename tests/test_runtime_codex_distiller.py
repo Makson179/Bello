@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import shlex
+import secrets
 from types import SimpleNamespace
 
 import pytest
@@ -104,23 +106,116 @@ async def test_private_socket_output_only_protocol_and_cleanup(tmp_path):
     assert not selector.closed  # RuntimeClient owns the shared run worker.
 
 
-async def test_windows_transport_rejected_before_resources_or_inference(tmp_path, monkeypatch):
+async def test_windows_transport_is_authenticated_loopback_and_cleans_up(tmp_path, monkeypatch):
     selector = Selector()
     state = tmp_path / "state"
-    bridge = module.CodexDistillerBridge(selector, state)
     # Replace only this module's reference; changing global os.name breaks Path.
     monkeypatch.setattr(module, "os", SimpleNamespace(name="nt"))
-    with pytest.raises(RuntimeError, match="requires Unix sockets"):
-        await bridge.start()
-    assert not state.exists()
-    assert bridge._directory is None
-    assert bridge._socket_path is None
-    assert bridge._server is None
-    assert not selector.calls
+    bridge = module.CodexDistillerBridge(selector, state)
+    await bridge.start()
+    env = bridge.environment
+    host, port = env["BELLO_SELECTOR_TCP"].split(":")
+    assert host == "127.0.0.1" and 0 < int(port) < 65536
+    assert "BELLO_SELECTOR_SOCKET" not in env
+    try:
+        assert await tcp_exchange(bridge) == {"text": "selected\n"}
+        assert len(selector.calls) == 1
+        telemetry = (state / "native-distiller.jsonl").read_text()
+        assert env["BELLO_SELECTOR_TOKEN"] not in telemetry
+        assert "original test log" not in telemetry
+        assert bridge._directory is None and bridge._socket_path is None
+    finally:
+        await bridge.close()
+    assert bridge._token is None and bridge._server is None
     with pytest.raises(RuntimeError, match="not started"):
         _ = bridge.environment
-    await bridge.close()
     assert not selector.closed
+
+
+def client_proof(token, role, client_nonce, server_nonce):
+    # Independent protocol construction also pins the cross-language wire bytes.
+    data = b"bello-selector-" + role.encode() + b"-v1\0" + client_nonce.encode() + server_nonce.encode()
+    return hmac.new(bytes.fromhex(token), data, hashlib.sha256).hexdigest()
+
+
+@pytest.mark.parametrize("role,expected", [
+    ("server", "c81e01ef7f2511bbf4cfa67aef685dd774dbeb78964db4eaf2b9d09d046770ae"),
+    ("client", "a04597c07a1a70fe870b484a052d4c094d8654562933d58b6f17ff004e061002"),
+])
+def test_authentication_wire_vectors_match_native_patch(role, expected):
+    assert module._authentication_proof(bytes(32), role, "11" * 32, "22" * 32) == expected
+
+
+async def tcp_exchange(bridge, *, token=None, replay=None, capture=None):
+    env = bridge.environment
+    host, port = env["BELLO_SELECTOR_TCP"].split(":")
+    token = token or env["BELLO_SELECTOR_TOKEN"]
+    reader, writer = await asyncio.open_connection(host, int(port))
+    nonce = "1" * 64 if replay is not None else secrets.token_hex(32)
+    try:
+        writer.write(json.dumps({"version": 1, "nonce": nonce}).encode() + b"\n")
+        await writer.drain()
+        challenge = json.loads(await reader.readline())
+        server_proof = client_proof(env["BELLO_SELECTOR_TOKEN"], "server", nonce, challenge["nonce"])
+        assert hmac.compare_digest(challenge["proof"], server_proof)
+        auth = replay or client_proof(token, "client", nonce, challenge["nonce"])
+        if capture is not None:
+            capture.append(auth)
+        writer.write(json.dumps({"auth": auth, "command": "pytest -q", "focus": "Check failure",
+                                 "log": "long original test log\n"}).encode() + b"\n")
+        await writer.drain()
+        line = await reader.readline()
+        return json.loads(line) if line else None
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def test_tcp_wrong_credentials_and_replayed_proof_never_run_selector(tmp_path):
+    selector = Selector()
+    bridge = module.CodexDistillerBridge(selector, tmp_path, transport="tcp")
+    await bridge.start()
+    try:
+        capture = []
+        assert await tcp_exchange(bridge, token="0" * 64, capture=capture) is None
+        assert await tcp_exchange(bridge, replay=capture[0]) is None
+        assert not selector.calls
+        assert bridge.metrics["authentication_error"] == 2
+    finally:
+        await bridge.close()
+
+
+async def test_tcp_successful_proof_cannot_be_reused_on_new_connection(tmp_path):
+    selector = Selector()
+    bridge = module.CodexDistillerBridge(selector, tmp_path, transport="tcp")
+    await bridge.start()
+    try:
+        capture = []
+        assert await tcp_exchange(bridge, replay="", capture=capture) == {"text": "selected\n"}
+        assert await tcp_exchange(bridge, replay=capture[0]) is None
+        assert len(selector.calls) == 1
+    finally:
+        await bridge.close()
+
+
+@pytest.mark.parametrize("greeting", [{}, {"version": 1, "nonce": "short"},
+    {"version": True, "nonce": "a" * 64}, {"version": 1, "nonce": "A" * 64},
+    {"version": 1, "nonce": "a" * 64, "padding": "x" * 1024}])
+async def test_tcp_invalid_greetings_do_not_return_output(tmp_path, greeting):
+    selector = Selector()
+    bridge = module.CodexDistillerBridge(selector, tmp_path, transport="tcp")
+    await bridge.start()
+    try:
+        host, port = bridge.environment["BELLO_SELECTOR_TCP"].split(":")
+        reader, writer = await asyncio.open_connection(host, int(port))
+        writer.write(json.dumps(greeting).encode() + b"\n")
+        await writer.drain()
+        assert await asyncio.wait_for(reader.read(), 2) == b""
+        writer.close()
+        await writer.wait_closed()
+        assert not selector.calls
+    finally:
+        await bridge.close()
 
 
 @pytest.mark.parametrize("command", [
@@ -208,7 +303,7 @@ async def test_manifest_hash_deadline_and_real_feature_probe(monkeypatch, tmp_pa
     digest = hashlib.sha256(binary.read_bytes()).hexdigest()
     manifest = tmp_path / "capability.json"
     capability = {"binary_sha256": digest, "protocol": 1, "feature": "bello_native_selection",
-                  "transport_timeout_seconds": 315}
+                  "transport_timeout_seconds": 315, "transports": ["tcp-hmac-v1"]}
     manifest.write_text(json.dumps(capability))
     invocations = []
 
@@ -274,7 +369,8 @@ async def test_manifest_does_not_replace_actual_feature_probe(monkeypatch, tmp_p
     binary = native_binary
     manifest = tmp_path / "capability.json"
     manifest.write_text(json.dumps({"binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
-        "feature": "bello_native_selection", "protocol": 1, "transport_timeout_seconds": 315}))
+        "feature": "bello_native_selection", "protocol": 1, "transport_timeout_seconds": 315,
+        "transports": ["tcp-hmac-v1"]}))
     class Probe:
         returncode = 0
         async def communicate(self):
@@ -284,3 +380,19 @@ async def test_manifest_does_not_replace_actual_feature_probe(monkeypatch, tmp_p
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
     with pytest.raises(RuntimeError, match="does not advertise"):
         await module.validate_native_selection([str(binary)], manifest)
+
+
+@pytest.mark.parametrize("transports", [None, [], ["unix"], "tcp-hmac-v1"])
+async def test_windows_rejects_old_build_before_launch(tmp_path, monkeypatch, native_binary, transports):
+    manifest = tmp_path / "capability.json"
+    manifest.write_text(json.dumps({"binary_sha256": hashlib.sha256(native_binary.read_bytes()).hexdigest(),
+        "feature": "bello_native_selection", "protocol": 1, "transport_timeout_seconds": 315,
+        "transports": transports}))
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="nt"))
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("Old Windows build must be rejected before any launch")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden)
+    with pytest.raises(RuntimeError, match="tcp-hmac-v1"):
+        await module.validate_native_selection([str(native_binary)], manifest)

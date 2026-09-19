@@ -13,11 +13,13 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import platform
+import re
 import stat
 import tarfile
 import tempfile
 from urllib.request import Request, urlopen
 
+from supervisor.filesystem_safety import is_link_or_reparse
 from supervisor.state import FileLock
 
 
@@ -40,11 +42,148 @@ BUNDLES: dict[tuple[str, str], NativeBundle] = {
 }
 _MAX_DOWNLOAD = 1024 * 1024 * 1024
 _MAX_UNPACKED = 2 * _MAX_DOWNLOAD
+_IS_WINDOWS = os.name == "nt"
 _FILES = frozenset({
     "bin/codex", "bin/codex-code-mode-host", "selection-manifest.json",
     "LICENSE", "NOTICE", "native-codex-selection.patch",
     "THIRD-PARTY-NOTICES", "BUILD-INFO",
 })
+_WINDOWS_FILES = (_FILES - {"bin/codex", "bin/codex-code-mode-host"}) | frozenset({
+    "bin/codex.exe", "bin/codex-code-mode-host.exe", "bin/codex-command-runner.exe",
+    "bin/codex-windows-sandbox-setup.exe",
+})
+
+
+def _bundle_files(system: str) -> frozenset[str]:
+    return _WINDOWS_FILES if system == "Windows" else _FILES
+
+
+def _validate_windows_security_descriptor(descriptor: str, user_sid: str) -> None:
+    """Fail closed on any grant outside the user, SYSTEM and administrators.
+
+    These are private executable caches, not shared installation directories.
+    Parsing the OS-produced SDDL permits only simple allow ACEs; unfamiliar ACLs
+    are rejected rather than interpreted optimistically. Existing ACLs are never
+    repaired. Administrators/SYSTEM remain trusted as on a normal user profile.
+    """
+    owner, separator, dacl = descriptor.partition("D:")
+    trusted = {user_sid, "SY", "BA", "S-1-5-18", "S-1-5-32-544"}
+    if not separator or owner.removeprefix("O:") not in trusted or not owner.startswith("O:"):
+        raise ValueError("Native Codex cache must have a trusted Windows owner and private DACL")
+    flags, _, entries = dacl.partition("(")
+    if not re.fullmatch(r"(?:P|AI|AR)*", flags) or not entries:
+        raise ValueError("Native Codex cache must have a private Windows DACL")
+    aces = re.findall(r"\([^()]*\)", "(" + entries)
+    if "".join(aces) != "(" + entries:
+        raise ValueError("Native Codex cache has an unsupported Windows DACL")
+    for ace in aces:
+        fields = ace[1:-1].split(";")
+        if (len(fields) != 6 or fields[0] != "A" or fields[3] or fields[4]
+                or fields[5] not in trusted or not fields[2]
+                or not re.fullmatch(r"(?:OI|CI|NP|IO|ID)*", fields[1])):
+            raise ValueError("Native Codex cache must not grant access to other Windows accounts")
+
+
+def _windows_private_acl(path: Path, *, create: bool = False) -> None:
+    """Atomically create a private directory, or validate an existing entry.
+
+    chmod(0700) does not establish a Windows DACL on supported Python 3.11.
+    Use OS APIs, without shell commands, account-name localization or pywin32.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    pointer = ctypes.c_void_p
+    functions = (
+        (kernel, "GetCurrentProcess", [], wintypes.HANDLE),
+        (kernel, "CloseHandle", [wintypes.HANDLE], wintypes.BOOL),
+        (kernel, "LocalFree", [pointer], pointer),
+        (kernel, "CreateDirectoryW", [wintypes.LPCWSTR, pointer], wintypes.BOOL),
+        (advapi, "OpenProcessToken", [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)], wintypes.BOOL),
+        (advapi, "GetTokenInformation", [wintypes.HANDLE, ctypes.c_int, pointer, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        (advapi, "ConvertSidToStringSidW", [pointer, ctypes.POINTER(pointer)], wintypes.BOOL),
+        (advapi, "ConvertStringSecurityDescriptorToSecurityDescriptorW", [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(pointer), pointer], wintypes.BOOL),
+        (advapi, "GetNamedSecurityInfoW", [wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD, pointer, pointer, pointer, pointer, ctypes.POINTER(pointer)], wintypes.DWORD),
+        (advapi, "ConvertSecurityDescriptorToStringSecurityDescriptorW", [pointer, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(pointer), pointer], wintypes.BOOL),
+    )
+    for library, name, arguments, result in functions:
+        function = getattr(library, name)
+        function.argtypes, function.restype = arguments, result
+
+    class SecurityAttributes(ctypes.Structure):
+        _fields_ = [("length", wintypes.DWORD), ("descriptor", pointer), ("inherit", wintypes.BOOL)]
+
+    token = wintypes.HANDLE()
+    allocated = []
+    try:
+        if not advapi.OpenProcessToken(kernel.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        length = wintypes.DWORD()
+        advapi.GetTokenInformation(token, 1, None, 0, ctypes.byref(length))
+        if not length.value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        user = ctypes.create_string_buffer(length.value)
+        if not advapi.GetTokenInformation(token, 1, user, length, ctypes.byref(length)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        sid_string = pointer()
+        if not advapi.ConvertSidToStringSidW(pointer.from_buffer(user), ctypes.byref(sid_string)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        allocated.append(sid_string)
+        user_sid = ctypes.wstring_at(sid_string)
+        if create:
+            descriptor = pointer()
+            sddl = f"O:{user_sid}D:P(A;OICI;FA;;;{user_sid})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+            if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(descriptor), None):
+                raise ctypes.WinError(ctypes.get_last_error())
+            allocated.append(descriptor)
+            security = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
+            if not kernel.CreateDirectoryW(str(path), ctypes.byref(security)):
+                error = ctypes.get_last_error()
+                if error != 183:  # ERROR_ALREADY_EXISTS: inspect, never chmod/repair.
+                    raise ctypes.WinError(error)
+        metadata = path.lstat()
+        if is_link_or_reparse(path, stat_result=metadata):
+            raise ValueError("Native Codex cache must not use Windows reparse points")
+        descriptor = pointer()
+        error = advapi.GetNamedSecurityInfoW(str(path), 1, 0x00000005, None, None, None, None,
+                                           ctypes.byref(descriptor))
+        if error:
+            raise ctypes.WinError(error)
+        allocated.append(descriptor)
+        sddl = pointer()
+        if not advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, 1, 0x00000005,
+                                                                          ctypes.byref(sddl), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        allocated.append(sddl)
+        _validate_windows_security_descriptor(ctypes.wstring_at(sddl), user_sid)
+    finally:
+        for allocation in reversed(allocated):
+            kernel.LocalFree(allocation)
+        if token:
+            kernel.CloseHandle(token)
+
+
+def _reject_windows_reparse_ancestors(path: Path) -> None:
+    if _IS_WINDOWS:
+        for ancestor in (path, *path.parents):
+            if is_link_or_reparse(ancestor):
+                raise ValueError("Native Codex cache must not traverse Windows reparse points")
+
+
+def _private_directory(path: Path, *, parents: bool = False) -> None:
+    _reject_windows_reparse_ancestors(path)
+    if _IS_WINDOWS:
+        if parents:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        _reject_windows_reparse_ancestors(path)
+        # A public parent could replace a private child using DELETE_CHILD.
+        _windows_private_acl(path.parent)
+        _windows_private_acl(path, create=True)
+    else:
+        path.mkdir(parents=parents, exist_ok=True, mode=0o700)
+    _owned(path, directory=True, private=True)
 
 
 def _sha256(path: Path) -> str:
@@ -53,22 +192,31 @@ def _sha256(path: Path) -> str:
 
 
 def _regular(path: Path) -> bool:
-    return path.is_file() and not path.is_symlink()
+    return path.is_file() and not is_link_or_reparse(path)
 
 
 def _owned(path: Path, *, directory: bool = False, private: bool = False) -> None:
     metadata = path.lstat()
     valid_type = stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(metadata.st_mode)
-    if path.is_symlink() or not valid_type:
+    if is_link_or_reparse(path, stat_result=metadata) or not valid_type:
         raise ValueError(f"Native Codex cache path must be a real {'directory' if directory else 'file'}: {path}")
-    if os.name != "nt" and (metadata.st_uid != os.getuid()
-                            or stat.S_IMODE(metadata.st_mode) & (0o077 if private else 0o022)):
+    if _IS_WINDOWS:
+        _windows_private_acl(path)
+    elif (metadata.st_uid != os.getuid()
+          or stat.S_IMODE(metadata.st_mode) & (0o077 if private else 0o022)):
         raise ValueError(f"Native Codex cache path must be owned by this user and not writable by others: {path}")
 
 
-def _verify(directory: Path, bundle: NativeBundle) -> None:
+def _verify(directory: Path, bundle: NativeBundle, *, system: str = "Darwin") -> None:
+    expected_files = _bundle_files(system)
+    executable = "bin/codex.exe" if system == "Windows" else "bin/codex"
     _owned(directory, directory=True, private=True)
     _owned(directory / "bin", directory=True, private=True)
+    if ({path.name for path in directory.iterdir()}
+            != {name.split("/")[0] for name in expected_files}
+            or {path.name for path in (directory / "bin").iterdir()}
+            != {name.removeprefix("bin/") for name in expected_files if name.startswith("bin/")}):
+        raise ValueError("Native Codex cache contains unexpected bundled files")
     manifest_path = directory / "selection-manifest.json"
     if not _regular(manifest_path) or manifest_path.stat().st_size > 64 * 1024:
         raise ValueError("Native Codex capability manifest is missing or invalid")
@@ -77,19 +225,24 @@ def _verify(directory: Path, bundle: NativeBundle) -> None:
         raise ValueError("Native Codex capability manifest checksum mismatch")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     files = manifest.get("files") if isinstance(manifest, dict) else None
-    if not isinstance(files, dict) or set(files) != _FILES - {"selection-manifest.json"}:
+    if not isinstance(files, dict) or set(files) != expected_files - {"selection-manifest.json"}:
         raise ValueError("Native Codex bundle file manifest is incomplete")
     for name, digest in files.items():
         path = directory / name
         if not _regular(path) or _sha256(path) != digest:
             raise ValueError(f"Native Codex bundled file checksum mismatch: {name}")
         _owned(path)
-    if (manifest.get("binary_sha256") != files["bin/codex"]
+    if (manifest.get("binary_sha256") != files[executable]
             or type(manifest.get("protocol")) is not int or manifest["protocol"] != 1
             or manifest.get("feature") != "bello_native_selection"
             or manifest.get("transport_timeout_seconds") != 315):
         raise ValueError("Native Codex bundle does not implement the required selection protocol")
-    for name in ("bin/codex", "bin/codex-code-mode-host"):
+    if system == "Windows" and (not isinstance(manifest.get("transports"), list)
+                                or "tcp-hmac-v1" not in manifest["transports"]):
+        raise ValueError("Native Codex Windows bundle requires the tcp-hmac-v1 selection transport")
+    for name in expected_files:
+        if not name.startswith("bin/"):
+            continue
         if not os.access(directory / name, os.X_OK):
             raise ValueError(f"Native Codex bundled executable is not executable: {name}")
 
@@ -113,16 +266,18 @@ def _download(bundle: NativeBundle, destination: Path) -> None:
         raise ValueError("Native Codex archive checksum mismatch")
 
 
-def _unpack(archive: Path, destination: Path) -> None:
+def _unpack(archive: Path, destination: Path, *, system: str = "Darwin") -> None:
     """Extract only the small, fixed regular-file layout; never tar links/modes."""
     seen = set()
     size = 0
+    expected_files = _bundle_files(system)
+    _owned(destination, directory=True)
     with tarfile.open(archive, "r:gz") as source:
         for member in source:
             name = member.name.removeprefix("./")
             if member.isdir() and name.rstrip("/") in {".", "bin"}:
                 continue
-            if (name not in _FILES or name in seen or not member.isfile()
+            if (name not in expected_files or name in seen or not member.isfile()
                     or PurePosixPath(name).is_absolute() or member.size < 0):
                 raise ValueError(f"Unexpected entry in native Codex archive: {member.name}")
             seen.add(name)
@@ -131,6 +286,7 @@ def _unpack(archive: Path, destination: Path) -> None:
                 raise ValueError("Native Codex archive expands beyond its size limit")
             target = destination / name
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            _owned(target.parent, directory=True)
             stream = source.extractfile(member)
             if stream is None:
                 raise ValueError(f"Unreadable native Codex archive entry: {name}")
@@ -138,7 +294,7 @@ def _unpack(archive: Path, destination: Path) -> None:
                 while chunk := stream.read(1024 * 1024):
                     output.write(chunk)
             target.chmod(0o700 if name.startswith("bin/") else 0o600)
-    if seen != _FILES:
+    if seen != expected_files:
         raise ValueError("Native Codex archive is incomplete")
 
 
@@ -160,32 +316,36 @@ def ensure_native_selection() -> tuple[list[str], Path | None]:
             "see docs/native-codex-selection.md. Other engines and distiller-off runs do not need it."
         )
     base = Path(os.environ.get("BELLO_RUNTIME_DIR", str(Path.home() / ".bello" / "runtime"))).expanduser().absolute()
-    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _reject_windows_reparse_ancestors(base)
+    if _IS_WINDOWS:
+        _private_directory(base, parents=True)
+    else:
+        base.mkdir(parents=True, exist_ok=True, mode=0o700)
     _owned(base, directory=True)
     root = base / "native-codex"
-    if root.is_symlink():
-        raise ValueError("Native Codex cache root must not be a symbolic link")
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    _owned(root, directory=True, private=True)
+    _private_directory(root)
     destination = root / bundle.archive_sha256
     lock_path = root / f".{bundle.archive_sha256}.lock"
-    if lock_path.is_symlink():
-        raise ValueError("Native Codex installation lock must not be a symbolic link")
+    if is_link_or_reparse(lock_path):
+        raise ValueError("Native Codex installation lock must not be a symbolic link or reparse point")
     if lock_path.exists():
         _owned(lock_path)
     with FileLock(lock_path):
-        if destination.exists() or destination.is_symlink():
+        _owned(lock_path)
+        if destination.exists() or is_link_or_reparse(destination):
             # Never repair/replace a changed or active executable underneath a run.
-            _verify(destination, bundle)
+            _verify(destination, bundle, system=key[0])
         else:
             with tempfile.TemporaryDirectory(prefix=".download-", dir=root) as temporary:
                 staging = Path(temporary)
+                _owned(staging, directory=True, private=True)
                 archive = staging / "bundle.tar.gz"
                 _download(bundle, archive)
                 unpacked = staging / "unpacked"
                 unpacked.mkdir(mode=0o700)
-                _unpack(archive, unpacked)
-                _verify(unpacked, bundle)
+                _unpack(archive, unpacked, system=key[0])
+                _verify(unpacked, bundle, system=key[0])
                 unpacked.rename(destination)
-    return ([str(destination / "bin" / "codex"), "app-server", "--listen", "stdio://"],
+    executable = "codex.exe" if key[0] == "Windows" else "codex"
+    return ([str(destination / "bin" / executable), "app-server", "--listen", "stdio://"],
             destination / "selection-manifest.json")

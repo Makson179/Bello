@@ -60,7 +60,14 @@ CASES = (
 )
 
 
-def isolated_environment(home: Path, binary: Path, port: int, socket: str) -> dict[str, str]:
+def windows_shell() -> str:
+    return str(Path(os.environ.get("SystemRoot", r"C:\Windows")) /
+               "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
+
+
+def isolated_environment(home: Path, binary: Path, port: int,
+                         bridge_environment: dict[str, str], *, windows: bool | None = None) -> dict[str, str]:
+    windows = os.name == "nt" if windows is None else windows
     proxy = f"http://127.0.0.1:{port}"
     env = {
         "HOME": str(home), "CODEX_HOME": str(home),
@@ -69,21 +76,42 @@ def isolated_environment(home: Path, binary: Path, port: int, socket: str) -> di
         "XDG_CONFIG_HOME": str(home / "config"), "XDG_DATA_HOME": str(home / "data"),
         "XDG_CACHE_HOME": str(home / "cache"), "SHELL": "/bin/bash", "RUST_LOG": "warn",
         "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
-        "BELLO_SELECTOR_SOCKET": socket,
         "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost",
     }
+    if windows:
+        system = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        env.update({"SystemRoot": str(system), "WINDIR": str(system),
+                    "USERPROFILE": str(home), "APPDATA": str(home / "config"),
+                    "LOCALAPPDATA": str(home / "data"), "COMSPEC": str(system / "System32" / "cmd.exe"),
+                    "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+                    "PATH": ";".join(map(str, (binary.parent, system / "System32", Path(windows_shell()).parent)))})
+        env.pop("SHELL")
+    allowed = {"BELLO_SELECTOR_SOCKET", "BELLO_SELECTOR_TCP", "BELLO_SELECTOR_TOKEN"}
+    if set(bridge_environment) - allowed:
+        raise ValueError("Unexpected native bridge environment")
+    env.update(bridge_environment)
     for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
         env[name] = proxy
     return env
 
 
-def invocation(case: Case) -> tuple[dict[str, Any], str]:
+def invocation(case: Case, *, windows: bool | None = None) -> tuple[dict[str, Any], str]:
+    windows = os.name == "nt" if windows is None else windows
     command = {"task": "cat fixture-requirements.data; exit 7", "help": "bash fixture-help.sh --help; exit 7"}.get(
         case.protected, "cat diagnostic.log; exit 7")
     if case.mode == "poll":
         command = "sleep 2; " + command
+    if windows:
+        command = {
+            "task": "[Console]::Out.Write((Get-Content -Raw -LiteralPath 'fixture-requirements.data')); exit 7",
+            "help": "& ./fixture-help.ps1 --help; exit 7",
+        }.get(case.protected, "[Console]::Out.Write((Get-Content -Raw -LiteralPath 'diagnostic.log')); exit 7")
+        if case.mode == "poll":
+            command = "Start-Sleep -Seconds 2; " + command
     args: dict[str, Any] = {"cmd": command, "yield_time_ms": 250 if case.mode == "poll" else 1000,
                            "max_output_tokens": 10000, "login": False}
+    if windows:
+        args["shell"] = windows_shell()
     if case.focus:
         args["focus"] = FOCUS
     if case.mode == "direct":
@@ -312,8 +340,10 @@ async def run_case(binary: Path, case: Case, output: Path) -> dict[str, Any]:
     home.mkdir(mode=0o700)
     (home / "tmp").mkdir()
     for name in ("diagnostic.log", "fixture-requirements.data"):
-        (work / name).write_text(RAW)
+        (work / name).write_text(RAW, encoding="utf-8", newline="\n")
     (work / "fixture-help.sh").write_text("#!/bin/bash\ncat diagnostic.log\n")
+    (work / "fixture-help.ps1").write_text(
+        "[Console]::Out.Write([IO.File]::ReadAllText('diagnostic.log'))\n", encoding="utf-8")
     selections = []
 
     class SelectorDouble:
@@ -341,8 +371,7 @@ async def run_case(binary: Path, case: Case, output: Path) -> dict[str, Any]:
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
         'wire_api = "responses"\nrequires_openai_auth = false\nsupports_websockets = false\n'
         'request_max_retries = 0\nstream_max_retries = 0\n')
-    session = NativeSession(binary, home, isolated_environment(home, binary, port,
-                                                              bridge.environment["BELLO_SELECTOR_SOCKET"]))
+    session = NativeSession(binary, home, isolated_environment(home, binary, port, bridge.environment))
     failure = None
     try:
         await session.start()

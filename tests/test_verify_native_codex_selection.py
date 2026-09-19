@@ -46,7 +46,8 @@ def test_environment_does_not_inherit_credentials_or_parent_settings(tmp_path, m
     monkeypatch.setenv("OPENAI_API_KEY", "synthetic-not-an-api-key")
     monkeypatch.setenv("CODEX_HOME", "/wrong")
     monkeypatch.setenv("CODEX_PERMISSION_PROFILE", "danger-full-access")
-    env = proof.isolated_environment(tmp_path, tmp_path / "bin" / "codex", 9123, "/tmp/synthetic.sock")
+    env = proof.isolated_environment(tmp_path, tmp_path / "bin" / "codex", 9123,
+                                    {"BELLO_SELECTOR_SOCKET": "/tmp/synthetic.sock"})
     assert env["HOME"] == env["CODEX_HOME"] == str(tmp_path)
     assert "OPENAI_API_KEY" not in env and "CODEX_PERMISSION_PROFILE" not in env
     assert env["HTTPS_PROXY"] == "http://127.0.0.1:9123"
@@ -69,17 +70,58 @@ def test_rejects_bad_provider_request():
 
 
 def test_wire_invocations_use_optional_focus_and_real_poll_command():
-    direct, cmd = proof.invocation(proof.Case("direct"))
+    direct, cmd = proof.invocation(proof.Case("direct"), windows=False)
     assert direct["name"] == "exec_command"
     assert json.loads(direct["arguments"])["focus"] == proof.FOCUS
     assert json.loads(direct["arguments"])["cmd"] == cmd
     missing, _ = proof.invocation(proof.Case("missing", focus=False))
     assert "focus" not in json.loads(missing["arguments"])
-    poll, command = proof.invocation(proof.Case("poll", mode="poll"))
+    poll, command = proof.invocation(proof.Case("poll", mode="poll"), windows=False)
     assert poll["type"] == "custom_tool_call" and poll["name"] == "exec"
     assert command.startswith("sleep 2;")
     assert "tools.write_stdin" in poll["input"] and proof.POLL_FOCUS in poll["input"]
     assert 'Missing live session' in poll["input"]
+
+
+def test_windows_environment_only_inherits_required_os_paths(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "never-copy")
+    monkeypatch.setenv("PATH", "untrusted-parent-directory")
+    bridge_env = {"BELLO_SELECTOR_TCP": "127.0.0.1:9999", "BELLO_SELECTOR_TOKEN": "a" * 64}
+    env = proof.isolated_environment(tmp_path, tmp_path / "bin/codex.exe", 9123, bridge_env, windows=True)
+    assert env["USERPROFILE"] == env["CODEX_HOME"] == str(tmp_path)
+    assert "SystemRoot" in env and "COMSPEC" in env and ";" in env["PATH"]
+    assert "SHELL" not in env and "ANTHROPIC_API_KEY" not in env
+    assert "untrusted-parent-directory" not in env["PATH"]
+    assert all(env[k] == v for k, v in bridge_env.items())
+
+
+@pytest.mark.parametrize("case", proof.CASES)
+def test_windows_invocations_preserve_exit_code_focus_and_polling(case):
+    tool, command = proof.invocation(case, windows=True)
+    assert command.endswith("exit 7")
+    assert "bash" not in command and "cat " not in command
+    if case.mode == "direct":
+        args = json.loads(tool["arguments"])
+        assert args["shell"].endswith("powershell.exe")
+        assert ("focus" in args) == case.focus
+    if case.mode == "poll":
+        assert command.startswith("Start-Sleep -Seconds 2;")
+        assert "tools.write_stdin" in tool["input"]
+    if case.protected == "help":
+        assert "--help" in command
+
+
+def test_bridge_environment_cannot_smuggle_credentials(tmp_path):
+    with pytest.raises(ValueError, match="Unexpected native bridge"):
+        proof.isolated_environment(tmp_path, tmp_path / "codex", 9123, {"OPENAI_API_KEY": "never-copy"})
+
+
+@pytest.mark.parametrize("protected", ["task", "help"])
+def test_windows_protected_commands_are_recognized_at_real_boundary(tmp_path, protected):
+    from supervisor.runtime.distiller_policy import preserve_tool_output
+    _, command = proof.invocation(proof.Case("protected", protected=protected), windows=True)
+    assert preserve_tool_output("exec_command", {"command": command}, workspace=tmp_path,
+                                task_path=tmp_path / "fixture-requirements.data")
 
 
 def test_sse_second_response_cannot_request_another_tool():

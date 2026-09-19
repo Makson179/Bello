@@ -137,6 +137,11 @@ class CodexBackend:
             if self._initialized:
                 return
             environment = {"OPENAI_API_KEY": None, "CODEX_API_KEY": None, "OPENAI_BASE_URL": None}
+            # A helper belongs to this run only. Never inherit another run's
+            # selector address/credential from the launching shell.
+            environment.update({key: None for key in (
+                "BELLO_SELECTOR_SOCKET", "BELLO_SELECTOR_TCP", "BELLO_SELECTOR_TOKEN",
+            )})
             environment.update({key: str(self._tool_tmp) for key in ("TMPDIR", "TMP", "TEMP")})
             # Git must work without opening the user's private global config
             # (or invoking its credential helpers) outside the assigned scope.

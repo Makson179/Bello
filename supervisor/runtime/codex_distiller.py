@@ -11,12 +11,16 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 import hashlib
+import hmac
 import json
 import logging
 import math
 import os
 from pathlib import Path
+import re
+import secrets
 import shutil
+import socket
 import tempfile
 from typing import Sequence
 
@@ -30,6 +34,13 @@ FEATURE_KEY = "features.bello_native_selection"
 _FEATURE_NAME = "bello_native_selection"
 _MAX_WIRE_BYTES = MAX_INPUT_BYTES * 6 + 4096
 _MAX_MANIFEST_BYTES = 64 * 1024
+_TCP_TRANSPORT = "tcp-hmac-v1"
+_NONCE = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _authentication_proof(token: bytes, role: str, client_nonce: str, server_nonce: str) -> str:
+    message = f"bello-selector-{role}-v1\0{client_nonce}{server_nonce}".encode("ascii")
+    return hmac.new(token, message, hashlib.sha256).hexdigest()
 # The original 0.149.0 build passed the model-visible-output fixture and the
 # virtual-time regression accepting a response after 301 seconds.
 _VERIFIED_BINARIES = {
@@ -95,6 +106,13 @@ async def validate_native_selection(
             "custom build. Stock Codex and the older 135-second build cannot enable it. "
             "Alternatively disable log_distiller; see docs/native-codex-selection.md."
         )
+    transports = capability.get("transports")
+    if os.name == "nt" and (not isinstance(transports, list) or _TCP_TRANSPORT not in transports):
+        raise RuntimeError(
+            "Native log distiller on Windows requires a compatible Codex build with "
+            "the tcp-hmac-v1 transport; the selected build does not declare it. "
+            "See docs/native-codex-selection.md."
+        )
     process = await asyncio.create_subprocess_exec(
         str(path), "features", "list", stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
@@ -114,7 +132,13 @@ async def validate_native_selection(
 
 
 class CodexDistillerBridge:
-    """One private Unix endpoint per run, borrowing the run's LogDistiller.
+    """One host-local endpoint per run, borrowing the run's LogDistiller.
+
+    Unix retains its private filesystem socket. Windows uses authenticated
+    loopback TCP: mutual challenge/response prevents a port squatter receiving
+    logs and rejects unauthenticated clients before inference. The random secret
+    goes only to the trusted app-server environment; the matching native patch
+    removes all BELLO_SELECTOR_* values from tool subprocess environments.
 
     Protocol v1 has no thread/cwd fields. Register each exact coder workspace/task
     before start/resume/revision; only their protected reads bypass selection.
@@ -123,7 +147,11 @@ class CodexDistillerBridge:
     """
 
     def __init__(self, distiller: LogDistiller, state_dir: Path,
-                 workspace: Path | None = None, task_path: Path | None = None):
+                 workspace: Path | None = None, task_path: Path | None = None,
+                 *, transport: str | None = None):
+        self._transport = transport or ("tcp" if os.name == "nt" else "unix")
+        if self._transport not in {"tcp", "unix"}:
+            raise ValueError("Unknown native distiller transport")
         self.distiller = distiller
         self.state_dir = Path(state_dir)
         self.metrics: Counter = Counter()
@@ -131,6 +159,8 @@ class CodexDistillerBridge:
         self._directory: tempfile.TemporaryDirectory | None = None
         self._socket_path: Path | None = None
         self._server: asyncio.AbstractServer | None = None
+        self._tcp_address: str | None = None
+        self._token: bytes | None = None
         self._handlers: set[asyncio.Task] = set()
         self._closed = False
         if workspace is not None:
@@ -145,8 +175,10 @@ class CodexDistillerBridge:
 
     @property
     def environment(self) -> dict[str, str]:
-        if self._socket_path is None or self._server is None:
+        if self._server is None:
             raise RuntimeError("Native distiller bridge has not started")
+        if self._tcp_address is not None and self._token is not None:
+            return {"BELLO_SELECTOR_TCP": self._tcp_address, "BELLO_SELECTOR_TOKEN": self._token.hex()}
         return {"BELLO_SELECTOR_SOCKET": str(self._socket_path)}
 
     @property
@@ -158,9 +190,20 @@ class CodexDistillerBridge:
             return
         if self._closed:
             raise RuntimeError("Native distiller bridge is closed")
-        if os.name == "nt":
-            raise RuntimeError("This native selection build requires Unix sockets")
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        if self._transport == "tcp":
+            self._token = secrets.token_bytes(32)
+            try:
+                self._server = await asyncio.start_server(
+                    self._handle, host="127.0.0.1", port=0, family=socket.AF_INET,
+                    limit=_MAX_WIRE_BYTES, reuse_address=False,
+                )
+                port = self._server.sockets[0].getsockname()[1]
+                self._tcp_address = f"127.0.0.1:{port}"
+            except BaseException:
+                self._token = None
+                raise
+            return
         # Short private path avoids the ~104-byte Unix socket path limit on macOS.
         self._directory = tempfile.TemporaryDirectory(prefix="bello-sel-")
         self._socket_path = Path(self._directory.name) / "selector.sock"
@@ -215,19 +258,42 @@ class CodexDistillerBridge:
         self._record(outcome, before, len(selected.encode("utf-8")))
         return selected
 
+    async def _authenticate(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> str:
+        """Return expected client proof; do not send/accept log bytes yet."""
+        line = await reader.readline()
+        if not line.endswith(b"\n") or len(line) > 1024:
+            raise ValueError("invalid authentication greeting")
+        hello = json.loads(line)
+        nonce = hello.get("nonce") if isinstance(hello, dict) else None
+        if (not isinstance(hello, dict) or type(hello.get("version")) is not int
+                or hello["version"] != 1 or not isinstance(nonce, str) or not _NONCE.fullmatch(nonce)):
+            raise ValueError("invalid authentication greeting")
+        server_nonce = secrets.token_hex(32)
+        proof = _authentication_proof(self._token, "server", nonce, server_nonce)
+        writer.write(json.dumps({"nonce": server_nonce, "proof": proof}).encode() + b"\n")
+        await writer.drain()
+        return _authentication_proof(self._token, "client", nonce, server_nonce)
+
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        if self._closed:
+        if self._closed or len(self._handlers) >= 64:
             writer.close()
             return
         task = asyncio.current_task()
         self._handlers.add(task)
         try:
             async with asyncio.timeout(5):
+                expected = await self._authenticate(reader, writer) if self._token is not None else None
                 line = await reader.readline()
             request = json.loads(line)
             if (not line.endswith(b"\n") or not isinstance(request, dict)
                     or not all(isinstance(request.get(key), str) for key in ("log", "focus", "command"))):
                 raise ValueError("invalid native selection request")
+            if expected is not None:
+                auth = request.get("auth")
+                if (not isinstance(auth, str) or not _NONCE.fullmatch(auth)
+                        or not hmac.compare_digest(auth, expected)):
+                    self._record("authentication_error")
+                    return
             selected = await self._select(request)
             writer.write(json.dumps({"text": selected}, ensure_ascii=False).encode("utf-8") + b"\n")
             async with asyncio.timeout(5):
@@ -254,6 +320,8 @@ class CodexDistillerBridge:
         if self._server is not None:
             await self._server.wait_closed()
             self._server = None
+        self._tcp_address = None
+        self._token = None
         if self._directory is not None:
             self._directory.cleanup()
             self._directory = None

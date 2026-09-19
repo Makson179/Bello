@@ -1,0 +1,124 @@
+name: Native Codex Windows proof
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [mystery, 'codex/**']
+    paths:
+      - '.github/workflows/native-codex-windows.yml'
+      - 'scripts/native-codex-selection.patch'
+      - 'scripts/build_native_codex_windows.py'
+      - 'scripts/verify_native_codex_selection.py'
+      - 'supervisor/runtime/codex_distiller.py'
+      - 'supervisor/runtime/distiller_policy.py'
+      - 'supervisor/runtime/native_codex_install.py'
+      - 'tests/test_build_native_codex_windows.py'
+      - 'tests/test_verify_native_codex_selection.py'
+      - 'tests/test_native_codex_install.py'
+      - 'tests/test_native_codex_download_transport.py'
+      - 'tests/test_runtime_codex_distiller.py'
+      - 'tests/test_runtime_codex_backend.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-codex-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-proof:
+    runs-on: windows-2025
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/bello-native-target
+      CARGO_HOME: ${{ runner.temp }}/bello-cargo
+      CARGO_BUILD_JOBS: '3'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      CARGO_PROFILE_RELEASE_LTO: 'false'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      LIBSQLITE3_FLAGS: SQLITE_DISABLE_INTRINSIC
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install host and offline test dependencies, without optional models
+        run: python -c "import pathlib, subprocess, sys, tomllib; deps = tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['dependencies']; subprocess.run([sys.executable, '-m', 'pip', 'install', 'pytest', 'pytest-asyncio', *deps], check=True)"
+      - name: Run installer ACL, native bridge, backend and proof regressions
+        run: python -m pytest -q tests/test_build_native_codex_windows.py tests/test_verify_native_codex_selection.py tests/test_native_codex_install.py tests/test_native_codex_download_transport.py tests/test_runtime_codex_distiller.py tests/test_runtime_codex_backend.py
+      - name: Enable long checkout paths
+        run: git config --global core.longpaths true
+      - uses: actions/checkout@v4
+        with:
+          repository: openai/codex
+          ref: 3d2ee51ca2d5db578f328aa75e20aa22c0197c9a
+          path: native-source
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: ./native-source/.github/actions/setup-msvc-env
+        with:
+          target: x86_64-pc-windows-msvc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.CARGO_HOME }}/registry
+            ${{ env.CARGO_HOME }}/git
+            ${{ env.CARGO_TARGET_DIR }}
+          key: native-codex-windows-1.95.0-v1-${{ hashFiles('scripts/native-codex-selection.patch', 'scripts/build_native_codex_windows.py', '.github/workflows/native-codex-windows.yml') }}
+          restore-keys: native-codex-windows-1.95.0-v1-
+      - name: Prepare exact upstream source and patch
+        run: python scripts/build_native_codex_windows.py prepare --source native-source --patch scripts/native-codex-selection.patch
+      - name: Download checksum-pinned upstream V8 library and bindings
+        run: |
+          $v8 = Join-Path $env:RUNNER_TEMP 'bello-v8'
+          New-Item -ItemType Directory -Path $v8 -Force | Out-Null
+          $base = 'https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0'
+          $archive = 'rusty_v8_ptrcomp_sandbox_release_x86_64-pc-windows-msvc.lib.gz'
+          $binding = 'src_binding_ptrcomp_sandbox_release_x86_64-pc-windows-msvc.rs'
+          foreach ($name in @($archive, $binding)) {
+            Invoke-WebRequest "$base/$name" -OutFile (Join-Path $v8 $name)
+          }
+          python scripts/build_native_codex_windows.py verify-v8 --directory $v8
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned V8 verification failed' }
+          "RUSTY_V8_ARCHIVE=$(Join-Path $v8 $archive)" >> $env:GITHUB_ENV
+          "RUSTY_V8_SRC_BINDING_PATH=$(Join-Path $v8 $binding)" >> $env:GITHUB_ENV
+      - name: Build four native Windows executables
+        working-directory: native-source/codex-rs
+        run: cargo build --locked --release --timings --target x86_64-pc-windows-msvc --bin codex --bin codex-code-mode-host --bin codex-command-runner --bin codex-windows-sandbox-setup
+      - name: Verify real native direct, code-mode and poll provider boundaries
+        run: python scripts/verify_native_codex_selection.py --codex "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/codex.exe" --output-dir native-proof
+      - name: Package only after all nine proof cases pass
+        run: python scripts/build_native_codex_windows.py package --source native-source --patch scripts/native-codex-selection.patch --release "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release" --proof native-proof/report.json --cargo-home "$env:CARGO_HOME" --output native-artifact
+      - name: Upload verified unsigned bundle (no release publication)
+        uses: actions/upload-artifact@v4
+        with:
+          name: bello-native-codex-windows-x64-${{ github.sha }}
+          path: |
+            native-artifact/*.tar.gz
+            native-artifact/checksums.json
+            native-artifact/bundle/selection-manifest.json
+            native-artifact/bundle/BUILD-INFO
+          if-no-files-found: error
+      - name: Upload synthetic diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-codex-windows-proof-${{ github.sha }}
+          path: |
+            native-proof/report.json
+            native-proof/*/result.json
+            native-proof/*/provider-request-*.json
+            native-proof/*/selector-inputs.json
+            native-proof/*/native-stderr.txt
+            native-proof/*/rpc.jsonl
+            ${{ env.CARGO_TARGET_DIR }}/cargo-timings/*.html
+          if-no-files-found: warn

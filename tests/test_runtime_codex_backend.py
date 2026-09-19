@@ -161,6 +161,8 @@ async def test_native_prompt_tools_and_subscription_are_preserved(tmp_path):
         assert "features.multi_agent_v2=false" in command
         assert "agents.enabled=false" in command
         assert client.options["environment_overrides"]["OPENAI_API_KEY"] is None
+        assert all(client.options["environment_overrides"][key] is None for key in (
+            "BELLO_SELECTOR_SOCKET", "BELLO_SELECTOR_TCP", "BELLO_SELECTOR_TOKEN"))
         assert client.options["environment_overrides"]["GIT_CONFIG_GLOBAL"] == os.devnull
         assert client.options["environment_overrides"]["GIT_CONFIG_NOSYSTEM"] == "1"
         assert {client.options["environment_overrides"][key] for key in ("TMPDIR", "TMP", "TEMP")} == {str(backend._tool_tmp)}

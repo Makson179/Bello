@@ -66,8 +66,35 @@ The bridge uses Unix sockets. Automatic native selection is available for macOS
 Apple Silicon (arm64); the archive contains both native executables and their
 license notices. The macOS executable has SHA-256
 `e01aceea077958b9d9bc3645f3dbd6ab8d86f4b45e6e0a5391a20f67175a5656`.
-Linux currently uses the explicit compatible-build option above. Windows native
-selection is not supported. This is not a universal prebuilt package.
+Linux currently uses the explicit compatible-build option above. The Windows
+implementation uses an authenticated loopback transport instead of Unix sockets;
+its manifest must additionally declare `"transports": ["tcp-hmac-v1"]`.
+The Windows build/provider-proof workflow below must pass before a Windows
+archive is added to the automatic-download table. This is not a universal
+prebuilt package, and an unverified Windows binary is not a supported release.
+
+### Windows build and verification
+
+The `Native Codex Windows proof` workflow builds the pinned upstream source on
+Windows Server 2025, runs the installer and bridge regressions, and checks all
+nine offline provider-boundary cases. It creates a downloadable CI artifact only
+after those checks pass; it does not publish a release or modify the user's
+global Codex. The Windows archive includes `codex.exe`, `codex-code-mode-host.exe`,
+`codex-command-runner.exe`, and `codex-windows-sandbox-setup.exe` together.
+
+For a verified Windows artifact, the explicit-build configuration is:
+
+```powershell
+$env:BELLO_CODEX_BINARY = 'C:\bello-native\bin\codex.exe'
+$env:BELLO_CODEX_SELECTION_MANIFEST = 'C:\bello-native\selection-manifest.json'
+```
+
+The bridge listens only on `127.0.0.1` and uses a new 256-bit secret for each run.
+Both sides authenticate using fresh challenges before command output is sent.
+The secret is passed only to the trusted native app-server, never stored in a
+log/configuration file, and removed from tool subprocess environments even when
+a shell policy requests full environment inheritance. A failed handshake retains
+the original native output; it never counts as successful compression.
 
 ## Build from source
 
@@ -129,7 +156,7 @@ Bello's pinned artifact, which is why the explicit manifest option exists.
 
 Only coder threads with distillation enabled receive the short focus instruction
 and native feature flag, including resumed/revision coder work. Other roles do
-not. The private socket returns only selected text; no recovery handle or extra
+not. The private channel returns only selected text; no recovery handle or extra
 metadata is appended to the coder's output. The 300-second selector deadline
 fits inside the 315-second native transport deadline. Missing focus, worker
 failure, or a non-shorter result retains the normal native output.
@@ -151,7 +178,7 @@ calls. All nine cases pass for the macOS executable pinned above. The helper's
 transport checks are separate from the learned selector's quality evaluation.
 
 The [official app-server protocol](https://learn.chatgpt.com/docs/app-server#protocol)
-remains the external native transport. The private selection socket is a Bello
+remains the external native transport. The private selection channel is a Bello
 extension, not an official OpenAI protocol capability.
 
 ## License
