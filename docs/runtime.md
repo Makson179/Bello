@@ -46,10 +46,10 @@ the selection hook must replace the native tool result before it enters the
 conversation, including Code Mode. Stock Codex is supported with distillation
 off. With distillation on, missing native selection support fails before a
 model turn; Bello never silently falls back to Pi or pretends to compress.
-On macOS Apple Silicon and Windows x86-64, Bello automatically downloads and
-verifies a pinned Codex 0.153.4 helper before the first distilled native run.
-Linux currently uses an explicit compatible build selected with
-`BELLO_CODEX_BINARY`. An alternate build requires an explicitly trusted local
+On macOS Apple Silicon, Windows x86-64, and Linux x86-64 with glibc 2.35+,
+Bello automatically downloads and verifies a pinned Codex 0.153.4 helper before
+the first distilled native run. An alternate build selected with
+`BELLO_CODEX_BINARY` requires an explicitly trusted local
 `BELLO_CODEX_SELECTION_MANIFEST`. Bello verifies the hash, selection protocol
 and bridge deadline before use. The bridge allows at least 315 seconds around
 the selector's 300-second limit. The helper is cached separately; it does not

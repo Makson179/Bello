@@ -191,7 +191,10 @@ def test_live_history_uses_explicit_owned_rollout_path_and_reports_counts(tmp_pa
     assert hashes == {live.digest("exact\r\n")}
     assert counts == {"path_from_server": True, "files_found": 1, "owned_files": 1,
                       "records": 4, "response_items": 2, "tool_outputs": 2,
-                      "parsed_outputs": 1, "unparsed_tool_outputs": 1}
+                      "parsed_outputs": 1, "unparsed_tool_outputs": 1,
+                      "tool_output_shapes": [{"shape": live.history_output_shape(record["payload"]),
+                                               "parsed": index == 0, "count": 1}
+                                              for index, record in enumerate(records[2:])]}
     records[0]["payload"]["id"] = "another-thread"
     path.write_text("".join(json.dumps(record) + "\n" for record in records))
     with pytest.raises(ValueError, match="exact smoke thread"):
@@ -203,6 +206,22 @@ def test_live_history_uses_explicit_owned_rollout_path_and_reports_counts(tmp_pa
         live.selected_history_evidence(tmp_path, "owned", str(tmp_path.parent / "unrelated.jsonl"))
     hashes, counts = live.selected_history_evidence(tmp_path, "owned", str(tmp_path / "missing.jsonl"))
     assert not hashes and counts["files_found"] == counts["owned_files"] == counts["records"] == 0
+
+
+def test_live_output_shape_never_exports_text_or_unknown_keys():
+    from scripts import verify_windows_modernbert_live as live
+    text = "Process exited with code 0\r\nOutput:\r\nPRIVATE_SECRET_VALUE"
+    shape = live.history_output_shape({"type": "function_call_output", "output": text})
+    assert shape["plain_output_sha256"] == live.digest(text)
+    assert shape["crlf_output_separator"] is True and shape["lf_output_separator"] is False
+    assert shape["canonical_direct_header"] is False
+    assert shape["lf_newlines"] == shape["crlf_newlines"] == 2
+    assert "PRIVATE_SECRET_VALUE" not in json.dumps(shape)
+    for value in ({"PRIVATE_SECRET_KEY": "PRIVATE_SECRET_VALUE", "body": "PRIVATE_SECRET_VALUE"},
+                  [{"type": "PRIVATE_SECRET_TYPE", "text": "PRIVATE_SECRET_VALUE"}],
+                  '{"PRIVATE_SECRET_KEY":"PRIVATE_SECRET_VALUE","output":"PRIVATE_SECRET_VALUE"}'):
+        encoded = json.dumps(live.history_output_shape({"output": value}))
+        assert "PRIVATE_SECRET" not in encoded
 
 
 @pytest.mark.parametrize("failure_phase", [None, "prepare_private_runtime", "prepare_private_auth_home", "download_model"])

@@ -77,11 +77,51 @@ def history_output_texts(payload: dict) -> list[str]:
     return outputs
 
 
+def history_output_shape(payload: dict) -> dict:
+    """Structural diagnostics only: fixed keys/types, never tool text or keys supplied by a model."""
+    def kind(value):
+        if isinstance(value, str):
+            return "string"
+        if isinstance(value, list):
+            return "array"
+        if isinstance(value, dict):
+            return "object"
+        if value is None:
+            return "null"
+        return "scalar"
+    value = payload.get("output")
+    shape = {"output_type": kind(value)}
+    if isinstance(value, str):
+        shape.update(plain_output_sha256=digest(value), lf_newlines=value.count("\n"),
+                     crlf_newlines=value.count("\r\n"), lf_output_separator="\nOutput:\n" in value,
+                     crlf_output_separator="\r\nOutput:\r\n" in value,
+                     completed_header="Process exited with code " in value,
+                     running_header="Process running with session ID " in value,
+                     canonical_direct_header=bool(re.search(
+                         r"(?m)^(?:Process exited with code -?\d+|Process running with session ID \d+|Exit code: -?\d+)$",
+                         value)))
+        try:
+            value = json.loads(value)
+        except ValueError:
+            value = None
+        shape["string_json_type"] = kind(value)
+    allowed = {"type", "text", "output", "body", "content", "content_items", "metadata", "success",
+               "exit_code", "session_id", "chunk_id", "wall_time_seconds", "encrypted_content"}
+    if isinstance(value, dict):
+        shape["known_keys"] = {key: kind(value[key]) for key in sorted(allowed & value.keys())}
+    elif isinstance(value, list):
+        shape["array_types"] = sorted({kind(item) for item in value})
+        known_types = {"input_text", "output_text", "text", "input_image", "input_audio", "encrypted_content"}
+        shape["known_content_types"] = sorted({item["type"] for item in value if isinstance(item, dict)
+            and isinstance(item.get("type"), str) and item["type"] in known_types})
+    return shape
+
+
 def selected_history_evidence(home: Path, thread_id: str, rollout_path: str | None = None) -> tuple[set[str], dict]:
     hashes: set[str] = set()
     counts = {"path_from_server": rollout_path is not None, "files_found": 0, "owned_files": 0,
               "records": 0, "response_items": 0, "tool_outputs": 0, "parsed_outputs": 0,
-              "unparsed_tool_outputs": 0}
+              "unparsed_tool_outputs": 0, "tool_output_shapes": []}
     if rollout_path is not None:
         candidate = Path(rollout_path).resolve()
         if not candidate.is_relative_to(home.resolve()) or candidate.suffix != ".jsonl":
@@ -116,6 +156,12 @@ def selected_history_evidence(home: Path, thread_id: str, rollout_path: str | No
             outputs = history_output_texts(payload)
             counts["parsed_outputs"] += len(outputs)
             counts["unparsed_tool_outputs"] += int(not outputs)
+            shape = history_output_shape(payload)
+            item = next((entry for entry in counts["tool_output_shapes"] if entry["shape"] == shape), None)
+            if item is None:
+                counts["tool_output_shapes"].append({"shape": shape, "parsed": bool(outputs), "count": 1})
+            else:
+                item["count"] += 1
             hashes.update(digest(text) for text in outputs)
     return hashes, counts
 

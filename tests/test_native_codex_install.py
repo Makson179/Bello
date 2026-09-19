@@ -649,6 +649,17 @@ def test_windows_without_verified_bundle_requests_explicit_build_without_downloa
     assert release[2] == []
 
 
+def test_linux_x64_bundle_pins_verified_native_artifact():
+    assert {machine for system, machine in install.BUNDLES if system == "Linux"} == {"x86_64"}
+    assert install.BUNDLES[("Linux", "x86_64")] == install.NativeBundle(
+        url=("https://github.com/Makson179/Bello/releases/download/"
+             "native-codex-0.153.4-selection-v1/"
+             "bello-native-codex-0.153.4-x86_64-unknown-linux-gnu.tar.gz"),
+        archive_sha256="887bb0ca1b4f04598e899fef184b40faa4b4361f7a9ff914ddce9fd5972beb0e",
+        manifest_sha256="cc3be17f14331159297e99cabb63d84fb0de09af7f24d53879a0904453a90f5a",
+    )
+
+
 def test_windows_x64_bundle_pins_verified_native_artifact():
     # Native provider proof and installed-cache proof both passed for this exact
     # archive; Windows ARM and other builds still require separate verification.

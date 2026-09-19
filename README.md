@@ -62,8 +62,8 @@ Then add the model sources you want, any one is enough:
   `bello runtime login <provider>`.
 - Log distiller: `pipx install 'bello[log-distiller]' --force`. The model
   (599 MB) downloads on the first run with the distiller on. With subscription
-  Codex it also needs a patched Codex build (automatic on Apple Silicon and
-  Windows x86_64, manual on Linux), see
+  Codex it also downloads a compatible Codex helper on Apple Silicon,
+  Windows x86_64, and Linux x86_64 (glibc 2.35+); see
   [docs/native-codex-selection.md](./docs/native-codex-selection.md).
 
 `bello doctor` shows what is ready, and `bello update` updates Bello. To run

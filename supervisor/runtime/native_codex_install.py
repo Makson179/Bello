@@ -32,6 +32,13 @@ class NativeBundle:
 
 # Add a platform only after the offline native provider-boundary proof passes.
 BUNDLES: dict[tuple[str, str], NativeBundle] = {
+    ("Linux", "x86_64"): NativeBundle(
+        url=("https://github.com/Makson179/Bello/releases/download/"
+             "native-codex-0.153.4-selection-v1/"
+             "bello-native-codex-0.153.4-x86_64-unknown-linux-gnu.tar.gz"),
+        archive_sha256="887bb0ca1b4f04598e899fef184b40faa4b4361f7a9ff914ddce9fd5972beb0e",
+        manifest_sha256="cc3be17f14331159297e99cabb63d84fb0de09af7f24d53879a0904453a90f5a",
+    ),
     ("Darwin", "arm64"): NativeBundle(
         url=("https://github.com/Makson179/Bello/releases/download/"
              "native-codex-0.153.4-selection-v1/"
