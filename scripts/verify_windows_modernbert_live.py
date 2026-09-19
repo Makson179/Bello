@@ -53,7 +53,7 @@ def solution_passes(work: Path) -> bool:
         return False
 
 
-def history_output_texts(payload: dict) -> list[str]:
+def history_output_texts(payload: dict, tool_name: str = "other") -> list[str]:
     """Pinned native wire output is text or input_text content, never {body: ...}."""
     value = payload.get("output")
     texts = ([value] if isinstance(value, str) else
@@ -69,15 +69,19 @@ def history_output_texts(payload: dict) -> list[str]:
                 r"(?m)^(?:Process exited with code -?\d+|Process running with session ID \d+|Exit code: -?\d+)$",
                 header):
             outputs.append(content)
-        elif payload.get("type") == "custom_tool_call_output":
-            packet = {**payload, "call_id": native.CALL_ID, "output": text}
+        elif (payload.get("type") == "custom_tool_call_output"
+              or (payload.get("type") == "function_call_output" and tool_name == "wait")):
+            # Native code-mode exec is custom, but its wait continuation is a
+            # function tool with the same structured runtime output. Only allow
+            # this form after exact call-ID correlation to the fixed wait tool.
+            packet = {**payload, "type": "custom_tool_call_output", "call_id": native.CALL_ID, "output": text}
             for item in native.output_packets({"input": [packet]}, "code"):
                 if isinstance(item.get("output"), str):
                     outputs.append(item["output"])
     return outputs
 
 
-def history_output_shape(payload: dict) -> dict:
+def history_output_shape(payload: dict, tool_name: str = "other") -> dict:
     """Structural diagnostics only: fixed keys/types, never tool text or keys supplied by a model."""
     def kind(value):
         if isinstance(value, str):
@@ -90,7 +94,11 @@ def history_output_shape(payload: dict) -> dict:
             return "null"
         return "scalar"
     value = payload.get("output")
-    shape = {"output_type": kind(value)}
+    allowed_tools = {"exec_command", "write_stdin", "exec", "wait", "apply_patch", "shell", "shell_command"}
+    item_type = payload.get("type")
+    shape = {"output_type": kind(value),
+             "output_item_type": item_type if item_type in {"function_call_output", "custom_tool_call_output"} else "other",
+             "tool_name": tool_name if tool_name in allowed_tools else "other"}
     if isinstance(value, str):
         shape.update(plain_output_sha256=digest(value), lf_newlines=value.count("\n"),
                      crlf_newlines=value.count("\r\n"), lf_output_separator="\nOutput:\n" in value,
@@ -114,6 +122,9 @@ def history_output_shape(payload: dict) -> dict:
         known_types = {"input_text", "output_text", "text", "input_image", "input_audio", "encrypted_content"}
         shape["known_content_types"] = sorted({item["type"] for item in value if isinstance(item, dict)
             and isinstance(item.get("type"), str) and item["type"] in known_types})
+        shape["input_text_shapes"] = [history_output_shape({"type": item_type, "output": item["text"]}, tool_name)
+            for item in value if isinstance(item, dict) and item.get("type") == "input_text"
+            and isinstance(item.get("text"), str)]
     return shape
 
 
@@ -145,6 +156,12 @@ def selected_history_evidence(home: Path, thread_id: str, rollout_path: str | No
             raise ValueError("Native rollout does not belong to the exact smoke thread")
         counts["owned_files"] += 1
         counts["records"] += len(records)
+        # Correlate locally, but export neither call IDs nor tool arguments.
+        calls = {record["payload"].get("call_id"): record["payload"].get("name")
+                 for record in records if record.get("type") == "response_item"
+                 and isinstance(record.get("payload"), dict)
+                 and record["payload"].get("type") in {"function_call", "custom_tool_call"}
+                 and isinstance(record["payload"].get("call_id"), str)}
         for record in records:
             payload = record.get("payload", {})
             if record.get("type") != "response_item" or not isinstance(payload, dict):
@@ -153,10 +170,11 @@ def selected_history_evidence(home: Path, thread_id: str, rollout_path: str | No
             if payload.get("type") not in {"function_call_output", "custom_tool_call_output"}:
                 continue
             counts["tool_outputs"] += 1
-            outputs = history_output_texts(payload)
+            tool_name = calls.get(payload.get("call_id"), "other")
+            outputs = history_output_texts(payload, tool_name)
             counts["parsed_outputs"] += len(outputs)
             counts["unparsed_tool_outputs"] += int(not outputs)
-            shape = history_output_shape(payload)
+            shape = history_output_shape(payload, tool_name)
             item = next((entry for entry in counts["tool_output_shapes"] if entry["shape"] == shape), None)
             if item is None:
                 counts["tool_output_shapes"].append({"shape": shape, "parsed": bool(outputs), "count": 1})

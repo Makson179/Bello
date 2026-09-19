@@ -175,6 +175,31 @@ def test_live_history_parser_uses_native_wire_formats_without_fuzzy_matching(kin
     assert live.history_output_texts({"type": kind, "output": value}) == expected
 
 
+def test_live_history_parses_actual_native_wait_array_only_after_tool_correlation(tmp_path):
+    from scripts import verify_windows_modernbert_live as live
+    # Actual published-helper offline fixture: code-mode exec yields, function
+    # wait returns a timing block and a separate JSON output content item.
+    packet = {"type": "function_call_output", "call_id": "wait-fixture", "output": [
+        {"type": "input_text", "text": "Script completed\nWall time 0.6 seconds\nOutput:\n"},
+        {"type": "input_text", "text": '{"chunk_id":"ecec3a","wall_time_seconds":0.000011417,"exit_code":7,"original_token_count":1052,"output":"KEEP_SENTINEL failure: expected 3, received 4\\n"}'},
+    ]}
+    assert live.history_output_texts(packet) == []
+    assert live.history_output_texts(packet, "exec_command") == []
+    assert live.history_output_texts(packet, "wait") == ["KEEP_SENTINEL failure: expected 3, received 4\n"]
+    path = tmp_path / "sessions" / "owned.jsonl"
+    path.parent.mkdir()
+    records = [{"type": "session_meta", "payload": {"id": "owned"}},
+               {"type": "response_item", "payload": {"type": "function_call", "call_id": "wait-fixture", "name": "wait"}},
+               {"type": "response_item", "payload": packet}]
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    hashes, counts = live.selected_history_evidence(tmp_path, "owned", str(path))
+    assert hashes == {live.digest("KEEP_SENTINEL failure: expected 3, received 4\n")}
+    assert counts["parsed_outputs"] == 1 and counts["unparsed_tool_outputs"] == 0
+    shape = counts["tool_output_shapes"][0]["shape"]
+    assert shape["tool_name"] == "wait" and shape["output_type"] == "array"
+    assert shape["input_text_shapes"][1]["string_json_type"] == "object"
+
+
 def test_live_history_uses_explicit_owned_rollout_path_and_reports_counts(tmp_path):
     from scripts import verify_windows_modernbert_live as live
     path = tmp_path / "sessions" / "rollout-different-file-id.jsonl"
@@ -222,6 +247,32 @@ def test_live_output_shape_never_exports_text_or_unknown_keys():
                   '{"PRIVATE_SECRET_KEY":"PRIVATE_SECRET_VALUE","output":"PRIVATE_SECRET_VALUE"}'):
         encoded = json.dumps(live.history_output_shape({"output": value}))
         assert "PRIVATE_SECRET" not in encoded
+    assert live.history_output_shape({"type": "PRIVATE_SECRET_TYPE", "output": None},
+                                     "PRIVATE_SECRET_TOOL")["output_item_type"] == "other"
+    assert live.history_output_shape({"output": None}, "PRIVATE_SECRET_TOOL")["tool_name"] == "other"
+
+
+def test_live_history_shape_correlates_only_fixed_tool_names_without_call_ids_or_arguments(tmp_path):
+    from scripts import verify_windows_modernbert_live as live
+    path = tmp_path / "sessions" / "rollout-owned.jsonl"
+    path.parent.mkdir()
+    records = [{"type": "session_meta", "payload": {"id": "owned"}}]
+    names = ["exec_command", "write_stdin", "exec", "wait", "apply_patch", "shell", "shell_command", "PRIVATE_TOOL"]
+    for index, name in enumerate(names):
+        call_id = "PRIVATE_CALL_ID_" + str(index)
+        kind = "custom_tool_call" if name in {"exec", "apply_patch"} else "function_call"
+        records.extend([
+            {"type": "response_item", "payload": {"type": kind, "name": name, "call_id": call_id,
+                                                    "arguments": "PRIVATE_ARGUMENTS", "input": "PRIVATE_INPUT"}},
+            {"type": "response_item", "payload": {"type": kind + "_output", "call_id": call_id, "output": "synthetic"}},
+        ])
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    _, counts = live.selected_history_evidence(tmp_path, "owned", str(path))
+    shapes = [entry["shape"] for entry in counts["tool_output_shapes"]]
+    assert [shape["tool_name"] for shape in shapes] == names[:-1] + ["other"]
+    assert [shape["output_item_type"] for shape in shapes] == [
+        "custom_tool_call_output" if name in {"exec", "apply_patch"} else "function_call_output" for name in names]
+    assert "PRIVATE" not in json.dumps(counts)
 
 
 @pytest.mark.parametrize("failure_phase", [None, "prepare_private_runtime", "prepare_private_auth_home", "download_model"])
