@@ -313,11 +313,15 @@ def install_local(artifact: Path, runtime_root: Path, proof_output: Path) -> Non
 
     if platform.system() != "Windows" or platform.machine().lower() not in {"amd64", "x86_64"}:
         raise ValueError("Installed-artifact proof requires Windows x64")
-    runner_temp = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
+    # RUNNER_TEMP can be a shared directory whose ACL is intentionally rejected
+    # by the private-cache installer. A real per-user LOCALAPPDATA is another
+    # fixture anchor; no parent ACL is modified or bypassed by this allowance.
+    anchors = [Path(value).resolve(strict=True) for name in ("RUNNER_TEMP", "LOCALAPPDATA")
+               if (value := os.environ.get(name))]
     runtime_root = runtime_root.resolve()
-    if (runtime_root == runner_temp or not runtime_root.is_relative_to(runner_temp)
-            or runtime_root.exists()):
-        raise ValueError("Installer proof requires a new child directory of RUNNER_TEMP")
+    if (runtime_root.exists() or not any(
+            runtime_root != anchor and runtime_root.is_relative_to(anchor) for anchor in anchors)):
+        raise ValueError("Installer proof requires a new child directory of RUNNER_TEMP or LOCALAPPDATA")
     archive = artifact / f"bello-native-codex-{VERSION}-{TARGET}.tar.gz"
     checksums = json.loads((artifact / "checksums.json").read_text(encoding="utf-8"))
     if checksums.get("archive") != archive.name or checksums.get("archive_sha256") != sha256(archive):

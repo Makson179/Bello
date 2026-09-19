@@ -202,12 +202,18 @@ def test_package_binds_four_executables_licenses_manifest_and_proof(packaged_art
         build.package(**{name: value for name, value in packaged_artifact.items() if name != "archive"})
 
 
-def test_installed_proof_uses_real_cache_and_rejects_failed_second_proof(packaged_artifact, tmp_path, monkeypatch):
+@pytest.mark.parametrize("anchor", ["RUNNER_TEMP", "LOCALAPPDATA"])
+def test_installed_proof_uses_real_cache_and_rejects_failed_second_proof(packaged_artifact, tmp_path, monkeypatch, anchor):
     from supervisor.runtime import codex_distiller, native_codex_install as installer
 
     monkeypatch.setattr(build.platform, "system", lambda: "Windows")
     monkeypatch.setattr(build.platform, "machine", lambda: "AMD64")
     monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    if anchor == "LOCALAPPDATA":
+        shared = tmp_path / "shared-temp"
+        shared.mkdir()
+        monkeypatch.setenv("RUNNER_TEMP", str(shared))
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     monkeypatch.setenv("BELLO_CODEX_BINARY", "must-not-bypass-the-installer")
     monkeypatch.setenv("OPENAI_API_KEY", "synthetic-parent-secret")
     expected_hash = build.sha256(packaged_artifact["release"] / "codex.exe")
@@ -243,6 +249,25 @@ def test_installed_proof_uses_real_cache_and_rejects_failed_second_proof(package
     assert build.os.environ["BELLO_CODEX_BINARY"] == "must-not-bypass-the-installer"
     with pytest.raises(ValueError, match="new child directory"):
         build.install_local(packaged_artifact["output"], tmp_path / "private-cache", proof_output)
+
+
+@pytest.mark.parametrize("target", ["temp_root", "local_root", "existing", "outside"])
+def test_installed_proof_rejects_anchor_itself_existing_or_unrelated_target(packaged_artifact, tmp_path, monkeypatch, target):
+    monkeypatch.setattr(build.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(build.platform, "machine", lambda: "AMD64")
+    temp, local = tmp_path / "temp", tmp_path / "local"
+    temp.mkdir()
+    local.mkdir()
+    monkeypatch.setenv("RUNNER_TEMP", str(temp))
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    existing = local / "existing"
+    existing.mkdir()
+    root = {"temp_root": temp, "local_root": local, "existing": existing,
+            "outside": tmp_path / "unrelated"}[target]
+    with pytest.raises(ValueError, match="new child directory"):
+        build.install_local(packaged_artifact["output"], root, tmp_path / "proof")
+    assert not (tmp_path / "proof").exists()
+    assert not (tmp_path / "unrelated").exists()
 
 
 @pytest.mark.parametrize("change", ["payload", "acl"])

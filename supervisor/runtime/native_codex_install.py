@@ -222,7 +222,15 @@ def _private_directory(path: Path, *, parents: bool = False) -> None:
     _reject_windows_reparse_ancestors(path)
     if _IS_WINDOWS:
         if parents:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                path.parent.lstat()
+            except FileNotFoundError:
+                if path.parent == path:
+                    raise ValueError("Native Codex cache requires an existing filesystem anchor")
+                # Never create intermediate cache directories with inherited
+                # public ACLs. Stop at the first existing ancestor, validate it
+                # as a parent, and atomically create each missing private child.
+                _private_directory(path.parent, parents=True)
         _reject_windows_reparse_ancestors(path)
         # A public parent could replace a private child using DELETE_CHILD.
         _windows_private_acl(path.parent, parent=True)

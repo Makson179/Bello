@@ -65,7 +65,15 @@ jobs:
       - name: Package only after all nine proof cases pass
         run: python scripts/build_native_codex_windows.py package-candidate --candidate native-candidate --proof native-proof/report.json --output native-artifact
       - name: Install local artifact into private cache and repeat all nine proof cases
-        run: python scripts/build_native_codex_windows.py install-local --artifact native-artifact --runtime-root "$env:RUNNER_TEMP/bello-install-proof" --proof-output native-installed-proof
+        run: |
+          $proofRoot = Join-Path $env:LOCALAPPDATA "bello-install-proof-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          python scripts/build_native_codex_windows.py install-local --artifact native-artifact --runtime-root "$proofRoot" --proof-output native-installed-proof
+          $proofExit = $LASTEXITCODE
+          $receipt = Join-Path $proofRoot 'installed-cache.json'
+          if (Test-Path -LiteralPath $receipt) {
+            Copy-Item -LiteralPath $receipt -Destination native-artifact/installed-cache.json
+          }
+          exit $proofExit
       - name: Upload verified unsigned bundle (no release publication)
         uses: actions/upload-artifact@v4
         with:
@@ -75,7 +83,7 @@ jobs:
             native-artifact/checksums.json
             native-artifact/bundle/selection-manifest.json
             native-artifact/bundle/BUILD-INFO
-            ${{ runner.temp }}/bello-install-proof/installed-cache.json
+            native-artifact/installed-cache.json
             native-installed-proof/report.json
           if-no-files-found: error
       - name: Upload synthetic diagnostics even on failure
@@ -100,5 +108,5 @@ jobs:
             native-installed-proof/*/windows-setup-stdout.txt
             native-installed-proof/*/windows-setup-stderr.txt
             native-installed-proof/*/rpc.jsonl
-            ${{ runner.temp }}/bello-install-proof/installed-cache.json
+            native-artifact/installed-cache.json
           if-no-files-found: warn

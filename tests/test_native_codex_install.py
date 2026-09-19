@@ -353,6 +353,77 @@ def test_private_directory_uses_readonly_parent_policy_only_for_parent(tmp_path,
     assert calls == [(tmp_path, False, True), (directory, True, False), (directory, False, False)]
 
 
+def test_windows_missing_filesystem_anchor_is_rejected_without_recursion(tmp_path, monkeypatch):
+    root = Path(tmp_path.anchor)
+
+    def missing(path):
+        raise FileNotFoundError(str(path))
+
+    def unexpected_acl(*args, **kwargs):
+        pytest.fail("Missing filesystem anchor must not reach ACL creation")
+
+    monkeypatch.setattr(install, "_IS_WINDOWS", True)
+    monkeypatch.setattr(install, "_reject_windows_reparse_ancestors", lambda path: None)
+    monkeypatch.setattr(Path, "lstat", missing)
+    monkeypatch.setattr(install, "_windows_private_acl", unexpected_acl)
+    with pytest.raises(ValueError, match="existing filesystem anchor"):
+        install._private_directory(root, parents=True)
+
+
+def test_windows_missing_cache_ancestors_are_created_private_before_children(tmp_path, monkeypatch):
+    directory = tmp_path / "missing-one" / "missing-two" / "cache"
+    calls = []
+    private = set()
+
+    def acl(path, *, create=False, parent=False):
+        calls.append((path, create, parent))
+        if create:
+            assert path.parent == tmp_path or path.parent in private
+            assert not path.exists()
+            path.mkdir()
+            private.add(path)
+
+    monkeypatch.setattr(install, "_IS_WINDOWS", True)
+    monkeypatch.setattr(install, "_windows_private_acl", acl)
+    install._private_directory(directory, parents=True)
+    chain = [tmp_path / "missing-one", directory.parent, directory]
+    assert [path for path, create, _ in calls if create] == chain
+    assert calls[0] == (tmp_path, False, True)
+    assert private == set(chain)
+
+
+def test_windows_missing_chain_refuses_unsafe_existing_parent_before_creation(tmp_path, monkeypatch):
+    directory = tmp_path / "missing" / "cache"
+    calls = []
+
+    def acl(path, *, create=False, parent=False):
+        calls.append((path, create, parent))
+        assert not create
+        install._validate_windows_security_descriptor(
+            f"O:{_USER_SID}D:P(A;OICI;FA;;;{_USER_SID})(A;OICI;FA;;;BU)", _USER_SID, parent=parent)
+
+    monkeypatch.setattr(install, "_IS_WINDOWS", True)
+    monkeypatch.setattr(install, "_windows_private_acl", acl)
+    with pytest.raises(ValueError, match="other Windows accounts"):
+        install._private_directory(directory, parents=True)
+    assert calls == [(tmp_path, False, True)]
+    assert not (tmp_path / "missing").exists()
+
+
+@pytest.mark.skipif(not install._IS_WINDOWS, reason="Native Windows DACL APIs")
+def test_windows_missing_chain_has_real_private_acls_and_preserves_existing_parent(tmp_path):
+    from scripts.verify_native_codex_selection import _windows_fixture_sddl
+
+    directory = tmp_path / "missing-one" / "missing-two" / "cache"
+    install._windows_private_acl(tmp_path, parent=True)
+    before = _windows_fixture_sddl(tmp_path)
+    install._private_directory(directory, parents=True)
+    for path in (directory, directory.parent, directory.parent.parent):
+        install._windows_private_acl(path)
+    install._private_directory(directory, parents=True)
+    assert _windows_fixture_sddl(tmp_path) == before
+
+
 @pytest.mark.skipif(not install._IS_WINDOWS, reason="Native Windows DACL APIs")
 def test_windows_private_directory_has_real_private_dacl_and_is_reusable(tmp_path):
     directory = tmp_path / "native-private-cache"
@@ -391,6 +462,9 @@ def test_windows_existing_public_acl_is_rejected_without_repair(tmp_path):
         install._private_directory(directory)
     with pytest.raises(ValueError, match="other Windows accounts"):
         install._windows_private_acl(directory)  # The rejected ACL remains unmodified.
+    with pytest.raises(ValueError, match="other Windows accounts"):
+        install._private_directory(directory / "missing" / "cache", parents=True)
+    assert not (directory / "missing").exists()
 
 
 def test_download_checksum_rejected_without_publishing_cache(release, monkeypatch):
