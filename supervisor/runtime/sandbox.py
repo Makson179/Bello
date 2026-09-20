@@ -1024,7 +1024,7 @@ async def _probe_backend(invocation: _Invocation) -> None:
     probe_argv = (*invocation.argv[:marker + 1], "/usr/bin/true")
     process: asyncio.subprocess.Process | None = None
     try:
-        process = await asyncio.create_subprocess_exec(
+        process = await _spawn_owned_process(
             *probe_argv,
             cwd=str(invocation.cwd),
             env=invocation.env,
@@ -1122,6 +1122,26 @@ async def _finish_cleanup(cleanup: asyncio.Task[None]) -> None:
         except asyncio.CancelledError:
             continue
     cleanup.result()
+
+
+async def _spawn_owned_process(*args, **kwargs) -> asyncio.subprocess.Process:
+    """Retain process-group ownership if cancellation races subprocess startup."""
+    spawn = asyncio.create_task(asyncio.create_subprocess_exec(*args, **kwargs))
+    try:
+        return await asyncio.shield(spawn)
+    except asyncio.CancelledError:
+        async def finish_cancelled_spawn() -> None:
+            try:
+                process = await spawn
+            except (Exception, asyncio.CancelledError):
+                # Observe a failed spawn, but preserve the caller's cancellation.
+                # No Process was returned, so there is no group owned here.
+                return
+            # Even an already-exited shell can have live background descendants.
+            await _terminate_process_tree(process)
+
+        await _finish_cleanup(asyncio.create_task(finish_cancelled_spawn()))
+        raise
 
 
 class SandboxRunner:
@@ -1281,7 +1301,7 @@ class SandboxRunner:
             creation_flags = 0
             if os.name == "nt":
                 creation_flags = getattr(__import__("subprocess"), "CREATE_NEW_PROCESS_GROUP", 0)
-            process = await asyncio.create_subprocess_exec(
+            process = await _spawn_owned_process(
                 *invocation.argv,
                 cwd=str(invocation.cwd),
                 env=invocation.env,

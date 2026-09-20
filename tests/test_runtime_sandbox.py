@@ -1219,13 +1219,25 @@ async def test_callback_oserror_is_not_misreported_as_backend_failure(
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group behavior")
 @pytest.mark.asyncio
+@pytest.mark.parametrize("spawn_delay", [0, 0.1])
 async def test_repeated_task_cancellation_cannot_interrupt_tree_cleanup(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, spawn_delay: float
 ) -> None:
     marker = tmp_path / "late"
+    command_ready = asyncio.Event()
     cleanup_started = asyncio.Event()
     release_cleanup = asyncio.Event()
+    spawn = asyncio.create_subprocess_exec
     terminate = sandbox._terminate_process_tree
+
+    async def delayed_spawn(*args, **kwargs):
+        # Exercise a startup slower than the former fixed 50ms sleep. The
+        # repeated-cancel assertion must run after ownership reaches run().
+        await asyncio.sleep(spawn_delay)
+        return await spawn(*args, **kwargs)
+
+    async def observe_ready(_chunk: str) -> None:
+        command_ready.set()
 
     async def delayed_cleanup(process, *, descendants_only=False):
         cleanup_started.set()
@@ -1233,20 +1245,130 @@ async def test_repeated_task_cancellation_cannot_interrupt_tree_cleanup(
         await terminate(process, descendants_only=descendants_only)
 
     monkeypatch.setattr(sandbox, "_terminate_process_tree", delayed_cleanup)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
     task = asyncio.create_task(
         SandboxRunner(SandboxPolicy(tmp_path, mode="danger-full-access")).run(
-            f"(sleep 0.4; printf escaped > {shlex.quote(str(marker))}) & wait", tmp_path, 2
+            f"(printf ready; sleep 0.4; printf escaped > {shlex.quote(str(marker))}) & wait",
+            tmp_path, 2, on_output=observe_ready,
         )
     )
-    await asyncio.sleep(0.05)
-    task.cancel()
-    await asyncio.wait_for(cleanup_started.wait(), 1)
-    task.cancel()
-    release_cleanup.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    await asyncio.sleep(0.45)
-    assert not marker.exists()
+    try:
+        await asyncio.wait_for(command_ready.wait(), 5)
+        task.cancel()
+        await asyncio.wait_for(cleanup_started.wait(), 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done(), "second cancellation must not bypass pending tree cleanup"
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.45)
+        assert not marker.exists()
+    finally:
+        release_cleanup.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX subprocess startup and process-group behavior")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["run", "probe"])
+@pytest.mark.parametrize("shell_exits", [False, True])
+async def test_startup_cancellation_owns_already_spawned_descendants(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, entrypoint: str, shell_exits: bool
+) -> None:
+    import asyncio.base_subprocess
+
+    ready, release_child, marker = (tmp_path / name for name in ("ready", "release-child", "late"))
+    release_pipes = asyncio.Event()
+    transports = []
+    connect = asyncio.base_subprocess.BaseSubprocessTransport._connect_pipes
+
+    async def delayed_connect(transport, waiter):
+        # Popen has already launched the shell; hold only pipe attachment so
+        # cancellation races the real ownership handoff, not a fake process.
+        transports.append(transport)
+        await release_pipes.wait()
+        await connect(transport, waiter)
+
+    monkeypatch.setattr(asyncio.base_subprocess.BaseSubprocessTransport, "_connect_pipes", delayed_connect)
+    command = (f"(printf ready > {shlex.quote(str(ready))}; "
+               f"while [ ! -e {shlex.quote(str(release_child))} ]; do sleep 0.01; done; "
+               f"printf escaped > {shlex.quote(str(marker))}) & "
+               + ("exit 0" if shell_exits else "wait"))
+    if entrypoint == "run":
+        operation = SandboxRunner(SandboxPolicy(tmp_path, mode="danger-full-access")).run(command, tmp_path, 5)
+    else:
+        launcher = tmp_path / "probe-launcher"
+        launcher.write_text("#!/bin/sh\n" + command + "\n")
+        launcher.chmod(0o700)
+        operation = sandbox._probe_backend(sandbox._Invocation((str(launcher), "--"), None, tmp_path, "test-probe"))
+    task = asyncio.create_task(operation)
+    try:
+        async with asyncio.timeout(5):
+            while not transports or not ready.exists() or (shell_exits and transports[0].get_returncode() is None):
+                await asyncio.sleep(0.01)
+        assert transports and not release_pipes.is_set()
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done(), "startup cancellation must await process ownership and tree cleanup"
+        release_pipes.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        release_child.touch()
+        await asyncio.sleep(0.05)
+        assert not marker.exists(), "a descendant survived cancellation during subprocess startup"
+    finally:
+        release_pipes.set()
+        release_child.touch()
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+        for transport in transports:
+            await sandbox._signal_process_group(transport.get_pid(), signal.SIGKILL)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_owned_spawn_observes_startup_errors_and_preserves_cancellation(
+    monkeypatch: pytest.MonkeyPatch, cancelled: bool
+) -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+    spawn_error = OSError("synthetic spawn failure")
+    cleanup_calls = []
+
+    async def failing_spawn(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+        raise spawn_error
+
+    async def unexpected_cleanup(*_args, **_kwargs):
+        cleanup_calls.append(True)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", failing_spawn)
+    monkeypatch.setattr(sandbox, "_terminate_process_tree", unexpected_cleanup)
+    task = asyncio.create_task(sandbox._spawn_owned_process("unused"))
+    try:
+        await entered.wait()
+        if cancelled:
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+        release.set()
+        if cancelled:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(OSError) as caught:
+                await task
+            assert caught.value is spawn_error
+        assert not cleanup_calls
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 def _native_backend_expected() -> bool:
