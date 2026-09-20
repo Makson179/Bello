@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="480" height="489" viewBox="0 0 480 489" role="img" aria-labelledby="readme-distiller-mobile-title readme-distiller-mobile-desc">
-<title id="readme-distiller-mobile-title">Log distiller: cost versus quality</title>
-<desc id="readme-distiller-mobile-desc">Astra XHigh: Raw cost index 100, score 62.22%; distiller cost index 77.98, score 60.57%; Luna Max: Raw cost index 100, score 56.75%; distiller cost index 85.22, score 55.45%. JSON Schema. Astra has 3 runs per arm and runtime off. Luna has 6 runs per arm; its distiller arm includes runtime. Cost is estimated at API-equivalent token rates, normalized separately to Raw = 100 for each model, not a comparison of absolute prices. Score axis 50–65%; cost axis 70–105. Lower cost and higher score are better.</desc>
+<title id="readme-distiller-mobile-title">Log distiller: API-equivalent cost versus quality</title>
+<desc id="readme-distiller-mobile-desc">Astra XHigh: Raw cost index 100, score 62.22%; distiller cost index 77.98, score 60.57%; Luna Max: Raw cost index 100, score 56.75%; distiller cost index 85.22, score 55.45%. JSON Schema. Astra has 3 runs per arm and runtime off. Luna has 6 runs per arm; its distiller arm includes runtime. API-equivalent cost: Raw = 100 for each model. Score axis 50–65%; cost axis 70–105. Lower cost and higher score are better.</desc>
 <style>
 svg { --bg:#fff; --ink:#26323e; --muted:#64707c; --grid:#e4e9ee;
   --raw:#557ca6; --bello:#c84b32; }
@@ -59,5 +59,5 @@ text { font-family:Arial,Helvetica,sans-serif; fill:var(--ink);
 <text x="224.64" y="312.42" font-size="18" font-weight="600" class="bello halo" text-anchor="middle">55.45</text>
 <text x="292.96" y="221.58" font-size="16" font-weight="500" class="halo" text-anchor="middle">Luna Max · −14.78% cost</text>
 <text x="292.96" y="249.58" font-size="14" font-weight="400" class="muted halo" text-anchor="middle">runtime included</text>
-<text x="250.00" y="448.00" font-size="16" font-weight="400" class="muted" text-anchor="middle">← Estimated cost (Raw = 100 per model)</text>
+<text x="250.00" y="448.00" font-size="16" font-weight="400" class="muted" text-anchor="middle">← API-equivalent cost (Raw = 100 per model)</text>
 </svg>

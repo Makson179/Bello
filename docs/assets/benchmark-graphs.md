@@ -11,7 +11,7 @@
 
 <picture>
   <source media="(max-width: 600px)" srcset="./readme-distiller-mobile.svg">
-  <img src="./readme-distiller.svg" alt="Distiller cost versus quality: Astra cost 100 to 77.98, score 62.22% to 60.57%; Luna cost 100 to 85.22, score 56.75% to 55.45%, including runtime. Costs are normalized independently for each model." width="100%">
+  <img src="./readme-distiller.svg" alt="Distiller API-equivalent cost versus quality: Astra cost 100 to 77.98, score 62.22% to 60.57%; Luna cost 100 to 85.22, score 56.75% to 55.45%, including runtime. Costs are normalized independently for each model." width="100%">
 </picture>
 
 ## Budget C+A
@@ -53,17 +53,10 @@ python3 scripts/plot_readme_graphs.py
 | Figure | Data | What the comparison means |
 | --- | --- | --- |
 | `readme-model-comparison` | Reported 24-run table: Luna, Terra, Sol, Astra × Solar, Samtools, rumdl × Raw/Bello | Each point is the unweighted mean of three task scores. 12 Raw + 12 Bello runs, not 24 pairs or three seeds for every task. |
-| `readme-distiller` | JSON Schema Astra XHigh 3+3 and Luna Max 6+6 summaries | Estimated cost at API-equivalent token rates versus score. Raw cost is normalized to 100 separately for each model; absolute prices are not compared. Luna includes runtime. Times and the runtime-subtraction calculation remain in the README. |
+| `readme-distiller` | JSON Schema Astra XHigh 3+3 and Luna Max 6+6 summaries | API-equivalent cost versus score. Raw = 100 for each model. Luna includes runtime. |
 | `programbench-efficient-budget-quality-cost` | Published four-task Budget comparison, 12+12 runs | Luna-based Budget C+A versus Raw Sol XHigh. Scores are means; usage is summed across three runs per task. Headline usage is summed across all twelve runs per arm. |
 | `programbench-ca-performance` | [`programbench_ca_run_info.csv`](../../programbench_ca_run_info.csv) | Sol Ultra Raw versus one completion review + adversary. Not the older 4C+A+2C schedule. Score and solution time stay separate. |
 | `runtime-only-custom-task-results` | Published Marl / Slab / Pinch custom-task table | Task-specific scores, not a pooled ProgramBench score. |
-
-Source summaries are in the README of the parent `apex` commit
-[`f77595c`](https://github.com/Makson179/Bello/blob/f77595c4b60b221c5927a12b42ad3f06cf53ba34/README.md)
-and the earlier full tables at
-[`32450a1`](https://github.com/Makson179/Bello/blob/32450a17456f3e4df804d5a45068d5cf1e4168ba/README.md).
-The first link refers to the preview branch's source summary; its exact revision
-is also recorded in the history of this graphics branch.
 
 Published rounded aggregates are retained; do not recompute them from rounded
 per-run rows. Visible value labels use two decimal places; source precision is

@@ -37,7 +37,7 @@ an API provider. The four components can be enabled or disabled independently.
 In our [tests](#results), the Efficient Budget configuration used 66.3% less
 of the weekly Codex limit than Raw GPT-5.6 Sol XHigh without lowering average
 quality, and its mean score was 1.45% higher. Sol Ultra C+A raised the mean
-score over Raw Codex by 26.4%. The log distiller cut subscription usage by 22% on
+score over Raw Codex by 26.4%. The log distiller cut API-equivalent cost by 22% on
 Astra and by 14.8% on Luna.
 
 ## Install
@@ -254,21 +254,21 @@ pass through unchanged.
 
 We measured it on the JSON Schema task with the same coder model, with and
 without distillation, on a weaker model (GPT-5.6 Luna) and on a frontier model
-(GPT-6 Astra). Usage fell with both, so the selector works for weak and strong
+(GPT-6 Astra). API-equivalent cost fell with both, so the selector works for weak and strong
 coders alike.
 
 <picture>
   <source media="(max-width: 600px)" srcset="./docs/assets/readme-distiller-mobile.svg">
-  <img src="./docs/assets/readme-distiller.svg" alt="Cost versus quality: each model's Raw cost is normalized to 100. Astra XHigh changes from cost 100 and score 62.22% to cost 77.98 and score 60.57%. Luna Max changes from cost 100 and score 56.75% to cost 85.22 and score 55.45%, including runtime." width="100%">
+  <img src="./docs/assets/readme-distiller.svg" alt="API-equivalent cost versus quality: each model's Raw cost is normalized to 100. Astra XHigh changes from cost 100 and score 62.22% to cost 77.98 and score 60.57%. Luna Max changes from cost 100 and score 56.75% to cost 85.22 and score 55.45%, including runtime." width="100%">
 </picture>
 
-| Coder | Runs per arm | Usage | Score, off to on | Mean solution time, off to on |
+| Coder | Runs per arm | API-equivalent cost | Score, off to on | Mean solution time, off to on |
 | --- | ---: | ---: | ---: | ---: |
 | Astra XHigh, runtime off | 3 | -22.0% | 62.22% to 60.57% | 33:04 to 42:10 |
 | Luna Max, runtime on | 6 | -14.8% | 56.75% to 55.45% | 1:41:53 to 1:22:38 |
 
-Luna's 14.8% includes the runtime supervisor's usage in the Bello arm. After
-subtracting the recorded runtime cost, the coder alone used 25.3% less. Scores were 1.3 to 1.7 points lower with the
+Luna's 14.8% includes the runtime supervisor's API-equivalent cost in the Bello arm. After
+subtracting the recorded runtime cost, the coder's API-equivalent cost was 25.3% lower. Scores were 1.3 to 1.7 points lower with the
 distiller on.
 
 [Model on Hugging Face.](https://huggingface.co/Makson179/bello-log-distiller)

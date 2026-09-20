@@ -231,10 +231,9 @@ def distiller(mobile):
         f"{100*dc/rc:.2f}, score {ds:.2f}%"
         for name,rc,dc,rs,ds in DISTILLER)
     p=Chart("readme-distiller",489 if mobile else 467,
-            "Log distiller: cost versus quality",desc+
+            "Log distiller: API-equivalent cost versus quality",desc+
             ". JSON Schema. Astra has 3 runs per arm and runtime off. Luna has 6 runs per arm; "
-            "its distiller arm includes runtime. Cost is estimated at API-equivalent token rates, "
-            "normalized separately to Raw = 100 for each model, not a comparison of absolute prices. "
+            "its distiller arm includes runtime. API-equivalent cost: Raw = 100 for each model. "
             "Score axis 50–65%; cost axis 70–105. Lower cost and higher score are better.",mobile)
     p.parts.append('<style>.cost-link { stroke:var(--muted); stroke-opacity:.55; stroke-width:1.5; }</style>')
     # The connector pairs the two observations for each model; it is not a fit.
@@ -264,7 +263,7 @@ def distiller(mobile):
                f"{name} · −{100-cost:.2f}% cost",16 if mobile else 22,"halo","middle",500)
         if i==1:
             p.text(mid_x,mid_y-22,"runtime included",14 if mobile else 17,"muted halo","middle")
-    p.text((left+right)/2,bottom+65,"← Estimated cost (Raw = 100 per model)",
+    p.text((left+right)/2,bottom+65,"← API-equivalent cost (Raw = 100 per model)",
            16 if mobile else 20,"muted","middle")
     p.save()
 
