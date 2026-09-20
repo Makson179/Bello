@@ -1,0 +1,122 @@
+name: Native Codex Windows proof
+
+on:
+  workflow_dispatch:
+  push:
+    # Readiness tests the already published, pinned helper in its ModernBERT
+    # workflow. A new branch cannot reuse another branch's native build cache.
+    branches: [mystery, 'codex/**', '!codex/release-0.6.0-readiness']
+    paths:
+      - '.github/workflows/native-codex-windows*.yml'
+      - 'scripts/native-codex-selection.patch'
+      - 'scripts/prepare_native_codex_windows.py'
+      - 'scripts/build_native_codex_windows.py'
+      - 'scripts/verify_native_codex_selection.py'
+      - 'scripts/verify_native_codex_download.py'
+      - 'supervisor/appserver.py'
+      - 'supervisor/runtime/codex.py'
+      - 'supervisor/runtime/codex_permissions.py'
+      - 'supervisor/runtime/codex_distiller.py'
+      - 'supervisor/runtime/distiller_policy.py'
+      - 'supervisor/runtime/native_codex_install.py'
+      - 'pyproject.toml'
+      - 'tests/test_build_native_codex_windows.py'
+      - 'tests/test_native_codex_windows_workflow.py'
+      - 'tests/test_verify_native_codex_selection.py'
+      - 'tests/test_native_codex_install.py'
+      - 'tests/test_native_codex_download_transport.py'
+      - 'tests/test_runtime_codex_distiller.py'
+      - 'tests/test_runtime_codex_backend.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-codex-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-build:
+    uses: ./.github/workflows/native-codex-windows-build.yml
+
+  native-proof:
+    needs: native-build
+    runs-on: windows-2025
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.native-build.outputs.artifact-name }}
+          path: native-candidate
+      - name: Validate cached native build before executing it
+        run: python scripts/build_native_codex_windows.py verify-build --candidate native-candidate
+      - name: Install host and offline test dependencies, without optional models
+        run: python -c "import pathlib, subprocess, sys, tomllib; deps = tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['dependencies']; subprocess.run([sys.executable, '-m', 'pip', 'install', 'pytest', 'pytest-asyncio', *deps], check=True)"
+      - name: Run installer ACL, native bridge, backend and proof regressions
+        run: python -m pytest -q tests/test_build_native_codex_windows.py tests/test_native_codex_windows_workflow.py tests/test_verify_native_codex_selection.py tests/test_native_codex_install.py tests/test_native_codex_download_transport.py tests/test_runtime_codex_distiller.py tests/test_runtime_codex_backend.py
+      - name: Verify real native direct, code-mode and poll provider boundaries
+        run: python scripts/verify_native_codex_selection.py --codex native-candidate/bin/codex.exe --output-dir native-proof
+      - name: Package only after all nine proof cases pass
+        run: python scripts/build_native_codex_windows.py package-candidate --candidate native-candidate --proof native-proof/report.json --output native-artifact
+      - name: Install local artifact into private cache and repeat all nine proof cases
+        run: |
+          $proofRoot = Join-Path $env:LOCALAPPDATA "bello-install-proof-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          python scripts/build_native_codex_windows.py install-local --artifact native-artifact --runtime-root "$proofRoot" --proof-output native-installed-proof
+          $proofExit = $LASTEXITCODE
+          $receipt = Join-Path $proofRoot 'installed-cache.json'
+          if (Test-Path -LiteralPath $receipt) {
+            Copy-Item -LiteralPath $receipt -Destination native-artifact/installed-cache.json
+          }
+          exit $proofExit
+      - name: Verify published HTTPS cold install and unchanged cache reuse
+        run: |
+          $downloadRoot = Join-Path $env:LOCALAPPDATA "bello-https-proof-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          python scripts/verify_native_codex_download.py --runtime-root "$downloadRoot" --report native-https-installed.json
+          exit $LASTEXITCODE
+      - name: Upload verified unsigned bundle (no release publication)
+        uses: actions/upload-artifact@v4
+        with:
+          name: bello-native-codex-windows-x64-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            native-artifact/*.tar.gz
+            native-artifact/checksums.json
+            native-artifact/bundle/selection-manifest.json
+            native-artifact/bundle/BUILD-INFO
+            native-artifact/installed-cache.json
+            native-installed-proof/report.json
+            native-https-installed.json
+          if-no-files-found: error
+      - name: Upload synthetic diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-codex-windows-proof-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            native-proof/report.json
+            native-proof/*/result.json
+            native-proof/*/provider-request-*.json
+            native-proof/*/selector-inputs.json
+            native-proof/*/native-stderr.txt
+            native-proof/*/windows-setup-stdout.txt
+            native-proof/*/windows-setup-stderr.txt
+            native-proof/*/rpc.jsonl
+            native-installed-proof/report.json
+            native-installed-proof/*/result.json
+            native-installed-proof/*/provider-request-*.json
+            native-installed-proof/*/selector-inputs.json
+            native-installed-proof/*/native-stderr.txt
+            native-installed-proof/*/windows-setup-stdout.txt
+            native-installed-proof/*/windows-setup-stderr.txt
+            native-installed-proof/*/rpc.jsonl
+            native-artifact/installed-cache.json
+            native-https-installed.json
+          if-no-files-found: warn

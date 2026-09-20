@@ -1,0 +1,53 @@
+name: Native Codex persistent history diagnostic
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['codex/release-0.6.0-readiness']
+    paths:
+      - '.github/workflows/native-codex-history-smoke.yml'
+      - 'scripts/verify_native_codex_history.py'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-history:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install host dependencies only
+        run: python -c "import pathlib, subprocess, sys, tomllib; deps = tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['dependencies']; subprocess.run([sys.executable, '-m', 'pip', 'install', 'pytest', 'pytest-asyncio', *deps], check=True)"
+      - name: Check history parsing and no-auth reproduction fixture
+        run: python -m pytest -q tests/test_windows_modernbert_smoke.py tests/test_native_codex_history.py
+      - name: Published helper and persistent synthetic rollout
+        run: |
+          $runtime = Join-Path $env:LOCALAPPDATA "bello-history-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          python scripts/verify_native_codex_history.py --runtime-root "$runtime" --output-dir native-history-proof
+          exit $LASTEXITCODE
+      - name: Upload synthetic-only diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-history-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            native-history-proof/report.json
+            native-history-proof/published-install.json
+            native-history-proof/case/result.json
+            native-history-proof/case/provider-request-*.json
+            native-history-proof/case/selector-inputs.json
+            native-history-proof/case/rpc.jsonl
+            native-history-proof/case/native-stderr.txt
+            native-history-proof/case/windows-setup-*.txt
+            native-history-proof/case/empty-home/sessions/**/*.jsonl
+            native-history-proof/case/empty-home/archived_sessions/**/*.jsonl
+          if-no-files-found: warn

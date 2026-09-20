@@ -30,6 +30,9 @@ from supervisor.appserver import (
     AppServerMessage,
     last_agent_message_text,
 )
+from supervisor.runtime.client import RuntimeClient
+from supervisor.runtime_errors import bounded_provider_error, sanitize_error_text
+from supervisor.runtime.models import parse_model_selection
 from supervisor.approvals import ApprovalManager, normalize_approval_request
 from supervisor.coder import (
     CODER_SANDBOX_DANGER_FULL_ACCESS,
@@ -45,9 +48,10 @@ from supervisor.health import (
     patch_health,
     record_restart_issue_intervention,
 )
+from supervisor.immutable_reads import _literal_parts
 from supervisor.filesystem_safety import is_link_or_reparse, is_windows_platform
 from supervisor.executables import ExecutableResolutionError, require_trusted_executable
-from supervisor.project_config import DEFAULT_MODEL, MultiAgentConfig, ProjectConfig
+from supervisor.project_config import DEFAULT_MODEL, LogDistillerConfig, MultiAgentConfig, ProjectConfig
 from supervisor.policy import (
     _executable_basename,
     command_is_windows_shell_wrapper,
@@ -96,7 +100,7 @@ from supervisor.schemas import (
     ValidationRun,
 )
 from supervisor.schemas.models import ensure_relative_to
-from supervisor.state import DECISIONS, HANDOFF, PROGRESS, StateStore
+from supervisor.state import CONFIG, DECISIONS, HANDOFF, PROGRESS, StateStore
 from supervisor.supervisor_agent import StatelessSupervisorAgent, SupervisorAgentError
 from supervisor.task_select import resolve_plan, resolve_task
 from supervisor.tui import TerminalTUI, UserCommand
@@ -161,6 +165,11 @@ MANDATORY_FULL_RUNTIME_WAKE_REASONS = {
 }
 CONTROLLER_IDLE_GUARD_INTERVAL_SECONDS = 60.0
 CONTROLLER_IDLE_GUARD_STALL_SECONDS = 120.0
+# These are transport diagnostics, not a time limit on coding or commands. Silence
+# alone never fails a run. Only an explicitly retrying provider gets a budget.
+CODER_STATUS_PROBE_AFTER_SECONDS = 300.0
+CODER_STATUS_PROBE_TIMEOUT_SECONDS = 10.0
+CODER_PROVIDER_RETRY_BUDGET_SECONDS = 300.0
 # Provider no_message (empty-completion) recovery for the completion review. A transient
 # backend blip can return empty "completed" turns for a couple of minutes; ride it out with
 # backed-off retries before declaring the run infra-invalid. The budget is CONSECUTIVE
@@ -325,6 +334,17 @@ class SubagentRuntimeState:
         self.last_sequence = sequence
 
 
+@dataclass
+class _ActiveCoderWatch:
+    identity: tuple[int, str, str, int]
+    last_progress: float
+    last_probe: float = float("-inf")
+    retry_since: float | None = None
+    last_error: str = ""
+    reported_stall: bool = False
+    running_tools: set[str] = field(default_factory=set)
+
+
 class BelloController:
     def __init__(
         self,
@@ -352,6 +372,8 @@ class BelloController:
         adversary_enabled: bool | None = None,
         adversary_runs: int | None = None,
         completion_review: bool | None = None,
+        runtime_enabled: bool | None = None,
+        log_distiller: LogDistillerConfig | None = None,
         declared_grading_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
         project_config: ProjectConfig | None = None,
     ):
@@ -409,9 +431,11 @@ class BelloController:
         # CLI override for the completion-review toggle; stays runtime-scoped and never
         # rewrites the persisted project config, matching the other run settings.
         self.completion_review = completion_review
+        self.runtime_enabled = runtime_enabled
+        self.log_distiller = log_distiller
         self.project_config = project_config
         self.event_queue: asyncio.Queue[ControllerEvent] = asyncio.Queue()
-        self.client = client or AppServerClient(
+        self.client = client or RuntimeClient(
             cwd=self.project_root,
             notification_handler=self._on_notification,
             server_request_handler=self._on_server_request,
@@ -509,6 +533,12 @@ class BelloController:
         self.initialize_state()
         self._write_run_checkpoint("startup", state="active")
         try:
+            configure_run = getattr(self.client, "configure_run", None)
+            if callable(configure_run):
+                configure_run(
+                    runtime_enabled=self._runtime_enabled(),
+                    log_distiller=self._log_distiller_config(),
+                )
             await self.client.start()
             await self.client.initialize()
             await self.tui.start()
@@ -516,11 +546,6 @@ class BelloController:
             self.tui.render("SYSTEM", self._runtime_settings_summary())
             self._prepare_coder_workspace()
             self._write_run_checkpoint("coder_workspace", state="stable")
-            if self._adversary_enabled_for_config() and not self._effective_completion_review():
-                self.tui.render(
-                    "SYSTEM",
-                    "adversary requires completion review; disabled for this run",
-                )
             await self.preflight()
             if not self.running:
                 return
@@ -537,7 +562,7 @@ class BelloController:
                     thread_id,
                     role="runtime",
                 ),
-            )
+            ) if self._runtime_enabled() else None
             self.completion_supervisor = StatelessSupervisorAgent(
                 self.client,
                 self.store,
@@ -555,25 +580,25 @@ class BelloController:
                     thread_id,
                     role="completion_review",
                 ),
-            )
+            ) if self._effective_completion_review() else None
             self.adv_report_controller = StatelessSupervisorAgent(
                 self.client,
                 self.store,
                 self.task_path,
                 workspace_root=self._active_workspace_root(),
                 task_contents=self._canonical_task_contents,
-                model=self._completion_model(),
+                model=self._completion_model() if self._effective_completion_review() else self._adversary_model(),
                 fast=self._fast_mode(),
-                intelligence=self._completion_intelligence(),
+                intelligence=self._completion_intelligence() if self._effective_completion_review() else self._adversary_intelligence(),
                 completion_source_snapshot=getattr(self, "_coder_snapshot", None),
                 on_thread_start=lambda thread_id: self._register_reviewer_thread(
                     thread_id,
                     role="adv_report_controller",
                 ),
-            )
+            ) if self._adversary_model_required_for_preflight() else None
             self.approvals = ApprovalManager(
                 self._active_workspace_root(),
-                supervisor=self,
+                supervisor=self if self._runtime_enabled() else None,
                 declared_grading_roots=self.declared_grading_roots,
                 immutable_paths=self._immutable_approval_paths(),
             )
@@ -587,6 +612,7 @@ class BelloController:
                 intelligence=self._active_coder_intelligence(),
                 multi_agent=self._multi_agent_config(),
                 plan_path=self._active_coder_plan_path(),
+                readonly_roots=self._active_dependency_roots(),
             )
             await self.coder.start_thread()
             self._coder_started = True
@@ -600,6 +626,28 @@ class BelloController:
             await self.fail_provider(f"app-server RPC failed: {exc}")
         except WorkspaceSnapshotError as exc:
             await self.fail_provider(f"run infrastructure failed: {exc}")
+        except Exception as exc:
+            # An unexpected local failure must not leave a dead run advertised
+            # as running. Preserve the unaccepted snapshot via the existing
+            # failure path, then re-raise so CLI callers retain a nonzero exit
+            # and the original traceback. Cancellation/KeyboardInterrupt are
+            # BaseExceptions and deliberately keep their existing behavior.
+            detail = f"run infrastructure failed: {type(exc).__name__}: {sanitize_error_text(str(exc))}"
+            try:
+                await self.fail_provider(detail)
+                self.pending_approvals.clear()
+                if self.coder is not None:
+                    self.coder.active_turn_id = None
+                self.store.update_bello_config(
+                    lambda cfg: cfg.model_copy(update={
+                        "active_coder_turn_id": None,
+                        "pending_server_request_ids": [],
+                    })
+                )
+                self._write_run_checkpoint("terminal", state="terminal", detail=detail)
+            except Exception as finalization_error:
+                exc.add_note(f"Failure finalization also failed: {type(finalization_error).__name__}")
+            raise
         finally:
             self.running = False
             await self._stop_supervisor_task()
@@ -653,7 +701,9 @@ class BelloController:
             max_completion_returns_before_adversary=project_config.completion_returns_before_adversary,
             max_completion_returns_after_adversary=project_config.completion_returns_after_adversary,
             completion_review_enabled=project_config.completion_review,
-            cheap_runtime=project_config.cheap_runtime,
+            cheap_runtime=self._runtime_enabled() and project_config.cheap_runtime,
+            runtime_enabled=self._runtime_enabled(),
+            log_distiller=self._log_distiller_config().to_json_data(),
             multi_agent=project_config.multi_agent.to_json_data(),
             completion_multi_agent=project_config.completion_multi_agent.to_json_data(),
             adversary_multi_agent=project_config.adversary_multi_agent.to_json_data(),
@@ -759,7 +809,9 @@ class BelloController:
                     "max_completion_returns_before_adversary": project_config.completion_returns_before_adversary,
                     "max_completion_returns_after_adversary": project_config.completion_returns_after_adversary,
                     "completion_review_enabled": project_config.completion_review,
-                    "cheap_runtime": project_config.cheap_runtime,
+                    "cheap_runtime": self._runtime_enabled() and project_config.cheap_runtime,
+                    "runtime_enabled": self._runtime_enabled(),
+                    "log_distiller": self._log_distiller_config().to_json_data(),
                     "multi_agent": project_config.multi_agent.to_json_data(),
                     "completion_multi_agent": project_config.completion_multi_agent.to_json_data(),
                     "adversary_multi_agent": project_config.adversary_multi_agent.to_json_data(),
@@ -769,6 +821,10 @@ class BelloController:
 
     def _active_workspace_root(self) -> Path:
         return Path(getattr(self, "workspace_root", self.project_root)).resolve()
+
+    def _active_dependency_roots(self) -> tuple[Path, ...]:
+        snapshot = getattr(self, "_coder_snapshot", None)
+        return getattr(snapshot, "readonly_dependency_roots", ())
 
     def _active_task_path(self) -> Path:
         return Path(getattr(self, "workspace_task_path", self.task_path)).resolve()
@@ -1213,18 +1269,47 @@ class BelloController:
         return bool(getattr(self, "fast", False))
 
     def _cheap_runtime_enabled(self) -> bool:
+        if not self._runtime_enabled():
+            return False
         try:
             return bool(self.store.get_bello_config().cheap_runtime)
         except Exception:
             project_config = getattr(self, "project_config", None)
             return bool(project_config.cheap_runtime) if project_config is not None else True
 
+    def _runtime_enabled(self) -> bool:
+        override = getattr(self, "runtime_enabled", None)
+        if override is not None:
+            return bool(override)
+        config = getattr(self, "project_config", None)
+        if config is not None:
+            return bool(getattr(config, "runtime_enabled", True))
+        try:
+            return bool(self.store.get_bello_config().runtime_enabled)
+        except Exception:
+            return True
+
+    def _post_coder_review_enabled(self) -> bool:
+        return self._effective_completion_review() or self._adversary_model_required_for_preflight()
+
+    def _log_distiller_config(self) -> LogDistillerConfig:
+        override = getattr(self, "log_distiller", None)
+        if override is not None:
+            return override
+        config = getattr(self, "project_config", None)
+        if config is not None:
+            return config.log_distiller
+        try:
+            saved = self.store.read_json(CONFIG, {})
+            return LogDistillerConfig(**saved.get("log_distiller", {}))
+        except (AttributeError, FileNotFoundError):
+            return LogDistillerConfig()
+
     def _effective_completion_review(self) -> bool:
         """Whether the completion review gate is active for this run.
 
         CLI override wins; otherwise the persisted project-config mirror. With the gate
-        off, the coder's readiness marker finalizes the run directly and the adversary
-        (which runs inside the review-accept path) is inactive.
+        off, the independently configured adversary can still review coder readiness.
         """
         override = getattr(self, "completion_review", None)
         if override is not None:
@@ -1264,6 +1349,8 @@ class BelloController:
             completion_intelligence=self._completion_intelligence() or DEFAULT_INTELLIGENCE,
             adversary_intelligence=self._adversary_intelligence() or DEFAULT_INTELLIGENCE,
             speed="fast" if self._fast_mode() else "usual",
+            runtime_enabled=self._runtime_enabled(),
+            log_distiller=self._log_distiller_config(),
             start_over=self.overwrite_state,
             adversary=self._adversary_enabled_for_config(),
             clean=self.clean_workspace,
@@ -1302,6 +1389,8 @@ class BelloController:
             f"completion-intelligence={self._completion_intelligence()} "
             f"adversary-intelligence={self._adversary_intelligence()} "
             f"speed={speed} "
+            f"runtime={_format_bool(self._runtime_enabled())} "
+            f"log-distiller={_format_bool(self._log_distiller_config().enabled)} "
             f"cheap-runtime={_format_bool(self._cheap_runtime_enabled())} "
             f"multi-agent={multi_agent_summary} "
             f"completion-multi-agent={completion_multi_agent_summary} "
@@ -1309,7 +1398,7 @@ class BelloController:
             f"start-over={_format_bool(self.overwrite_state)} "
             f"clean={_format_bool(self.clean_workspace)} "
             f"completion-review={_format_bool(self._effective_completion_review())} "
-            f"adversary={_format_bool(self._adversary_enabled_for_config() and self._effective_completion_review())} "
+            f"adversary={_format_bool(self._effective_max_adversary_runs() > 0)} "
             f"protected-path={protected_paths}"
         )
 
@@ -1404,10 +1493,18 @@ class BelloController:
     def _completion_supervisor_agent(self) -> StatelessSupervisorAgent | None:
         return getattr(self, "completion_supervisor", None) or getattr(self, "supervisor", None)
 
+    def _post_coder_review_agent(self) -> StatelessSupervisorAgent | None:
+        if self._effective_completion_review():
+            return self._completion_supervisor_agent()
+        return self._adv_report_controller_agent()
+
     def _adv_report_controller_agent(self) -> StatelessSupervisorAgent | None:
         return getattr(self, "adv_report_controller", None)
 
     async def preflight(self) -> None:
+        if isinstance(self.client, RuntimeClient):
+            await self._runtime_preflight()
+            return
         self.tui.status("checking Codex version")
         codex = _controller_executable("codex", self.project_root)
         if codex is None:
@@ -1443,16 +1540,20 @@ class BelloController:
         await self._ensure_selected_models_available(models_response)
         if self.store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE:
             return
-        self.tui.status("checking supervisor structured output")
-        await self._structured_output_self_test()
-        await self._configure_runtime_triage()
+        if self._runtime_enabled():
+            self.tui.status("checking supervisor structured output")
+            await self._structured_output_self_test()
+            await self._configure_runtime_triage()
         self.tui.status("checking config requirements")
         await self.client.config_requirements_read()
         self.tui.status("checking coder sandbox and approval settings")
         thread = await self.client.thread_start(
             coder_thread_params(
                 self._active_workspace_root(),
+                task_path=self._active_task_path(),
+                readonly_roots=self._active_dependency_roots(),
                 model=self._coder_model(),
+                intelligence=self._coder_intelligence(),
                 fast=self._fast_mode(),
                 multi_agent=self._multi_agent_config(),
             )
@@ -1472,16 +1573,89 @@ class BelloController:
         if isinstance(thread_id, str):
             await self._cleanup_preflight_probe_thread(thread_id)
 
+    async def _runtime_preflight(self) -> None:
+        from supervisor.runtime.models import parse_model_selection
+        from supervisor.runtime.sandbox import SandboxPolicy, SandboxRunner
+        self.tui.status("checking Bello execution engines and configured models")
+        selected = [self._coder_model()]
+        if self._runtime_enabled():
+            selected.append(self._runtime_model())
+        if self._effective_completion_review():
+            selected.append(self._completion_model())
+        if self._post_coder_review_enabled() and self._revision_coder_enabled():
+            selected.append(self._revision_coder_model())
+        if self._adversary_model_required_for_preflight():
+            selected.append(self._adversary_model())
+        selected.extend(self._enabled_subagent_models_for_preflight())
+        self.client.required_models = tuple(dict.fromkeys(selected))
+        models = await self.client.model_list()
+        self.store.update_bello_config(lambda cfg: cfg.model_copy(update={
+            "runtime_name": "bello-codex/pi/claude-code", "runtime_protocol_version": 1,
+        }))
+        self._persist_model_config()
+        await self._ensure_selected_models_available(models)
+        if self.store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE:
+            return
+        profiles = [(self._coder_model(), self._coder_intelligence())]
+        if self._runtime_enabled():
+            profiles.append((self._runtime_model(), self._runtime_intelligence()))
+        policies = [self._multi_agent_config()]
+        if self._effective_completion_review():
+            profiles.append((self._completion_model(), self._completion_intelligence()))
+            policies.append(self._completion_multi_agent_config())
+        if self._post_coder_review_enabled() and self._revision_coder_enabled():
+            profiles.append((self._revision_coder_model(), self._revision_coder_intelligence()))
+        if self._adversary_model_required_for_preflight():
+            profiles.append((self._adversary_model(), self._adversary_intelligence()))
+            policies.append(self._adversary_multi_agent_config())
+        for policy in policies:
+            if policy.enabled:
+                profiles.extend((model, effort) for model, efforts in policy.allowed.items() for effort in efforts)
+        distilled_models = set()
+        if self._log_distiller_config().enabled:
+            distilled_models.add(parse_model_selection(self._coder_model()).qualified)
+            if self._post_coder_review_enabled() and self._revision_coder_enabled():
+                distilled_models.add(parse_model_selection(self._revision_coder_model()).qualified)
+            coder_agents = self._multi_agent_config()
+            if coder_agents.enabled:
+                distilled_models.update(parse_model_selection(model).qualified for model in coder_agents.allowed)
+        for model, effort in dict.fromkeys(profiles):
+            selection = parse_model_selection(model)
+            request = {
+                "model": model, "effort": effort,
+                "serviceTier": "priority" if self._fast_mode() else None,
+            }
+            if selection.engine == "codex" and selection.qualified in distilled_models:
+                # Check native D capability before runtime's paid startup probe,
+                # but do not require a patched binary for Codex reviewers alone.
+                request["distillerEnabled"] = True
+            validation = await self.client.request("model/validate", request)
+            if validation.get("valid") is not True:
+                raise RuntimeError(f"execution engine could not validate the exact model profile: {model} / {effort}")
+        self.tui.status("checking the operating-system sandbox")
+        root = self._active_workspace_root()
+        probe = await SandboxRunner(SandboxPolicy(
+            root=root, mode=coder_sandbox_mode(), readable_roots=self._active_dependency_roots(),
+        )).run(
+            "echo bello-sandbox-probe", root, 10
+        )
+        if probe.exit_code != 0 or "bello-sandbox-probe" not in probe.output:
+            raise RuntimeError("Bello could not start its required OS sandbox; no model run was started")
+        if self._runtime_enabled():
+            self.tui.status("checking supervisor structured output")
+            await self._structured_output_self_test()
+            await self._configure_runtime_triage()
+
     async def _ensure_selected_models_available(self, models_response: dict[str, Any]) -> None:
         result = _selected_model_availability(
             models_response,
             coder_model=self._coder_model(),
             revision_coder_model=(
                 self._revision_coder_model()
-                if self._revision_coder_enabled() and self._effective_completion_review()
+                if self._revision_coder_enabled() and self._post_coder_review_enabled()
                 else None
             ),
-            runtime_model=self._runtime_model(),
+            runtime_model=self._runtime_model() if self._runtime_enabled() else None,
             completion_model=self._completion_model() if self._effective_completion_review() else None,
             adversary_model=self._adversary_model() if self._adversary_model_required_for_preflight() else None,
             subagent_models=self._enabled_subagent_models_for_preflight(),
@@ -1492,7 +1666,7 @@ class BelloController:
         missing = ", ".join(result.missing_roles)
         message = (
             "model availability preflight failed before coder start: "
-            f"selected model(s) are not available from Codex app-server model/list: {missing}. "
+            f"selected model(s) are not available from the execution engine: {missing}. "
             f"Available models: {available}. "
             "The interruption is recorded in .supervisor/FINAL_REPORT.md."
         )
@@ -1515,8 +1689,6 @@ class BelloController:
         return tuple(models)
 
     def _adversary_model_required_for_preflight(self) -> bool:
-        if not self._effective_completion_review():
-            return False
         enabled = getattr(self, "adversary_enabled", None)
         if enabled is False:
             return False
@@ -1548,6 +1720,12 @@ class BelloController:
                     await self.handle_controller_event(completed)
                 elif isinstance(completed, UserCommand):
                     await self.handle_user_command(completed)
+            # Quota/status notifications must not indefinitely postpone the
+            # active-turn diagnostic just because the event queue stays busy.
+            now = time.monotonic()
+            if now - getattr(self, "_last_active_guard_tick", float("-inf")) >= CONTROLLER_IDLE_GUARD_INTERVAL_SECONDS:
+                self._last_active_guard_tick = now
+                await self._handle_active_coder_guard(now=now)
 
     def _mark_controller_activity(self) -> None:
         self._last_controller_activity_monotonic = time.monotonic()
@@ -1558,6 +1736,7 @@ class BelloController:
             return
         cfg = self.store.get_bello_config()
         if cfg.active_coder_turn_id:
+            await self._handle_active_coder_guard(now=now)
             return
         coder = getattr(self, "coder", None)
         if coder is None:
@@ -1590,6 +1769,117 @@ class BelloController:
             }
         )
         await self._handle_no_marker_idle()
+
+    def _active_coder_watch(self, cfg: BelloConfig | None = None, *, now: float | None = None) -> _ActiveCoderWatch | None:
+        cfg = cfg or self.store.get_bello_config()
+        coder = getattr(self, "coder", None)
+        if (not self._coder_lifecycle_accepts_activity(cfg) or coder is None
+                or not cfg.coder_thread_id or not cfg.active_coder_turn_id):
+            return None
+        identity = (cfg.generation, cfg.coder_thread_id, cfg.active_coder_turn_id, id(coder))
+        watch = getattr(self, "_coder_watch", None)
+        if watch is None or watch.identity != identity:
+            watch = _ActiveCoderWatch(identity, time.monotonic() if now is None else now)
+            self._coder_watch = watch
+        return watch
+
+    def _record_coder_progress(self, method: str, params: dict[str, Any], cfg: BelloConfig) -> None:
+        watch = self._active_coder_watch(cfg)
+        if watch is None:
+            return
+        item = params.get("item")
+        item_id = _item_id_from_params(params)
+        if isinstance(item, dict) and item_id:
+            if (method == "item/started" and _is_completed_action(item)
+                    and item.get("status") in {None, "inProgress"}
+                    and (item.get("type") != "commandExecution" or item.get("command"))):
+                watch.running_tools.add(item_id)
+            elif method == "item/completed":
+                watch.running_tools.discard(item_id)
+        # A repeated item/started, token counter, or retry is not forward
+        # progress. Real output and completed work break the retry streak.
+        meaningful = method == "item/completed" or (
+            _is_stream_delta_method(method) and bool(params.get("delta"))
+        )
+        if meaningful:
+            watch.last_progress = time.monotonic()
+            watch.retry_since = None
+            watch.last_error = ""
+            watch.reported_stall = False
+
+    async def _handle_active_coder_guard(self, *, now: float | None = None) -> None:
+        current_time = time.monotonic() if now is None else now
+        watch = self._active_coder_watch(now=current_time)
+        if watch is None or getattr(self, "_transport_error_pending", False):
+            return
+        # Other engines keep their own lifecycle. The read-only reconciliation
+        # below relies specifically on native Codex turn records.
+        if parse_model_selection(self._active_coder_model() or DEFAULT_MODEL).engine != "codex":
+            return
+        if (getattr(self, "pending_approvals", None) or watch.running_tools
+                or self._active_coder_subagents()):
+            # Waiting on an approved tool/user is not waiting for model retry.
+            watch.retry_since = None
+        retry_expired = (watch.retry_since is not None
+                         and current_time - watch.retry_since >= CODER_PROVIDER_RETRY_BUDGET_SECONDS)
+        if (not retry_expired and current_time - watch.last_progress < CODER_STATUS_PROBE_AFTER_SECONDS
+                or current_time - watch.last_probe < CONTROLLER_IDLE_GUARD_INTERVAL_SECONDS):
+            return
+        watch.last_probe = current_time
+        progress_before_probe = watch.last_progress
+        _, thread_id, turn_id, _ = watch.identity
+        probe_error = None
+        turn = None
+        try:
+            result = await asyncio.wait_for(
+                self.client.thread_read(thread_id, include_turns=True,
+                                        timeout=CODER_STATUS_PROBE_TIMEOUT_SECONDS),
+                timeout=CODER_STATUS_PROBE_TIMEOUT_SECONDS,
+            )
+            thread = result.get("thread", {})
+            if isinstance(thread, dict) and thread.get("id") == thread_id:
+                turn = _thread_turn_by_id(thread, turn_id)
+        except (AppServerError, TimeoutError) as exc:
+            probe_error = sanitize_error_text(str(exc) or "thread/read timed out")
+        if (self._active_coder_watch() is not watch or watch.last_progress != progress_before_probe
+                or not self.event_queue.empty()):
+            return  # Paused/restarted/completed or made progress during the RPC.
+        if isinstance(turn, dict) and turn.get("status") in {"completed", "failed", "interrupted"}:
+            reconcile = getattr(self.client, "reconcile_terminal_turn", None)
+            if reconcile is not None:
+                try:
+                    reconciled = await asyncio.wait_for(reconcile(thread_id, turn_id, turn),
+                                                        timeout=CODER_STATUS_PROBE_TIMEOUT_SECONDS)
+                    if reconciled and self._active_coder_watch() is watch:
+                        self._append_event(AppEventSource.APP_SERVER, "coder/completionRecovered",
+                                           thread_id=thread_id, turn_id=turn_id,
+                                           reason="Recovered terminal status from native thread/read; no task replay")
+                        # The final agentMessage notification may have been lost
+                        # along with completion. Restore it from the exact turn,
+                        # not from other turns or an untrusted thread status.
+                        text = last_agent_message_text(turn)
+                        if text and text.strip():
+                            self.last_coder_message = CoderMessage(text=text.strip(), sequence=self._sequence)
+                    return  # Normal queued turn/completed performs review exactly once.
+                except (AppServerError, TimeoutError) as exc:
+                    probe_error = sanitize_error_text(str(exc) or "turn reconciliation timed out")
+                    # The provider did finish; a local cleanup problem must not
+                    # be misreported as an exhausted model retry budget.
+                    retry_expired = False
+        if not watch.reported_stall:
+            reason = ("Coder has no new progress; checking native turn status without restarting it. "
+                      + (f"Status read failed: {probe_error}" if probe_error else
+                         f"Native turn status: {turn.get('status', 'unknown') if turn else 'unknown'}"))
+            self._append_event(AppEventSource.APP_SERVER, "coder/progressStalled", thread_id=thread_id,
+                               turn_id=turn_id, reason=reason)
+            self.tui.render("SYSTEM", reason)
+            watch.reported_stall = True
+        if retry_expired:
+            await self.fail_provider(
+                "Coder provider retry budget exceeded: no forward progress for "
+                f"{CODER_PROVIDER_RETRY_BUDGET_SECONDS:g}s after a retryable error. "
+                f"No task replay was attempted. Last error: {watch.last_error}"
+            )
 
     async def handle_controller_event(self, event: ControllerEvent) -> None:
         try:
@@ -1870,12 +2160,13 @@ class BelloController:
             self.client,
             self.store,
             self._active_workspace_root(),
-            self._active_task_path(),
+            previous.task_read_path,
             model=self._active_coder_model(),
             fast=self._fast_mode(),
             intelligence=self._active_coder_intelligence(),
             multi_agent=self._multi_agent_config(),
             plan_path=self._active_coder_plan_path(),
+            readonly_roots=previous.readonly_roots,
         )
         self.coder = replacement
         new_thread_id = await replacement.start_thread()
@@ -1937,6 +2228,9 @@ class BelloController:
             health = self.store.get_health()
             self.tui.render("SYSTEM", f"task={Path(cfg.task_path).name} generation={cfg.generation} active_turn={cfg.active_coder_turn_id} pending_approvals={len(self.pending_approvals)} restarts={health.restart_count}")
             return
+        if not self._runtime_enabled():
+            await self._deliver_coder_message(command.text)
+            return
         self._schedule_supervisor_check(
             f"Human message to supervisor: {text}",
             human_message=HumanMessage(text=command.text, sequence=self._sequence),
@@ -1967,7 +2261,15 @@ class BelloController:
             reason=context.command or context.grant_root or context.request_type.value,
         )
         is_adversary_request = self._is_adversary_approval_context(context)
-        if is_adversary_request:
+        if not self._runtime_enabled():
+            # The runtime grants network inside each assigned filesystem sandbox.
+            # An explicit sandbox escape needs separate user authority, which this
+            # unattended approval protocol does not provide. Do not call any model
+            # or auto-approve a host-wide command as a substitute.
+            manager = ApprovalManager(self._active_workspace_root())
+            resolution = manager._deny(context, "outside-sandbox approval is unavailable while runtime supervision is disabled")
+            response = manager.response_payload(context, resolution)
+        elif is_adversary_request:
             adversary_workspace_root = getattr(self, "_active_adversary_workspace_root", None)
             fallback_manager = ApprovalManager(
                 adversary_workspace_root or self._active_workspace_root(),
@@ -2012,7 +2314,7 @@ class BelloController:
                     PROGRESS,
                     f"- Adversary approval denied without steering coder: {resolution.reason}\n",
                 )
-            elif self.coder is not None:
+            elif self.coder is not None and self._runtime_enabled():
                 delivery_reason = resolution.reason
                 if self._is_coder_descendant(context.thread_id):
                     delivery_reason = (
@@ -2070,7 +2372,7 @@ class BelloController:
         return True
 
     async def decide_approval(self, context: ApprovalContext, reason: str) -> SupervisorDecision:
-        if self.supervisor is None:
+        if not self._runtime_enabled() or self.supervisor is None:
             raise SupervisorAgentError("supervisor not ready")
         self._reconcile_intervention_accounting()
         cfg = self.store.get_bello_config()
@@ -2108,6 +2410,10 @@ class BelloController:
         turn_id = _turn_id_from_params(params)
         item_id = _item_id_from_params(params)
         cfg = self.store.get_bello_config()
+        current_coder_turn = bool(thread_id == cfg.coder_thread_id and turn_id
+                                  and turn_id == cfg.active_coder_turn_id)
+        if current_coder_turn:
+            self._record_coder_progress(method, params, cfg)
         if _is_stream_delta_method(method):
             # Completion/adversary commands are deliberately outside the coder evidence
             # ledger. Do not retain their potentially large output chunks waiting for a
@@ -2115,7 +2421,8 @@ class BelloController:
             if thread_id == cfg.coder_thread_id or self._is_coder_descendant(thread_id, cfg=cfg):
                 self._record_command_output_delta(method, params, item_id=item_id)
             return
-        event_payload = _bounded_subagent_event_payload(method, params)
+        event_payload = (bounded_provider_error(params) if method == "error"
+                         else _bounded_subagent_event_payload(method, params))
         if self._exposes_review_private_input(event_payload):
             event_payload.pop("prompt", None)
         self._append_event(
@@ -2124,12 +2431,33 @@ class BelloController:
             thread_id=thread_id,
             turn_id=turn_id,
             item_id=item_id,
+            reason=event_payload.get("error", {}).get("message") if method == "error" else None,
             payload=event_payload,
         )
         if getattr(self, "_terminal_cleanup_started", False) and method != "serverRequest/resolved":
             return
 
         lifecycle_accepts_activity = self._coder_lifecycle_accepts_activity(cfg)
+
+        if method == "error":
+            # Reviewer/old-turn errors remain journalled but may not terminate
+            # the current coder. Missing willRetry is unknown, never False.
+            if not lifecycle_accepts_activity or not current_coder_turn:
+                return
+            error = event_payload.get("error", {})
+            detail = error.get("message") if isinstance(error, dict) else None
+            detail = detail or "provider sent an error without a message"
+            retry = event_payload.get("willRetry")
+            if retry is False:
+                await self.fail_provider(f"coder execution failed: {detail}")
+            else:
+                watch = self._active_coder_watch()
+                if watch is not None:
+                    if retry is True and watch.retry_since is None:
+                        watch.retry_since = time.monotonic()
+                    watch.last_error = detail
+                self.tui.render("SYSTEM", f"Coder provider {'is retrying' if retry is True else 'reported an error'}: {detail}")
+            return
         await self._track_subagent_notification(
             method,
             params,
@@ -2168,6 +2496,7 @@ class BelloController:
             self._current_turn_action_count = 0
             self._generation_has_coder_turn = True
             self.store.update_bello_config(lambda current: current.model_copy(update={"active_coder_turn_id": turn_id}))
+            self._active_coder_watch()
             self._write_run_checkpoint("coder", state="active")
             self.tui.render("CODER", f"turn started {turn_id}")
             return
@@ -2197,6 +2526,20 @@ class BelloController:
             )
             return
         if method == "turn/completed" and thread_id == cfg.coder_thread_id:
+            completion_key = (cfg.generation, thread_id, turn_id)
+            seen_completions = getattr(self, "_handled_coder_completions", None)
+            if seen_completions is None:
+                seen_completions = deque(maxlen=128)
+                self._handled_coder_completions = seen_completions
+            if completion_key in seen_completions or (
+                    cfg.active_coder_turn_id and turn_id != cfg.active_coder_turn_id):
+                return
+            seen_completions.append(completion_key)
+            turn = params.get("turn", {})
+            if isinstance(turn, dict) and turn.get("status") == "failed":
+                detail = bounded_provider_error({"error": turn.get("error")}).get("error", {})
+                await self.fail_provider(f"coder execution failed: {detail or 'provider returned a failed turn'}")
+                return
             if self.coder and isinstance(turn_id, str):
                 self.coder.mark_turn_completed(turn_id)
             self._write_run_checkpoint("coder_turn_complete", state="stable")
@@ -2450,7 +2793,7 @@ class BelloController:
             changed_files=changed_files,
             validation_trigger_reasons=validation_trigger_reasons,
         )
-        if repaired_runtime_controls:
+        if repaired_runtime_controls and self._runtime_enabled():
             runtime_decision = RuntimeTriggerDecision(
                 should_wake=True,
                 reasons=tuple(dict.fromkeys((*runtime_decision.reasons, "runtime_control_replacement"))),
@@ -2571,6 +2914,10 @@ class BelloController:
             state.active_turn_id = None
         state.nickname = _optional_bounded_text(thread.get("agentNickname"), 120) or state.nickname
         state.role = _optional_bounded_text(thread.get("agentRole"), 120) or state.role
+        if isinstance(thread.get("model"), str):
+            state.model = thread["model"]
+        if isinstance(thread.get("reasoningEffort"), str):
+            state.reasoning_effort = thread["reasoningEffort"]
         state.last_sequence = max(state.last_sequence, self._sequence)
         return state
 
@@ -3102,7 +3449,7 @@ class BelloController:
         repaired_runtime_controls = self._repair_snapshot_runtime_controls(source="coder_turn_completed")
         if await self._escalate_runtime_integrity_issue(source="coder_turn_completed"):
             return
-        if repaired_runtime_controls:
+        if repaired_runtime_controls and self._runtime_enabled():
             self._schedule_supervisor_check(
                 "Runtime integrity trigger: coder workspace runtime links were replaced and restored.",
                 triggering_item_id=item_id,
@@ -3118,7 +3465,7 @@ class BelloController:
                     self._deferred_completion_check = QueuedSupervisorCheck(
                         summary="Coder provided exact readiness marker; waiting for active subagents before completion.",
                         triggering_item_id=item_id,
-                        completion_review=self._effective_completion_review(),
+                        completion_review=self._post_coder_review_enabled(),
                     )
                     reason = (
                         "Coder declared readiness while relevant subagents are still active: "
@@ -3133,7 +3480,7 @@ class BelloController:
                     return
                 self._last_completion_marker_sequence = message.sequence
                 self.no_marker_idle_nudge_count = 0
-                done_gap = await self._done_without_fresh_behavioral_validation()
+                done_gap = await self._done_without_fresh_behavioral_validation() if self._runtime_enabled() else None
                 if done_gap is not None:
                     self._record_runtime_trigger_trace(
                         event_type="turn/completed",
@@ -3169,6 +3516,9 @@ class BelloController:
                 sequence=message.sequence,
             )
             return
+        if not self._runtime_enabled():
+            await self._handle_no_marker_idle()
+            return
         if self.pending_approvals:
             self._schedule_supervisor_check("Coder turn completed", triggering_item_id=item_id)
             return
@@ -3190,7 +3540,7 @@ class BelloController:
             self._deferred_completion_check = QueuedSupervisorCheck(
                 summary="Coder provided exact readiness marker; continuing completion after active subagents finish.",
                 triggering_item_id=triggering_item_id,
-                completion_review=self._effective_completion_review(),
+                completion_review=self._post_coder_review_enabled(),
             )
             reason = "Wait for active subagents, review and integrate their results, then emit the readiness marker again."
             self._append_event(
@@ -3200,11 +3550,11 @@ class BelloController:
             )
             await self._steer_for_marker(reason, message=reason)
             return
-        if not self._effective_completion_review():
+        if not self._post_coder_review_enabled():
             await self._finalize_completion_review_disabled()
             return
         self._schedule_supervisor_check(
-            "Coder provided exact readiness marker; running completion_review.",
+            "Coder provided exact readiness marker; running configured final reviews.",
             triggering_item_id=triggering_item_id,
             completion_review=True,
         )
@@ -3240,11 +3590,12 @@ class BelloController:
         if self.coder:
             await self._deliver_coder_message(message)
 
-    async def _handle_no_marker_idle(self) -> None:
+    async def _handle_no_marker_idle(self, *, subagents_refreshed: bool = False) -> None:
         cfg = self.store.get_bello_config()
         if cfg.active_coder_turn_id:
             return
-        await self._refresh_coder_subagents()
+        if not subagents_refreshed:
+            await self._refresh_coder_subagents()
         if self._active_coder_subagents():
             return
         if not getattr(self, "_generation_has_coder_turn", True):
@@ -3261,16 +3612,17 @@ class BelloController:
         if getattr(self, "_no_marker_completion_review_key", None) == review_key:
             return
         self._no_marker_completion_review_key = review_key
-        if not self._effective_completion_review():
+        if not self._post_coder_review_enabled():
             # No review gate to force: nudge the coder to finish and emit the marker,
             # which is the only terminal signal in this mode.
             await self._steer_for_marker(
                 "Coder is idle with no active turn and no readiness marker; completion review is disabled, nudging coder to finish.",
             )
             return
+        review_label = "completion_review" if self._effective_completion_review() else "adversary review"
         self.store.append_text_locked(
             PROGRESS,
-            "- Controller forcing completion_review: coder is idle with no active turn and no readiness marker.\n",
+            f"- Controller forcing {review_label}: coder is idle with no active turn and no readiness marker.\n",
         )
         self._append_event(
             AppEventSource.SUPERVISOR,
@@ -3278,7 +3630,7 @@ class BelloController:
             reason="coder idle with no active turn and no readiness marker",
         )
         self._schedule_supervisor_check(
-            "Coder is idle with no active turn and no readiness marker. Run completion_review on the current state.",
+            f"Coder is idle with no active turn and no readiness marker. Run {review_label} on the current state.",
             completion_review=True,
         )
 
@@ -3446,6 +3798,7 @@ class BelloController:
             intelligence=self._active_coder_intelligence(),
             multi_agent=self._multi_agent_config(),
             plan_path=self._active_coder_plan_path(),
+            readonly_roots=self._active_dependency_roots(),
         )
         await self.coder.start_thread()
         if (
@@ -3606,7 +3959,9 @@ class BelloController:
                 recovery_path,
             )
         try:
-            result = await asyncio.to_thread(apply_snapshot_patch, snapshot)
+            result = await asyncio.to_thread(
+                apply_snapshot_patch, snapshot, runtime_enabled=self._runtime_enabled(),
+            )
         except (SnapshotPatchError, WorkspaceSnapshotError) as exc:
             recovery_path = await self._preserve_snapshot_for_recovery(snapshot, reason="patch_failed")
             message = (
@@ -3787,12 +4142,14 @@ class BelloController:
         patch_summary: str | None = None,
         completion_review: bool = False,
     ) -> None:
+        if not completion_review and not self._runtime_enabled():
+            return
         if (
             not self.running
             or getattr(self, "paused", False)
             or getattr(self, "_finalizing", False)
             or getattr(self, "_terminal_cleanup_started", False)
-            or getattr(self, "supervisor", None) is None
+            or (self._post_coder_review_agent() if completion_review else getattr(self, "supervisor", None)) is None
         ):
             return
         if not completion_review:
@@ -3828,6 +4185,8 @@ class BelloController:
         patch_summary: str | None = None,
         completion_review: bool,
     ) -> None:
+        if not completion_review and not self._runtime_enabled():
+            return
         self._supervisor_dirty = True
         queued = QueuedSupervisorCheck(
             summary=summary,
@@ -4106,6 +4465,8 @@ class BelloController:
         changed_files: list[ChangedFile],
         validation_trigger_reasons: tuple[str, ...] = (),
     ) -> RuntimeTriggerDecision:
+        if not self._runtime_enabled():
+            return RuntimeTriggerDecision(should_wake=False, reasons=())
         reasons: list[str] = list(validation_trigger_reasons)
         read_only_action = bool(action.command and _is_read_only_inspection_command(action.command))
         if (
@@ -4409,6 +4770,8 @@ class BelloController:
         patch_summary: str | None,
         completion_review: bool = False,
     ) -> None:
+        if not completion_review and not self._runtime_enabled():
+            return
         if not self._coder_lifecycle_accepts_activity():
             if completion_review:
                 await self._close_completion_review_session()
@@ -4449,7 +4812,7 @@ class BelloController:
             )
         else:
             runtime_trigger_actions = []
-        agent = self._completion_supervisor_agent() if completion_review else self.supervisor
+        agent = self._post_coder_review_agent() if completion_review else self.supervisor
         if agent is None:
             return
         self._reconcile_intervention_accounting()
@@ -4552,6 +4915,12 @@ class BelloController:
                 await self._close_completion_review_session()
             return
         if completion_review:
+            if not self._effective_completion_review():
+                if self._adversary_runs_remaining():
+                    await self._run_adversary_before_complete(None, packet=packet)
+                else:
+                    await self._finalize_adversary_only("adversary pass budget exhausted after coder follow-up")
+                return
             budget_action = self._completion_review_budget_action(packet=packet)
             if budget_action == "adversary":
                 await self._run_adversary_before_complete(None, packet=packet)
@@ -4584,6 +4953,7 @@ class BelloController:
                     cheap = await self._cheap_runtime_route(packet)
                     if cheap is not None and cheap.decision == "noop":
                         self._ack_runtime_trigger_batch(runtime_trigger_batch)
+                        await self._resume_idle_after_runtime_noop(packet)
                         return
                 decision = await agent.decide(packet)
         except SupervisorAgentError as exc:
@@ -4742,6 +5112,12 @@ class BelloController:
                 self._runtime_decision_retry_count = 0
                 self._ack_runtime_trigger_batch(runtime_trigger_batch)
                 await self._resume_readiness_after_runtime_noop(decision, packet)
+                if (
+                    decision.decision == SupervisorDecisionKind.NOOP
+                    and decision.wake_sequence == packet.wake_sequence
+                    and decision.generation == packet.generation
+                ):
+                    await self._resume_idle_after_runtime_noop(packet)
             elif not applied:
                 attempts = int(getattr(self, "_runtime_decision_retry_count", 0) or 0)
                 if attempts < 1:
@@ -4760,6 +5136,40 @@ class BelloController:
                     "runtime supervisor returned a stale or mismatched decision after retry",
                     status=BelloStatus.PROVIDER_FAILURE,
                 )
+
+    async def _resume_idle_after_runtime_noop(self, packet: SupervisorWakePacket) -> bool:
+        # A denied native approval can end a turn after its last action. A runtime
+        # noop means no intervention is needed, not that the now-idle coder is done.
+        # Continue the existing no-marker review/nudge policy without waiting for
+        # the idle watchdog, and never revive a paused or superseded lifecycle.
+        if not self._runtime_noop_idle_context_is_current(packet):
+            return False
+        await self._refresh_coder_subagents()
+        if not self._runtime_noop_idle_context_is_current(packet) or self._active_coder_subagents():
+            return False
+        await self._handle_no_marker_idle(subagents_refreshed=True)
+        return True
+
+    def _runtime_noop_idle_context_is_current(self, packet: SupervisorWakePacket) -> bool:
+        cfg = self.store.get_bello_config()
+        coder = getattr(self, "coder", None)
+        return bool(
+            packet.current_summary == "Coder turn completed"
+            and coder is not None
+            and self._coder_lifecycle_accepts_activity(cfg)
+            and cfg.generation == packet.generation
+            and cfg.coder_thread_id == packet.coder_thread_id
+            and not self._readiness_snapshot_has_new_invalidating_event(packet, cfg=cfg)
+            and cfg.active_coder_turn_id is None
+            and not getattr(coder, "active_turn_id", None)
+            and not self.pending_approvals
+            and not cfg.pending_server_request_ids
+            and getattr(self, "_supervisor_next_runtime_summary", None) is None
+            and getattr(self, "_supervisor_next_runtime_check", None) is None
+            and getattr(self, "_supervisor_next_completion_summary", None) is None
+            and getattr(self, "_supervisor_next_completion_check", None) is None
+            and getattr(self, "_deferred_completion_check", None) is None
+        )
 
     async def _resume_readiness_after_runtime_noop(
         self,
@@ -5057,6 +5467,8 @@ class BelloController:
         packet_thread_id: str | None,
         packet: SupervisorWakePacket | None = None,
     ) -> bool:
+        if not self._runtime_enabled():
+            return False
         cfg = self.store.get_bello_config()
         if not self._coder_lifecycle_accepts_activity(cfg, require_running=False):
             return False
@@ -5245,8 +5657,10 @@ class BelloController:
         adversary_run_count, max_adversary_runs = self._reserve_adversary_run()
         self._adversary_reservation_recovery_pending = False
         self._write_run_checkpoint("adversary", state="active")
-        forced_by_budget = decision is None
-        run_reason = "completion review budget" if forced_by_budget else "completion accept"
+        run_reason = (
+            "coder readiness" if not self._effective_completion_review()
+            else "completion review budget" if decision is None else "completion accept"
+        )
         self.tui.render(
             "ADVERSARY",
             f"running pre-complete adversarial tester ({adversary_run_count}/{max_adversary_runs}; {run_reason})",
@@ -5498,6 +5912,9 @@ class BelloController:
         )
         if accepted_completion_decision is None:
             self._accepted_adversary_report = report
+            if not self._effective_completion_review():
+                await self._finalize_adversary_only("adversary report contained no findings to return")
+                return
             await self._finalize_bounded_completion(
                 reason=(
                     "completion review budget reached and the normalized adversary "
@@ -5662,12 +6079,7 @@ class BelloController:
         )
 
     async def _finalize_completion_review_disabled(self) -> None:
-        """Completion review is disabled: the coder's readiness marker is the finish line.
-
-        Runtime supervision (approvals, steering, restarts) already ran its course; the
-        final report carries the validation ledger and states plainly that no completion
-        review or adversary pass certified the result.
-        """
+        """Finalize coder readiness when neither final review is configured."""
         self.store.append_text_locked(
             PROGRESS,
             "- Coder declared readiness; completion review is disabled by config, finalizing without review.\n",
@@ -5679,6 +6091,15 @@ class BelloController:
         )
         await self.finalize(
             "coder declared readiness; completion review disabled by config (no review or adversary certification)",
+            status=BelloStatus.COMPLETE,
+            completion_review_accepted=False,
+        )
+
+    async def _finalize_adversary_only(self, reason: str) -> None:
+        self._accepted_completion_decision = None
+        self.store.append_text_locked(PROGRESS, f"- Adversary-only review completed: {reason}; completion review is disabled.\n")
+        await self.finalize(
+            f"coder completed with adversary-only review: {reason}",
             status=BelloStatus.COMPLETE,
             completion_review_accepted=False,
         )
@@ -5815,10 +6236,6 @@ class BelloController:
         )
 
     def _effective_max_adversary_runs(self) -> int:
-        if not self._effective_completion_review():
-            # The adversary runs inside the completion-review accept path; without the
-            # review gate there is no point where it could fire.
-            return 0
         enabled = getattr(self, "adversary_enabled", None)
         if enabled is False:
             return 0
@@ -6099,6 +6516,7 @@ class BelloController:
             intelligence=self._revision_coder_intelligence(),
             multi_agent=self._multi_agent_config(),
             plan_path=None,
+            readonly_roots=self._active_dependency_roots(),
         )
         try:
             new_thread_id = await revision_coder.start_thread(persist_state=False)
@@ -6415,7 +6833,7 @@ class BelloController:
         return list(files.values())[:200]
 
     def _record_changed_files(self, action: TriggeringAction) -> None:
-        if not action.paths:
+        if not action.paths or action.kind == "fileRead":
             return
         observed = getattr(self, "observed_changed_files", None)
         if observed is None:
@@ -6857,6 +7275,8 @@ class BelloController:
         return await asyncio.to_thread(self._generate_schema_hash)
 
     async def _structured_output_self_test(self) -> None:
+        if not self._runtime_enabled():
+            return
         agent = StatelessSupervisorAgent(
             self.client,
             self.store,
@@ -6889,6 +7309,9 @@ class BelloController:
             raise RuntimeError("structured-output supervisor self-test returned an unexpected decision")
 
     async def _configure_runtime_triage(self) -> None:
+        if not self._runtime_enabled():
+            self.runtime_triage_reviewer = None
+            return
         config = runtime_triage_config_from_env(enabled=self._cheap_runtime_enabled())
         self.runtime_triage_config = config
         self.runtime_triage_reviewer = None
@@ -6922,6 +7345,8 @@ class BelloController:
         self.tui.render("SYSTEM", f"cheap runtime triage enabled with model {config.model}")
 
     async def _cheap_runtime_structured_output_self_test(self, reviewer: CheapRuntimeReviewer) -> None:
+        if not self._runtime_enabled():
+            return
         packet = SupervisorWakePacket(
             wake_sequence=1,
             latest_event_sequence=0,
@@ -6936,6 +7361,8 @@ class BelloController:
             raise RuntimeError("cheap runtime structured-output self-test returned an unexpected decision")
 
     async def _cheap_runtime_route(self, packet: SupervisorWakePacket) -> CheapRuntimeDecision | None:
+        if not self._runtime_enabled():
+            return None
         reviewer = self.runtime_triage_reviewer
         if reviewer is None:
             return None
@@ -7761,10 +8188,12 @@ def _validation_from_action(
 ) -> ValidationRun | None:
     if action.kind != "commandExecution" or not action.command:
         return None
-    validation_type = _classify_validation_command(action.command, changed_paths=changed_paths or [])
+    output = _command_output_from_item(item)
+    validation_type = _classify_validation_command(
+        action.command, changed_paths=changed_paths or [], output=output,
+    )
     if validation_type is None:
         return None
-    output = _command_output_from_item(item)
     normalized_command = _normalize_command(action.command)
     raw_selector = _raw_validation_selector(action.command)
     executed_test_names = _executed_test_names(action.command, output)
@@ -7821,6 +8250,23 @@ def _inspection_from_action(
     sequence: int,
     item: Any = None,
 ) -> InspectionRun | None:
+    if action.kind == "fileRead" and isinstance(item, dict) and item.get("tool") in {
+        "read_file", "search", "list_directory", "view_image"
+    }:
+        # Native managed reads are evidence too. Keep their actual tool identity
+        # instead of inventing a shell command that was never executed.
+        operation = "tool:" + item["tool"] + " " + json.dumps(item.get("arguments", {}), sort_keys=True, ensure_ascii=False)
+        output = _command_output_from_item(item)
+        passed = action.exit_code == 0 and action.status == "completed"
+        return InspectionRun(
+            inspection_id=_stable_inspection_id(normalized_command=operation, cwd=action.cwd, inspected_paths=action.paths),
+            command=operation, raw_command=operation, normalized_command=operation,
+            cwd=action.cwd, exit_code=action.exit_code, shell_exit_code=None,
+            outcome="pass" if passed else "fail", passed=passed,
+            summary=_validation_summary(action.summary, output), captured_output=output,
+            captured_output_truncated=output.endswith("...<truncated>"), sequence=sequence,
+            inspected_paths=action.paths,
+        )
     if action.kind != "commandExecution" or not action.command:
         return None
     if not _is_read_only_inspection_command(action.command):
@@ -7852,7 +8298,26 @@ def _inspection_from_action(
     )
 
 
-def _classify_validation_command(command: str, *, changed_paths: list[str]) -> str | None:
+def _classify_validation_command(
+    command: str, *, changed_paths: list[str], output: str = "",
+) -> str | None:
+    # A test followed by a syntax/diff check still supplies behavioral evidence.
+    # Classify individual shell segments first, preserving static-only commands
+    # such as `node --check game.test.js` and ignoring quoted/printed test names.
+    inner = _shell_command_payload(command)
+    segments = _posix_validation_command_segments(inner if inner is not None else command)
+    # A shell branch can skip the named tests and still exit zero. Promote a
+    # mixed command only with runner evidence, not merely a test name in argv.
+    has_runner_output = _captured_output_looks_like_test_runner(output) or any(
+        count is not None for count in _test_count_summary(output)
+    )
+    if segments is not None and len(segments) > 1 and has_runner_output:
+        for segment in segments:
+            segment_command = shlex.join(segment)
+            if _is_observationless_output_command(segment_command):
+                continue
+            if _classify_validation_command(segment_command, changed_paths=changed_paths) == "behavioral":
+                return "behavioral"
     if _is_git_inspection_command(command):
         return "static" if _is_git_diff_check_command(command) else None
     if _is_read_only_inspection_command(command):
@@ -8046,59 +8511,111 @@ def _is_behavioral_validation_command(command: str) -> bool:
     windows_surface, windows_tokens, _payload = _windows_classification_tokens(command)
     if windows_surface:
         return bool(windows_tokens and _windows_tokens_are_behavioral_validation(windows_tokens))
-    inner = _shell_command_payload(command)
-    if inner is not None and inner != command:
-        return _is_behavioral_validation_command(inner)
-    lowered = command.lower()
-    executable_prefix = r"(^|[\s;&|()'\"])(?:npx\s+|(?:\.{0,2}/|/)?(?:[\w.-]+/)*)"
-    python_flags = r"(?:\s+-(?!m(?:\s|$))[a-z][\w-]*(?:=[^\s;&|()'\"]+)?)"
-    node_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*node(?:js)?"
-    python_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*python(?:3(?:\.\d+)?)?"
-    patterns = (
-        executable_prefix + r"mocha(\s|$)",
-        r"(^|[\s;&|()'\"])(npm|pnpm|yarn)\s+(run\s+)?test(\s|$|:)",
-        r"(^|[\s;&|()'\"])" + node_exec + r"\s+--test(\s|$)",
-        r"(^|[\s;&|()'\"])" + python_exec + python_flags + r"*\s+-m\s+(pytest|unittest|tox|nose2?)($|[\s;&|()'\"])",
-        executable_prefix + r"(jest|ava|tap|vitest|playwright|cypress|pytest|tox|rspec)(\s|$)",
-        executable_prefix + r"(go|cargo|mvn|gradle|swift|dotnet|make)\s+test(\s|$)",
-    )
-    return any(re.search(pattern, lowered) for pattern in patterns) or _is_test_wrapper_script_command(command)
+    return any(_posix_tokens_are_behavioral_validation(tokens)
+               for tokens in _posix_validation_command_segments(command) or [])
+
+
+def _posix_validation_command_segments(command: str) -> list[list[str]] | None:
+    """Find literal command positions, never test names in arbitrary argv.
+
+    Reuse the quote-aware splitter: a printed/escaped ';' is not a new command.
+    This is evidence classification, not a shell evaluator or execution gate.
+    Unsupported syntax is not promoted to trusted test evidence.
+    """
+    parts = _literal_parts(command)
+    if parts is None:
+        return None
+    segments: list[list[str]] = []
+    for index, (text, operator) in enumerate(parts):
+        try:
+            tokens = _strip_env_command_prefix(shlex.split(text))
+        except ValueError:
+            return None
+        if not tokens:
+            if index == len(parts) - 1 and operator is None:
+                continue
+            return None
+        inner = _shell_command_payload(shlex.join(tokens))
+        if inner is not None:
+            nested = _posix_validation_command_segments(inner)
+            if nested is None:
+                return None
+            segments.extend(nested)
+        else:
+            segments.append(tokens)
+    return segments
+
+
+def _posix_tokens_are_behavioral_validation(tokens: list[str]) -> bool:
+    executable = tokens[0].rsplit("/", 1)[-1].lower()
+    args = tokens[1:]
+    if executable == "npx":
+        while args and args[0] in {"--yes", "-y", "--no-install"}:
+            args = args[1:]
+        return bool(args and not args[0].startswith("-")
+                    and _posix_tokens_are_behavioral_validation(args))
+    if executable == "pytest":
+        return not _pytest_args_request_no_test_execution(args)
+    if executable in {"mocha", "jest", "ava", "tap", "vitest", "playwright", "cypress", "tox", "rspec"}:
+        return True
+    if executable in {"npm", "pnpm", "yarn"}:
+        args = args[1:] if args[:1] == ["run"] else args
+        return bool(args and (args[0] == "test" or args[0].startswith("test:")))
+    if executable in {"node", "nodejs"} and args[:1] == ["--test"]:
+        return True
+    # The existing Python action parser consumes option values and stops at
+    # the actual script/-c/-m operand, rather than scanning later arguments.
+    python_action = _windows_python_action([executable, *args])
+    if python_action is not None and python_action[0] == "module":
+        module = python_action[1]
+        if module == "pytest":
+            return not _pytest_args_request_no_test_execution(python_action[2])
+        return module in {"unittest", "tox", "nose", "nose2"}
+    if executable in {"go", "cargo", "mvn", "gradle", "swift", "dotnet", "make"}:
+        return args[:1] == ["test"]
+    script = _posix_script_execution_operand(tokens)
+    return bool(script and re.search(r"(^|[._-])tests?([._-]|$)",
+                                    script.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()))
+
+
+def _posix_script_execution_operand(tokens: list[str]) -> str | None:
+    executable = tokens[0].rsplit("/", 1)[-1].lower()
+    script = tokens[0]
+    args = tokens[1:]
+    python_action = _windows_python_action([executable, *args])
+    if python_action is not None:
+        script = python_action[1] if python_action[0] == "script" else ""
+    elif re.fullmatch(r"python(?:3(?:\.\d+)?)?", executable):
+        return None
+    elif executable in {"node", "nodejs", "ruby", "bash", "sh", "zsh"}:
+        # Only known no-value execution options may precede a script. In
+        # particular -c/-e inline code, --check/-n and flag operands aren't it.
+        no_value_options = ({"--no-warnings", "--enable-source-maps"} if executable in {"node", "nodejs"}
+                            else {"-w"} if executable == "ruby" else {"-e", "-u", "-x", "-eu", "-eux"})
+        while args and args[0] in no_value_options:
+            args = args[1:]
+        if args[:1] == ["--"]:
+            args = args[1:]
+        if not args or args[0].startswith("-"):
+            return None
+        script = args[0]
+    return script if re.fullmatch(r"[\w./ -]+\.(?:py|js|mjs|cjs|rb|sh)", script, re.IGNORECASE) else None
 
 
 def _is_test_wrapper_script_command(command: str) -> bool:
-    lowered = command.lower()
-    boundary = r"(?=$|[\s;&|()'\"])"
-    test_script_basename = r"(?:tests?(?:[._-][\w.-]+)*|[\w.-]+[._-]tests?(?:[._-][\w.-]+)*)"
-    script_with_test_token = (
-        r"(?:\.{1,2}/|/)?(?:[\w.-]+/)*" + test_script_basename + r"\.(py|js|mjs|cjs|rb|sh)"
-    )
-    interpreter_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*(?:python(?:3(?:\.\d+)?)?|node(?:js)?|ruby|bash|sh)"
-    shell_prefix = r"(^|[\s;&|()'\"])(?:\.{0,2}/|/)?(?:[\w.-]+/)*(?:bash|sh|zsh)"
-    patterns = (
-        r"(^|[\s;&|()'\"])" + interpreter_exec + r"\s+(?!-)" + script_with_test_token + boundary,
-        r"(^|[\s;&|()'\"])" + script_with_test_token + boundary,
-        shell_prefix + r"\s+-[a-z]*c\s+['\"]?" + script_with_test_token + boundary,
-    )
-    return any(re.search(pattern, lowered) for pattern in patterns)
+    for tokens in _posix_validation_command_segments(command) or []:
+        script = _posix_script_execution_operand(tokens)
+        if script and re.search(r"(^|[._-])tests?([._-]|$)", script.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()):
+            return True
+    return False
 
 
 def _is_direct_script_execution_command(command: str) -> bool:
     windows_surface, windows_tokens, _payload = _windows_classification_tokens(command)
     if windows_surface:
         return bool(windows_tokens and _windows_tokens_execute_script(windows_tokens))
-    lowered = command.lower()
-    boundary = r"(?=$|[\s;&|()'\"])"
-    python_flags = r"(?:\s+-(?!m(?:\s|$))[a-z][\w-]*(?:=[^\s;&|()'\"]+)?)"
-    python_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*python(?:3(?:\.\d+)?)?"
-    interpreter_exec = r"(?:\.{0,2}/|/)?(?:[\w.-]+/)*(?:node(?:js)?|ruby|bash|sh)"
-    shell_prefix = r"(^|[\s;&|()'\"])(?:\.{0,2}/|/)?(?:[\w.-]+/)*(?:bash|sh|zsh)"
-    patterns = (
-        r"(^|[\s;&|()'\"])" + python_exec + python_flags + r"*\s+(?!-)[\w./-]+\.py" + boundary,
-        r"(^|[\s;&|()'\"])" + interpreter_exec + r"\s+(?!-)[\w./-]+\.(js|mjs|cjs|rb|sh)" + boundary,
-        r"(^|[\s;&|()'\"])(?:\.{1,2}/|/)[\w./-]+\.(py|js|mjs|cjs|rb|sh)" + boundary,
-        shell_prefix + r"\s+-[a-z]*c\s+['\"]?(?!-)[\w./-]+\.(py|js|mjs|cjs|rb|sh)" + boundary,
-    )
-    return any(re.search(pattern, lowered) for pattern in patterns)
+    return any(_posix_script_execution_operand(tokens) is not None
+               for tokens in _posix_validation_command_segments(command) or [])
 
 
 def _is_behavior_demo_command(command: str, *, changed_paths: list[str]) -> bool:
@@ -8247,8 +8764,10 @@ def _tests_executed(command: str, output: str) -> bool:
         return True
     lowered = output.lower()
     zero_test_patterns = (
-        r"\b0\s+(passing|failing|pending|tests?|specs?)\b",
-        r"\b0\s+tests?\s+(run|executed|passed|failed|total)\b",
+        # Do not treat npm's `package@1.0.0 test` header as zero tests.
+        r"(?<![\w.])0[ \t]+(passing|failing|pending|tests?|specs?)\b",
+        r"(?<![\w.])0[ \t]+tests?[ \t]+(run|executed|passed|failed|total)\b",
+        r"(?m)^[ \t]*[#ℹ][ \t]+tests[ \t]+0[ \t]*$",
         r"\btests?:\s+0\s+total\b",
         r"\btest suites?:\s+0\b",
         r"\bran\s+0\s+tests?\b",
@@ -8506,6 +9025,7 @@ def _test_count_summary(output: str) -> tuple[int | None, int | None]:
             r"\b(\d+)\s+passing\b",
             r"\bpasses:\s*(\d+)\b",
             r"\btests?:\s*(\d+)\s+passed\b",
+            r"(?m)^[ \t]*[#ℹ][ \t]+pass[ \t]+(\d+)[ \t]*$",
         ),
     )
     failed = _first_int_match(
@@ -8517,6 +9037,14 @@ def _test_count_summary(output: str) -> tuple[int | None, int | None]:
             r"\btests?:\s*\d+\s+passed,\s*(\d+)\s+failed\b",
         ),
     )
+    # A zero-failure Node summary must not hide a failure from another runner
+    # or an earlier Node invocation in the same shell command.
+    node_failures = [
+        int(match.group(1))
+        for match in re.finditer(r"(?m)^[ \t]*[#ℹ][ \t]+fail[ \t]+(\d+)[ \t]*$", lowered)
+    ]
+    if node_failures:
+        failed = max(failed or 0, *node_failures)
     if passed is not None and failed is None:
         failed = 0
     return passed, failed
@@ -8602,6 +9130,8 @@ def _is_recoverable_app_server_transport_error(message: str) -> bool:
         marker in normalized
         for marker in (
             "app-server stream closed",
+            "pi worker stream closed",
+            "claude code stream closed",
             "broken pipe",
             "connection reset",
             "connection closed",
@@ -10232,6 +10762,8 @@ def _item_summary(item: Any) -> str:
         return f"command completed: {item.get('command', '')} exit={item.get('exitCode')}"
     if item_type == "fileChange":
         return f"file change completed: {len(item.get('changes') or [])} changes"
+    if item_type == "fileRead":
+        return f"file inspection completed: {item.get('tool')} {', '.join(item.get('paths') or [])}"
     if item_type == "mcpToolCall":
         return f"mcp tool completed: {item.get('server')}/{item.get('tool')}"
     if item_type == "dynamicToolCall":
@@ -10242,7 +10774,7 @@ def _item_summary(item: Any) -> str:
 
 
 def _is_completed_action(item: Any) -> bool:
-    return isinstance(item, dict) and item.get("type") in {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"}
+    return isinstance(item, dict) and item.get("type") in {"commandExecution", "fileChange", "fileRead", "mcpToolCall", "dynamicToolCall", "webSearch"}
 
 
 def _adversary_enabled_from_env() -> bool | None:

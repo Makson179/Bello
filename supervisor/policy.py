@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import fnmatch
 import ntpath
 import os
@@ -303,6 +304,39 @@ def _path_is_within(path: Path, root: Path, *, windows_paths: bool) -> bool:
     return bool(boundary and candidate.startswith(boundary + "\\"))
 
 
+def _path_has_root_identity(path: Path, root: Path) -> bool:
+    """Match an existing authority even when resolve() retains a case alias.
+
+    Inspect ancestors too: the requested leaf may not exist yet. Identity,
+    unlike casefolding, preserves distinct names on case-sensitive filesystems.
+    """
+    try:
+        boundary = root.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    identity = (boundary.st_dev, boundary.st_ino)
+    for ancestor in (path, *path.parents):
+        try:
+            metadata = ancestor.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as exc:
+            if exc.errno != errno.ENAMETOOLONG and getattr(exc, "winerror", None) not in {
+                123,  # ERROR_INVALID_NAME
+                206,  # ERROR_FILENAME_EXCED_RANGE
+            }:
+                raise
+            # Shell payloads/inline programs can be candidates without being
+            # filesystem names. Windows may report invalid syntax rather than
+            # ENAMETOOLONG; do not suppress generic EINVAL or access/I/O errors.
+            # Skip the impossible leaf, but still inspect
+            # its parents so an existing protected authority is not bypassed.
+            continue
+        if (metadata.st_dev, metadata.st_ino) == identity:
+            return True
+    return False
+
+
 def path_root_hit(
     raw: str | os.PathLike[str],
     *,
@@ -324,7 +358,8 @@ def path_root_hit(
             resolved_root = root.resolve(strict=False)
         except OSError:
             continue
-        if _path_is_within(resolved, resolved_root, windows_paths=windows_paths):
+        if (_path_is_within(resolved, resolved_root, windows_paths=windows_paths)
+                or _path_has_root_identity(resolved, resolved_root)):
             return str(resolved_root)
     return None
 
@@ -364,6 +399,20 @@ def is_supervisor_runtime_path(workspace: Path, path: Path) -> bool:
 
 def is_protected_path(workspace: Path, path: Path) -> bool:
     return is_secret_path(path) or is_workspace_cheating_path(workspace, path)
+
+
+def is_workspace_control_path(workspace: Path, path: Path) -> bool:
+    """Reserved controller/Git authorities, not guesses about project filenames."""
+    root = workspace.resolve()
+    candidate = path.resolve()
+    for relative in (".git", ".supervisor", ".codex/bello-run"):
+        control = root / relative
+        if any(candidate == boundary or candidate.is_relative_to(boundary)
+               for boundary in (control, control.resolve())):
+            return True
+        if _path_has_root_identity(candidate, control):
+            return True
+    return False
 
 
 def _resolve_outside_candidate(
@@ -1681,6 +1730,19 @@ class PolicyEngine:
     def _command_immutable_hit(self, analysis: CommandAnalysis, *, cwd: str | None) -> str | None:
         if not self.immutable_paths:
             return None
+        if not self.windows_paths:
+            from supervisor.immutable_reads import literal_pinned_read_tokens
+            checked = literal_pinned_read_tokens(
+                analysis.command,
+                cwd=Path(cwd).resolve() if cwd else self.workspace,
+                immutable_paths=self.immutable_paths,
+                workspace=self.workspace,
+            )
+            if checked is not None:
+                # Only this hard-deny check sees the masked operands. Normal
+                # analysis, runtime review and execution retain the original
+                # command, including every destructive or unknown segment.
+                analysis = analysis.model_copy(update={"command": shlex.join(checked), "tokens": checked})
         raw_hit = self._raw_windows_command_path_hit(
             analysis.command,
             self.immutable_paths,
@@ -1941,10 +2003,14 @@ class PolicyEngine:
             return PolicyDecision.route_llm("apply_patch input is not a patch")
         return self._evaluate_patch_paths(patch_paths)
 
-    def evaluate_patch_paths(self, raw_paths: list[str]) -> PolicyDecision:
-        return self._evaluate_patch_paths(raw_paths)
+    def evaluate_patch_paths(
+        self, raw_paths: list[str], *, check_path_heuristics: bool = True,
+    ) -> PolicyDecision:
+        return self._evaluate_patch_paths(raw_paths, check_path_heuristics=check_path_heuristics)
 
-    def _evaluate_patch_paths(self, raw_paths: list[str]) -> PolicyDecision:
+    def _evaluate_patch_paths(
+        self, raw_paths: list[str], *, check_path_heuristics: bool = True,
+    ) -> PolicyDecision:
         if not raw_paths:
             return PolicyDecision.route_llm("patch paths could not be determined")
         immutable_hit = self._immutable_hit_for_raw_paths(raw_paths, cwd=self.workspace)
@@ -1960,8 +2026,11 @@ class PolicyEngine:
         )
         if path_problem:
             return PolicyDecision.route_llm(path_problem)
-        if any(is_protected_path(self.workspace, path) for path in paths):
+        # Resolution, explicit authority and immutable roots remain mandatory.
+        # Only project-local name guesses are optional for runtime-off export.
+        if check_path_heuristics and any(is_protected_path(self.workspace, path) for path in paths):
             return PolicyDecision.deny("writes to secret-pattern paths are denied")
-        if any(is_supervisor_runtime_path(self.workspace, path) for path in paths):
+        control_check = is_supervisor_runtime_path if check_path_heuristics else is_workspace_control_path
+        if any(control_check(self.workspace, path) for path in paths):
             return PolicyDecision.deny("writes to supervisor runtime/state files are denied")
         return PolicyDecision.allow("workspace patch inside workspace")

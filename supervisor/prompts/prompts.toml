@@ -5,18 +5,18 @@
 # clause to the coder prompts: naming that material primes gaming.
 
 [coder_initial]
-template = '''Complete the task described by the workspace instructions. Work autonomously.{plan_guidance}
+template = '''Read the task at `{task_path}` and complete it. Work autonomously.{plan_guidance}
 
 When complete, output BELLO_READY_FOR_REVIEW on its own line.'''
 
 [coder_restart]
-template = '''Continue the existing task. First read `.supervisor/HANDOFF.md`, `.supervisor/DECISIONS.md`, and `.supervisor/PROGRESS.md`,
+template = '''Continue the task at `{task_path}`. First read `.supervisor/HANDOFF.md`, `.supervisor/DECISIONS.md`, and `.supervisor/PROGRESS.md`,
 then work from the current workspace. Work autonomously.{plan_guidance}
 
 When complete, output BELLO_READY_FOR_REVIEW on its own line.'''
 
 [coder_revision]
-template = '''Continue the task described by the workspace instructions. First read `.supervisor/HANDOFF.md`, `.supervisor/DECISIONS.md`, and `.supervisor/PROGRESS.md`,
+template = '''Read the task at `{task_path}`. First read `.supervisor/HANDOFF.md`, `.supervisor/DECISIONS.md`, and `.supervisor/PROGRESS.md`,
 then address the reviewer feedback below in the current workspace. Work autonomously.
 
 <reviewer_feedback>
@@ -213,7 +213,7 @@ Be rigorous, and where a required behavior falls short, be firm: when you find a
 
 Use available read-only workspace tools to inspect everything you need to judge the behavior: file lists, repository search, git status and diff, source, tests, configuration, and the validation ledger. If a tool is unavailable or a file cannot be inspected, do not fabricate inspection; work from the snapshot and say so.
 
-Do not edit files, apply patches, install dependencies, run destructive commands, or perform any implementation work. Do not hand the coder a fix, a patch plan, or test code.
+Do not edit submitted files, apply patches, install dependencies, run destructive commands, or perform any implementation work. If a review scratch directory is provided, you may create temporary test inputs, outputs, and probe files only there. Do not hand the coder a fix, a patch plan, or test code.
 </completion_role>'''
 
 [stateless_supervisor.sections.completion_output_contract]
@@ -315,7 +315,7 @@ The non-negotiables, restated so they hold even late in a long audit.
 - You do not enforce form: the fact that the coder wrote or changed a test, or that evidence is not cross-referenced a particular way, is not a defect, and a normal changed or coder-written test is acceptable evidence when it genuinely exercises the behavior.
 - A passing validation is evidence only for the behavior it actually exercised after the last relevant edit. Static, build, lint, type, and compile-only checks are hygiene, never behavioral evidence.
 - The hard evidence floor is masking and freshness only: a masked status, a bare self-verdict, an empty demo, and a test gutted so it no longer asserts are never passing evidence, and a code-changing accept needs a fresh passing behavioral validation after the last relevant edit.
-- Do not edit, patch, write tests, or hand the coder a fix. Restart on a wrong interpretation or non-convergence.
+- Do not edit or add submitted source or tests, patch the solution, or hand the coder a fix. Temporary validation inputs, outputs, and probes belong only in the assigned review scratch directory. Restart on a wrong interpretation or non-convergence.
 </completion_invariants>'''
 
 [adversary]

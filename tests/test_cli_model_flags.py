@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
@@ -12,6 +13,7 @@ from supervisor.project_config import (
     MODEL_GPT_5_5,
     MODEL_GPT_5_6_LUNA,
     MODEL_GPT_5_6_SOL,
+    LogDistillerConfig,
     ProjectConfig,
     project_config_path,
 )
@@ -34,6 +36,52 @@ def test_shared_model_flag_is_not_registered() -> None:
     assert result.exit_code != 0
     assert "No such option" in result.output
     assert "--model" in result.output
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_cli_runtime_and_distiller_boolean_pairs(monkeypatch, tmp_path, enabled) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("supervisor.main._startup_update_gate", lambda: None)
+    captured = []
+
+    async def fake_run(settings):
+        captured.append(settings)
+        return 0
+
+    monkeypatch.setattr("supervisor.main._run_bello", fake_run)
+    monkeypatch.setattr("supervisor.main._run_async_cleanly", asyncio.run)
+    result = CliRunner().invoke(cli, [
+        "--runtime" if enabled else "--no-runtime",
+        "--log-distiller" if enabled else "--no-log-distiller",
+        "--distiller-model", "models/local-selector", "--completion-review", "false", "--adversary",
+    ])
+    assert result.exit_code == 0, result.output
+    assert captured[0].runtime_enabled is enabled
+    assert captured[0].log_distiller == LogDistillerConfig(
+        enabled=enabled, model_path=str(Path("models/local-selector")),
+    )
+    assert captured[0].adversary and not captured[0].completion_review
+
+
+def test_run_settings_preserve_distiller_config_until_explicitly_overridden(tmp_path) -> None:
+    config = ProjectConfig(runtime_enabled=False, log_distiller=LogDistillerConfig(True, "saved-bundle"))
+    defaults = _resolve_run_settings(project_config=config)
+    assert not defaults.runtime_enabled and defaults.log_distiller == config.log_distiller
+    override = _resolve_run_settings(project_config=config, runtime_enabled=True, log_distiller_enabled=False,
+                                     distiller_model_path=tmp_path / "other-bundle")
+    assert override.runtime_enabled
+    assert override.log_distiller == LogDistillerConfig(False, str(tmp_path / "other-bundle"))
+    assert config.log_distiller == LogDistillerConfig(True, "saved-bundle")
+
+
+def test_disabled_roles_do_not_validate_unused_model_efforts() -> None:
+    settings = _resolve_run_settings(project_config=ProjectConfig(
+        runtime_enabled=False, completion_review=False, adversary=False,
+        runtime_mod=MODEL_GPT_5_6_LUNA, runtime_intelligence="ultra",
+        completion_mod=MODEL_GPT_5_6_LUNA, completion_intelligence="ultra",
+        adversary_mod=MODEL_GPT_5_6_LUNA, adversary_intelligence="ultra",
+    ))
+    assert not settings.runtime_enabled and not settings.completion_review and not settings.adversary
 
 
 def test_four_role_flags_are_registered() -> None:
@@ -195,7 +243,7 @@ def test_run_settings_reject_ultra_for_luna_per_role(role: str) -> None:
 
     with pytest.raises(RuntimeError, match=rf"{role} model .* does not support reasoning effort ultra"):
         _resolve_run_settings(
-            project_config=ProjectConfig(),
+            project_config=ProjectConfig(completion_review=True, adversary=True),
             **model_overrides,
             **effort_overrides,
         )
@@ -354,6 +402,8 @@ def test_controller_runtime_settings_summary_uses_all_effective_role_values(tmp_
         "completion-intelligence=ultra "
         "adversary-intelligence=ultra "
         "speed=fast "
+        "runtime=true "
+        "log-distiller=false "
         "cheap-runtime=true "
         "multi-agent=off "
         "completion-multi-agent=off "

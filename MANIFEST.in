@@ -1,0 +1,5 @@
+include setup.py
+recursive-include native/windows-sandbox Cargo.toml Cargo.lock README.md THIRD_PARTY_NOTICES.txt
+recursive-include native/windows-sandbox/src *.rs
+recursive-include native/windows-sandbox/ci *.py *.ps1
+prune native/windows-sandbox/target

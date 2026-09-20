@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import errno
+import shlex
 from pathlib import Path
 
 import pytest
@@ -20,6 +22,142 @@ def _symlink_or_skip(link: Path, target: Path, *, target_is_directory: bool = Fa
         link.symlink_to(target, target_is_directory=target_is_directory)
     except (NotImplementedError, OSError) as exc:
         pytest.skip(f"filesystem symlinks are unavailable: {exc}")
+
+
+@pytest.mark.parametrize("windows_error", [None, 123, 206])
+def test_long_inline_javascript_routes_to_review_instead_of_crashing(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch, windows_error: int | None,
+) -> None:
+    task = workspace / "TASK.md"
+    task.write_text("Build the game", encoding="utf-8")
+    script = (
+        "const tab = await fetch('http://127.0.0.1:9222/json/new'); "
+        + "const unused = '" + "x" * 2000 + "'; "
+        + "console.log(await tab.text());"
+    )
+    command = "/bin/zsh -c " + shlex.quote("node --input-type=module -e " + shlex.quote(script))
+    invalid_candidates: list[Path] = []
+    if windows_error is not None:
+        original_stat = Path.stat
+
+        def fake_stat(path: Path, *args, **kwargs):
+            if "const tab = await fetch(" in str(path):
+                invalid_candidates.append(path)
+                error = OSError(errno.EINVAL, "Invalid candidate filename")
+                error.winerror = windows_error
+                raise error
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", fake_stat)
+    decision = _policy_engine(workspace, immutable_paths=(task,)).evaluate(
+        {"command": command, "cwd": str(workspace)},
+    )
+    assert decision.kind == PolicyDecisionKind.ROUTE_LLM
+    analysis = command_analysis_from_policy_decision(decision)
+    assert analysis is not None
+    assert "unknown_executable" in analysis.risk_tags
+    if windows_error is not None:
+        assert invalid_candidates
+
+
+@pytest.mark.parametrize("protected_kind", ["immutable", "grading"])
+@pytest.mark.parametrize("windows_error", [None, 123, 206])
+def test_long_inline_javascript_keeps_later_protected_path_operands_denied(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch, protected_kind: str,
+    windows_error: int | None,
+) -> None:
+    protected = workspace / "restricted"
+    protected.mkdir()
+    script = "const padding = '" + "x" * 2000 + "'; console.log('" + str(protected / "file.txt") + "');"
+    command = (
+        "/bin/zsh -c " + shlex.quote("node -e " + shlex.quote(script))
+        + " && cat " + shlex.quote(str(protected / "file.txt"))
+    )
+    if windows_error is not None:
+        original_stat = Path.stat
+
+        def fake_stat(path: Path, *args, **kwargs):
+            if "const padding = '" in str(path):
+                error = OSError(errno.EINVAL, "Invalid candidate filename")
+                error.winerror = windows_error
+                raise error
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", fake_stat)
+    kwargs = {"immutable_paths" if protected_kind == "immutable" else "declared_grading_roots": (protected,)}
+    decision = _policy_engine(workspace, **kwargs).evaluate({"command": command, "cwd": str(workspace)})
+    assert decision.kind == PolicyDecisionKind.DENY
+    assert str(protected) in decision.reason
+
+
+@pytest.mark.parametrize("windows_error", [None, 123, 206])
+def test_root_identity_checks_parent_after_impossible_leaf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, windows_error: int | None,
+) -> None:
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    leaf = protected / ("x" * 300)
+    original_stat = Path.stat
+
+    def fake_stat(path: Path, *args, **kwargs):
+        if path == leaf:
+            error = OSError(
+                errno.ENAMETOOLONG if windows_error is None else errno.EINVAL,
+                "Invalid candidate filename",
+            )
+            if windows_error is not None:
+                error.winerror = windows_error
+            raise error
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    assert policy_module._path_has_root_identity(leaf, protected) is True
+    assert policy_module._path_has_root_identity(leaf, tmp_path / "unrelated") is False
+
+
+@pytest.mark.parametrize("error_number, windows_error", [
+    (errno.EACCES, None), (errno.EIO, None), (errno.EINVAL, None),
+    (errno.EACCES, 5), (errno.EIO, 1117),
+])
+def test_root_identity_does_not_silently_ignore_other_stat_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_number: int,
+    windows_error: int | None,
+) -> None:
+    candidate = tmp_path / "candidate"
+    original_stat = Path.stat
+
+    def fake_stat(path: Path, *args, **kwargs):
+        if path == candidate:
+            error = OSError(error_number, "unavailable")
+            if windows_error is not None:
+                error.winerror = windows_error
+            raise error
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    with pytest.raises(OSError) as error:
+        policy_module._path_has_root_identity(candidate, tmp_path)
+    assert error.value.errno == error_number
+
+
+@pytest.mark.parametrize("windows_error", [123, 206])
+def test_root_identity_does_not_ignore_invalid_protected_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, windows_error: int,
+) -> None:
+    protected = tmp_path / "protected"
+    original_stat = Path.stat
+
+    def fake_stat(path: Path, *args, **kwargs):
+        if path == protected:
+            error = OSError(errno.EINVAL, "Invalid protected root")
+            error.winerror = windows_error
+            raise error
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    with pytest.raises(OSError) as error:
+        policy_module._path_has_root_identity(tmp_path / "candidate", protected)
+    assert error.value.winerror == windows_error
 
 
 def test_tracked_path_git_query_uses_isolated_configuration(

@@ -23,6 +23,8 @@ CODER_SANDBOX_WORKSPACE_WRITE = "workspace-write"
 CODER_SANDBOX_DANGER_FULL_ACCESS = "danger-full-access"
 CODEX_FAST_SERVICE_TIER = "priority"
 DEFAULT_INTELLIGENCE = "xhigh"
+# Time to acknowledge an explicit interruption, not a coding/tool execution limit.
+CODER_INTERRUPT_RPC_TIMEOUT_SECONDS = 600.0
 
 
 def coder_sandbox_mode() -> str:
@@ -62,6 +64,31 @@ def coder_turn_sandbox_policy(project_root: Path | None = None) -> dict[str, Any
 
 def codex_service_tier(*, fast: bool) -> str | None:
     return CODEX_FAST_SERVICE_TIER if fast else None
+
+
+def task_runtime_workspace_roots(
+    workspace_root: Path, task_path: Path | None = None,
+    *, readonly_roots: tuple[Path, ...] = (),
+) -> list[Path]:
+    """Add only host-pinned task/dependency authority, never infer it from links."""
+
+    root = workspace_root.resolve()
+    roots = [root]
+    if task_path is not None:
+        task = task_path if task_path.is_absolute() else root / task_path
+        task = task.resolve()
+        if not task.is_relative_to(root):
+            if not task.is_file():
+                raise ValueError("task read authority must be an existing file")
+            roots.append(task)
+    for dependency in readonly_roots:
+        # Callers supply canonical roots captured before any model work. Do not
+        # rescan the writable snapshot's dependency aliases on turns/resumes.
+        if not dependency.is_absolute():
+            raise ValueError("dependency read authority must be an absolute pinned path")
+        if dependency not in roots:
+            roots.append(dependency)
+    return roots
 
 
 def apply_intelligence(params: dict[str, Any], intelligence: str | None) -> dict[str, Any]:
@@ -121,6 +148,7 @@ def apply_multi_agent_thread_start_params(
     *,
     role: MultiAgentRole = "coder",
 ) -> dict[str, Any]:
+    params["belloRole"] = role
     agents: dict[str, Any] = {"enabled": config.enabled}
     if config.enabled:
         agents.update(
@@ -128,6 +156,8 @@ def apply_multi_agent_thread_start_params(
                 "max_concurrent_threads_per_session": config.max_concurrent,
                 "default_subagent_model": config.default.model,
                 "default_subagent_reasoning_effort": config.default.intelligence,
+                "allowed_profiles": {model: list(efforts) for model, efforts in config.allowed.items()},
+                "role": role,
             }
         )
         params["developerInstructions"] = build_multi_agent_developer_instructions(
@@ -144,14 +174,17 @@ def apply_multi_agent_thread_start_params(
 def coder_thread_params(
     project_root: Path,
     *,
+    task_path: Path | None = None,
+    readonly_roots: tuple[Path, ...] = (),
     model: str | None = None,
     fast: bool = False,
+    intelligence: str | None = None,
     multi_agent: MultiAgentConfig | None = None,
 ) -> dict[str, Any]:
     multi_agent = multi_agent or MultiAgentConfig()
     params: dict[str, Any] = {
         "cwd": str(project_root),
-        "runtimeWorkspaceRoots": [str(project_root.resolve())],
+        "runtimeWorkspaceRoots": [str(root) for root in task_runtime_workspace_roots(project_root, task_path, readonly_roots=readonly_roots)],
         "approvalPolicy": "on-request",
         "approvalsReviewer": "user",
         "sandbox": coder_sandbox_mode(),
@@ -162,17 +195,22 @@ def coder_thread_params(
         "config": {},
     }
     apply_multi_agent_thread_start_params(params, multi_agent, role="coder")
+    if task_path is not None:
+        params["runtimeTaskPath"] = str((task_path if task_path.is_absolute() else project_root / task_path).resolve())
     if model:
         params["model"] = model
-    return params
+    return apply_intelligence(params, intelligence)
 
 
 def coder_thread_resume_params(
     thread_id: str,
     project_root: Path,
     *,
+    task_path: Path | None = None,
+    readonly_roots: tuple[Path, ...] = (),
     model: str | None = None,
     fast: bool = False,
+    intelligence: str | None = None,
     multi_agent: MultiAgentConfig | None = None,
 ) -> dict[str, Any]:
     """Build the supported ``thread/resume`` overrides for a coder thread."""
@@ -181,6 +219,7 @@ def coder_thread_resume_params(
     params: dict[str, Any] = {
         "threadId": thread_id,
         "cwd": str(project_root.resolve()),
+        "runtimeWorkspaceRoots": [str(root) for root in task_runtime_workspace_roots(project_root, task_path, readonly_roots=readonly_roots)],
         "approvalPolicy": "on-request",
         "approvalsReviewer": "user",
         "sandbox": coder_sandbox_mode(),
@@ -188,9 +227,11 @@ def coder_thread_resume_params(
         "config": {},
     }
     apply_multi_agent_thread_start_params(params, multi_agent, role="coder")
+    if task_path is not None:
+        params["runtimeTaskPath"] = str((task_path if task_path.is_absolute() else project_root / task_path).resolve())
     if model:
         params["model"] = model
-    return params
+    return apply_intelligence(params, intelligence)
 
 
 def coder_turn_params(
@@ -198,6 +239,8 @@ def coder_turn_params(
     text: str,
     project_root: Path,
     *,
+    task_path: Path | None = None,
+    readonly_roots: tuple[Path, ...] = (),
     model: str | None = None,
     fast: bool = False,
     intelligence: str | None = None,
@@ -206,7 +249,7 @@ def coder_turn_params(
         "threadId": thread_id,
         "input": [text_input(text)],
         "cwd": str(project_root),
-        "runtimeWorkspaceRoots": [str(project_root.resolve())],
+        "runtimeWorkspaceRoots": [str(root) for root in task_runtime_workspace_roots(project_root, task_path, readonly_roots=readonly_roots)],
         "approvalPolicy": "on-request",
         "approvalsReviewer": "user",
         "sandboxPolicy": coder_turn_sandbox_policy(project_root),
@@ -231,13 +274,33 @@ class CoderSession:
     coder_rpc_timeout_seconds: float = APP_SERVER_CODER_RPC_TIMEOUT_SECONDS
     multi_agent: MultiAgentConfig = field(default_factory=MultiAgentConfig)
     plan_path: Path | None = None
+    readonly_roots: tuple[Path, ...] = ()
+    cleanup_rpc_timeout_seconds: float = CODER_INTERRUPT_RPC_TIMEOUT_SECONDS
+    _task_read_path: Path = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # The model can replace a snapshot symlink. Its later target must never
+        # become new read authority when a turn starts or a session resumes.
+        task = self.task_path if self.task_path.is_absolute() else self.project_root / self.task_path
+        self._task_read_path = task.resolve()
+        self.readonly_roots = tuple(dict.fromkeys(self.readonly_roots))
+        if any(not root.is_absolute() for root in self.readonly_roots):
+            raise ValueError("dependency read authority must be an absolute pinned path")
+
+    @property
+    def task_read_path(self) -> Path:
+        """The canonical task authority fixed before the model starts."""
+        return self._task_read_path
 
     async def start_thread(self, *, persist_state: bool = True) -> str:
         response = await self.client.thread_start(
             coder_thread_params(
                 self.project_root,
+                task_path=self._task_read_path,
+                readonly_roots=self.readonly_roots,
                 model=self.model,
                 fast=self.fast,
+                intelligence=self.intelligence,
                 multi_agent=self.multi_agent,
             ),
             timeout=APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
@@ -258,8 +321,11 @@ class CoderSession:
             coder_thread_resume_params(
                 self.thread_id,
                 self.project_root,
+                task_path=self._task_read_path,
+                readonly_roots=self.readonly_roots,
                 model=self.model,
                 fast=self.fast,
+                intelligence=self.intelligence,
                 multi_agent=self.multi_agent,
             ),
             timeout=APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
@@ -271,17 +337,17 @@ class CoderSession:
 
     async def start_initial_turn(self) -> str:
         return await self.start_turn(
-            build_coder_prompt(self.task_path, plan_path=self.plan_path)
+            build_coder_prompt(self._task_read_path, plan_path=self.plan_path)
         )
 
     async def start_restart_turn(self) -> str:
         return await self.start_turn(
-            build_restart_prompt(self.task_path, plan_path=self.plan_path)
+            build_restart_prompt(self._task_read_path, plan_path=self.plan_path)
         )
 
     async def start_revision_turn(self, reviewer_feedback: str, *, persist_state: bool = True) -> str:
         return await self.start_turn(
-            build_revision_prompt(self.task_path, reviewer_feedback),
+            build_revision_prompt(self._task_read_path, reviewer_feedback),
             persist_state=persist_state,
         )
 
@@ -292,6 +358,8 @@ class CoderSession:
                 thread_id,
                 message,
                 self.project_root,
+                task_path=self._task_read_path,
+                readonly_roots=self.readonly_roots,
                 model=self.model,
                 fast=self.fast,
                 intelligence=self.intelligence,
@@ -302,9 +370,9 @@ class CoderSession:
         turn_id = turn.get("id")
         if not isinstance(turn_id, str):
             raise RuntimeError("app-server turn/start did not return a turn id")
-        self.active_turn_id = turn_id
+        self.active_turn_id = None if turn.get("status") in {"completed", "failed", "interrupted"} else turn_id
         if persist_state:
-            self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"active_coder_turn_id": turn_id}))
+            self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"active_coder_turn_id": self.active_turn_id}))
         return turn_id
 
     async def steer_or_start(self, message: str) -> str | None:
@@ -332,7 +400,7 @@ class CoderSession:
         await self.client.turn_interrupt(
             self.thread_id,
             self.active_turn_id,
-            timeout=self.coder_rpc_timeout_seconds,
+            timeout=self.cleanup_rpc_timeout_seconds,
         )
 
     def mark_turn_completed(self, turn_id: str) -> None:

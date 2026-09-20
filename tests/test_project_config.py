@@ -13,6 +13,7 @@ from supervisor.project_config import (
     DEFAULT_INTELLIGENCE,
     DEFAULT_MODEL,
     INTELLIGENCE_CHOICES,
+    LogDistillerConfig,
     MODEL_GPT_5_5,
     MODEL_GPT_5_6_LUNA,
     MODEL_GPT_5_6_SOL,
@@ -808,7 +809,7 @@ def test_config_editor_inline_adversary_runs_updates_value() -> None:
     assert config.adversary_runs == 3
 
 
-def test_config_editor_disabling_completion_review_hides_and_skips_dependencies() -> None:
+def test_config_editor_disabling_completion_review_preserves_adversary() -> None:
     config = ProjectConfig(completion_review=True, adversary=True)
     params = parameter_defs(config)
     review_index = [param.key for param in params].index("completion_review")
@@ -821,10 +822,12 @@ def test_config_editor_disabling_completion_review_hides_and_skips_dependencies(
     updated_params = parameter_defs(config)
     updated_keys = {parameter.key for parameter in updated_params}
     assert "completion_mod" not in updated_keys
-    assert "adversary" not in updated_keys
-    assert "adversary_runs" not in updated_keys
+    assert config.adversary is True
+    assert "adversary" in updated_keys
+    assert "adversary_runs" in updated_keys
+    assert "adversary_mod" in updated_keys
     assert "completion_returns_before_adversary" not in updated_keys
-    assert updated_params[state.parameter_index].key == "clean"
+    assert updated_params[state.parameter_index].key == "adversary"
 
 
 def test_config_editor_disabling_adversary_hides_and_skips_its_dependencies() -> None:
@@ -1085,8 +1088,9 @@ def test_config_command_invokes_editor(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert "revision-coder: off" in result.output
     assert "coder-mod: gpt-coder" in result.output
     assert f"runtime-mod: {DEFAULT_MODEL}" in result.output
-    assert f"completion-mod: {DEFAULT_MODEL}" in result.output
-    assert f"adversary-mod: {DEFAULT_MODEL}" in result.output
+    assert "completion-review: false" in result.output
+    assert "adversary: false" in result.output
+    assert "log-distiller: false" in result.output
     assert "cheap-runtime: true" in result.output
 
 
@@ -1295,6 +1299,71 @@ def test_cheap_runtime_parsed_from_payload(tmp_path: Path) -> None:
     _write_config_payload(tmp_path, '{"cheap_runtime": false}')
 
     assert load_project_config(tmp_path, create=False).cheap_runtime is False
+
+
+def test_runtime_and_distiller_defaults_load_from_legacy_config(tmp_path: Path) -> None:
+    _write_config_payload(tmp_path, '{}')
+    config = load_project_config(tmp_path, create=False)
+    assert config.runtime_enabled is True
+    assert config.log_distiller == LogDistillerConfig()
+    assert config.to_json_data()["log_distiller"] == {"enabled": False, "model_path": None}
+
+
+@pytest.mark.parametrize("runtime", [False, True])
+@pytest.mark.parametrize("completion", [False, True])
+@pytest.mark.parametrize("adversary", [False, True])
+@pytest.mark.parametrize("distiller", [False, True])
+def test_independent_stage_settings_round_trip(tmp_path: Path, runtime, completion, adversary, distiller) -> None:
+    config = ProjectConfig(
+        runtime_enabled=runtime, completion_review=completion, adversary=adversary,
+        log_distiller=LogDistillerConfig(enabled=distiller, model_path="models/local-selector"),
+    )
+    save_project_config(tmp_path, config)
+    loaded = load_project_config(tmp_path, create=False)
+    assert (loaded.runtime_enabled, loaded.completion_review, loaded.adversary, loaded.log_distiller.enabled) == (
+        runtime, completion, adversary, distiller,
+    )
+    assert loaded.log_distiller.model_path == "models/local-selector"
+    state = StateStore(tmp_path).get_bello_config()
+    assert state.runtime_enabled is runtime
+    assert state.cheap_runtime is runtime
+    restored = BelloConfig.model_validate_json(state.model_dump_json())
+    assert restored.log_distiller == config.log_distiller.to_json_data()
+
+
+@pytest.mark.parametrize("value", [None, [], {"enabled": "true"}, {"enabled": 1}, {"model_path": 7},
+                                        {"model_path": " "}, {"model_path": "x\x00y"}, {"threshold": 0.8}])
+def test_log_distiller_rejects_invalid_config(tmp_path: Path, value) -> None:
+    _write_config_payload(tmp_path, json.dumps({"log_distiller": value}))
+    with pytest.raises(ProjectConfigError, match="log_distiller"):
+        load_project_config(tmp_path, create=False)
+
+
+def test_runtime_toggle_hides_only_runtime_settings() -> None:
+    config = ProjectConfig(completion_review=True, adversary=True)
+    params = parameter_defs(config)
+    index = [param.key for param in params].index("runtime_enabled")
+    updated, _, _ = select_current(config, EditorState(parameter_index=index, expanded_index=index, option_index=1))
+    keys = {param.key for param in parameter_defs(updated)}
+    assert not updated.runtime_enabled
+    assert not updated.effective_cheap_runtime
+    assert {"runtime_mod", "runtime_intelligence", "cheap_runtime"}.isdisjoint(keys)
+    assert {"completion_mod", "adversary_mod", "log_distiller_enabled", "runtime_enabled"}.issubset(keys)
+
+
+def test_distiller_toggle_and_model_path_are_editable_without_changing_other_stages() -> None:
+    config = ProjectConfig(runtime_enabled=False, completion_review=False, adversary=True)
+    params = parameter_defs(config)
+    index = [param.key for param in params].index("log_distiller_enabled")
+    updated, _, _ = select_current(config, EditorState(parameter_index=index, expanded_index=index, option_index=0))
+    assert updated.log_distiller == LogDistillerConfig(enabled=True)
+    params = parameter_defs(updated)
+    path_index = [param.key for param in params].index("distiller_model_path")
+    updated, state, _ = select_current(updated, EditorState(parameter_index=path_index))
+    updated, _, _ = select_current(updated, replace(state, edit_value="models/selector"))
+    assert updated.log_distiller.model_path == "models/selector"
+    assert not updated.runtime_enabled and not updated.completion_review and updated.adversary
+    assert changed_project_config_fields(config, updated) == ("log_distiller",)
 
 
 def test_cheap_runtime_rejects_invalid_values(tmp_path: Path) -> None:

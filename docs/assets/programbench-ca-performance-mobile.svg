@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="793" viewBox="0 0 480 793" role="img" aria-labelledby="programbench-ca-performance-mobile-title programbench-ca-performance-mobile-desc">
+<title id="programbench-ca-performance-mobile-title">Sol Ultra, Raw versus completion review and adversary</title>
+<desc id="programbench-ca-performance-mobile-desc">Solar: score 53.13 to 59.00%; time 00:32:33 to 02:17:45; Samtools: score 51.86 to 63.00%; time 00:36:17 to 02:14:40; Rumdl: score 55.60 to 81.00%; time 01:40:05 to 02:35:41</desc>
+<style>
+svg { --bg:#fff; --ink:#26323e; --muted:#64707c; --grid:#e4e9ee;
+  --raw:#557ca6; --bello:#c84b32; }
+@media (prefers-color-scheme:dark) {
+  svg { --bg:#0d1117; --ink:#edf2f7; --muted:#a6b2bf; --grid:#2b3542;
+    --raw:#8dadd2; --bello:#ef987e; }
+}
+.paper { fill:var(--bg); }
+text { font-family:Arial,Helvetica,sans-serif; fill:var(--ink);
+  font-variant-numeric:tabular-nums; }
+.muted { fill:var(--muted); }
+.raw { fill:var(--raw); }
+.bello { fill:var(--bello); }
+.halo { paint-order:stroke; stroke:var(--bg); stroke-width:5; stroke-linejoin:round; }
+.grid { stroke:var(--grid); stroke-width:1; }
+.raw-line { stroke:var(--raw); fill:none; stroke-width:2.5; stroke-dasharray:7 5; }
+.bello-line { stroke:var(--bello); fill:none; stroke-width:3; }
+.raw-point { fill:var(--bg); stroke:var(--raw); stroke-width:2; }
+.bello-point { fill:var(--bello); }
+.raw-bar { fill:var(--raw); fill-opacity:.22; stroke:var(--raw); stroke-width:1.3; }
+.bello-bar { fill:var(--bello); }
+</style>
+<rect class="paper" width="480" height="793"/>
+<rect x="24.00" y="16.00" width="16.00" height="13.00" class="raw-bar"/>
+<text x="54.00" y="30.00" font-size="17" font-weight="400" class="raw" text-anchor="start">Raw Sol Ultra</text>
+<rect x="244.00" y="16.00" width="16.00" height="13.00" class="bello-bar"/>
+<text x="274.00" y="30.00" font-size="17" font-weight="400" class="bello" text-anchor="start">Bello C+A</text>
+<text x="49.00" y="80.00" font-size="19" font-weight="400" class="" text-anchor="start">Score (%)</text>
+<line x1="49.00" y1="360.00" x2="456.00" y2="360.00" class="grid"/>
+<text x="39.00" y="365.00" font-size="14" font-weight="400" class="muted" text-anchor="end">0</text>
+<line x1="49.00" y1="241.00" x2="456.00" y2="241.00" class="grid"/>
+<text x="39.00" y="246.00" font-size="14" font-weight="400" class="muted" text-anchor="end">50</text>
+<line x1="49.00" y1="122.00" x2="456.00" y2="122.00" class="grid"/>
+<text x="39.00" y="127.00" font-size="14" font-weight="400" class="muted" text-anchor="end">100</text>
+<rect x="64.83" y="233.55" width="38.00" height="126.45" class="raw-bar"/>
+<text x="83.83" y="223.55" font-size="17" font-weight="500" class="raw" text-anchor="middle">53.13</text>
+<rect x="130.83" y="219.58" width="38.00" height="140.42" class="bello-bar"/>
+<text x="149.83" y="209.58" font-size="17" font-weight="500" class="bello" text-anchor="middle">59.00</text>
+<text x="116.83" y="391.00" font-size="16" font-weight="400" class="" text-anchor="middle">Solar</text>
+<rect x="200.50" y="236.57" width="38.00" height="123.43" class="raw-bar"/>
+<text x="219.50" y="226.57" font-size="17" font-weight="500" class="raw" text-anchor="middle">51.86</text>
+<rect x="266.50" y="210.06" width="38.00" height="149.94" class="bello-bar"/>
+<text x="285.50" y="200.06" font-size="17" font-weight="500" class="bello" text-anchor="middle">63.00</text>
+<text x="252.50" y="391.00" font-size="16" font-weight="400" class="" text-anchor="middle">Samtools</text>
+<rect x="336.17" y="227.67" width="38.00" height="132.33" class="raw-bar"/>
+<text x="355.17" y="217.67" font-size="17" font-weight="500" class="raw" text-anchor="middle">55.60</text>
+<rect x="402.17" y="167.22" width="38.00" height="192.78" class="bello-bar"/>
+<text x="421.17" y="157.22" font-size="17" font-weight="500" class="bello" text-anchor="middle">81.00</text>
+<text x="388.17" y="391.00" font-size="16" font-weight="400" class="" text-anchor="middle">Rumdl</text>
+<text x="49.00" y="455.00" font-size="19" font-weight="400" class="" text-anchor="start">Solution time (h)</text>
+<line x1="49.00" y1="735.00" x2="456.00" y2="735.00" class="grid"/>
+<text x="39.00" y="740.00" font-size="14" font-weight="400" class="muted" text-anchor="end">0</text>
+<line x1="49.00" y1="616.00" x2="456.00" y2="616.00" class="grid"/>
+<text x="39.00" y="621.00" font-size="14" font-weight="400" class="muted" text-anchor="end">1.5</text>
+<line x1="49.00" y1="497.00" x2="456.00" y2="497.00" class="grid"/>
+<text x="39.00" y="502.00" font-size="14" font-weight="400" class="muted" text-anchor="end">3</text>
+<rect x="64.83" y="691.96" width="38.00" height="43.04" class="raw-bar"/>
+<text x="83.83" y="681.96" font-size="17" font-weight="500" class="raw" text-anchor="middle">32:33</text>
+<rect x="130.83" y="552.86" width="38.00" height="182.14" class="bello-bar"/>
+<text x="149.83" y="542.86" font-size="17" font-weight="500" class="bello" text-anchor="middle">2:17:45</text>
+<text x="116.83" y="766.00" font-size="16" font-weight="400" class="" text-anchor="middle">Solar</text>
+<rect x="200.50" y="687.03" width="38.00" height="47.97" class="raw-bar"/>
+<text x="219.50" y="677.03" font-size="17" font-weight="500" class="raw" text-anchor="middle">36:17</text>
+<rect x="266.50" y="556.94" width="38.00" height="178.06" class="bello-bar"/>
+<text x="285.50" y="546.94" font-size="17" font-weight="500" class="bello" text-anchor="middle">2:14:40</text>
+<text x="252.50" y="766.00" font-size="16" font-weight="400" class="" text-anchor="middle">Samtools</text>
+<rect x="336.17" y="602.67" width="38.00" height="132.33" class="raw-bar"/>
+<text x="355.17" y="592.67" font-size="17" font-weight="500" class="raw" text-anchor="middle">1:40:05</text>
+<rect x="402.17" y="529.15" width="38.00" height="205.85" class="bello-bar"/>
+<text x="421.17" y="519.15" font-size="17" font-weight="500" class="bello" text-anchor="middle">2:35:41</text>
+<text x="388.17" y="766.00" font-size="16" font-weight="400" class="" text-anchor="middle">Rumdl</text>
+</svg>

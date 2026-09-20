@@ -161,6 +161,7 @@ def test_coder_thread_resume_params_restore_policy_and_multi_agent(tmp_path: Pat
         "thread-1",
         tmp_path,
         model=MODEL_GPT_5_6_TERRA,
+        intelligence="high",
         multi_agent=config,
     )
 
@@ -169,6 +170,7 @@ def test_coder_thread_resume_params_restore_policy_and_multi_agent(tmp_path: Pat
     assert params["approvalPolicy"] == "on-request"
     assert params["approvalsReviewer"] == "user"
     assert params["model"] == MODEL_GPT_5_6_TERRA
+    assert params["effort"] == "high"
     assert params["config"]["agents"]["enabled"] is True
     assert params["config"]["agents"]["max_concurrent_threads_per_session"] == 3
 
@@ -419,7 +421,8 @@ def test_coder_fast_mode_sets_codex_service_tier(tmp_path: Path) -> None:
     assert coder_turn_params("thread", "work", tmp_path, fast=True)["serviceTier"] == CODEX_FAST_SERVICE_TIER
 
 
-def test_coder_turn_params_include_intelligence_effort(tmp_path: Path) -> None:
+def test_coder_thread_and_turn_params_include_intelligence_effort(tmp_path: Path) -> None:
+    assert coder_thread_params(tmp_path, intelligence="xhigh")["effort"] == "xhigh"
     assert coder_turn_params("thread", "work", tmp_path, intelligence="xhigh")["effort"] == "xhigh"
 
 
@@ -449,6 +452,8 @@ def test_coder_thread_applies_structured_multi_agent_config_and_separate_instruc
             "max_concurrent_threads_per_session": 6,
             "default_subagent_model": MODEL_GPT_5_6_LUNA,
             "default_subagent_reasoning_effort": "xhigh",
+            "allowed_profiles": {model: list(efforts) for model, efforts in multi_agent.allowed.items()},
+            "role": "coder",
         }
     }
     instructions = params["developerInstructions"]
@@ -518,6 +523,7 @@ async def test_coder_session_passes_multi_agent_config_only_at_thread_start(tmp_
 
     assert client.thread_params["config"]["agents"]["enabled"] is True
     assert client.thread_params["runtimeWorkspaceRoots"] == [str(tmp_path.resolve())]
+    assert client.thread_params["effort"] == "xhigh"
     assert "developerInstructions" in client.thread_params
     assert client.turn_params["input"] == [
         {"type": "text", "text": "unchanged user prompt", "text_elements": []}
@@ -1229,6 +1235,273 @@ async def test_runtime_git_inspection_waits_for_trusted_snapshot_config(tmp_path
         snapshot.cleanup()
 
 
+@pytest.mark.parametrize("passed_count", [4, 5])
+@pytest.mark.parametrize("reporter_prefix", ["ℹ", "#"])
+def test_node_test_summary_is_not_confused_with_npm_package_version(
+    tmp_path: Path,
+    posix_command_semantics: None,
+    passed_count: int,
+    reporter_prefix: str,
+) -> None:
+    # Reproduces the npm header from native 2048 runs: its final version digit
+    # is not the test count ("1.0.0 test" previously matched "0 test").
+    output = (
+        "> signalglass-2048@1.0.0 test\n> node --test\n"
+        "✔ validates persisted games defensively (0.616583ms)\n"
+        f"{reporter_prefix} tests {passed_count}\n"
+        f"{reporter_prefix} suites 0\n"
+        f"{reporter_prefix} pass {passed_count}\n"
+        f"{reporter_prefix} fail 0\n"
+        f"{reporter_prefix} cancelled 0\n"
+        f"{reporter_prefix} skipped 0\n"
+        f"{reporter_prefix} todo 0\n"
+    )
+    controller, store, _ = _runtime_controller(tmp_path)
+    for sequence in (335, 432):
+        validation = _validation_from_action(
+            TriggeringAction(
+                kind="commandExecution", command="/bin/zsh -c 'npm test'",
+                exit_code=0, status="completed", summary="command completed",
+            ),
+            sequence=sequence,
+            item={"aggregatedOutput": output},
+        )
+        assert validation is not None
+        assert validation.type == "behavioral"
+        assert validation.outcome == "pass"
+        assert validation.trusted_validation_outcome == "passed"
+        assert validation.passed is True
+        assert validation.passed_count == passed_count
+        assert validation.failed_count == 0
+        assert controller._record_validation_runtime_state(validation) == ()
+        controller._record_validation_progress(validation)
+    assert store.get_bello_config().last_trusted_passing_behavioral_validation_sequence == 432
+
+
+@pytest.mark.parametrize(
+    ("output", "expected_passed", "expected_failed"),
+    [
+        ("ℹ tests 5\nℹ pass 4\nℹ fail 1\n", 4, 1),
+        ("# tests 5\n# pass 4\n# fail 1\n", 4, 1),
+        ("ℹ tests 0\nℹ pass 0\nℹ fail 0\n", 0, 0),
+        ("# tests 0\n# pass 0\n# fail 0\n", 0, 0),
+        ("0 tests executed\n", None, None),
+    ],
+)
+def test_node_failed_or_empty_suite_is_not_a_successful_validation(
+    output: str, expected_passed: int | None, expected_failed: int | None,
+) -> None:
+    validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution", command="npm test", exit_code=0,
+            status="completed", summary="command completed",
+        ),
+        sequence=1, item={"stdout": output},
+    )
+    assert validation is not None
+    assert validation.type == "behavioral"
+    assert validation.outcome == "fail"
+    assert validation.trusted_validation_outcome == "failed"
+    assert validation.passed is False
+    assert validation.passed_count == expected_passed
+    assert validation.failed_count == expected_failed
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/bin/zsh -c 'npm test && git diff --check'",
+        "/bin/zsh -c 'npm test && node --check app.js && node --check game.js'",
+        "node --check game.js && npm test",
+        "git diff --check && npm test",
+        "npm run lint; npm test",
+    ],
+)
+def test_compound_test_and_static_checks_remain_behavioral(
+    tmp_path: Path, posix_command_semantics: None, command: str,
+) -> None:
+    validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution", command=command, exit_code=0,
+            status="completed", summary="command completed",
+        ),
+        sequence=815,
+        item={"stdout": (
+            "> signalglass-2048@1.0.0 test\n> node --test\n"
+            "✔ validates persisted games defensively (0.0925ms)\n"
+            "ℹ tests 5\nℹ suites 0\nℹ pass 5\nℹ fail 0\n"
+        )},
+    )
+    assert validation is not None
+    assert validation.type == "behavioral"
+    assert validation.trusted_validation_outcome == "passed"
+    controller, store, _ = _runtime_controller(tmp_path)
+    controller._record_validation_progress(validation)
+    assert store.get_bello_config().last_trusted_passing_behavioral_validation_sequence == 815
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "node --check game.test.js",
+        "node --check game.test.js && git diff --check",
+        "printf 'npm test' && node --check game.js",
+        "cat npm-test.log && node --check game.js",
+    ],
+)
+def test_compound_static_checks_do_not_invent_test_execution(
+    posix_command_semantics: None, command: str,
+) -> None:
+    validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution", command=command, exit_code=0,
+            status="completed", summary="command completed",
+        ),
+        sequence=1, item={"stdout": ""},
+    )
+    assert validation is not None
+    assert validation.type == "static"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "false && npm test; git diff --check",
+        "true || npm test; git diff --check",
+    ],
+)
+def test_skipped_compound_test_branch_is_not_behavioral_evidence(
+    posix_command_semantics: None, command: str,
+) -> None:
+    validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution", command=command, exit_code=0,
+            status="completed", summary="command completed",
+        ),
+        sequence=1, item={"stdout": ""},
+    )
+    assert validation is not None
+    assert validation.type == "static"
+    assert _has_passing_behavioral_validation([validation]) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/bin/zsh -lc \"printf '\\n===== test/game.test.js =====\\n'; sed -n '1,260p' 'test/game.test.js'\"",
+        "/bin/zsh -lc 'git -c core.excludesFile=/dev/null diff -- game.js app.js styles.css index.html test/game.test.js'",
+        "/bin/zsh -lc 'git --no-pager --no-optional-locks -c core.excludesfile=/dev/null -c global.excludesfile=/dev/null diff -- game.js app.js test/game.test.js styles.css package.json'",
+        "/bin/zsh -lc \"sleep 2; stat -f '%Sm %N' -t '%H:%M:%S' game.js app.js test/game.test.js styles.css package.json\"",
+        "printf '%s' ./test/game.test.js",
+        "printf '%s' 'node --test'",
+        "printf '%s' 'python -m pytest'",
+        "printf '%s' ';' ./run_tests.sh",
+        r"printf '%s' \; ./run_tests.sh",
+        "sed -n '1,20p' ./run_tests.sh",
+        "git diff -- ./run_tests.sh",
+        "sleep 2; stat ./run_tests.sh",
+        "command -v playwright || true",
+        "command -v chromium || command -v playwright || true",
+    ],
+    ids=["saved-printf-sed", "saved-git-config", "saved-git-options", "saved-sleep-stat",
+         "printf-path", "printed-node", "printed-pytest", "quoted-separator", "escaped-separator",
+         "sed-path", "diff-path", "stat-path", "which-runner", "which-fallbacks"],
+)
+def test_test_names_in_inspection_arguments_do_not_create_trusted_validation(
+    posix_command_semantics: None, command: str,
+) -> None:
+    # Even reading a log containing genuine runner output must not turn the
+    # inspection into an executed test or advance trusted validation freshness.
+    validation = _validation_from_action(
+        TriggeringAction(kind="commandExecution", command=command, exit_code=0,
+                         status="completed", summary="command completed"),
+        sequence=850, item={"stdout": "# tests 5\n# pass 5\n# fail 0\n"},
+        changed_paths=["game.js", "test/game.test.js"],
+    )
+    assert validation is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "./run_visible_tests.sh",
+        "/bin/bash -lc ./run_visible_tests.sh",
+        "sh ./run_tests.sh",
+        "bash -eu ./run_tests.sh",
+        "python3 -B ./test_game.py",
+        "python3 -W ignore ./test_game.py",
+        "python3 -X dev -m unittest -v",
+        "node test/game.test.js",
+        "node --no-warnings test/game.test.js",
+        "ruby ./game_test.rb",
+        "env CI=1 python3 -m pytest tests/test_game.py",
+        "./node_modules/.bin/mocha test/game.test.js",
+        "npx --no-install vitest run",
+        "node --test",
+        "cd app && node test/game.test.js",
+        "printf '%s' 'test/game.test.js'; sh ./run_tests.sh",
+        "sh ./run_tests.sh && git diff --check",
+    ],
+)
+def test_test_wrappers_are_recognized_only_at_execution_positions(
+    posix_command_semantics: None, command: str,
+) -> None:
+    validation = _validation_from_action(
+        TriggeringAction(kind="commandExecution", command=command, exit_code=0,
+                         status="completed", summary="command completed"),
+        sequence=900, item={"stdout": "# tests 5\n# pass 5\n# fail 0\n"},
+    )
+    assert validation is not None
+    assert validation.type == "behavioral"
+    assert validation.trusted_validation_outcome == "passed"
+    assert _has_passing_behavioral_validation([validation])
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 -W test_game.py application.py",
+        "python3 -c 'print(1)' test_game.py",
+        "node -e 'console.log(1)' test/game.test.js",
+        "node --check test/game.test.js",
+        "node app.js --test test/game.test.js",
+        "bash -n ./run_tests.sh",
+    ],
+)
+def test_interpreter_flag_values_and_script_arguments_are_not_test_wrappers(
+    posix_command_semantics: None, command: str,
+) -> None:
+    assert not controller_module._is_behavioral_validation_command(command)
+    assert not controller_module._is_test_wrapper_script_command(command)
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "ℹ tests 5\nℹ pass 5\nℹ fail 0\n1 failed\n",
+        "0 failed\nℹ tests 5\nℹ pass 4\nℹ fail 1\n",
+        "ℹ tests 5\nℹ pass 5\nℹ fail 0\nℹ tests 5\nℹ pass 4\nℹ fail 1\n",
+    ],
+    ids=["node-pass-other-runner-fail", "other-runner-pass-node-fail", "node-pass-node-fail"],
+)
+def test_compound_node_summary_cannot_hide_a_failing_validation(
+    posix_command_semantics: None, output: str,
+) -> None:
+    validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution", command="npm test; node --check game.js",
+            exit_code=0, status="completed", summary="command completed",
+        ),
+        sequence=1, item={"stdout": output},
+    )
+    assert validation is not None
+    assert validation.type == "behavioral"
+    assert validation.failed_count == 1
+    assert validation.outcome == "fail"
+    assert validation.trusted_validation_outcome == "failed"
+    assert validation.passed is False
+
+
 def test_validation_ledger_classifies_static_and_behavioral_commands(
     posix_command_semantics: None,
 ) -> None:
@@ -1930,6 +2203,7 @@ async def test_summary_done_without_marker_steers_for_exact_marker_not_completio
 )
 async def test_former_material_limitation_phrases_are_not_terminal(tmp_path: Path, phrase: str) -> None:
     controller, store, _ = _runtime_controller(tmp_path)
+    controller.adversary_enabled = False
 
     class FakeCoder:
         def __init__(self) -> None:
@@ -1984,6 +2258,7 @@ async def test_no_marker_idle_forces_completion_review_once(tmp_path: Path) -> N
 
 async def test_marker_with_completion_review_disabled_finalizes_without_review(tmp_path: Path) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
+    controller.adversary_enabled = False
     store.update_bello_config(lambda cfg: cfg.model_copy(update={"completion_review_enabled": False}))
     controller.last_coder_message = CoderMessage(
         text="Summary: done\nValidation: pytest\nBELLO_READY_FOR_REVIEW",
@@ -2020,7 +2295,7 @@ async def test_completion_review_cli_override_beats_persisted_config(tmp_path: P
     assert controller._effective_completion_review() is False
 
 
-async def test_completion_review_disabled_suppresses_adversary(tmp_path: Path) -> None:
+async def test_completion_review_disabled_preserves_independent_adversary(tmp_path: Path) -> None:
     controller, store, _ = _runtime_controller(tmp_path)
     controller.adversary_enabled = True
     controller.adversary_runs = None
@@ -2028,12 +2303,13 @@ async def test_completion_review_disabled_suppresses_adversary(tmp_path: Path) -
         lambda cfg: cfg.model_copy(update={"max_adversary_runs": 2, "completion_review_enabled": False})
     )
 
-    assert controller._effective_max_adversary_runs() == 0
-    assert controller._adversary_model_required_for_preflight() is False
+    assert controller._effective_max_adversary_runs() == 2
+    assert controller._adversary_model_required_for_preflight() is True
 
 
 async def test_no_marker_idle_nudges_coder_when_completion_review_disabled(tmp_path: Path) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
+    controller.adversary_enabled = False
     store.update_bello_config(
         lambda cfg: cfg.model_copy(
             update={"active_coder_turn_id": None, "last_event_sequence": 17, "completion_review_enabled": False}
@@ -2054,6 +2330,148 @@ async def test_no_marker_idle_nudges_coder_when_completion_review_disabled(tmp_p
 
     assert fake.completion_packets == []
     assert controller.coder.messages == [NO_MARKER_IDLE_NUDGE]
+
+
+@pytest.mark.parametrize("cheap_runtime", [False, True])
+@pytest.mark.parametrize("completion_review", [False, True])
+async def test_denied_native_turn_runtime_noop_continues_idle_policy(
+    tmp_path: Path, cheap_runtime: bool, completion_review: bool,
+) -> None:
+    controller, store, fake = _runtime_controller(tmp_path)
+    controller.adversary_enabled = False
+    store.update_bello_config(
+        lambda cfg: cfg.model_copy(update={
+            "active_coder_turn_id": "turn",
+            "completion_review_enabled": completion_review,
+        })
+    )
+
+    class NativeCoder:
+        thread_id = "thread"
+        active_turn_id = "turn"
+
+        def __init__(self):
+            self.messages = []
+
+        async def steer_or_start(self, message):
+            self.messages.append(message)
+            self.active_turn_id = self.active_turn_id or "resumed-turn"
+            store.update_bello_config(
+                lambda cfg: cfg.model_copy(update={"active_coder_turn_id": self.active_turn_id})
+            )
+            return self.active_turn_id
+
+        def mark_turn_completed(self, turn_id):
+            if self.active_turn_id == turn_id:
+                self.active_turn_id = None
+                store.update_bello_config(lambda cfg: cfg.model_copy(update={"active_coder_turn_id": None}))
+
+    class NativeClient:
+        def __init__(self):
+            self.responses = []
+
+        async def respond(self, request_id, response):
+            self.responses.append((request_id, response))
+
+    controller.coder = NativeCoder()
+    controller.client = NativeClient()
+    controller.approvals = ApprovalManager(tmp_path)
+    cheap = _CheapRuntimeNoopReviewer()
+    if cheap_runtime:
+        controller.runtime_triage_reviewer = cheap
+        controller.runtime_triage_config = SimpleNamespace(model=cheap.model)
+    controller._current_turn_action_count = 1
+    await controller.handle_server_request(AppServerMessage({
+        "id": 56,
+        "method": "item/fileChange/requestApproval",
+        "params": {
+            "threadId": "thread", "turnId": "turn",
+            "grantRoot": str(store.path(CONFIG)),
+            "availableDecisions": ["accept", "decline", "cancel"],
+        },
+    }))
+    await controller.handle_notification(AppServerMessage({
+        "method": "serverRequest/resolved", "params": {"requestId": 56},
+    }))
+    await controller.handle_notification(AppServerMessage({
+        "method": "turn/completed",
+        "params": {"threadId": "thread", "turn": {"id": "turn", "status": "interrupted"}},
+    }))
+    await controller._supervisor_task
+
+    assert controller.client.responses == [(56, {"decision": "decline"})]
+    assert controller.pending_approvals == {}
+    assert len(cheap.calls) == int(cheap_runtime)
+    assert len(fake.runtime_packets) == int(not cheap_runtime)
+    assert len(fake.completion_packets) == int(completion_review)
+    assert controller.coder.messages[-1] == ("not used" if completion_review else NO_MARKER_IDLE_NUDGE)
+    assert controller.coder.active_turn_id == "resumed-turn"
+    assert store.get_bello_config().active_coder_turn_id == "resumed-turn"
+    assert store.get_bello_config().status != BelloStatus.COMPLETE
+
+
+@pytest.mark.parametrize("changed_during_refresh", [False, True])
+@pytest.mark.parametrize("blocker", [
+    "missing_coder", "active_turn", "coder_active_turn", "active_subagent", "generation", "thread", "new_event",
+    "pending_approval", "persisted_approval", "queued_runtime", "queued_completion",
+    "deferred_completion", "paused", "paused_status", "stopped", "finalizing", "terminal_cleanup",
+])
+async def test_runtime_noop_idle_does_not_resume_changed_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocker: str, changed_during_refresh: bool,
+) -> None:
+    controller, store, _fake = _runtime_controller(tmp_path)
+    controller.coder = SimpleNamespace(thread_id="thread", active_turn_id=None)
+    packet = SupervisorWakePacket(
+        wake_sequence=1, latest_event_sequence=0, generation=0, restart_count=0,
+        coder_thread_id="thread", task_path=str(controller.task_path), task_contents="# Task",
+        current_summary="Coder turn completed",
+    )
+
+    def change_state():
+        config_changes = {
+            "active_turn": {"active_coder_turn_id": "new-turn"},
+            "generation": {"generation": 1},
+            "thread": {"coder_thread_id": "new-thread"},
+            "persisted_approval": {"pending_server_request_ids": [57]},
+            "paused_status": {"status": BelloStatus.PAUSED},
+        }
+        if blocker in config_changes:
+            store.update_bello_config(lambda cfg: cfg.model_copy(update=config_changes[blocker]))
+        elif blocker == "missing_coder":
+            controller.coder = None
+        elif blocker == "coder_active_turn":
+            controller.coder = SimpleNamespace(active_turn_id="new-turn")
+        elif blocker == "active_subagent":
+            monkeypatch.setattr(controller, "_active_coder_subagents", lambda: [object()])
+        elif blocker == "new_event":
+            controller._append_event(AppEventSource.APP_SERVER, "turn/started", thread_id="thread")
+        elif blocker == "pending_approval":
+            controller.pending_approvals[57] = object()
+        elif blocker == "queued_runtime":
+            controller._supervisor_next_runtime_summary = "new runtime evidence"
+        elif blocker == "queued_completion":
+            controller._supervisor_next_completion_summary = "ready for review"
+        elif blocker == "deferred_completion":
+            controller._deferred_completion_check = object()
+        else:
+            attribute, value = {
+                "paused": ("paused", True), "stopped": ("running", False),
+                "finalizing": ("_finalizing", True), "terminal_cleanup": ("_terminal_cleanup_started", True),
+            }[blocker]
+            setattr(controller, attribute, value)
+
+    async def refresh():
+        if changed_during_refresh:
+            change_state()
+
+    async def unexpected_idle(**kwargs):
+        raise AssertionError("stale runtime noop must not restart or review the coder")
+
+    monkeypatch.setattr(controller, "_refresh_coder_subagents", refresh)
+    monkeypatch.setattr(controller, "_handle_no_marker_idle", unexpected_idle)
+    if not changed_during_refresh:
+        change_state()
+    assert await controller._resume_idle_after_runtime_noop(packet) is False
 
 
 def test_runtime_supervisor_schema_rejects_complete() -> None:
@@ -4040,6 +4458,7 @@ async def test_done_without_fresh_validation_runtime_noop_finalizes_when_review_
     tmp_path: Path,
 ) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
+    controller.adversary_enabled = False
     store.update_bello_config(lambda cfg: cfg.model_copy(update={"completion_review_enabled": False}))
     _prepare_done_without_fresh_validation(controller)
 
@@ -5273,9 +5692,11 @@ async def test_supervisor_agent_sets_intelligence_effort(tmp_path: Path) -> None
 
     class FakeClient:
         def __init__(self) -> None:
+            self.thread_params = None
             self.turn_params = None
 
         async def thread_start(self, params, *, timeout):
+            self.thread_params = params
             return {"thread": {"id": "supervisor-thread"}}
 
         async def turn_start(self, params, *, timeout):
@@ -5303,6 +5724,7 @@ async def test_supervisor_agent_sets_intelligence_effort(tmp_path: Path) -> None
     decision = await agent.decide(packet)
 
     assert decision.decision == SupervisorDecisionKind.NOOP
+    assert client.thread_params["effort"] == "high"
     assert client.turn_params["effort"] == "high"
 
 
@@ -7228,9 +7650,33 @@ async def test_adversary_report_controller_routes_schema_valid_normalized_report
     assert "overall: broke" not in coder_readable_log
 
 
-async def test_adversary_observations_are_routed_when_candidate_finding_is_false(
+@pytest.mark.parametrize(
+    "raw_report",
+    [
+        pytest.param(
+            "candidate_finding: false\n"
+            "attacked: cache behavior\n"
+            "findings: none\n"
+            "observations:\n"
+            "- cache count changed without the expected header\n"
+            "held: ordinary cache path\n"
+            "overall: I believe no defects remain in the submitted solution",
+            id="declared-no-findings",
+        ),
+        pytest.param(
+            "candidate_finding: false\n\n## observations\n"
+            "Cache count changed without the expected header.",
+            id="markdown-without-required-sections",
+        ),
+        pytest.param(
+            "No defects found. Cache count changed without the expected header.",
+            id="heading-free-report-without-routing-line",
+        ),
+    ],
+)
+async def test_nonempty_adversary_reports_reach_report_controller_without_format_retry(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    raw_report: str,
 ) -> None:
     validations = [
         ValidationRun(
@@ -7248,9 +7694,8 @@ async def test_adversary_observations_are_routed_when_candidate_finding_is_false
         validations=validations,
     )
     controller.adversary_enabled = True
-    controller.client = object()
     controller.running = True
-    controller.adv_report_controller = _FakeAdvReportController(
+    normalized = _FakeAdvReportController(
         [
             AdvReportControllerDecision(
                 forward_to_coder=True,
@@ -7262,28 +7707,34 @@ async def test_adversary_observations_are_routed_when_candidate_finding_is_false
             )
         ]
     )
+    controller.adv_report_controller = normalized
 
-    class ObservingAdversary:
-        def __init__(self, *args, **kwargs) -> None:
-            pass
+    class FakeClient:
+        def __init__(self) -> None:
+            self.thread_count = 0
+            self.turn_count = 0
+            self.archived: list[str] = []
 
-        async def run(self, packet, *, previous_adversary_report=None):
-            return SimpleNamespace(
-                report_text=(
-                    "candidate_finding: false\n"
-                    "attacked: cache behavior\n"
-                    "findings: none\n"
-                    "observations:\n"
-                    "- cache count changed without the expected header\n"
-                    "held: ordinary cache path\n"
-                    "overall: I believe no defects remain in the submitted solution"
-                ),
-                thread_id="adv-thread",
-                turn_id="adv-turn",
-                candidate_finding=False,
-            )
+        async def thread_start(self, params, *, timeout):
+            self.thread_count += 1
+            return {"thread": {"id": f"adv-thread-{self.thread_count}"}}
 
-    monkeypatch.setattr("supervisor.controller.AdversaryAgent", ObservingAdversary)
+        async def turn_start(self, params, *, timeout):
+            self.turn_count += 1
+            return {
+                "turn": {
+                    "id": f"adv-turn-{self.turn_count}",
+                    "status": "completed",
+                    "items": [{"type": "agentMessage", "text": raw_report}],
+                }
+            }
+
+        async def thread_archive(self, thread_id, *, timeout):
+            self.archived.append(thread_id)
+            return {}
+
+    client = FakeClient()
+    controller.client = client
 
     await controller.apply_completion_decision(
         _covered_accept_decision(wake_sequence=1, validation_id="validation-3"),
@@ -7291,6 +7742,12 @@ async def test_adversary_observations_are_routed_when_candidate_finding_is_false
         packet=_gate_packet(task, validations=validations),
     )
 
+    assert client.thread_count == 1
+    assert client.turn_count == 1
+    assert client.archived == ["adv-thread-1"]
+    assert len(normalized.packets) == 1
+    assert normalized.packets[0].adversary_report is not None
+    assert normalized.packets[0].adversary_report.report_text == raw_report
     assert store.get_bello_config().status == BelloStatus.STARTING
     assert len(coder.messages) == 1
     assert "## Observations requiring investigation" in coder.messages[0]
@@ -9446,6 +9903,100 @@ async def test_execpolicy_amendment_approval_is_not_rendered_as_denied(
     assert controller.coder.messages == []
 
 
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError, asyncio.CancelledError, KeyboardInterrupt])
+async def test_run_unexpected_exception_finalizes_failure_without_applying_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_type: type[BaseException],
+) -> None:
+    task = tmp_path / "TASK.md"
+    task.write_text("# Task", encoding="utf-8")
+    source = tmp_path / "app.py"
+    source.write_text("original\n", encoding="utf-8")
+
+    class Client:
+        def __init__(self):
+            self.stopped = False
+            self.responses = []
+
+        async def start(self):
+            pass
+
+        async def initialize(self):
+            return {}
+
+        async def stop(self):
+            self.stopped = True
+
+        async def respond(self, request_id, response):
+            self.responses.append((request_id, response))
+
+    class Coder:
+        def __init__(self, client, store, *args, **kwargs):
+            self.store = store
+            self.thread_id = "coder-thread"
+            self.active_turn_id = None
+
+        async def start_thread(self):
+            self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"coder_thread_id": self.thread_id}))
+
+        async def start_initial_turn(self):
+            self.active_turn_id = "coder-turn"
+            self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"active_coder_turn_id": self.active_turn_id}))
+
+        async def interrupt(self):
+            pass
+
+    monkeypatch.setattr(controller_module, "CoderSession", Coder)
+    client = Client()
+    controller = BelloController(
+        tmp_path, task_path=task, client=client, tui=_FakeTUI(),
+        runtime_enabled=False, completion_review=False, adversary_enabled=False,
+        overwrite_state=True, use_git_diff=False,
+    )
+    controller.preflight = _async_noop
+    failure = error_type("synthetic event-loop failure")
+
+    async def broken_event_loop():
+        (controller._active_workspace_root() / "app.py").write_text("unaccepted change\n", encoding="utf-8")
+        context = normalize_approval_request(AppServerMessage({
+            "id": "pending-1", "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "coder-thread", "turnId": "coder-turn",
+                       "command": "node -e 'test'", "availableDecisions": ["accept", "decline"]},
+        }))
+        controller.pending_approvals["pending-1"] = context
+        controller.store.update_bello_config(lambda cfg: cfg.model_copy(update={"pending_server_request_ids": ["pending-1"]}))
+        raise failure
+
+    controller.event_loop = broken_event_loop
+    with pytest.raises(error_type) as caught:
+        await controller.run()
+    assert caught.value is failure
+    assert any(frame.name == "broken_event_loop" for frame in caught.traceback)
+    assert client.stopped is True
+    assert source.read_text(encoding="utf-8") == "original\n"
+    recovery = tmp_path / ".supervisor" / "recovery" / "run1" / "workspace"
+    assert (recovery / "app.py").read_text(encoding="utf-8") == "unaccepted change\n"
+    assert controller._snapshot_patch_applied is False
+    if not issubclass(error_type, Exception):
+        # These control-flow exceptions are not converted into provider errors.
+        assert controller.store.get_bello_config().status != BelloStatus.PROVIDER_FAILURE
+        return
+    cfg = controller.store.get_bello_config()
+    assert cfg.status == BelloStatus.PROVIDER_FAILURE
+    assert cfg.active_coder_turn_id is None
+    assert cfg.pending_server_request_ids == []
+    assert controller.pending_approvals == {}
+    assert client.responses == [("pending-1", {"decision": "decline"})]
+    checkpoint = json.loads(controller.store.path(RUN_CHECKPOINT).read_text(encoding="utf-8"))
+    assert checkpoint["status"] == "provider_failure"
+    assert checkpoint["phase"] == checkpoint["state"] == "terminal"
+    assert checkpoint["active_coder_turn_id"] is None
+    report = controller.store.path(FINAL_REPORT).read_text(encoding="utf-8")
+    assert "- Status: provider_failure" in report
+    assert f"run infrastructure failed: {error_type.__name__}" in report
+    assert "unaccepted coder workspace preserved" in report
+    assert controller.running is False
+
+
 async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path: Path, monkeypatch) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
@@ -9513,6 +10064,7 @@ async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path:
         runtime_intelligence="xhigh",
         completion_intelligence="high",
         adversary_enabled=False,
+        completion_review=True,
         overwrite_state=True,
         use_git_diff=False,
     )
@@ -9538,10 +10090,7 @@ async def test_run_shutdown_after_final_report_stops_stubbed_appserver(tmp_path:
     assert controller.completion_supervisor is not controller.supervisor
     assert controller.completion_supervisor.model == "gpt-completion"
     assert controller.completion_supervisor.intelligence == "high"
-    assert controller.adv_report_controller is not None
-    assert controller.adv_report_controller is not controller.completion_supervisor
-    assert controller.adv_report_controller.model == "gpt-completion"
-    assert controller.adv_report_controller.intelligence == "high"
+    assert controller.adv_report_controller is None
     assert client.stopped is True
     assert controller.running is False
 

@@ -196,19 +196,15 @@ def test_config_editor_hides_completion_dependencies_when_review_is_disabled() -
         "completion_mod",
         "completion_mod_variant",
         "completion_intelligence",
-        "adversary_mod",
-        "adversary_mod_variant",
-        "adversary_intelligence",
-        "adversary",
-        "adversary_runs",
         "completion_returns_before_adversary",
         "completion_returns_after_adversary",
     }.isdisjoint(keys)
 
-    output = _render(disabled, width=160, height=40)
+    output = _render(disabled, width=160, height=80)
     assert "completion-mod" not in output
-    assert "adversary-mod" not in output
-    assert "max-adversary-runs" not in output
+    assert {"adversary_mod", "adversary_runs", "adversary"}.issubset(keys)
+    assert "adversary-mod" in output
+    assert "max-adversary-runs" in output
     assert "max-reviews" not in output
 
 
@@ -225,13 +221,15 @@ def test_config_editor_default_surface_is_everyday() -> None:
         "runtime_mod",
         "cheap_runtime",
         "completion_review",
+        "runtime_enabled",
+        "adversary",
+        "log_distiller_enabled",
     }.issubset(keys)
     assert {
         "completion_mod",
         "completion_intelligence",
         "adversary_mod",
         "adversary_intelligence",
-        "adversary",
         "adversary_runs",
         "completion_returns_before_adversary",
         "completion_returns_after_adversary",

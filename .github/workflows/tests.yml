@@ -1,8 +1,9 @@
 name: Tests
 
 on:
+  workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, codex/0.6.0-multi-provider, mystery]
   pull_request:
 
 jobs:
@@ -16,13 +17,73 @@ jobs:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: supervisor/pi_worker/package-lock.json
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install
-        run: python -m pip install -e ".[test]"
-      - name: Run tests
-        run: python -m pytest -q
+      - name: Install and verify Linux sandbox
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap apparmor-profiles
+          if [ "$(id -u)" -eq 0 ]; then
+            echo "::error::Native sandbox checks must run as the unprivileged runner."
+            exit 1
+          fi
+          sandbox_diagnostics() {
+            /usr/bin/bwrap --version
+            sysctl kernel.unprivileged_userns_clone user.max_user_namespaces \
+              kernel.apparmor_restrict_unprivileged_userns || true
+            sudo grep -E 'bwrap|unprivileged_userns' \
+              /sys/kernel/security/apparmor/profiles || true
+            sudo journalctl -k --boot --no-pager --since '-2 minutes' \
+              | grep -E 'apparmor=.*(bwrap|unprivileged_userns)' | tail -30 || true
+          }
+          sandbox_probe() {
+            /usr/bin/bwrap --die-with-parent --new-session \
+              --unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-net \
+              --cap-drop ALL --clearenv --ro-bind / / --proc /proc --dev /dev \
+              -- /usr/bin/true
+          }
+          sandbox_diagnostics
+          if ! sandbox_probe; then
+            sandbox_diagnostics
+            # Noble ships this targeted profile in apparmor-profiles, but does
+            # not load it by default. Keep AppArmor and network isolation on.
+            if [ ! -f /etc/apparmor.d/bwrap-userns-restrict ]; then
+              sudo install -m 0644 \
+                /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
+                /etc/apparmor.d/bwrap-userns-restrict
+            fi
+            sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+            sandbox_diagnostics
+            if ! sandbox_probe; then
+              sandbox_diagnostics
+              echo "::error::Bubblewrap cannot establish the required native sandbox."
+              exit 1
+            fi
+          fi
+      - name: Install pinned Pi runtime
+        working-directory: supervisor/pi_worker
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Install Python package and optional SDK
+        run: python -m pip install -e ".[test,claude]" wheel
+      - name: Run Pi worker tests
+        working-directory: supervisor/pi_worker
+        run: npm test
+      - name: Run Python tests except the separately gated Pi integration
+        env:
+          BELLO_REQUIRE_NATIVE_SANDBOX: "1"
+        run: python -m pytest -q --ignore=tests/test_runtime_pi_integration.py
+      - name: Run real offline Pi SDK and native sandbox integration
+        env:
+          BELLO_REQUIRE_NATIVE_SANDBOX: "1"
+          BELLO_REQUIRE_PI_INTEGRATION: "1"
+        run: python -m pytest -q tests/test_runtime_pi_integration.py
 
   native-platforms:
     name: ${{ matrix.name }} / Python ${{ matrix.python-version }}
@@ -43,90 +104,153 @@ jobs:
             python-version: "3.14"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: supervisor/pi_worker/package-lock.json
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install
-        run: python -m pip install ".[test]"
-      - name: Run full applicable test suite
-        run: python -m pytest -q
+      - name: Install pinned Windows helper toolchain
+        if: runner.os == 'Windows'
+        uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install pinned Pi runtime
+        working-directory: supervisor/pi_worker
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Install Python package and optional SDK
+        run: python -m pip install ".[test,claude]" wheel
+      - name: Stage and prepare the Windows native helper
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe"
+          $sourceBin = Join-Path $PWD "supervisor/runtime/bin"
+          New-Item -ItemType Directory -Force -Path $sourceBin | Out-Null
+          Copy-Item $helper (Join-Path $sourceBin "bello-windows-sandbox.exe")
+          Copy-Item "native/windows-sandbox/THIRD_PARTY_NOTICES.txt" (Join-Path $sourceBin "THIRD_PARTY_NOTICES.txt")
+          ./native/windows-sandbox/ci/verify_host_setup.ps1 `
+            -Helper $helper -Phase Prepare `
+            -SnapshotPath (Join-Path $env:RUNNER_TEMP "bello-host-setup-baseline.json") `
+            -Report (Join-Path $env:RUNNER_TEMP "bello-host-setup-prepare.json")
+          $setup = Get-Content (Join-Path $env:RUNNER_TEMP "bello-host-setup-prepare.json") -Raw | ConvertFrom-Json
+          $checkoutRoot = [IO.Path]::GetPathRoot((Get-Item -LiteralPath $env:GITHUB_WORKSPACE).FullName)
+          if ($checkoutRoot -notmatch '^[A-Za-z]:\\$') { throw "checkout is not on a literal local drive" }
+          if ($checkoutRoot -ine $setup.systemRoot) {
+            ./native/windows-sandbox/ci/verify_host_setup.ps1 `
+              -Helper $helper -Phase Prepare -Drive $checkoutRoot.Substring(0, 2) `
+              -SnapshotPath (Join-Path $env:RUNNER_TEMP "bello-checkout-drive-baseline.json") `
+              -Report (Join-Path $env:RUNNER_TEMP "bello-checkout-drive-prepare.json")
+          }
+      - name: Prepare and verify the Windows null device
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe"
+          ./native/windows-sandbox/ci/verify_null_device.ps1 `
+            -Helper $helper -Phase Prepare `
+            -SnapshotPath (Join-Path $env:RUNNER_TEMP "bello-null-device-baseline.json") `
+            -Report (Join-Path $env:RUNNER_TEMP "bello-null-device-prepare.json")
+      - name: Prepare and verify offline network isolation
+        id: network_setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $helper = Resolve-Path "supervisor/runtime/bin/bello-windows-sandbox.exe"
+          ./native/windows-sandbox/ci/verify_network_setup.ps1 `
+            -Helper $helper -Phase Prepare `
+            -SnapshotPath (Join-Path $env:RUNNER_TEMP "bello-network-baseline.json") `
+            -Report (Join-Path $env:RUNNER_TEMP "bello-network-prepare.json")
+      - name: Collect only offline broker startup errors
+        if: always() && runner.os == 'Windows' && steps.network_setup.outcome == 'failure'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          ./native/windows-sandbox/ci/collect_network_service_events.ps1 `
+            -Report (Join-Path $env:RUNNER_TEMP "bello-network-service-events.json")
+      - name: Run Pi worker tests
+        working-directory: supervisor/pi_worker
+        run: npm test
+      - name: Run full applicable Python suite except the separately gated Pi integration
+        env:
+          BELLO_REQUIRE_PI_INTEGRATION: "1"
+        run: python -m pytest -v -o faulthandler_timeout=120 --ignore=tests/test_runtime_pi_integration.py
+      - name: Run real offline Pi SDK and native sandbox integration
+        env:
+          BELLO_REQUIRE_NATIVE_SANDBOX: "1"
+          BELLO_REQUIRE_PI_INTEGRATION: "1"
+        run: python -m pytest -q tests/test_runtime_pi_integration.py
       - name: Exercise installed CLI help
         run: bello --help
       - name: Report Windows runner image
         if: runner.os == 'Windows'
         shell: pwsh
         run: Write-Output "$env:ImageOS $env:ImageVersion"
-      - name: Exercise doctor with deterministic Codex app-server
+      - name: Verify doctor has no legacy executor dependency
         if: runner.os == 'Windows'
+        run: python -m pytest -q tests/test_doctor.py::test_doctor_does_not_start_the_removed_codex_executor
+      - name: Restore and verify offline network setup
+        if: always() && runner.os == 'Windows'
         shell: pwsh
-        env:
-          BELLO_SKIP_UPDATE_CHECK: "1"
         run: |
-          $fixtureBin = Join-Path $env:RUNNER_TEMP "bello-fixture-bin"
-          New-Item -ItemType Directory -Force -Path $fixtureBin | Out-Null
-          Copy-Item "tests/windows_fixtures/*" $fixtureBin
-          $env:PATH = "$fixtureBin;$env:PATH"
-
-          # Reproduce the normal native-Windows CODEX_HOME shape that caused
-          # issue #22: installer/plugin junctions plus files held with
-          # FILE_SHARE_NONE by a running Codex process.
-          $codexHome = Join-Path $env:RUNNER_TEMP "bello-doctor-codex-home"
-          New-Item -ItemType Directory -Force -Path $codexHome | Out-Null
-          Set-Content -Path (Join-Path $codexHome "auth.json") -Value '{"token":"fixture"}'
-          Set-Content -Path (Join-Path $codexHome "config.toml") -Value 'model = "gpt-test"'
-
-          $packageTarget = Join-Path $codexHome "packages/standalone/1.2.3"
-          $packageJunction = Join-Path $codexHome "packages/standalone/current"
-          New-Item -ItemType Directory -Force -Path (Split-Path $packageJunction) | Out-Null
-          New-Item -ItemType Directory -Force -Path $packageTarget | Out-Null
-          New-Item -ItemType Junction -Path $packageJunction -Target $packageTarget | Out-Null
-
-          $pluginTarget = Join-Path $codexHome "plugins/cache/openai-bundled/chrome/1.2.3"
-          $pluginJunction = Join-Path $codexHome "plugins/cache/openai-bundled/chrome/latest"
-          New-Item -ItemType Directory -Force -Path (Split-Path $pluginJunction) | Out-Null
-          New-Item -ItemType Directory -Force -Path $pluginTarget | Out-Null
-          Set-Content -Path (Join-Path $pluginTarget "SKILL.md") -Value '# fixture plugin'
-          New-Item -ItemType Junction -Path $pluginJunction -Target $pluginTarget | Out-Null
-          $pluginState = Join-Path $codexHome "plugins/data/bello.json"
-          New-Item -ItemType Directory -Force -Path (Split-Path $pluginState) | Out-Null
-          Set-Content -Path $pluginState -Value '{"enabled":true}'
-
-          $writerLock = Join-Path $codexHome "thread-writer-locks/active.lock"
-          $tempLock = Join-Path $codexHome "tmp/arg0/active.lock"
-          $dotTempLock = Join-Path $codexHome ".tmp/plugins.sync.lock"
-          New-Item -ItemType Directory -Force -Path (Split-Path $writerLock) | Out-Null
-          New-Item -ItemType Directory -Force -Path (Split-Path $tempLock) | Out-Null
-          New-Item -ItemType Directory -Force -Path (Split-Path $dotTempLock) | Out-Null
-          $env:CODEX_HOME = $codexHome
-          $writerStream = $null
-          $tempStream = $null
-          $dotTempStream = $null
-          try {
-            $writerStream = [System.IO.File]::Open(
-              $writerLock,
-              [System.IO.FileMode]::OpenOrCreate,
-              [System.IO.FileAccess]::ReadWrite,
-              [System.IO.FileShare]::None
-            )
-            $tempStream = [System.IO.File]::Open(
-              $tempLock,
-              [System.IO.FileMode]::OpenOrCreate,
-              [System.IO.FileAccess]::ReadWrite,
-              [System.IO.FileShare]::None
-            )
-            $dotTempStream = [System.IO.File]::Open(
-              $dotTempLock,
-              [System.IO.FileMode]::OpenOrCreate,
-              [System.IO.FileAccess]::ReadWrite,
-              [System.IO.FileShare]::None
-            )
-            bello doctor
-            if ($LASTEXITCODE -ne 0) {
-              throw "bello doctor failed with exit code $LASTEXITCODE"
-            }
+          $snapshot = Join-Path $env:RUNNER_TEMP "bello-network-baseline.json"
+          if (Test-Path -LiteralPath $snapshot) {
+            $helper = Resolve-Path "supervisor/runtime/bin/bello-windows-sandbox.exe"
+            ./native/windows-sandbox/ci/verify_network_setup.ps1 `
+              -Helper $helper -Phase Restore -SnapshotPath $snapshot `
+              -Report (Join-Path $env:RUNNER_TEMP "bello-network-restore.json")
           }
-          finally {
-            if ($dotTempStream) { $dotTempStream.Dispose() }
-            if ($tempStream) { $tempStream.Dispose() }
-            if ($writerStream) { $writerStream.Dispose() }
+      - name: Restore and verify the Windows null-device security
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $snapshot = Join-Path $env:RUNNER_TEMP "bello-null-device-baseline.json"
+          if (Test-Path -LiteralPath $snapshot) {
+            $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe"
+            ./native/windows-sandbox/ci/verify_null_device.ps1 `
+              -Helper $helper -Phase Restore -SnapshotPath $snapshot `
+              -Report (Join-Path $env:RUNNER_TEMP "bello-null-device-restore.json")
           }
+      - name: Restore the Windows checkout-drive setup ACL
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $snapshot = Join-Path $env:RUNNER_TEMP "bello-checkout-drive-baseline.json"
+          if (Test-Path -LiteralPath $snapshot) {
+            $selection = Get-Content -LiteralPath $snapshot -Raw | ConvertFrom-Json
+            $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe"
+            ./native/windows-sandbox/ci/verify_host_setup.ps1 `
+              -Helper $helper -Phase Restore -Drive $selection.selectedDrive -SnapshotPath $snapshot `
+              -Report (Join-Path $env:RUNNER_TEMP "bello-checkout-drive-restore.json")
+          }
+      - name: Restore the Windows host setup ACL
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $snapshot = Join-Path $env:RUNNER_TEMP "bello-host-setup-baseline.json"
+          if (Test-Path -LiteralPath $snapshot) {
+            $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe"
+            ./native/windows-sandbox/ci/verify_host_setup.ps1 `
+              -Helper $helper -Phase Restore -SnapshotPath $snapshot `
+              -Report (Join-Path $env:RUNNER_TEMP "bello-host-setup-restore.json")
+          }
+      - name: Upload Windows host setup verification
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-host-setup-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/bello-host-setup-prepare.json
+            ${{ runner.temp }}/bello-host-setup-restore.json
+            ${{ runner.temp }}/bello-checkout-drive-prepare.json
+            ${{ runner.temp }}/bello-checkout-drive-restore.json
+            ${{ runner.temp }}/bello-host-setup-*.mismatch.json
+            ${{ runner.temp }}/bello-checkout-drive-*.mismatch.json
+            ${{ runner.temp }}/bello-null-device-prepare.json
+            ${{ runner.temp }}/bello-null-device-restore.json
+            ${{ runner.temp }}/bello-network-prepare.json
+            ${{ runner.temp }}/bello-network-restore.json
+            ${{ runner.temp }}/bello-network-service-events.json
+          if-no-files-found: ignore

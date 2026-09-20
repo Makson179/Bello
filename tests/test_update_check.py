@@ -182,9 +182,10 @@ def test_update_command_uses_pipx_upgrade_for_pipx_installs(monkeypatch: pytest.
         install_mode="pipx",
     )
     monkeypatch.setattr(update_check.sys, "platform", "linux")
-    monkeypatch.setattr(update_check.shutil, "which", lambda name: "/usr/bin/pipx" if name == "pipx" else None)
+    monkeypatch.setattr(update_check, "resolve_trusted_executable", lambda *args, **kwargs: "/usr/bin/pipx")
+    monkeypatch.setattr(update_check, "_pipx_target", lambda: ("bello", {}))
 
-    assert update_check.update_command(info) == ["pipx", "upgrade", "bello"]
+    assert update_check.update_command(info) == ["/usr/bin/pipx", "upgrade", "bello"]
 
 
 def test_update_command_uses_trusted_absolute_pipx_on_windows(
@@ -197,6 +198,7 @@ def test_update_command_uses_trusted_absolute_pipx_on_windows(
     )
     trusted = r"C:\Program Files\pipx\pipx.exe"
     monkeypatch.setattr(update_check.sys, "platform", "win32")
+    monkeypatch.setattr(update_check, "_pipx_target", lambda: ("bello", {}))
     monkeypatch.setattr(
         update_check,
         "resolve_trusted_executable",
@@ -216,6 +218,7 @@ def test_update_command_uses_pip_inside_venv(monkeypatch: pytest.MonkeyPatch) ->
 
     assert update_check.update_command(info) == [
         update_check.sys.executable,
+        "-I",
         "-m",
         "pip",
         "install",

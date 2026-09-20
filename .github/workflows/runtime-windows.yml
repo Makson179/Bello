@@ -1,0 +1,330 @@
+name: Windows restricted sandbox
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, codex/0.6.0-multi-provider, mystery]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  native-windows:
+    name: ${{ matrix.name }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows Server 2022
+            os: windows-2022
+            python-version: "3.11"
+          - name: Windows Server 2025
+            os: windows-2025
+            python-version: "3.14"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: supervisor/pi_worker/package-lock.json
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc
+      - name: Audit native formatting, types, and lints
+        shell: pwsh
+        run: |
+          cargo fmt --manifest-path native/windows-sandbox/Cargo.toml --all -- --check
+          cargo check --locked --manifest-path native/windows-sandbox/Cargo.toml --target x86_64-pc-windows-msvc
+          cargo clippy --locked --manifest-path native/windows-sandbox/Cargo.toml --all-targets -- -D warnings
+      - name: Prepare and verify metadata-only Windows host setup
+        id: host_setup
+        shell: pwsh
+        run: |
+          cargo build --locked --manifest-path native/windows-sandbox/Cargo.toml --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "host setup helper build failed" }
+          $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/debug/bello-windows-sandbox.exe"
+          ./native/windows-sandbox/ci/verify_host_setup.ps1 `
+            -Helper $helper -Phase Prepare `
+            -SnapshotPath (Join-Path $env:RUNNER_TEMP "bello-host-setup-baseline.json") `
+            -Report (Join-Path $env:RUNNER_TEMP "bello-host-setup-prepare.json")
+          $setup = Get-Content (Join-Path $env:RUNNER_TEMP "bello-host-setup-prepare.json") -Raw | ConvertFrom-Json
+          $checkoutRoot = [IO.Path]::GetPathRoot((Get-Item -LiteralPath $env:GITHUB_WORKSPACE).FullName)
+          if ($checkoutRoot -notmatch '^[A-Za-z]:\\$') { throw "checkout is not on a literal local drive" }
+          if ($checkoutRoot -ine $setup.systemRoot) {
+            ./native/windows-sandbox/ci/verify_host_setup.ps1 `
+              -Helper $helper -Phase Prepare -Drive $checkoutRoot.Substring(0, 2) `
+              -SnapshotPath (Join-Path $env:RUNNER_TEMP "bello-checkout-drive-baseline.json") `
+              -Report (Join-Path $env:RUNNER_TEMP "bello-checkout-drive-prepare.json")
+          }
+      - name: Prepare and verify the Windows null device
+        id: null_setup
+        shell: pwsh
+        run: |
+          $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/debug/bello-windows-sandbox.exe"
+          ./native/windows-sandbox/ci/verify_null_device.ps1 `
+            -Helper $helper -Phase Prepare `
+            -SnapshotPath (Join-Path $env:RUNNER_TEMP "bello-null-device-baseline.json") `
+            -Report (Join-Path $env:RUNNER_TEMP "bello-null-device-prepare.json")
+      - name: Build and install package with mandatory helper
+        run: python -m pip install ".[test,claude]" wheel
+      - name: Stage helper beside the source package used by pytest
+        shell: pwsh
+        run: |
+          $sourceBin = Join-Path $PWD "supervisor/runtime/bin"
+          New-Item -ItemType Directory -Force -Path $sourceBin | Out-Null
+          # Cargo's top-level executable can be hard-linked to its deps artifact.
+          # Exercise an ordinary distributed copy, exactly as the wheel does.
+          Copy-Item `
+            "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe" `
+            (Join-Path $sourceBin "bello-windows-sandbox.exe")
+          Copy-Item `
+            "native/windows-sandbox/THIRD_PARTY_NOTICES.txt" `
+            (Join-Path $sourceBin "THIRD_PARTY_NOTICES.txt")
+      - name: Prepare and verify offline network isolation
+        id: network_setup
+        shell: pwsh
+        run: |
+          $helper = Resolve-Path "supervisor/runtime/bin/bello-windows-sandbox.exe"
+          ./native/windows-sandbox/ci/verify_network_setup.ps1 `
+            -Helper $helper -Phase Prepare `
+            -SnapshotPath (Join-Path $env:RUNNER_TEMP "bello-network-baseline.json") `
+            -Report (Join-Path $env:RUNNER_TEMP "bello-network-prepare.json")
+      - name: Collect only offline broker startup errors
+        if: always() && steps.network_setup.outcome == 'failure'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          ./native/windows-sandbox/ci/collect_network_service_events.ps1 `
+            -Report (Join-Path $env:RUNNER_TEMP "bello-network-service-events.json")
+      - name: Run native Rust unit tests
+        id: native_unit_tests
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $nativeTestLog = Join-Path $env:RUNNER_TEMP "bello-native-rust-tests.log"
+          # Preserve successful-test diagnostics too, including the observed
+          # system-DNS limitation; passing does not imply complete DNS isolation.
+          & cargo test --locked --manifest-path native/windows-sandbox/Cargo.toml -- --show-output 2>&1 |
+            Tee-Object -FilePath $nativeTestLog
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) { throw "Native Rust unit tests failed with exit $testExit" }
+      - name: Upload native Rust test output immediately
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-rust-tests-${{ matrix.os }}
+          path: ${{ runner.temp }}/bello-native-rust-tests.log
+          if-no-files-found: ignore
+      - name: Run serial offline broker lifecycle tests
+        id: network_lifecycle_tests
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $output = & cargo test --locked --manifest-path native/windows-sandbox/Cargo.toml `
+            network_broker::tests::real_ -- --ignored --test-threads=1 2>&1
+          $testExit = $LASTEXITCODE
+          $text = $output -join [Environment]::NewLine
+          Write-Host $text
+          if ($testExit -ne 0 -or $text -notmatch 'test result: ok\. 2 passed; 0 failed; 0 ignored;') {
+            throw "Both serial broker lifecycle tests must actually run and pass (exit $testExit)"
+          }
+      - name: Install pinned Pi runtime
+        working-directory: supervisor/pi_worker
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Run fail-closed Windows integration tests
+        id: native_integration_tests
+        continue-on-error: true
+        env:
+          BELLO_REQUIRE_NATIVE_SANDBOX: "1"
+          BELLO_WINDOWS_SANDBOX_TIMING_REPORT: ${{ runner.temp }}\bello-windows-sandbox-timing-pytest.json
+        run: python -m pytest -v -o faulthandler_timeout=120 tests/test_runtime_sandbox.py tests/test_runtime_windows_sandbox.py
+      - name: Run real Bello and Pi integration with the local test provider
+        id: pi_integration_tests
+        continue-on-error: true
+        shell: pwsh
+        env:
+          BELLO_REQUIRE_NATIVE_SANDBOX: "1"
+          BELLO_REQUIRE_PI_INTEGRATION: "1"
+        run: |
+          $report = Join-Path $env:RUNNER_TEMP "bello-windows-pi-integration.xml"
+          python -m pytest -v -o faulthandler_timeout=120 `
+            --junitxml $report `
+            tests/test_runtime_pi_integration.py tests/test_runtime_pipeline_integration.py
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) { throw "Bello/Pi integration tests failed with exit $testExit" }
+          [xml]$results = Get-Content -LiteralPath $report -Raw
+          if ($results.SelectNodes("//testcase").Count -eq 0 -or $results.SelectNodes("//testcase/skipped").Count -ne 0) {
+            throw "Bello/Pi integration must actually run; zero tests or skipped cases are not accepted"
+          }
+      - name: Trace failing native file operations
+        if: always() && (steps.native_unit_tests.outcome == 'failure' || steps.native_integration_tests.outcome == 'failure')
+        continue-on-error: true
+        shell: pwsh
+        env:
+          BELLO_REQUIRE_NATIVE_SANDBOX: "1"
+        run: |
+          ./native/windows-sandbox/ci/trace_file_access.ps1 `
+            -Python (Get-Command python).Source `
+            -OutputDirectory (Join-Path $env:RUNNER_TEMP "bello-file-trace")
+      - name: Upload only filtered file-access diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-file-trace-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/bello-file-trace/summary.json
+            ${{ runner.temp }}/bello-file-trace/cmd-events.jsonl
+            ${{ runner.temp }}/bello-file-trace/node-events.jsonl
+            ${{ runner.temp }}/bello-file-trace/cmd-test.txt
+            ${{ runner.temp }}/bello-file-trace/node-test.txt
+          if-no-files-found: ignore
+      - name: Build and inspect release wheel and sdist
+        shell: pwsh
+        run: |
+          $artifactDir = Join-Path $env:RUNNER_TEMP "bello-packages"
+          New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
+          python setup.py sdist --dist-dir $artifactDir
+          python setup.py bdist_wheel --dist-dir $artifactDir
+          $wheels = @(Get-ChildItem $artifactDir -Filter "*-py3-none-win_amd64.whl")
+          if ($wheels.Count -ne 1) { throw "expected exactly one py3-none-win_amd64 wheel" }
+          $sdists = @(Get-ChildItem $artifactDir -Filter "*.tar.gz")
+          if ($sdists.Count -ne 1) { throw "expected exactly one source distribution" }
+          @'
+          import sys, tarfile, zipfile
+          wheel, sdist = sys.argv[1:]
+          with zipfile.ZipFile(wheel) as archive:
+              wheel_names = [name for name in archive.namelist() if not name.endswith("/")]
+              metadata = [name for name in wheel_names if name.endswith(".dist-info/WHEEL")]
+              if len(metadata) != 1:
+                  raise SystemExit("expected exactly one wheel metadata file")
+              data_root = metadata[0].removesuffix(".dist-info/WHEEL") + ".data/"
+              library_roots = (data_root + "purelib/", data_root + "platlib/")
+              installed = {}
+              for name in wheel_names:
+                  relative = next((name[len(root):] for root in library_roots if name.startswith(root)), name)
+                  if relative in installed:
+                      raise SystemExit(f"duplicate installed wheel path: {relative}")
+                  installed[relative] = archive.read(name)
+          wheel_required = {
+              "supervisor/runtime/bin/bello-windows-sandbox.exe",
+              "supervisor/runtime/bin/THIRD_PARTY_NOTICES.txt",
+          }
+          if missing := wheel_required - installed.keys():
+              raise SystemExit(f"Windows wheel missing: {sorted(missing)}")
+          if empty := {name for name in wheel_required if not installed[name]}:
+              raise SystemExit(f"Windows wheel has empty assets: {sorted(empty)}")
+          with tarfile.open(sdist, "r:gz") as archive:
+              names = {name.split("/", 1)[-1] for name in archive.getnames()}
+          source_required = {
+              "setup.py", "MANIFEST.in", "native/windows-sandbox/Cargo.toml",
+              "native/windows-sandbox/Cargo.lock", "native/windows-sandbox/README.md",
+              "native/windows-sandbox/THIRD_PARTY_NOTICES.txt",
+              "native/windows-sandbox/src/main.rs",
+          }
+          if missing := source_required - names:
+              raise SystemExit(f"sdist missing: {sorted(missing)}")
+          '@ | python - $wheels[0].FullName $sdists[0].FullName
+      - name: Run native enforcement as a non-admin standard user
+        id: standard_user_tests
+        shell: pwsh
+        run: |
+          $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/release/bello-windows-sandbox.exe"
+          $report = Join-Path $env:RUNNER_TEMP "bello-standard-user-output/bello-windows-sandbox-timing-standard-user.json"
+          $nativeTests = @(Get-ChildItem "native/windows-sandbox/target/debug/deps" -Filter "bello_windows_sandbox-*.exe")
+          if ($nativeTests.Count -ne 1) { throw "expected exactly one previously built native Rust test binary" }
+          ./native/windows-sandbox/ci/run_standard_user.ps1 `
+            -Python (Get-Command python).Source `
+            -Helper $helper `
+            -NodeSource (Get-Command node).Source `
+            -NativeTestBinary $nativeTests[0].FullName `
+            -Report $report
+      - name: Restore and verify offline network setup
+        id: network_restore
+        if: always()
+        shell: pwsh
+        run: |
+          $snapshot = Join-Path $env:RUNNER_TEMP "bello-network-baseline.json"
+          if (Test-Path -LiteralPath $snapshot) {
+            $helper = Resolve-Path "supervisor/runtime/bin/bello-windows-sandbox.exe"
+            ./native/windows-sandbox/ci/verify_network_setup.ps1 `
+              -Helper $helper -Phase Restore -SnapshotPath $snapshot `
+              -Report (Join-Path $env:RUNNER_TEMP "bello-network-restore.json")
+          }
+      - name: Restore and verify the original null-device security
+        id: null_restore
+        if: always()
+        shell: pwsh
+        run: |
+          $snapshot = Join-Path $env:RUNNER_TEMP "bello-null-device-baseline.json"
+          if (Test-Path -LiteralPath $snapshot) {
+            $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/debug/bello-windows-sandbox.exe"
+            ./native/windows-sandbox/ci/verify_null_device.ps1 `
+              -Helper $helper -Phase Restore -SnapshotPath $snapshot `
+              -Report (Join-Path $env:RUNNER_TEMP "bello-null-device-restore.json")
+          }
+      - name: Restore and verify the original checkout-drive setup ACL
+        id: checkout_host_restore
+        if: always()
+        shell: pwsh
+        run: |
+          $snapshot = Join-Path $env:RUNNER_TEMP "bello-checkout-drive-baseline.json"
+          if (Test-Path -LiteralPath $snapshot) {
+            $selection = Get-Content -LiteralPath $snapshot -Raw | ConvertFrom-Json
+            $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/debug/bello-windows-sandbox.exe"
+            ./native/windows-sandbox/ci/verify_host_setup.ps1 `
+              -Helper $helper -Phase Restore -Drive $selection.selectedDrive -SnapshotPath $snapshot `
+              -Report (Join-Path $env:RUNNER_TEMP "bello-checkout-drive-restore.json")
+          }
+      - name: Restore and verify the original host setup ACL
+        id: host_restore
+        if: always()
+        shell: pwsh
+        run: |
+          $snapshot = Join-Path $env:RUNNER_TEMP "bello-host-setup-baseline.json"
+          if (Test-Path -LiteralPath $snapshot) {
+            $helper = Resolve-Path "native/windows-sandbox/target/x86_64-pc-windows-msvc/debug/bello-windows-sandbox.exe"
+            ./native/windows-sandbox/ci/verify_host_setup.ps1 `
+              -Helper $helper -Phase Restore -SnapshotPath $snapshot `
+              -Report (Join-Path $env:RUNNER_TEMP "bello-host-setup-restore.json")
+          }
+      - name: Upload native packages and timing reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-sandbox-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: |
+            ${{ runner.temp }}\bello-packages\*
+            ${{ runner.temp }}\bello-windows-sandbox-timing-*.json
+            ${{ runner.temp }}\bello-standard-user-output\*.json
+            ${{ runner.temp }}/bello-standard-user-output/standard-user-stdout.txt
+            ${{ runner.temp }}/bello-standard-user-output/standard-user-stderr.txt
+            ${{ runner.temp }}/bello-standard-user-output/global-acl-mutex-holder-stderr.txt
+            ${{ runner.temp }}/bello-host-setup-prepare.json
+            ${{ runner.temp }}/bello-host-setup-restore.json
+            ${{ runner.temp }}/bello-checkout-drive-prepare.json
+            ${{ runner.temp }}/bello-checkout-drive-restore.json
+            ${{ runner.temp }}/bello-host-setup-*.mismatch.json
+            ${{ runner.temp }}/bello-checkout-drive-*.mismatch.json
+            ${{ runner.temp }}/bello-null-device-prepare.json
+            ${{ runner.temp }}/bello-null-device-restore.json
+            ${{ runner.temp }}/bello-network-prepare.json
+            ${{ runner.temp }}/bello-network-restore.json
+            ${{ runner.temp }}/bello-network-service-events.json
+            ${{ runner.temp }}/bello-windows-pi-integration.xml
+          if-no-files-found: error
+      # Collect independent evidence after a failure, but never report this
+      # job as successful without setup, both test groups, non-admin enforcement,
+      # and restoration all passing. Diagnostic continuation never masks failure.
+      - name: Require all native sandbox checks to pass
+        if: always() && (steps.host_setup.outcome != 'success' || steps.null_setup.outcome != 'success' || steps.network_setup.outcome != 'success' || steps.native_unit_tests.outcome != 'success' || steps.network_lifecycle_tests.outcome != 'success' || steps.native_integration_tests.outcome != 'success' || steps.pi_integration_tests.outcome != 'success' || steps.standard_user_tests.outcome != 'success' || steps.network_restore.outcome != 'success' || steps.null_restore.outcome != 'success' || steps.checkout_host_restore.outcome != 'success' || steps.host_restore.outcome != 'success')
+        shell: pwsh
+        run: throw "A required native setup, enforcement, or cleanup check failed or did not run."

@@ -67,7 +67,15 @@ class MultiAgentConfig:
         }
 
     def is_allowed(self, model: str, intelligence: str) -> bool:
-        return intelligence in self.allowed.get(model, ())
+        if intelligence in self.allowed.get(model, ()):
+            return True
+        from supervisor.runtime.models import ModelSelectionError, parse_model_selection
+        try:
+            selected = parse_model_selection(model)
+            return any(parse_model_selection(candidate).qualified == selected.qualified and intelligence in efforts
+                       for candidate, efforts in self.allowed.items())
+        except ModelSelectionError:
+            return False
 
 
 RUNTIME_SYNC_FIELDS = (
@@ -84,7 +92,9 @@ RUNTIME_SYNC_FIELDS = (
     "completion_intelligence",
     "adversary_intelligence",
     "speed",
+    "runtime_enabled",
     "cheap_runtime",
+    "log_distiller",
     "start_over",
     "completion_review",
     "adversary",
@@ -104,6 +114,34 @@ class ProjectConfigError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class LogDistillerConfig:
+    enabled: bool = False
+    model_path: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ProjectConfigError("log_distiller.enabled must be a boolean")
+        if self.model_path is not None and (
+            not isinstance(self.model_path, str)
+            or not self.model_path.strip()
+            or "\x00" in self.model_path
+        ):
+            raise ProjectConfigError("log_distiller.model_path must be a nonempty local folder path or null")
+
+    def to_json_data(self) -> dict[str, Any]:
+        return {"enabled": self.enabled, "model_path": self.model_path}
+
+
+def _log_distiller_config(value: Any, *, path: Path) -> LogDistillerConfig:
+    if not isinstance(value, dict) or set(value) - {"enabled", "model_path"}:
+        raise ProjectConfigError(f"{path}: log_distiller must contain only enabled and model_path")
+    try:
+        return LogDistillerConfig(enabled=value.get("enabled", False), model_path=value.get("model_path"))
+    except ProjectConfigError as exc:
+        raise ProjectConfigError(f"{path}: {exc}") from exc
+
+
+@dataclass(frozen=True)
 class ProjectConfig:
     task: str | None = None
     coder_mod: str = DEFAULT_MODEL
@@ -118,7 +156,9 @@ class ProjectConfig:
     completion_intelligence: str = DEFAULT_INTELLIGENCE
     adversary_intelligence: str = DEFAULT_INTELLIGENCE
     speed: str = "usual"
+    runtime_enabled: bool = True
     cheap_runtime: bool = True
+    log_distiller: LogDistillerConfig = field(default_factory=LogDistillerConfig)
     start_over: bool = False
     completion_review: bool = False
     adversary: bool = False
@@ -134,6 +174,10 @@ class ProjectConfig:
     @property
     def fast(self) -> bool:
         return self.speed == "fast"
+
+    @property
+    def effective_cheap_runtime(self) -> bool:
+        return self.runtime_enabled and self.cheap_runtime
 
     def to_json_data(self) -> dict[str, Any]:
         return {
@@ -151,7 +195,9 @@ class ProjectConfig:
             "completion_intelligence": self.completion_intelligence,
             "adversary_intelligence": self.adversary_intelligence,
             "speed": self.speed,
+            "runtime_enabled": self.runtime_enabled,
             "cheap_runtime": self.cheap_runtime,
+            "log_distiller": self.log_distiller.to_json_data(),
             "start_over": self.start_over,
             "completion_review": self.completion_review,
             "adversary": self.adversary,
@@ -171,8 +217,16 @@ def default_project_config() -> ProjectConfig:
 
 
 def intelligence_choices_for_model(model: str) -> tuple[str, ...]:
+    if "/" in model:
+        from supervisor.runtime.models import parse_model_selection
+        parse_model_selection(model)
+        # Exact model/provider support is checked against the runtime catalog
+        # before execution. API catalogs also contain non-reasoning models;
+        # applying the old Codex-only list would reject their valid `off` setting.
+        # The editor must not silently clamp the saved effort.
+        return ("off", "minimal", *INTELLIGENCE_CHOICES)
     if model == MODEL_GPT_6_ASTRA:
-        # Bello uses Codex app-server, whose Astra catalog includes ultra.
+        # Preserve existing unqualified Codex profile validation.
         return INTELLIGENCE_CHOICES
     if model in {MODEL_GPT_5_6_SOL, MODEL_GPT_5_6_TERRA}:
         return INTELLIGENCE_CHOICES
@@ -354,11 +408,13 @@ def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfi
             path=path,
         ),
         speed=_speed_from_payload(payload, default.speed, path=path),
+        runtime_enabled=_bool(payload.get("runtime_enabled", default.runtime_enabled), "runtime_enabled", path=path),
         cheap_runtime=_bool(
             _first_present(payload, ("cheap_runtime", "cheap_runtime_enabled"), default.cheap_runtime),
             "cheap_runtime",
             path=path,
         ),
+        log_distiller=_log_distiller_config(payload.get("log_distiller", default.log_distiller.to_json_data()), path=path),
         start_over=_bool(payload.get("start_over", default.start_over), "start_over", path=path),
         completion_review=_bool(
             _first_present(
@@ -492,6 +548,20 @@ def _non_negative_int(value: Any, field: str, *, path: Path) -> int:
     raise ProjectConfigError(f"invalid Bello config at {path}: {field} must be a non-negative integer")
 
 
+def _configured_model(value: Any, field: str, *, path: Path) -> str:
+    value = _required_string(value, field, path=path)
+    if value in SUPPORTED_MODEL_CHOICES:
+        return value
+    if "/" in value:
+        from supervisor.runtime.models import ModelSelectionError, parse_model_selection
+        try:
+            parse_model_selection(value)
+            return value
+        except ModelSelectionError as exc:
+            raise ProjectConfigError(f"invalid Bello config at {path}: {field}: {exc}") from exc
+    raise ProjectConfigError(f"invalid Bello config at {path}: {field} must use a supported model or explicit provider/model id")
+
+
 def _positive_int(value: Any, field: str, *, path: Path) -> int:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
         return value
@@ -544,10 +614,9 @@ def _multi_agent_config(
         raise ProjectConfigError(
             f"invalid Bello config at {path}: {field_name}.default must be an object"
         )
-    default_model = _choice(
+    default_model = _configured_model(
         raw_default.get("model", defaults.default.model),
         f"{field_name}.default.model",
-        SUPPORTED_MODEL_CHOICES,
         path=path,
     )
     default_intelligence = _choice(
@@ -564,10 +633,9 @@ def _multi_agent_config(
         )
     allowed: dict[str, tuple[str, ...]] = {}
     for raw_model, raw_efforts in raw_allowed.items():
-        model = _choice(
+        model = _configured_model(
             raw_model,
             f"{field_name}.allowed model",
-            SUPPORTED_MODEL_CHOICES,
             path=path,
         )
         if not isinstance(raw_efforts, list | tuple) or not raw_efforts:
@@ -653,8 +721,12 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
     if "speed" in selected:
         updates["speed"] = config.speed
         updates["fast"] = config.fast
-    if "cheap_runtime" in selected:
-        updates["cheap_runtime"] = config.cheap_runtime
+    if "runtime_enabled" in selected:
+        updates["runtime_enabled"] = config.runtime_enabled
+    if selected.intersection({"cheap_runtime", "runtime_enabled"}):
+        updates["cheap_runtime"] = config.effective_cheap_runtime
+    if "log_distiller" in selected:
+        updates["log_distiller"] = config.log_distiller.to_json_data()
     if "start_over" in selected:
         updates["start_over"] = config.start_over
     if "clean" in selected:

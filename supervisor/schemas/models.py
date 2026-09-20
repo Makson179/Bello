@@ -147,6 +147,8 @@ class BelloConfig(BaseModel):
     task_hash: str | None = None
     codex_version: str | None = None
     appserver_schema_hash: str | None = None
+    runtime_name: str | None = None
+    runtime_protocol_version: int | None = None
     coder_thread_id: str | None = None
     active_coder_turn_id: str | None = None
     generation: int = 0
@@ -191,7 +193,9 @@ class BelloConfig(BaseModel):
     max_completion_returns_after_adversary: ReviewLimit = 0
     max_adversary_runs: int = 1
     completion_review_enabled: bool = True
+    runtime_enabled: bool = True
     cheap_runtime: bool = True
+    log_distiller: dict[str, Any] = Field(default_factory=lambda: {"enabled": False, "model_path": None})
     # Runtime-state mirror of the strictly validated ProjectConfig structure. Keep this
     # as JSON data because StateStore patches it with model_copy(update=...), which does
     # not revalidate nested model instances.

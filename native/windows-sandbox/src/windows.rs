@@ -1,0 +1,698 @@
+use crate::access_check::AccessVerifier;
+use crate::acl_lock::AclMutationLock;
+use crate::protocol::{Request, SandboxMode};
+use crate::{acl, identity, journal, process, winutil};
+use anyhow::{anyhow, Context, Result};
+use identity::{create_profile, profile_local_app_data, random_profile_name, CapabilitySids};
+use journal::{create_live_mutex, mutex_name, recover_stale, state_directory, Journal};
+use process::{
+    clean_environment, run_child_offline, run_child_verified, start_parent_monitor, Job,
+};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use windows_sys::Win32::Storage::FileSystem::{
+    DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
+    WRITE_DAC, WRITE_OWNER,
+};
+use windows_sys::Win32::System::Com::CoTaskMemFree;
+use windows_sys::Win32::UI::Shell::{FOLDERID_Profile, SHGetKnownFolderPath};
+use winutil::{
+    canonical_existing, contains, file_identity, is_normalized_local_absolute, is_volume_root,
+    open_path, path_eq, pin_directory_chain, require_persistent_acls, validate_final_path,
+    validate_plain_file_object, verbatim_local_absolute, walk_pinned_tree, Handle,
+};
+
+pub fn execute(request: Request) -> Result<i32> {
+    let state_dir = state_directory()?;
+    match request {
+        Request::Recover { .. } => {
+            let _lock = AclMutationLock::acquire(&state_dir, &AtomicBool::new(false))?;
+            recover_stale(state_dir.path())?;
+            Ok(0)
+        }
+        Request::Run {
+            command,
+            cwd,
+            root,
+            mode,
+            readable_roots,
+            private_paths,
+            network_access,
+            ..
+        } => run(
+            &state_dir,
+            command,
+            cwd,
+            root,
+            mode,
+            readable_roots,
+            private_paths,
+            network_access,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run(
+    state: &journal::StateDirectory,
+    command: String,
+    cwd: String,
+    root: String,
+    mode: SandboxMode,
+    readable_roots: Vec<String>,
+    private_paths: Vec<String>,
+    network_access: bool,
+) -> Result<i32> {
+    let state_dir = state.path();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    if command.trim().is_empty() || command.contains('\0') {
+        return Err(anyhow!("command must be non-empty and contain no NUL byte"));
+    }
+    // Preserve lexical ancestry before canonicalize can hide a junction. These
+    // no-delete-sharing pins remain alive until the sandbox Job is empty.
+    let mut ancestry_handles: Vec<(PathBuf, Handle)> = Vec::new();
+    let mut lexical_authority_handles: Vec<Handle> = Vec::new();
+    for supplied in std::iter::once(&root).chain(readable_roots.iter()) {
+        let lexical = verbatim_local_absolute(Path::new(supplied))?;
+        let parent = lexical
+            .parent()
+            .ok_or_else(|| anyhow!("authority has no directory parent"))?;
+        for (path, handle) in pin_directory_chain(parent, false)? {
+            if !ancestry_handles
+                .iter()
+                .any(|(held, _)| path_eq(held, &path))
+            {
+                ancestry_handles.push((path, handle));
+            }
+        }
+        let leaf = open_path(&lexical, false)?;
+        validate_final_path(&leaf, &lexical)?;
+        validate_plain_file_object(&leaf, &lexical)?;
+        lexical_authority_handles.push(leaf);
+    }
+    let root = canonical_existing(&root, "root")?;
+    if !root.is_dir() || is_volume_root(&root) {
+        return Err(anyhow!("root must be a non-volume directory"));
+    }
+    let readable_roots = readable_roots
+        .iter()
+        .enumerate()
+        .map(|(index, value)| canonical_existing(value, &format!("readableRoots[{index}]")))
+        .collect::<Result<Vec<_>>>()?;
+    if let Some(volume) = readable_roots.iter().find(|path| is_volume_root(path)) {
+        return Err(anyhow!(
+            "readable roots cannot grant an entire volume: {}",
+            volume.display()
+        ));
+    }
+    validate_authority_relationships(&root, &readable_roots, mode)?;
+    let cwd = canonical_existing(&cwd, "cwd")?;
+    if !cwd.is_dir()
+        || !std::iter::once(&root)
+            .chain(readable_roots.iter())
+            .filter(|path| path.is_dir())
+            .any(|authority| contains(authority, &cwd))
+    {
+        return Err(anyhow!("cwd is outside the assigned directory authorities"));
+    }
+    if std::iter::once(&root)
+        .chain(readable_roots.iter())
+        .any(|authority| contains(authority, state_dir) || contains(state_dir, authority))
+    {
+        return Err(anyhow!(
+            "the sandbox recovery directory overlaps a command authority"
+        ));
+    }
+    // Never interpret recovery data until the requested authorities are known
+    // not to overlap the fixed, OS-resolved state directory.
+    let mut mutation_lock = Some(AclMutationLock::acquire(state, &cancelled)?);
+    recover_stale(state_dir)?;
+
+    let authority_paths: Vec<PathBuf> = std::iter::once(root.clone())
+        .chain(readable_roots.iter().cloned())
+        .collect();
+    let profile_name = random_profile_name()?;
+    let mutex_name = mutex_name(&profile_name);
+    let _live_mutex = create_live_mutex(&mutex_name)?;
+    let mut journal = Journal::create(state_dir, &profile_name, &mutex_name, &authority_paths)?;
+    if !network_access {
+        // Write ahead of any registration/Job duplication; crash recovery must
+        // not mistake the helper's death for death of the broker-held job.
+        journal.require_network_broker()?;
+    }
+    // Both modes need Winsock initialization (including Python's _overlapped).
+    // Offline mode MUST use run_child_offline below: that path requires the
+    // broker's persistent per-package deny filters before ResumeThread.
+    let mut capabilities = CapabilitySids::for_network(true)?;
+    let sid = create_profile(journal.profile_name(), &capabilities)?;
+    let profile_local = profile_local_app_data(sid.0)?;
+    let job = Job::create()?;
+    start_parent_monitor(Arc::clone(&job), Arc::clone(&cancelled))?;
+
+    // Pins outlive run_child: grandchildren must be dead before any authority
+    // or private ancestor becomes renameable again.
+    let mut authority_handles: Vec<(PathBuf, Handle)> = Vec::new();
+    let mut private_handles: Vec<(PathBuf, Handle)> = Vec::new();
+
+    let operation = (|| -> Result<i32> {
+        let private_paths =
+            prepare_private_paths(&root, &readable_roots, mode, private_paths, &mut journal)?;
+        let authorities: Vec<&PathBuf> = std::iter::once(&root)
+            .chain(readable_roots.iter())
+            .collect();
+        for authority in &authorities {
+            scan_authority(authority, &cancelled)?;
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return Err(anyhow!("controller closed stdin during sandbox setup"));
+        }
+
+        for authority in &authorities {
+            let handle = open_path(authority, true)?;
+            validate_final_path(&handle, authority)?;
+            require_persistent_acls(&handle, authority)?;
+            journal.before_acl_mutation(authority, &handle)?;
+            authority_handles.push(((*authority).clone(), handle));
+            if cancelled.load(Ordering::Acquire) {
+                return Err(anyhow!("controller closed stdin during ACL setup"));
+            }
+        }
+
+        for private in &private_paths {
+            for ancestor in private_ancestors(&authorities, private)? {
+                if private_handles
+                    .iter()
+                    .any(|(held, _)| path_eq(held, &ancestor))
+                {
+                    continue;
+                }
+                let handle = open_path(&ancestor, false)?;
+                validate_final_path(&handle, &ancestor)?;
+                validate_plain_file_object(&handle, &ancestor)?;
+                private_handles.push((ancestor, handle));
+            }
+            let handle = open_path(private, false)?;
+            validate_final_path(&handle, private)?;
+            validate_plain_file_object(&handle, private)?;
+            private_handles.push((private.clone(), handle));
+        }
+        for authority in &authorities {
+            let authority_mode = if path_eq(authority, &root) {
+                mode
+            } else {
+                SandboxMode::ReadOnly
+            };
+            walk_pinned_tree(authority, true, &cancelled, &mut |path, handle| {
+                if private_paths.iter().any(|private| contains(private, path)) {
+                    return Ok(());
+                }
+                let allow_delete = !path_eq(authority, path)
+                    && !private_paths.iter().any(|private| contains(path, private));
+                acl::grant_object(handle, sid.0, authority_mode, allow_delete)
+                    .with_context(|| format!("could not grant {}", path.display()))
+            })?;
+        }
+        verify_effective_tree(&authorities, &private_paths, sid.0, mode, &cancelled)?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(anyhow!("controller closed stdin before process launch"));
+        }
+
+        let mut environment = clean_environment(&profile_local, &root, &readable_roots)?;
+        let mut verify_access = |token: &Handle| -> Result<()> {
+            let verifier = AccessVerifier::from_token(token)?;
+            let fixed = crate::host_prepare::fixed_targets()?
+                .into_iter()
+                .map(|target| verbatim_local_absolute(&target.path))
+                .collect::<Result<Vec<_>>>()?;
+            for (path, handle) in &ancestry_handles {
+                // A parent of one readable root may itself be inside another
+                // authority. Its existing full policy takes precedence.
+                if authorities
+                    .iter()
+                    .any(|authority| contains(authority, path))
+                {
+                    continue;
+                }
+                if verifier.granted_file_access(handle)? & acl::SYSTEM_ROOT_METADATA_MASK
+                    == acl::SYSTEM_ROOT_METADATA_MASK
+                {
+                    continue;
+                }
+                if is_volume_root(path) || fixed.iter().any(|target| path_eq(target, path)) {
+                    let selector = if is_volume_root(path) {
+                        let plain = path.to_string_lossy();
+                        let plain = plain.strip_prefix(r"\\?\").unwrap_or(&plain);
+                        format!(" --drive {}", &plain[..2])
+                    } else {
+                        String::new()
+                    };
+                    return Err(anyhow!("sandbox requires fixed host metadata preparation for {}; run bello runtime windows-sandbox prepare{selector} from an Administrator terminal (no automatic elevation)", path.display()));
+                }
+                let mutation = crate::host_prepare::metadata_mutation_lock(path, handle)
+                    .with_context(|| {
+                        format!("cannot prepare exact metadata ancestor {}", path.display())
+                    })?;
+                journal.before_metadata_mutation(path, &mutation.writable)?;
+                acl::set_system_root_metadata(&mutation.writable, sid.0, true)?;
+                if verifier.granted_file_access(&mutation.writable)?
+                    & acl::SYSTEM_ROOT_METADATA_MASK
+                    != acl::SYSTEM_ROOT_METADATA_MASK
+                {
+                    return Err(anyhow!(
+                        "actual sandbox token cannot read required metadata for {}",
+                        path.display()
+                    ));
+                }
+            }
+            for authority in &authorities {
+                let authority_mode = if path_eq(authority, &root) {
+                    mode
+                } else {
+                    SandboxMode::ReadOnly
+                };
+                walk_pinned_tree(authority, false, &cancelled, &mut |path, handle| {
+                    let granted = verifier.granted_file_access(handle)?;
+                    if private_paths.iter().any(|private| contains(private, path)) {
+                        if granted & FILE_ALL_ACCESS != 0 {
+                            return Err(anyhow!("actual sandbox token can access private object {} (mask {granted:#x})", path.display()));
+                        }
+                        return Ok(());
+                    }
+                    let mut required = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+                    let mut forbidden = WRITE_DAC | WRITE_OWNER | FILE_DELETE_CHILD;
+                    if authority_mode == SandboxMode::WorkspaceWrite {
+                        required |= FILE_GENERIC_WRITE;
+                        if path_eq(authority, path)
+                            || private_paths.iter().any(|private| contains(path, private))
+                        {
+                            forbidden |= DELETE;
+                        } else {
+                            required |= DELETE;
+                        }
+                    } else {
+                        forbidden |= FILE_WRITE_DATA
+                            | FILE_APPEND_DATA
+                            | FILE_WRITE_EA
+                            | FILE_WRITE_ATTRIBUTES
+                            | DELETE;
+                    }
+                    if granted & required != required || granted & forbidden != 0 {
+                        return Err(anyhow!("actual sandbox token does not match access policy for {} (mask {granted:#x})", path.display()));
+                    }
+                    Ok(())
+                })?;
+            }
+            // Grant setup and the actual suspended-token checks form one
+            // cooperative mutation phase. Never lock while commands execute.
+            drop(mutation_lock.take());
+            Ok(())
+        };
+        if network_access {
+            run_child_verified(
+                &command,
+                &cwd,
+                sid.0,
+                &mut capabilities,
+                &mut environment,
+                &job,
+                &cancelled,
+                &mut verify_access,
+            )
+        } else {
+            run_child_offline(
+                &command,
+                &cwd,
+                sid.0,
+                &mut capabilities,
+                &mut environment,
+                &job,
+                &cancelled,
+                &mut verify_access,
+                &profile_name,
+            )
+        }
+    })();
+
+    let requested_exit = operation.as_ref().copied().unwrap_or(125) as u32;
+    let _ = job.terminate(requested_exit);
+    let empty = job.ensure_empty();
+    drop(mutation_lock.take());
+    let mut failures = job.failure_messages();
+    if let Err(error) = &empty {
+        failures.push(format!("could not prove job empty: {error:#}"));
+    }
+    let cleanup = if empty.is_ok() {
+        drop(private_handles);
+        let cleanup_cancelled = AtomicBool::new(false);
+        match AclMutationLock::acquire(state, &cleanup_cancelled) {
+            Ok(_guard) => journal.cleanup(),
+            Err(error) => {
+                journal.defer_cleanup();
+                Err(error)
+            }
+        }
+    } else {
+        journal.defer_cleanup();
+        Err(anyhow!(
+            "ACL/profile cleanup deferred to crash recovery because the job is not proven empty"
+        ))
+    };
+    if let Err(error) = cleanup {
+        failures.push(format!("sandbox ACL/profile cleanup failed: {error:#}"));
+    }
+    if let Err(error) = operation {
+        failures.insert(0, format!("sandbox command failed: {error:#}"));
+    }
+    failures.sort();
+    failures.dedup();
+    if failures.is_empty() {
+        Ok(requested_exit as i32)
+    } else {
+        Err(anyhow!(failures.join("; ")))
+    }
+}
+
+fn private_ancestors(authorities: &[&PathBuf], private: &Path) -> Result<Vec<PathBuf>> {
+    let authority = authorities
+        .iter()
+        .find(|authority| contains(authority, private))
+        .ok_or_else(|| anyhow!("private path is outside every command authority"))?;
+    let mut ancestors = Vec::new();
+    let mut current = private.parent();
+    while let Some(path) = current {
+        if path_eq(path, authority) {
+            ancestors.reverse();
+            return Ok(ancestors);
+        }
+        if !contains(authority, path) {
+            break;
+        }
+        ancestors.push(path.to_owned());
+        current = path.parent();
+    }
+    Err(anyhow!(
+        "could not establish private-path ancestors for {}",
+        private.display()
+    ))
+}
+
+fn validate_authority_relationships(
+    root: &Path,
+    readable_roots: &[PathBuf],
+    mode: SandboxMode,
+) -> Result<()> {
+    let home = profile_directory()?;
+    if contains(root, &home) {
+        return Err(anyhow!(
+            "the writable/read-only root cannot contain the account home"
+        ));
+    }
+    for (index, authority) in readable_roots.iter().enumerate() {
+        if path_eq(root, authority) {
+            return Err(anyhow!("readableRoots[{index}] duplicates root"));
+        }
+        if mode == SandboxMode::WorkspaceWrite
+            && (contains(root, authority) || contains(authority, root))
+        {
+            return Err(anyhow!(
+                "a read-only authority overlaps the writable root: {}",
+                authority.display()
+            ));
+        }
+        if contains(authority, &home) {
+            return Err(anyhow!(
+                "a readable dependency cannot contain the account home: {}",
+                authority.display()
+            ));
+        }
+        for earlier in &readable_roots[..index] {
+            if path_eq(earlier, authority) {
+                return Err(anyhow!("duplicate readable root: {}", authority.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn profile_directory() -> Result<PathBuf> {
+    let mut raw: *mut u16 = std::ptr::null_mut();
+    let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_Profile, 0, 0, &mut raw) };
+    if hr < 0 || raw.is_null() {
+        return Err(anyhow!(
+            "SHGetKnownFolderPath(Profile) failed with HRESULT 0x{:08x}",
+            hr as u32
+        ));
+    }
+    let path = PathBuf::from(unsafe { winutil::wide_ptr_to_os_string(raw) });
+    unsafe {
+        CoTaskMemFree(raw as *const std::ffi::c_void);
+    }
+    if !is_normalized_local_absolute(&path) {
+        return Err(anyhow!("the account profile is not on a local drive"));
+    }
+    fs::canonicalize(&path)
+        .with_context(|| format!("could not canonicalize account profile {}", path.display()))
+}
+
+fn scan_authority(root: &Path, cancelled: &Arc<AtomicBool>) -> Result<()> {
+    walk_pinned_tree(root, false, cancelled, &mut |path, handle| {
+        acl::require_non_null_dacl(handle)
+            .with_context(|| format!("unsupported DACL on {}", path.display()))
+    })
+}
+
+fn prepare_private_paths(
+    root: &Path,
+    readable_roots: &[PathBuf],
+    mode: SandboxMode,
+    supplied: Vec<String>,
+    journal: &mut Journal,
+) -> Result<Vec<PathBuf>> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for (index, value) in supplied.iter().enumerate() {
+        let path = PathBuf::from(value);
+        if !is_normalized_local_absolute(&path) {
+            return Err(anyhow!(
+                "privatePaths[{index}] must be a normalized absolute local-drive path"
+            ));
+        }
+        let path = verbatim_local_absolute(&path)?;
+        let authority = std::iter::once(root)
+            .chain(readable_roots.iter().map(PathBuf::as_path))
+            .find(|authority| contains(authority, &path))
+            .ok_or_else(|| anyhow!(
+                "privatePaths[{index}] is outside every authority: supplied {value:?}, normalized {}, root {}, readable roots {readable_roots:?}",
+                path.display(), root.display(),
+            ))?;
+        if path.exists() {
+            let canonical = std::fs::canonicalize(&path)?;
+            if !contains(authority, &canonical) {
+                return Err(anyhow!("private path resolves outside its authority"));
+            }
+            if !candidates
+                .iter()
+                .any(|existing| path_eq(existing, &canonical))
+            {
+                candidates.push(canonical);
+            }
+        } else if mode == SandboxMode::WorkspaceWrite && path_eq(authority, root) {
+            validate_nearest_existing_ancestor(authority, &path)?;
+            materialize_private(root, &path, journal)?;
+            let canonical = std::fs::canonicalize(&path)?;
+            candidates.push(canonical);
+        }
+    }
+    // These names are part of Bello's hard security contract even if an older
+    // Python caller omitted them. Materialize missing names only in a writable
+    // root; a read-only root cannot create them after launch.
+    for relative in [
+        PathBuf::from(".supervisor"),
+        PathBuf::from(".codex").join("bello-run"),
+    ] {
+        let path = root.join(&relative);
+        if path.exists() {
+            let canonical = std::fs::canonicalize(&path)?;
+            if !candidates
+                .iter()
+                .any(|existing| path_eq(existing, &canonical))
+            {
+                candidates.push(canonical);
+            }
+        } else if mode == SandboxMode::WorkspaceWrite {
+            materialize_private(root, &path, journal)?;
+            candidates.push(std::fs::canonicalize(&path)?);
+        }
+    }
+    Ok(candidates)
+}
+
+fn validate_nearest_existing_ancestor(authority: &Path, target: &Path) -> Result<()> {
+    let mut nearest = target;
+    while !nearest.exists() {
+        nearest = nearest
+            .parent()
+            .ok_or_else(|| anyhow!("private path has no existing ancestor"))?;
+    }
+    let canonical = fs::canonicalize(nearest).with_context(|| {
+        format!(
+            "could not canonicalize private path ancestor {}",
+            nearest.display()
+        )
+    })?;
+    if !contains(authority, &canonical) {
+        return Err(anyhow!(
+            "private path ancestor resolves outside its authority: {}",
+            target.display()
+        ));
+    }
+    Ok(())
+}
+
+fn materialize_private(root: &Path, target: &Path, journal: &mut Journal) -> Result<()> {
+    if !contains(root, target) || path_eq(root, target) {
+        return Err(anyhow!("invalid private path {}", target.display()));
+    }
+    let relative = target
+        .strip_prefix(root)
+        .map_err(|_| anyhow!("private path casing does not match canonical root"))?;
+    let mut current = root.to_owned();
+    let mut pins = vec![open_path(root, false)?];
+    for component in relative.components() {
+        current.push(component);
+        if current.exists() {
+            let handle = open_path(&current, false)?;
+            validate_final_path(&handle, &current)?;
+            validate_plain_file_object(&handle, &current)?;
+            pins.push(handle);
+            continue;
+        }
+        fs::create_dir(&current)
+            .with_context(|| format!("could not materialize private path {}", current.display()))?;
+        let handle = open_path(&current, false)?;
+        validate_final_path(&handle, &current)?;
+        validate_plain_file_object(&handle, &current)?;
+        let identity = file_identity(&handle)?;
+        journal.record_created(current.clone(), identity)?;
+        pins.push(handle);
+    }
+    Ok(())
+}
+
+fn verify_effective_tree(
+    authorities: &[&PathBuf],
+    private_paths: &[PathBuf],
+    sid: *mut std::ffi::c_void,
+    root_mode: SandboxMode,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<()> {
+    // ACL propagation can skip a locked/protected child without making the
+    // root SetSecurityInfo call fail. Re-walk and verify the exact unique SID
+    // ACE on every reachable object before any untrusted process starts.
+    for authority in authorities {
+        let authority_mode = if path_eq(authority, authorities[0]) {
+            root_mode
+        } else {
+            SandboxMode::ReadOnly
+        };
+        acl::verify_tree(authority, private_paths, sid, authority_mode, cancelled)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn private_paths_accept_existing_and_missing_plain_drive_paths() {
+        let base = std::env::temp_dir().join(format!(
+            "bello-private-paths-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let supplied_root = base.join("workspace");
+        fs::create_dir_all(supplied_root.join(".supervisor")).unwrap();
+        let root = fs::canonicalize(&supplied_root).unwrap();
+        // Mirror the Python bridge's Path.resolve contract: expand existing
+        // temp-directory aliases (RUNNER~1) first, then send plain-drive paths
+        // without Rust's extended prefix, including a still-missing leaf.
+        let supplied_root = PathBuf::from(root.to_str().unwrap().strip_prefix(r"\\?\").unwrap());
+        let existing = supplied_root.join(".supervisor");
+        let existing_file = existing.join("preserved.txt");
+        fs::write(&existing_file, "preserved private file").unwrap();
+        let missing = supplied_root.join(".codex").join("bello-run");
+        assert!(!missing.exists());
+        let profile_name = random_profile_name().unwrap();
+        let mut journal = Journal::create(
+            &base.join("state"),
+            &profile_name,
+            &mutex_name(&profile_name),
+            std::slice::from_ref(&root),
+        )
+        .unwrap();
+        let paths = prepare_private_paths(
+            &root,
+            &[],
+            SandboxMode::WorkspaceWrite,
+            vec![
+                existing.to_string_lossy().into_owned(),
+                missing.to_string_lossy().into_owned(),
+            ],
+            &mut journal,
+        )
+        .unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&fs::canonicalize(&existing).unwrap()));
+        assert!(paths.contains(&fs::canonicalize(&missing).unwrap()));
+
+        let sibling = supplied_root
+            .with_file_name("workspace-other")
+            .join(".supervisor");
+        let error = prepare_private_paths(
+            &root,
+            &[],
+            SandboxMode::WorkspaceWrite,
+            vec![sibling.to_string_lossy().into_owned()],
+            &mut journal,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("outside every authority"));
+        assert!(!sibling.exists());
+
+        // Follow the actual mutation/recovery path: a created private leaf is
+        // both journaled for deletion and held open while its deny is revoked.
+        let sid = identity::derive_profile_sid(&profile_name).unwrap();
+        for path in std::iter::once(&root).chain(paths.iter()) {
+            let handle = open_path(path, true).unwrap();
+            journal.before_acl_mutation(path, &handle).unwrap();
+            if path == &root {
+                acl::grant(&handle, sid.0, SandboxMode::WorkspaceWrite).unwrap();
+            } else {
+                acl::deny_all(&handle, sid.0).unwrap();
+            }
+        }
+        journal.cleanup().unwrap();
+        acl::verify_absent_tree(&root, sid.0).unwrap();
+        assert!(
+            existing.is_dir(),
+            "pre-existing private directory was removed"
+        );
+        assert_eq!(
+            fs::read_to_string(existing_file).unwrap(),
+            "preserved private file"
+        );
+        assert!(
+            !missing.exists(),
+            "created private directory remained after cleanup"
+        );
+        assert!(!missing.parent().unwrap().exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+}

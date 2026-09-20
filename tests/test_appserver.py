@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -580,3 +581,124 @@ async def test_reader_reports_oversized_stdout_line_without_hanging() -> None:
     assert pending.done()
     with pytest.raises(AppServerProtocolError):
         pending.result()
+
+
+async def test_stderr_tail_sanitizes_credentials_before_retaining_them() -> None:
+    class Chunks:
+        def __init__(self):
+            self.parts = iter([
+                b"\x1b[31mupstream retry: Authorization: Bea",
+                b"rer privatecredential\x1b[0m\r\n",
+                b"https://name:pass@example.test/path?access_token=secret#private\n",
+                b"api_key=hidden-value\nUTF8: \xe2",
+                b"\x82\xac\nlast warning",
+                b"",
+            ])
+
+        async def read(self, size):
+            assert size == 4096
+            return next(self.parts)
+
+    client = AppServerClient()
+    client.process = SimpleNamespace(stderr=Chunks())
+    await client._drain_stderr()
+    tail = client.stderr_tail
+    assert "upstream retry" in tail
+    assert "https://[REDACTED]@example.test/path" in tail
+    assert "UTF8: €" in tail
+    assert tail.endswith("last warning")
+    for secret in ("privatecredential", "name:pass", "access_token=secret", "#private", "hidden-value", "\x1b"):
+        assert secret not in tail
+
+
+async def test_stderr_tail_is_bounded_and_drops_oversized_lines_without_stalling() -> None:
+    reader = asyncio.StreamReader(limit=64)
+    reader.feed_data(b"Authorization: Bearer " + b"s" * 20000 + b"\n")
+    reader.feed_data(b"small after oversized\n")
+    reader.feed_eof()
+    client = AppServerClient()
+    client.process = SimpleNamespace(stderr=reader)
+    await asyncio.wait_for(client._drain_stderr(), timeout=0.5)
+    assert client.stderr_tail == "[oversized stderr line omitted]\nsmall after oversized"
+    for index in range(100):
+        client._record_stderr_line(f"warning-{index}: " + "x" * 2000)
+    assert len(client.stderr_tail) <= appserver_module.APP_SERVER_STDERR_TAIL_CHARS
+    assert len(client._stderr_tail) <= appserver_module.APP_SERVER_STDERR_TAIL_LINES
+    assert "warning-99:" in client.stderr_tail
+    assert "warning-0:" not in client.stderr_tail
+
+
+async def test_transport_eof_includes_sanitized_tail_without_changing_stdout_dispatch() -> None:
+    stdout = asyncio.StreamReader()
+    stdout.feed_data(b'{"method":"turn/started","params":{"turn":{"id":"ok"}}}\n')
+    stdout.feed_eof()
+    stderr = asyncio.StreamReader()
+    stderr.feed_data(b"connection reset; api_key=secret-value\n")
+    stderr.feed_eof()
+    events = []
+    errors = []
+    client = AppServerClient(notification_handler=events.append, transport_error_handler=errors.append)
+    client.process = SimpleNamespace(stdout=stdout, stderr=stderr)
+    # Starting stdout first must not discard the last stderr diagnostic on EOF.
+    reader_task = asyncio.create_task(client._read_loop())
+    client._stderr_task = asyncio.create_task(client._drain_stderr())
+    await asyncio.wait_for(reader_task, timeout=0.5)
+    await client._stderr_task
+    assert [event.raw for event in events] == [
+        {"method": "turn/started", "params": {"turn": {"id": "ok"}}}
+    ]
+    assert len(errors) == 1
+    assert str(errors[0]).startswith("app-server stream closed")
+    assert "Recent app-server stderr:" in str(errors[0])
+    assert "connection reset" in str(errors[0])
+    assert "secret-value" not in str(errors[0])
+
+
+async def test_open_stderr_does_not_delay_transport_failure_indefinitely() -> None:
+    stdout = asyncio.StreamReader()
+    stdout.feed_eof()
+    stderr = asyncio.StreamReader()  # Deliberately never reaches EOF.
+    errors = []
+    client = AppServerClient(transport_error_handler=errors.append)
+    client.process = SimpleNamespace(stdout=stdout, stderr=stderr)
+    client._stderr_task = asyncio.create_task(client._drain_stderr())
+    try:
+        await asyncio.wait_for(client._read_loop(), timeout=0.5)
+        assert len(errors) == 1
+        assert not client._stderr_task.done()
+    finally:
+        client._stderr_task.cancel()
+        await asyncio.gather(client._stderr_task, return_exceptions=True)
+
+
+async def test_rpc_timeout_includes_stderr_diagnostics_without_secrets() -> None:
+    class Stdin:
+        def write(self, data):
+            pass
+
+        async def drain(self):
+            return None
+
+    client = AppServerClient()
+    client.process = SimpleNamespace(stdin=Stdin())
+    client._record_stderr_line("retrying upstream; access_token=hidden-secret")
+    with pytest.raises(AppServerTimeoutError) as caught:
+        await client.request("thread/read", {"threadId": "thread"}, timeout=0.01)
+    assert "thread/read response timed out" in str(caught.value)
+    assert "retrying upstream" in str(caught.value)
+    assert "hidden-secret" not in str(caught.value)
+
+
+async def test_stderr_does_not_retain_multiline_private_key_payload() -> None:
+    stderr = asyncio.StreamReader()
+    stderr.feed_data(
+        b"failed reading key: -----BEGIN PRIVATE KEY-----\n"
+        b"private-base64-first-line\nprivate-base64-second-line\n"
+        b"-----END PRIVATE KEY-----\nnext useful warning\n"
+    )
+    stderr.feed_eof()
+    client = AppServerClient()
+    client.process = SimpleNamespace(stderr=stderr)
+    await client._drain_stderr()
+    assert client.stderr_tail == "failed reading key: [REDACTED]\nnext useful warning"
+    assert not client._stderr_private_key_open

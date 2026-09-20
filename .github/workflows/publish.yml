@@ -7,6 +7,8 @@ on:
 jobs:
   build:
     name: Build distributions
+    # Native helper releases are downloadable components, not Bello/PyPI releases.
+    if: startsWith(github.event.release.tag_name, 'v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -57,12 +59,69 @@ jobs:
           PY
       - uses: actions/upload-artifact@v4
         with:
-          name: dist
+          name: dist-portable
           path: dist/*
+
+  build-windows:
+    name: Build Windows wheel with restricted sandbox
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install build tooling
+        run: python -m pip install --upgrade build twine
+      - name: Build platform wheel
+        run: python -m build --wheel
+      - name: Check metadata and mandatory native assets
+        shell: pwsh
+        run: |
+          python -m twine check dist/*
+          @'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheels = list(Path("dist").glob("*-py3-none-win_amd64.whl"))
+          if len(wheels) != 1:
+              raise SystemExit("expected exactly one Windows-specific wheel")
+          with ZipFile(wheels[0]) as wheel:
+              names = [name for name in wheel.namelist() if not name.endswith("/")]
+              metadata = [name for name in names if name.endswith(".dist-info/WHEEL")]
+              if len(metadata) != 1:
+                  raise SystemExit("expected exactly one wheel metadata file")
+              data_root = metadata[0].removesuffix(".dist-info/WHEEL") + ".data/"
+              library_roots = (data_root + "purelib/", data_root + "platlib/")
+              installed = {}
+              for name in names:
+                  relative = next((name[len(root):] for root in library_roots if name.startswith(root)), name)
+                  if relative in installed:
+                      raise SystemExit(f"duplicate installed wheel path: {relative}")
+                  installed[relative] = name
+              for required in (
+                  "supervisor/runtime/bin/bello-windows-sandbox.exe",
+                  "supervisor/runtime/bin/THIRD_PARTY_NOTICES.txt",
+                  "supervisor/pi_worker/package-lock.json",
+                  "supervisor/prompts/prompts.toml",
+              ):
+                  if required not in installed or not wheel.read(installed[required]):
+                      raise SystemExit(f"missing or empty Windows wheel asset: {required}")
+          '@ | python -
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
+          path: dist/*.whl
 
   publish-testpypi:
     name: Publish to TestPyPI
-    needs: build
+    needs: [build, build-windows]
     if: needs.build.outputs.prerelease == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -71,7 +130,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: dist
+          pattern: dist-*
+          merge-multiple: true
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
@@ -79,7 +139,7 @@ jobs:
 
   publish-pypi:
     name: Publish to PyPI
-    needs: build
+    needs: [build, build-windows]
     if: needs.build.outputs.prerelease == 'false'
     runs-on: ubuntu-latest
     permissions:
@@ -88,6 +148,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: dist
+          pattern: dist-*
+          merge-multiple: true
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1

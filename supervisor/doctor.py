@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import platform
 import shutil
 import struct
@@ -58,32 +59,7 @@ def collect_doctor_results() -> list[DoctorResult]:
         else DoctorResult("fail", "Git not found on PATH", _missing_git_detail())
     )
 
-    codex_path = _doctor_executable("codex")
-    results.append(
-        DoctorResult("ok", f"Codex found: {codex_path}")
-        if codex_path
-        else DoctorResult("fail", "Codex not found on PATH", _missing_codex_detail())
-    )
-    if codex_path:
-        results.append(_probe_result([codex_path, "--version"], "Codex version OK", "codex --version failed"))
-        results.append(
-            _probe_result(
-                [codex_path, "app-server", "--help"],
-                "Codex app-server supported",
-                "codex app-server --help failed",
-            )
-        )
-        results.append(_schema_generation_result(codex_path))
-        results.append(_codex_auth_result(codex_path))
-    else:
-        results.extend(
-            [
-                DoctorResult("fail", "codex --version failed", "Codex executable not found on PATH"),
-                DoctorResult("fail", "Codex app-server support not checked", "Codex executable not found on PATH"),
-                DoctorResult("fail", "app-server schema generation not checked", "Codex executable not found on PATH"),
-                DoctorResult("fail", "Codex auth check failed", "Codex executable not found on PATH"),
-            ]
-        )
+    results.extend(_runtime_dependency_results())
 
     info = update_check.read_install_info()
     if not info.metadata_available:
@@ -123,6 +99,99 @@ def collect_doctor_results() -> list[DoctorResult]:
             results.append(DoctorResult("warn", "Could not check for Bello updates", status.warning))
 
     return results
+
+
+def _runtime_dependency_results() -> list[DoctorResult]:
+    from supervisor.appserver import AppServerError
+    from supervisor.runtime.claude import ClaudeBackend
+    from supervisor.runtime.install import node_executable, worker_command
+
+    results: list[DoctorResult] = []
+    codex = _doctor_executable(os.environ.get("BELLO_CODEX_BINARY", "codex"))
+    results.append(DoctorResult("ok", f"Native Codex app-server executable found: {codex}") if codex else
+                   DoctorResult("warn", "Native Codex executable not found",
+                                "Required only for openai-codex subscription roles. Install Codex and run `bello runtime login openai-codex`."))
+    try:
+        node = node_executable()
+        results.append(DoctorResult("ok", f"Node.js supported: {node}"))
+        worker_command()
+        results.append(DoctorResult("ok", "Pinned Pi runtime installed"))
+    except Exception as exc:
+        results.append(DoctorResult("warn", "Pi runtime dependency check failed",
+                                    f"{exc}. Required only for Pi providers; native Codex does not need Pi."))
+    results.append(_sandbox_dependency_result())
+    try:
+        claude = ClaudeBackend._bundled_cli_path()
+    except (AppServerError, OSError) as exc:
+        results.append(DoctorResult(
+            "warn", "Claude Code subscription backend is not installed or is incomplete",
+            f"{exc}. Install Bello with the optional `claude` extra to use this backend. "
+            "A standalone claude on PATH does not replace the SDK bundle. Not required for Pi/API providers.",
+        ))
+    else:
+        results.append(DoctorResult(
+            "ok", f"Official Claude Code SDK bundle found: {claude}",
+            "Optional subscription backend; authenticate with `bello runtime login claude-code`.",
+        ))
+    return results
+
+
+def _sandbox_dependency_result() -> DoctorResult:
+    from supervisor.runtime import sandbox, windows_sandbox
+
+    system = platform.system()
+    try:
+        if system == "Linux":
+            backend = sandbox._linux_launcher()
+        elif system == "Darwin":
+            backend = sandbox._trusted_launcher(Path("/usr/bin/sandbox-exec"), "macOS sandbox-exec")
+        elif system == "Windows":
+            # Check the installed helper without executing it or changing ACLs.
+            # The actual run preflight checks the writable workspace authority.
+            backend = windows_sandbox._helper_path(Path.cwd(), "read-only")
+        else:
+            raise sandbox.SandboxUnavailableError(f"Unsupported sandbox platform: {system}")
+    except (sandbox.SandboxUnavailableError, windows_sandbox.WindowsSandboxUnavailableError, OSError) as exc:
+        detail = str(exc)
+        if system == "Linux":
+            detail += f". {_bubblewrap_install_hint()}"
+        detail += ". Bello will not silently run outside its configured sandbox."
+        return DoctorResult("fail", "No supported OS sandbox is available", detail)
+    detail = "The run preflight also checks whether the sandbox can actually start with the requested workspace permissions."
+    if system == "Windows":
+        detail += (
+            " Check one-time host preparation with `bello runtime windows-sandbox status`. "
+            "If needed, run `bello runtime windows-sandbox prepare` in an administrator terminal; "
+            "normal tasks do not require elevation. Check NUL device access separately with "
+            "`bello runtime windows-sandbox status --null-device`; if missing, explicitly run "
+            "`bello runtime windows-sandbox prepare --null-device` as administrator. "
+            "Windows resets the NUL permission on reboot. Offline runs additionally require "
+            "`bello runtime windows-sandbox prepare --network` once as administrator; "
+            "inspect that fixed service with `bello runtime windows-sandbox status --network`."
+        )
+    return DoctorResult("ok", f"OS sandbox executable found: {backend}", detail)
+
+
+def _bubblewrap_install_hint() -> str:
+    try:
+        release = platform.freedesktop_os_release()
+    except OSError:
+        release = {}
+    families = [release.get("ID", ""), *release.get("ID_LIKE", "").split()]
+    commands = {
+        "debian": "sudo apt install bubblewrap",
+        "ubuntu": "sudo apt install bubblewrap",
+        "fedora": "sudo dnf install bubblewrap",
+        "rhel": "sudo dnf install bubblewrap",
+        "arch": "sudo pacman -S bubblewrap",
+        "opensuse": "sudo zypper install bubblewrap",
+        "alpine": "sudo apk add bubblewrap",
+    }
+    command = next((commands[family] for family in families if family in commands), None)
+    action = f"Install the system package with: {command}" if command else (
+        "Install the bubblewrap system package using your distribution's package manager"
+    )
+    return f"{action}. This is a suggestion only; Bello does not install system packages automatically"
 
 
 def format_result(result: DoctorResult) -> str:

@@ -508,9 +508,9 @@ text = '''completion instruction'''
         monkeypatch.delenv(PROMPTS_ENV_VAR, raising=False)
 
 
-def test_default_coder_prompts_add_only_path_based_plan_guidance(tmp_path: Path) -> None:
+def test_default_coder_prompts_include_task_path_and_only_path_based_plan_guidance(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
-    task.write_text("# Task\n", encoding="utf-8")
+    task.write_text("PRIVATE TASK CONTENTS MUST BE READ FROM THE FILE\n", encoding="utf-8")
     plan = tmp_path / "PLAN.md"
     plan.write_text("Do not leak this implementation sequence.\n", encoding="utf-8")
 
@@ -518,17 +518,24 @@ def test_default_coder_prompts_add_only_path_based_plan_guidance(tmp_path: Path)
     restart_without_plan = build_restart_prompt(task)
     initial_with_plan = build_coder_prompt(task, plan_path=plan)
     restart_with_plan = build_restart_prompt(task, plan_path=plan)
+    revision = build_revision_prompt(task, "Check the edge case.")
 
     assert initial_without_plan == (
-        "Complete the task described by the workspace instructions. Work autonomously.\n\n"
+        f"Read the task at `{task.resolve()}` and complete it. Work autonomously.\n\n"
         "When complete, output BELLO_READY_FOR_REVIEW on its own line."
     )
     assert restart_without_plan == (
-        "Continue the existing task. First read `.supervisor/HANDOFF.md`, "
+        f"Continue the task at `{task.resolve()}`. First read `.supervisor/HANDOFF.md`, "
         "`.supervisor/DECISIONS.md`, and `.supervisor/PROGRESS.md`,\n"
         "then work from the current workspace. Work autonomously.\n\n"
         "When complete, output BELLO_READY_FOR_REVIEW on its own line."
     )
+    for prompt in (initial_without_plan, restart_without_plan, initial_with_plan, restart_with_plan, revision):
+        assert str(task.resolve()) in prompt
+        assert "PRIVATE TASK CONTENTS MUST BE READ FROM THE FILE" not in prompt
+        assert "Do not leak this implementation sequence." not in prompt
+    assert "Check the edge case." in revision
+    assert str(plan.resolve()) not in revision
     for prompt in (initial_with_plan, restart_with_plan):
         assert str(plan.resolve()) in prompt
         assert "working hypothesis" in prompt

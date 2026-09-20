@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Coroutine
 
@@ -15,6 +15,7 @@ from supervisor import doctor, update_check
 from supervisor.controller import BelloController
 from supervisor.project_config import (
     INTELLIGENCE_CHOICES,
+    LogDistillerConfig,
     ProjectConfig,
     ProjectConfigError,
     intelligence_choices_for_model,
@@ -66,26 +67,26 @@ class BelloClickGroup(click.Group):
 @click.option(
     "--coder-intelligence",
     default=None,
-    type=click.Choice(INTELLIGENCE_CHOICES),
+    type=click.Choice(("off", "minimal", *INTELLIGENCE_CHOICES)),
     help="Reasoning effort for coder turns.",
 )
 @click.option(
     "--runtime-intelligence",
     "runtime_intelligence",
     default=None,
-    type=click.Choice(INTELLIGENCE_CHOICES),
+    type=click.Choice(("off", "minimal", *INTELLIGENCE_CHOICES)),
     help="Reasoning effort for runtime supervisor turns.",
 )
 @click.option(
     "--completion-intelligence",
     default=None,
-    type=click.Choice(INTELLIGENCE_CHOICES),
+    type=click.Choice(("off", "minimal", *INTELLIGENCE_CHOICES)),
     help="Reasoning effort for completion review turns.",
 )
 @click.option(
     "--adversary-intelligence",
     default=None,
-    type=click.Choice(INTELLIGENCE_CHOICES),
+    type=click.Choice(("off", "minimal", *INTELLIGENCE_CHOICES)),
     help="Reasoning effort for adversarial tester turns.",
 )
 @click.option(
@@ -93,7 +94,7 @@ class BelloClickGroup(click.Group):
     "legacy_supervisor_intelligence",
     default=None,
     hidden=True,
-    type=click.Choice(INTELLIGENCE_CHOICES),
+    type=click.Choice(("off", "minimal", *INTELLIGENCE_CHOICES)),
     help="Legacy alias that sets both runtime and completion reasoning effort.",
 )
 @click.option(
@@ -125,14 +126,32 @@ class BelloClickGroup(click.Group):
     help="Delete everything except the selected task, optional plan, and protected paths before starting.",
 )
 @click.option(
+    "--runtime/--no-runtime",
+    "runtime_enabled",
+    default=None,
+    help="Enable or disable runtime supervision for this run.",
+)
+@click.option(
+    "--log-distiller/--no-log-distiller",
+    "log_distiller_enabled",
+    default=None,
+    help="Enable or disable local tool-output distillation for this run.",
+)
+@click.option(
+    "--distiller-model",
+    "distiller_model_path",
+    type=click.Path(exists=False, file_okay=False, path_type=Path),
+    default=None,
+    help="Local log-distiller bundle override; otherwise download and cache the published model.",
+)
+@click.option(
     "--completion-review",
     "completion_review",
     default=None,
     type=click.BOOL,
     metavar="[true|false]",
     help=(
-        "Run the completion review before finishing. false finishes on the coder's "
-        "readiness marker and disables the adversary, which runs inside the review."
+        "Run the completion review before finishing. Independent of runtime supervision and adversary."
     ),
 )
 @click.option(
@@ -140,7 +159,7 @@ class BelloClickGroup(click.Group):
     default=None,
     type=click.BOOL,
     metavar="[true|false]",
-    help="Run the adversarial tester before final completion; requires completion review.",
+    help="Run the adversarial tester before final completion, independently of completion review.",
 )
 @click.option(
     "--adversary-runs",
@@ -176,6 +195,9 @@ def cli(
     start_over: bool | None,
     protected_paths: tuple[Path, ...],
     clean: bool | None,
+    runtime_enabled: bool | None,
+    log_distiller_enabled: bool | None,
+    distiller_model_path: Path | None,
     completion_review: bool | None,
     adversary: bool | None,
     adversary_runs: int | None,
@@ -203,6 +225,9 @@ def cli(
             start_over=start_over,
             protected_paths=protected_paths,
             clean=clean,
+            runtime_enabled=runtime_enabled,
+            log_distiller_enabled=log_distiller_enabled,
+            distiller_model_path=distiller_model_path,
             completion_review=completion_review,
             adversary=adversary,
             adversary_runs=adversary_runs,
@@ -220,6 +245,7 @@ def cli(
 @click.option("--check", "check_only", is_flag=True, help="Check for updates without installing them.")
 @click.option("--json", "json_output", is_flag=True, help="Emit update status as JSON. Implies --check.")
 def update_command(check_only: bool, json_output: bool) -> None:
+    """Update Bello and prepare its compatible execution dependencies."""
     status = update_check.check_for_update()
     info = status.install_info
     if check_only or json_output:
@@ -232,19 +258,27 @@ def update_command(check_only: bool, json_output: bool) -> None:
     if status.state == update_check.UpdateState.UNKNOWN:
         raise click.ClickException(status.warning or "Could not check for Bello updates")
     if status.state == update_check.UpdateState.CURRENT:
+        click.echo("Checking Bello's execution dependencies...")
+        try:
+            prepared = update_check.prepare_runtime()
+        except update_check.UpdateCheckError as exc:
+            raise click.ClickException(str(exc)) from exc
         click.echo("Bello is up to date.")
-        click.echo(f"Installed: {info.version}")
+        click.echo(f"Installed: {prepared.version}")
+        click.echo("Compatible runtime ready.")
         return
 
     assert status.latest_version is not None
     old_version = info.version
+    click.echo("Updating Bello and preparing its execution dependencies...")
     try:
-        update_check.run_update(info)
+        prepared = update_check.run_update(info)
     except update_check.UpdateCheckError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo("Bello updated.")
     click.echo(f"Previous: {old_version}")
-    click.echo(f"Current:  {status.latest_version}")
+    click.echo(f"Current:  {prepared.version}")
+    click.echo("Compatible runtime ready.")
 
 
 def _update_status_payload(status: update_check.UpdateStatus) -> dict[str, Any]:
@@ -281,6 +315,216 @@ def doctor_command() -> None:
     raise click.exceptions.Exit(doctor.run_doctor())
 
 
+@cli.group("runtime")
+def runtime_group() -> None:
+    """Install execution dependencies, authenticate, or inspect available models."""
+
+
+@runtime_group.command("install")
+def runtime_install_command() -> None:
+    """Install the exact Pi dependencies pinned by this Bello version."""
+    from supervisor.runtime.install import install_worker
+    try:
+        destination = install_worker()
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Pi runtime installed: {destination}")
+
+
+@runtime_group.group("windows-sandbox")
+def runtime_windows_sandbox_group() -> None:
+    """Inspect or explicitly prepare fixed Windows sandbox host permissions."""
+
+
+@runtime_windows_sandbox_group.command("status")
+@click.option("--drive", help="Check only this fixed local drive root, for example D:.")
+@click.option("--null-device", is_flag=True, help="Check only access to the fixed NUL device.")
+@click.option("--network", is_flag=True, help="Check the fixed offline-network isolation service.")
+def runtime_windows_sandbox_status(drive: str | None, null_device: bool, network: bool) -> None:
+    """Check the host permission without changing it or requesting elevation."""
+    from supervisor.runtime.windows_sandbox import WindowsSandboxError, host_preparation
+    try:
+        result = host_preparation("status", drive=drive, null_device=null_device, **({"network": True} if network else {}))
+    except WindowsSandboxError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if network:
+        click.echo("Windows offline network isolation is prepared." if result["prepared"]
+                   else "Windows offline network isolation needs administrator setup.")
+        click.echo(f"Service: {result['serviceName']}; active runs: {result['activeLeases']}; retained leases: {result['retainedLeases']}.")
+        if not result["prepared"]:
+            click.echo("In an administrator terminal, run: bello runtime windows-sandbox prepare --network")
+        return
+    if null_device:
+        click.echo("Windows sandbox NUL access is prepared." if result["prepared"]
+                   else "Windows sandbox NUL access needs administrator setup.")
+        if not result["prepared"]:
+            click.echo("In an administrator terminal, run: bello runtime windows-sandbox prepare --null-device")
+        click.echo("Windows resets this device permission on reboot; check it again after restarting Windows.")
+        click.echo("This checks host preparation only, not every workspace or sandbox operation.")
+        return
+    targets = ", ".join(target["path"] for target in result["targets"])
+    if result["prepared"]:
+        click.echo(f"Windows sandbox metadata access is prepared for {targets}")
+    else:
+        click.echo("Windows sandbox metadata access needs one-time administrator setup.")
+        suffix = f" --drive {drive.upper()}" if drive else ""
+        click.echo(f"In an administrator terminal, run: bello runtime windows-sandbox prepare{suffix}")
+    click.echo("This checks host preparation only, not every workspace or sandbox operation.")
+
+
+def _windows_sandbox_change(operation: str, *, yes: bool, drive: str | None = None,
+                            null_device: bool = False, network: bool = False) -> None:
+    from supervisor.runtime.windows_sandbox import WindowsSandboxError, host_preparation
+    if network:
+        if drive is not None or null_device:
+            raise click.ClickException("Select only one of --network, --null-device, or --drive.")
+        _windows_network_change(operation, yes=yes)
+        return
+    # Perform a read-only check first, including platform/helper validation.
+    try:
+        current = host_preparation("status", drive=drive, null_device=null_device)
+    except WindowsSandboxError as exc:
+        raise click.ClickException(str(exc)) from exc
+    removing = operation == "remove"
+    present = current["prepared"] if null_device else any(target["prepared"] for target in current["targets"])
+    if (not removing and current["prepared"]) or (removing and not present):
+        click.echo("Permission already prepared." if not removing else "Permission already absent.")
+        return
+    verb = "Remove" if removing else "Add"
+    targets = current["path"] if null_device else ", ".join(target["path"] for target in current["targets"])
+    if null_device:
+        click.echo(
+            f"{verb} the Bello-named read/write permission on the fixed device {targets} only. "
+            "NUL returns empty input and discards writes. This does not grant access to files or other devices."
+        )
+        click.echo("Windows resets this permission on reboot; preparation may be needed again afterwards.")
+    else:
+        click.echo(
+            f"{verb} the persistent Bello-named metadata permission on these fixed directories only: {targets}. "
+            "It does not grant directory listing, file contents, writes, or inherited access."
+        )
+    if removing:
+        click.echo("Stop Bello runs first; removing this permission can interrupt their tools.")
+    click.echo("Run this setup command in an administrator terminal; run tasks normally afterwards.")
+    if not yes:
+        click.confirm(f"{verb} this permission?", abort=True)
+    try:
+        result = host_preparation("remove" if removing else "prepare", drive=drive, null_device=null_device)
+    except WindowsSandboxError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if (
+        result["capabilitySid"] != current["capabilitySid"]
+        or (null_device and result["path"] != current["path"])
+        or (not null_device and (
+            result["systemRoot"] != current["systemRoot"]
+            or {target["kind"]: target["path"] for target in result["targets"]}
+            != {target["kind"]: target["path"] for target in current["targets"]}
+        ))
+    ):
+        raise click.ClickException("The helper reported a different setup target; verify host preparation before continuing.")
+    click.echo(
+        f"Windows sandbox {'NUL' if null_device else 'metadata'} permission {'removed' if removing else 'prepared'} "
+        f"for {targets}."
+    )
+
+
+def _windows_network_change(operation: str, *, yes: bool) -> None:
+    from supervisor.runtime.windows_sandbox import WindowsSandboxError, host_preparation
+    try:
+        current = host_preparation("status", network=True)
+    except WindowsSandboxError as exc:
+        raise click.ClickException(str(exc)) from exc
+    removing = operation == "remove"
+    if (removing and not current["installed"]) or (not removing and current["prepared"]):
+        click.echo("Offline network service already absent." if removing else "Offline network service already prepared.")
+        return
+    if current["activeLeases"] or current["retainedLeases"]:
+        raise click.ClickException("Finish active Bello runs and resolve retained sandbox leases before changing the network service.")
+    verb = "Remove" if removing else "Install or update"
+    click.echo(f"{verb} the fixed BelloOfflineNetwork service at {current['installPath']}.")
+    click.echo("This Windows service runs as LocalSystem and only manages fixed blocking rules for Bello sandboxes. Agent commands still run without administrator rights.")
+    click.echo("It starts with Windows. No API keys or model calls are involved. Other applications' firewall rules are preserved.")
+    click.echo("Run this command in an administrator terminal; run tasks normally afterwards.")
+    if not yes:
+        click.confirm(f"{verb} this service?", abort=True)
+    try:
+        result = host_preparation(operation, network=True)
+    except WindowsSandboxError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if result["installPath"] != current["installPath"] or result["serviceName"] != current["serviceName"]:
+        raise click.ClickException("The helper reported a different network service target; inspect setup before continuing.")
+    click.echo("Offline network service removed." if removing else "Offline network service prepared.")
+
+
+@runtime_windows_sandbox_group.command("prepare")
+@click.option("--yes", is_flag=True, help="Confirm the selected fixed permission change without prompting.")
+@click.option("--drive", help="Prepare only this fixed local drive root, for example D:.")
+@click.option("--null-device", is_flag=True, help="Prepare only read/write access to the fixed NUL device.")
+@click.option("--network", is_flag=True, help="Install the fixed offline-network service (administrator only).")
+def runtime_windows_sandbox_prepare(yes: bool, drive: str | None, null_device: bool, network: bool) -> None:
+    """Fixed permission setup. Requires an administrator terminal."""
+    _windows_sandbox_change("prepare", yes=yes, drive=drive, null_device=null_device, network=network)
+
+
+@runtime_windows_sandbox_group.command("remove")
+@click.option("--yes", is_flag=True, help="Confirm removal of the selected fixed permission without prompting.")
+@click.option("--drive", help="Remove preparation only from this fixed local drive root, for example D:.")
+@click.option("--null-device", is_flag=True, help="Remove only Bello's fixed NUL device permission.")
+@click.option("--network", is_flag=True, help="Remove the fixed offline-network service after all runs finish.")
+def runtime_windows_sandbox_remove(yes: bool, drive: str | None, null_device: bool, network: bool) -> None:
+    """Remove the setup permission. Stop runs first; requires an administrator terminal."""
+    _windows_sandbox_change("remove", yes=yes, drive=drive, null_device=null_device, network=network)
+
+
+@runtime_group.command("models")
+@click.option("--engine", type=click.Choice(["all", "codex", "pi", "claude-code"]), default="all", show_default=True)
+def runtime_models_command(engine: str) -> None:
+    """List the configured provider/model catalog without making a model request."""
+    import tempfile
+    from supervisor.runtime.client import RuntimeClient
+    async def read_models(directory: Path) -> dict[str, Any]:
+        client = RuntimeClient(cwd=directory)
+        try:
+            await client.start()
+            return await client.request("model/list", {
+                "engines": ["codex", "pi", "claude-code"] if engine == "all" else [engine],
+                "optionalEngines": engine == "all",
+            })
+        finally:
+            await client.stop()
+    try:
+        with tempfile.TemporaryDirectory(prefix="bello-models-") as temporary:
+            result = asyncio.run(read_models(Path(temporary)))
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+@runtime_group.command("login")
+@click.argument("provider")
+def runtime_login_command(provider: str) -> None:
+    """Authenticate with a provider's normal login flow; does not run an agent."""
+    import subprocess
+    from supervisor.runtime.install import worker_command
+    try:
+        if provider == "openai-codex":
+            command = [os.environ.get("BELLO_CODEX_BINARY", "codex"), "login"]
+        elif provider == "claude-code":
+            from supervisor.runtime.claude import ClaudeBackend
+            command = [str(ClaudeBackend._bundled_cli_path()), "auth", "login"]
+        else:
+            command = worker_command()
+            auth = Path(command[1]).with_name("auth.mjs")
+            if not auth.is_file():
+                raise RuntimeError("the Pi authentication entrypoint is missing from this installation")
+            command = [command[0], str(auth), provider]
+        completed = subprocess.run(command, check=False)
+        if completed.returncode:
+            raise RuntimeError(f"provider login exited with code {completed.returncode}")
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 @cli.command("config")
 def config_command() -> None:
     try:
@@ -293,10 +537,19 @@ def config_command() -> None:
     if config.revision_coder_enabled:
         click.echo(f"revision-coder-mod: {config.revision_coder_mod}")
         click.echo(f"revision-coder-intelligence: {config.revision_coder_intelligence}")
-    click.echo(f"runtime-mod: {config.runtime_mod}")
-    click.echo(f"completion-mod: {config.completion_mod}")
-    click.echo(f"adversary-mod: {config.adversary_mod}")
-    click.echo(f"cheap-runtime: {str(config.cheap_runtime).lower()}")
+    click.echo(f"runtime: {str(config.runtime_enabled).lower()}")
+    if config.runtime_enabled:
+        click.echo(f"runtime-mod: {config.runtime_mod}")
+        click.echo(f"cheap-runtime: {str(config.effective_cheap_runtime).lower()}")
+    click.echo(f"completion-review: {str(config.completion_review).lower()}")
+    if config.completion_review:
+        click.echo(f"completion-mod: {config.completion_mod}")
+    click.echo(f"adversary: {str(config.adversary).lower()}")
+    if config.adversary:
+        click.echo(f"adversary-mod: {config.adversary_mod}")
+    click.echo(f"log-distiller: {str(config.log_distiller.enabled).lower()}")
+    if config.log_distiller.enabled:
+        click.echo(f"distiller-model: {config.log_distiller.model_path or 'published model (automatic cache)'}")
 
 
 def _version_callback(ctx: click.Context, value: bool) -> None:
@@ -378,6 +631,7 @@ def _format_update_available_message(status: update_check.UpdateStatus) -> str:
 
 
 def _update_and_reexec(status: update_check.UpdateStatus) -> None:
+    click.echo("Updating Bello and preparing its execution dependencies...")
     try:
         update_check.run_update(status.install_info)
     except update_check.UpdateCheckError as exc:
@@ -423,6 +677,8 @@ async def _run_bello(settings: RunSettings) -> int:
         overwrite_state=settings.start_over,
         declared_grading_roots=settings.protected_paths,
         clean_workspace=settings.clean,
+        runtime_enabled=settings.runtime_enabled,
+        log_distiller=settings.log_distiller,
         adversary_enabled=settings.adversary,
         adversary_runs=settings.adversary_runs,
         completion_review=settings.completion_review,
@@ -454,6 +710,8 @@ class RunSettings:
     completion_review: bool
     adversary: bool
     adversary_runs: int
+    runtime_enabled: bool = True
+    log_distiller: LogDistillerConfig = field(default_factory=LogDistillerConfig)
 
 
 def _resolve_run_settings(
@@ -475,6 +733,9 @@ def _resolve_run_settings(
     start_over: bool | None = None,
     protected_paths: tuple[Path, ...] = (),
     clean: bool | None = None,
+    runtime_enabled: bool | None = None,
+    log_distiller_enabled: bool | None = None,
+    distiller_model_path: Path | None = None,
     completion_review: bool | None = None,
     adversary: bool | None = None,
     adversary_runs: int | None = None,
@@ -500,16 +761,30 @@ def _resolve_run_settings(
     selected_runtime_intelligence = runtime_intelligence or project_config.runtime_intelligence
     selected_completion_intelligence = completion_intelligence or project_config.completion_intelligence
     selected_adversary_intelligence = adversary_intelligence or project_config.adversary_intelligence
+    selected_runtime_enabled = project_config.runtime_enabled if runtime_enabled is None else runtime_enabled
+    selected_completion_review = project_config.completion_review if completion_review is None else completion_review
+    selected_adversary = (
+        adversary if adversary is not None
+        else (adversary_runs > 0 if adversary_runs is not None else project_config.adversary)
+    )
+    selected_distiller = replace(
+        project_config.log_distiller,
+        enabled=project_config.log_distiller.enabled if log_distiller_enabled is None else log_distiller_enabled,
+        model_path=project_config.log_distiller.model_path if distiller_model_path is None else str(distiller_model_path),
+    )
     _validate_model_intelligence("coder", selected_coder_model, selected_coder_intelligence)
-    if project_config.revision_coder_enabled:
+    if project_config.revision_coder_enabled and (selected_completion_review or selected_adversary):
         _validate_model_intelligence(
             "revision coder",
             project_config.revision_coder_mod,
             project_config.revision_coder_intelligence,
         )
-    _validate_model_intelligence("runtime", selected_runtime_model, selected_runtime_intelligence)
-    _validate_model_intelligence("completion", selected_completion_model, selected_completion_intelligence)
-    _validate_model_intelligence("adversary", selected_adversary_model, selected_adversary_intelligence)
+    if selected_runtime_enabled:
+        _validate_model_intelligence("runtime", selected_runtime_model, selected_runtime_intelligence)
+    if selected_completion_review:
+        _validate_model_intelligence("completion", selected_completion_model, selected_completion_intelligence)
+    if selected_adversary:
+        _validate_model_intelligence("adversary", selected_adversary_model, selected_adversary_intelligence)
     selected_task = task_path if task_path is not None else Path(project_config.task) if project_config.task else None
     selected_protected_paths = protected_paths or tuple(Path(path) for path in project_config.protected_path)
     return RunSettings(
@@ -527,13 +802,11 @@ def _resolve_run_settings(
         start_over=project_config.start_over if start_over is None else start_over,
         protected_paths=selected_protected_paths,
         clean=project_config.clean if clean is None else clean,
-        completion_review=project_config.completion_review if completion_review is None else completion_review,
+        runtime_enabled=selected_runtime_enabled,
+        log_distiller=selected_distiller,
+        completion_review=selected_completion_review,
         # An explicit --adversary wins; otherwise an explicit --adversary-runs implies on/off (0 = off).
-        adversary=(
-            adversary
-            if adversary is not None
-            else (adversary_runs > 0 if adversary_runs is not None else project_config.adversary)
-        ),
+        adversary=selected_adversary,
         adversary_runs=project_config.adversary_runs if adversary_runs is None else adversary_runs,
     )
 
