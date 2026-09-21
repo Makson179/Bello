@@ -25,6 +25,7 @@ BUDGET = [
     ("Lightning CSS", 60.750, 60.302, 6.0281, 2.2569),
     ("Miller", 33.839, 34.684, 3.3190, 1.1428),
 ]
+BUDGET_OVERALL = ("Overall", 48.100, 48.797, 15.6297, 5.2690)
 RUNTIME = [
     ("Marl", 32.91, 37.91),
     ("Slab", 81.08, 85.69),
@@ -142,7 +143,7 @@ def model_comparison(mobile):
 
 
 def panel(p, x, y, width, height, title, names, raw, bello, maximum, ticks,
-          raw_labels, bello_labels, precision_size=17):
+          raw_labels, bello_labels, precision_size=17, emphasize_last=False):
     p.text(x,y,title,19 if p.mobile else 21)
     top,bottom=y+42,y+42+height
     scale=lambda v: bottom-v/maximum*height
@@ -150,8 +151,11 @@ def panel(p, x, y, width, height, title, names, raw, bello, maximum, ticks,
         p.line(x,scale(tick),x+width,scale(tick))
         p.text(x-10,scale(tick)+5,f"{tick:g}",14 if p.mobile else 16,"muted","end")
     group=width/len(names)
-    half_gap=25 if len(names)==4 else 33
-    bar_width=28 if len(names)==4 else 38
+    half_gap=20 if len(names)>=5 else (25 if len(names)==4 else 33)
+    bar_width=24 if len(names)>=5 else (28 if len(names)==4 else 38)
+    if emphasize_last:
+        separator=x+group*(len(names)-1)
+        p.line(separator,top,separator,bottom+55)
     for i,name in enumerate(names):
         center=x+group*(i+.5)
         for value,label,offset,series in [
@@ -163,7 +167,8 @@ def panel(p, x, y, width, height, title, names, raw, bello, maximum, ticks,
             p.text(xx,scale(value)-10,label,precision_size,series,"middle",500)
         label_lines=name.split(" ") if " " in name else [name]
         for j,line in enumerate(label_lines):
-            p.text(center,bottom+31+j*21,line,16 if p.mobile else 18,anchor="middle")
+            p.text(center,bottom+31+j*21,line,16 if p.mobile else 18,anchor="middle",
+                   weight=600 if emphasize_last and i==len(names)-1 else 400)
 
 
 def two_panel_geometry(mobile):
@@ -173,6 +178,7 @@ def two_panel_geometry(mobile):
 
 
 def budget(mobile):
+    rows=[*BUDGET,BUDGET_OVERALL]
     desc="; ".join(f"{n}: score {r:.3f} to {b:.3f}%; weekly limit {u:.4f} to {v:.4f}%"
                   for n,r,b,u,v in BUDGET)
     p=Chart("programbench-efficient-budget-quality-cost",815 if mobile else 475,
@@ -181,11 +187,13 @@ def budget(mobile):
             "Overall score 48.100 to 48.797%; total usage 15.6297 to 5.2690%.",mobile)
     p.legend("Raw Sol XHigh","Bello Budget")
     a,b=two_panel_geometry(mobile)
-    names=[r[0] for r in BUDGET]
-    panel(p,*a,"Mean score (%)",names,[r[1] for r in BUDGET],[r[2] for r in BUDGET],
-          70,[0,35,70],[f"{r[1]:.2f}" for r in BUDGET],[f"{r[2]:.2f}" for r in BUDGET],17)
-    panel(p,*b,"Weekly limit used (%)",names,[r[3] for r in BUDGET],[r[4] for r in BUDGET],
-          7,[0,3.5,7],[f"{r[3]:.2f}" for r in BUDGET],[f"{r[4]:.2f}" for r in BUDGET],17)
+    names=[r[0] for r in rows]
+    panel(p,*a,"Mean score (%)",names,[r[1] for r in rows],[r[2] for r in rows],
+          70,[0,35,70],[f"{r[1]:.2f}" for r in rows],[f"{r[2]:.2f}" for r in rows],
+          14,emphasize_last=True)
+    panel(p,*b,"Weekly limit used (%)",names,[r[3] for r in rows],[r[4] for r in rows],
+          20,[0,10,20],[f"{r[3]:.2f}" for r in rows],[f"{r[4]:.2f}" for r in rows],
+          14,emphasize_last=True)
     p.save()
 
 
