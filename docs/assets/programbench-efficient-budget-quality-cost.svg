@@ -35,55 +35,67 @@ text { font-family:Arial,Helvetica,sans-serif; fill:var(--ink);
 <text x="53.00" y="274.00" font-size="16" font-weight="400" class="muted" text-anchor="end">35</text>
 <line x1="63.00" y1="127.00" x2="495.00" y2="127.00" class="grid"/>
 <text x="53.00" y="132.00" font-size="16" font-weight="400" class="muted" text-anchor="end">70</text>
-<rect x="78.00" y="244.70" width="28.00" height="166.30" class="raw-bar"/>
-<text x="92.00" y="234.70" font-size="17" font-weight="500" class="raw" text-anchor="middle">40.99</text>
-<rect x="128.00" y="226.28" width="28.00" height="184.72" class="bello-bar"/>
-<text x="142.00" y="216.28" font-size="17" font-weight="500" class="bello" text-anchor="middle">45.53</text>
-<text x="117.00" y="442.00" font-size="18" font-weight="400" class="" text-anchor="middle">Revive</text>
-<rect x="186.00" y="180.47" width="28.00" height="230.53" class="raw-bar"/>
-<text x="200.00" y="170.47" font-size="17" font-weight="500" class="raw" text-anchor="middle">56.82</text>
-<rect x="236.00" y="189.18" width="28.00" height="221.82" class="bello-bar"/>
-<text x="250.00" y="179.18" font-size="17" font-weight="500" class="bello" text-anchor="middle">54.67</text>
-<text x="225.00" y="442.00" font-size="18" font-weight="400" class="" text-anchor="middle">JSON</text>
-<text x="225.00" y="463.00" font-size="18" font-weight="400" class="" text-anchor="middle">Schema</text>
-<rect x="294.00" y="164.53" width="28.00" height="246.47" class="raw-bar"/>
-<text x="308.00" y="154.53" font-size="17" font-weight="500" class="raw" text-anchor="middle">60.75</text>
-<rect x="344.00" y="166.35" width="28.00" height="244.65" class="bello-bar"/>
-<text x="358.00" y="156.35" font-size="17" font-weight="500" class="bello" text-anchor="middle">60.30</text>
-<text x="333.00" y="442.00" font-size="18" font-weight="400" class="" text-anchor="middle">Lightning</text>
-<text x="333.00" y="463.00" font-size="18" font-weight="400" class="" text-anchor="middle">CSS</text>
-<rect x="402.00" y="273.71" width="28.00" height="137.29" class="raw-bar"/>
-<text x="416.00" y="263.71" font-size="17" font-weight="500" class="raw" text-anchor="middle">33.84</text>
-<rect x="452.00" y="270.28" width="28.00" height="140.72" class="bello-bar"/>
-<text x="466.00" y="260.28" font-size="17" font-weight="500" class="bello" text-anchor="middle">34.68</text>
-<text x="441.00" y="442.00" font-size="18" font-weight="400" class="" text-anchor="middle">Miller</text>
+<line x1="408.60" y1="127.00" x2="408.60" y2="466.00" class="grid"/>
+<rect x="74.20" y="244.70" width="24.00" height="166.30" class="raw-bar"/>
+<text x="86.20" y="234.70" font-size="14" font-weight="500" class="raw" text-anchor="middle">40.99</text>
+<rect x="114.20" y="226.28" width="24.00" height="184.72" class="bello-bar"/>
+<text x="126.20" y="216.28" font-size="14" font-weight="500" class="bello" text-anchor="middle">45.53</text>
+<text x="106.20" y="442.00" font-size="18" font-weight="400" class="" text-anchor="middle">Revive</text>
+<rect x="160.60" y="180.47" width="24.00" height="230.53" class="raw-bar"/>
+<text x="172.60" y="170.47" font-size="14" font-weight="500" class="raw" text-anchor="middle">56.82</text>
+<rect x="200.60" y="189.18" width="24.00" height="221.82" class="bello-bar"/>
+<text x="212.60" y="179.18" font-size="14" font-weight="500" class="bello" text-anchor="middle">54.67</text>
+<text x="192.60" y="442.00" font-size="18" font-weight="400" class="" text-anchor="middle">JSON</text>
+<text x="192.60" y="463.00" font-size="18" font-weight="400" class="" text-anchor="middle">Schema</text>
+<rect x="247.00" y="164.53" width="24.00" height="246.47" class="raw-bar"/>
+<text x="259.00" y="154.53" font-size="14" font-weight="500" class="raw" text-anchor="middle">60.75</text>
+<rect x="287.00" y="166.35" width="24.00" height="244.65" class="bello-bar"/>
+<text x="299.00" y="156.35" font-size="14" font-weight="500" class="bello" text-anchor="middle">60.30</text>
+<text x="279.00" y="442.00" font-size="18" font-weight="400" class="" text-anchor="middle">Lightning</text>
+<text x="279.00" y="463.00" font-size="18" font-weight="400" class="" text-anchor="middle">CSS</text>
+<rect x="333.40" y="273.71" width="24.00" height="137.29" class="raw-bar"/>
+<text x="345.40" y="263.71" font-size="14" font-weight="500" class="raw" text-anchor="middle">33.84</text>
+<rect x="373.40" y="270.28" width="24.00" height="140.72" class="bello-bar"/>
+<text x="385.40" y="260.28" font-size="14" font-weight="500" class="bello" text-anchor="middle">34.68</text>
+<text x="365.40" y="442.00" font-size="18" font-weight="400" class="" text-anchor="middle">Miller</text>
+<rect x="419.80" y="215.85" width="24.00" height="195.15" class="raw-bar"/>
+<text x="431.80" y="205.85" font-size="14" font-weight="500" class="raw" text-anchor="middle">48.10</text>
+<rect x="459.80" y="213.02" width="24.00" height="197.98" class="bello-bar"/>
+<text x="471.80" y="203.02" font-size="14" font-weight="500" class="bello" text-anchor="middle">48.80</text>
+<text x="451.80" y="442.00" font-size="18" font-weight="600" class="" text-anchor="middle">Overall</text>
 <text x="610.00" y="85.00" font-size="21" font-weight="400" class="" text-anchor="start">Weekly limit used (%)</text>
 <line x1="610.00" y1="411.00" x2="1042.00" y2="411.00" class="grid"/>
 <text x="600.00" y="416.00" font-size="16" font-weight="400" class="muted" text-anchor="end">0</text>
 <line x1="610.00" y1="269.00" x2="1042.00" y2="269.00" class="grid"/>
-<text x="600.00" y="274.00" font-size="16" font-weight="400" class="muted" text-anchor="end">3.5</text>
+<text x="600.00" y="274.00" font-size="16" font-weight="400" class="muted" text-anchor="end">10</text>
 <line x1="610.00" y1="127.00" x2="1042.00" y2="127.00" class="grid"/>
-<text x="600.00" y="132.00" font-size="16" font-weight="400" class="muted" text-anchor="end">7</text>
-<rect x="625.00" y="278.10" width="28.00" height="132.90" class="raw-bar"/>
-<text x="639.00" y="268.10" font-size="17" font-weight="500" class="raw" text-anchor="middle">3.28</text>
-<rect x="675.00" y="368.18" width="28.00" height="42.82" class="bello-bar"/>
-<text x="689.00" y="358.18" font-size="17" font-weight="500" class="bello" text-anchor="middle">1.06</text>
-<text x="664.00" y="442.00" font-size="18" font-weight="400" class="" text-anchor="middle">Revive</text>
-<rect x="733.00" y="289.01" width="28.00" height="121.99" class="raw-bar"/>
-<text x="747.00" y="279.01" font-size="17" font-weight="500" class="raw" text-anchor="middle">3.01</text>
-<rect x="783.00" y="377.98" width="28.00" height="33.02" class="bello-bar"/>
-<text x="797.00" y="367.98" font-size="17" font-weight="500" class="bello" text-anchor="middle">0.81</text>
-<text x="772.00" y="442.00" font-size="18" font-weight="400" class="" text-anchor="middle">JSON</text>
-<text x="772.00" y="463.00" font-size="18" font-weight="400" class="" text-anchor="middle">Schema</text>
-<rect x="841.00" y="166.43" width="28.00" height="244.57" class="raw-bar"/>
-<text x="855.00" y="156.43" font-size="17" font-weight="500" class="raw" text-anchor="middle">6.03</text>
-<rect x="891.00" y="319.43" width="28.00" height="91.57" class="bello-bar"/>
-<text x="905.00" y="309.43" font-size="17" font-weight="500" class="bello" text-anchor="middle">2.26</text>
-<text x="880.00" y="442.00" font-size="18" font-weight="400" class="" text-anchor="middle">Lightning</text>
-<text x="880.00" y="463.00" font-size="18" font-weight="400" class="" text-anchor="middle">CSS</text>
-<rect x="949.00" y="276.34" width="28.00" height="134.66" class="raw-bar"/>
-<text x="963.00" y="266.34" font-size="17" font-weight="500" class="raw" text-anchor="middle">3.32</text>
-<rect x="999.00" y="364.63" width="28.00" height="46.37" class="bello-bar"/>
-<text x="1013.00" y="354.63" font-size="17" font-weight="500" class="bello" text-anchor="middle">1.14</text>
-<text x="988.00" y="442.00" font-size="18" font-weight="400" class="" text-anchor="middle">Miller</text>
+<text x="600.00" y="132.00" font-size="16" font-weight="400" class="muted" text-anchor="end">20</text>
+<line x1="955.60" y1="127.00" x2="955.60" y2="466.00" class="grid"/>
+<rect x="621.20" y="364.49" width="24.00" height="46.51" class="raw-bar"/>
+<text x="633.20" y="354.49" font-size="14" font-weight="500" class="raw" text-anchor="middle">3.28</text>
+<rect x="661.20" y="396.01" width="24.00" height="14.99" class="bello-bar"/>
+<text x="673.20" y="386.01" font-size="14" font-weight="500" class="bello" text-anchor="middle">1.06</text>
+<text x="653.20" y="442.00" font-size="18" font-weight="400" class="" text-anchor="middle">Revive</text>
+<rect x="707.60" y="368.30" width="24.00" height="42.70" class="raw-bar"/>
+<text x="719.60" y="358.30" font-size="14" font-weight="500" class="raw" text-anchor="middle">3.01</text>
+<rect x="747.60" y="399.44" width="24.00" height="11.56" class="bello-bar"/>
+<text x="759.60" y="389.44" font-size="14" font-weight="500" class="bello" text-anchor="middle">0.81</text>
+<text x="739.60" y="442.00" font-size="18" font-weight="400" class="" text-anchor="middle">JSON</text>
+<text x="739.60" y="463.00" font-size="18" font-weight="400" class="" text-anchor="middle">Schema</text>
+<rect x="794.00" y="325.40" width="24.00" height="85.60" class="raw-bar"/>
+<text x="806.00" y="315.40" font-size="14" font-weight="500" class="raw" text-anchor="middle">6.03</text>
+<rect x="834.00" y="378.95" width="24.00" height="32.05" class="bello-bar"/>
+<text x="846.00" y="368.95" font-size="14" font-weight="500" class="bello" text-anchor="middle">2.26</text>
+<text x="826.00" y="442.00" font-size="18" font-weight="400" class="" text-anchor="middle">Lightning</text>
+<text x="826.00" y="463.00" font-size="18" font-weight="400" class="" text-anchor="middle">CSS</text>
+<rect x="880.40" y="363.87" width="24.00" height="47.13" class="raw-bar"/>
+<text x="892.40" y="353.87" font-size="14" font-weight="500" class="raw" text-anchor="middle">3.32</text>
+<rect x="920.40" y="394.77" width="24.00" height="16.23" class="bello-bar"/>
+<text x="932.40" y="384.77" font-size="14" font-weight="500" class="bello" text-anchor="middle">1.14</text>
+<text x="912.40" y="442.00" font-size="18" font-weight="400" class="" text-anchor="middle">Miller</text>
+<rect x="966.80" y="189.06" width="24.00" height="221.94" class="raw-bar"/>
+<text x="978.80" y="179.06" font-size="14" font-weight="500" class="raw" text-anchor="middle">15.63</text>
+<rect x="1006.80" y="336.18" width="24.00" height="74.82" class="bello-bar"/>
+<text x="1018.80" y="326.18" font-size="14" font-weight="500" class="bello" text-anchor="middle">5.27</text>
+<text x="998.80" y="442.00" font-size="18" font-weight="600" class="" text-anchor="middle">Overall</text>
 </svg>
