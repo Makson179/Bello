@@ -678,6 +678,29 @@ def test_config_editor_state_expands_selects_and_advances() -> None:
     assert state.expanded_index is None
 
 
+def test_config_editor_empty_model_options_allow_enter_and_down() -> None:
+    config = ProjectConfig()
+    parameters = parameter_defs(config, model_choices=())
+    model_index = [parameter.key for parameter in parameters].index("coder_mod")
+    assert parameters[model_index].options == ()
+
+    updated, state, action = select_current(
+        config,
+        EditorState(parameter_index=model_index),
+        model_choices=(),
+    )
+    state = move_down(state, parameters)
+
+    assert updated == config
+    assert action is None
+    assert state.parameter_index == model_index + 1
+    assert state.expanded_index is None
+    assert state.option_index is None
+
+    expanded = EditorState(parameter_index=model_index, expanded_index=model_index)
+    assert move_down(expanded, parameters) == state
+
+
 def test_config_editor_starts_inline_edit_for_direct_text_field() -> None:
     config = ProjectConfig()
     params = parameter_defs(config)
@@ -1027,7 +1050,9 @@ def test_config_editor_switching_to_gpt_55_hides_variant_and_clamps_reasoning() 
     assert "coder_mod_variant" not in {parameter.key for parameter in parameter_defs(config)}
 
 
-def test_available_model_choices_falls_back_to_codex_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_available_model_choices_ignores_codex_cache_without_live_models(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     monkeypatch.setattr("supervisor.config_editor._available_models_from_app_server", lambda project_root: ())
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     cache = tmp_path / ".codex" / "models_cache.json"
@@ -1049,12 +1074,7 @@ def test_available_model_choices_falls_back_to_codex_cache(monkeypatch: pytest.M
         encoding="utf-8",
     )
 
-    assert available_model_choices(tmp_path) == (
-        MODEL_GPT_5_6_SOL,
-        MODEL_GPT_5_6_TERRA,
-        MODEL_GPT_5_6_LUNA,
-        MODEL_GPT_5_5,
-    )
+    assert available_model_choices(tmp_path) == ()
 
 
 @pytest.mark.parametrize(
