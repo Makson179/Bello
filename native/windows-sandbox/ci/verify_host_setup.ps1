@@ -124,6 +124,17 @@ function Write-AclMismatch([string]$Field, $Expected, $Actual, [string]$Target) 
 function Assert-AclEqual($Expected, $Actual, [string]$Target) {
     foreach ($field in @("owner", "group", "control", "revision")) {
         if ($Expected[$field] -ne $Actual[$field]) {
+            # Windows may clear SE_DACL_DEFAULTED when applying an explicit DACL;
+            # it describes how the final DACL is computed, not stored permissions.
+            # https://learn.microsoft.com/en-us/windows/win32/secauthz/security-descriptor-control
+            # Permit only that clear with a present DACL; keep every other bit,
+            # snapshot field, and ACE byte/order check strict.
+            if ($field -eq "control" -and
+                ([int]$Expected.control -band 0x000C) -eq 0x000C -and
+                ([int]$Actual.control -band 0x000C) -eq 0x0004 -and
+                ([int]$Expected.control -bxor [int]$Actual.control) -eq 0x0008) {
+                continue
+            }
             $diagnostic = Write-AclMismatch $field $Expected $Actual $Target
             throw "host setup changed unrelated ACL field: $field; $diagnostic"
         }

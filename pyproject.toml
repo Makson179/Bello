@@ -44,14 +44,14 @@ log-distiller = [
   "huggingface-hub>=0.28,<1",
 ]
 claude = [
-  "claude-agent-sdk==0.2.152",
+  "claude-agent-sdk==0.2.159",
 ]
 test = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
   "setuptools>=77",
   "wheel>=0.45,<1",
-  "claude-agent-sdk==0.2.152",
+  "claude-agent-sdk==0.2.159",
 ]
 
 [project.scripts]

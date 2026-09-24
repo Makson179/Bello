@@ -156,29 +156,32 @@ def test_editor_switches_astra_per_role_and_restores_model_specific_efforts(
     assert replace(config, **{f"{role}_mod": DEFAULT_MODEL, f"{role}_intelligence": "xhigh"}) == original
 
 
-@pytest.mark.parametrize("source", ["appserver", "cache", "unavailable"])
-def test_astra_discovery_uses_live_models_before_cache(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str
+@pytest.mark.parametrize(
+    "reported",
+    [(MODEL_GPT_6_ASTRA,), (), (MODEL_GPT_5_6_SOL,)],
+    ids=["live-astra", "empty-live-catalog", "live-other-model"],
+)
+def test_astra_discovery_uses_only_live_models(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reported: tuple[str, ...]
 ) -> None:
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     cache = tmp_path / ".codex" / "models_cache.json"
     cache.parent.mkdir()
     cache.write_text(json.dumps({"models": [{"slug": MODEL_GPT_6_ASTRA, "visibility": "list"}]}), encoding="utf-8")
-    reported = {
-        "appserver": (MODEL_GPT_6_ASTRA,),
-        "cache": (),
-        "unavailable": (MODEL_GPT_5_6_SOL,),
-    }[source]
     monkeypatch.setattr("supervisor.config_editor._available_models_from_app_server", lambda project_root: reported)
 
     choices = available_model_choices(tmp_path)
 
-    assert (MODEL_GPT_6_ASTRA in choices) is (source != "unavailable")
+    assert choices == reported
     options = next(parameter.options for parameter in parameter_defs(ProjectConfig(), choices) if parameter.key == "coder_mod")
-    assert ("GPT-6 Astra" in [option.label for option in options]) is (source != "unavailable")
+    assert tuple(option.value for option in options) == reported
     selected = ProjectConfig(coder_mod=MODEL_GPT_6_ASTRA)
-    selected_options = next(parameter.options for parameter in parameter_defs(selected, choices) if parameter.key == "coder_mod")
-    assert "GPT-6 Astra" in [option.label for option in selected_options]
+    saved = selected.to_json_data()
+    selected_parameter = next(parameter for parameter in parameter_defs(selected, choices) if parameter.key == "coder_mod")
+    assert tuple(option.value for option in selected_parameter.options) == reported
+    expected_value = "GPT-6 Astra" if MODEL_GPT_6_ASTRA in reported else "GPT-6 Astra (unavailable)"
+    assert selected_parameter.value == expected_value
+    assert selected.to_json_data() == saved
 
 
 def test_editor_renders_astra_family_and_six_efforts() -> None:

@@ -17,7 +17,6 @@ from wcwidth import wcwidth
 
 from supervisor.runtime.client import RuntimeClient
 from supervisor.project_config import (
-    DEFAULT_MODEL,
     GPT_5_6_MODELS,
     MODEL_GPT_5_5,
     MODEL_GPT_5_6_LUNA,
@@ -751,6 +750,22 @@ def _multi_agent_parameters(
         return (toggle,)
 
     allowed_models = tuple(model for model in models if settings.allowed.get(model))
+    unavailable_models = tuple(model for model in settings.allowed if model not in models)
+    unavailable_parameters = ()
+    if unavailable_models:
+        connected_allowed = {model: efforts for model, efforts in settings.allowed.items() if model in models}
+        unavailable_parameters = (EditorParameter(
+            f"{field_prefix}_unavailable_profiles",
+            f"{label_prefix}subagent-unavailable",
+            str(len(unavailable_models)),
+            (EditorOption("remove unavailable profiles", config_field, replace(settings, allowed=connected_allowed)),)
+            if settings.default.model in connected_allowed else (),
+            help_text=(
+                "Saved subagent profiles are unavailable: " + ", ".join(unavailable_models) + ". "
+                "Choose a connected default before removing them, or reconnect their provider. "
+                "Nothing is removed automatically."
+            ),
+        ),)
     default_model_parameters = _model_parameters(
         default_role,
         f"{field_prefix}_default_model",
@@ -801,6 +816,7 @@ def _multi_agent_parameters(
         ),
         *default_model_parameters,
         default_intelligence,
+        *unavailable_parameters,
         *allowed_parameters,
     )
 
@@ -838,28 +854,33 @@ def _model_parameters(
     available_models: tuple[str, ...],
 ) -> tuple[EditorParameter, ...]:
     available = set(available_models)
-    available_56 = [model for model in GPT_5_6_MODELS if model in available or model == selected_model]
+    available_56 = [model for model in GPT_5_6_MODELS if model in available]
     family_options: list[EditorOption] = []
-    if MODEL_GPT_6_ASTRA in available or selected_model == MODEL_GPT_6_ASTRA:
+    if MODEL_GPT_6_ASTRA in available:
         family_options.append(EditorOption(MODEL_FAMILY_ASTRA_LABEL, field, MODEL_GPT_6_ASTRA))
     if available_56:
-        selected_56 = selected_model if selected_model in GPT_5_6_MODELS else available_56[0]
+        selected_56 = selected_model if selected_model in available_56 else available_56[0]
         family_options.append(EditorOption(MODEL_FAMILY_5_6_LABEL, field, selected_56))
-    if MODEL_GPT_5_5 in available or selected_model == MODEL_GPT_5_5:
+    if MODEL_GPT_5_5 in available:
         family_options.append(EditorOption(MODEL_FAMILY_5_5_LABEL, field, MODEL_GPT_5_5))
-    for model in sorted((available | {selected_model}) - set(SUPPORTED_MODEL_CHOICES)):
+    for model in sorted(available - set(SUPPORTED_MODEL_CHOICES)):
         family_options.append(EditorOption(model, field, model))
 
     parameters = [
         EditorParameter(
             field,
             f"{role}-mod",
-            _model_family_label(selected_model),
+            _model_family_label(selected_model) + (" (unavailable)" if selected_model not in available else ""),
             tuple(family_options),
-            help_text=f"Model family for the {ROLE_PURPOSES[role]}.",
+            help_text=(
+                f"Models from connected providers for the {ROLE_PURPOSES[role]}. "
+                "Saved selections are not changed automatically."
+                + (" Connect a provider with bello runtime login <provider>, then reopen this editor."
+                   if not available else "")
+            ),
         )
     ]
-    if selected_model in GPT_5_6_MODELS:
+    if selected_model in GPT_5_6_MODELS and available_56:
         parameters.append(
             EditorParameter(
                 f"{field}_variant",
@@ -868,7 +889,7 @@ def _model_parameters(
                 tuple(
                     EditorOption(MODEL_VARIANT_LABELS[model], field, model)
                     for model in GPT_5_6_MODELS
-                    if model in available or model == selected_model
+                    if model in available
                 ),
                 help_text=f"GPT-5.6 variant for the {ROLE_PURPOSES[role]}: Sol, Terra, or Luna.",
             )
@@ -893,7 +914,7 @@ def move_down(state: EditorState, parameters: tuple[EditorParameter, ...]) -> Ed
         option_count = len(parameters[state.parameter_index].options)
         if state.option_index is None and option_count:
             return replace(state, option_index=0)
-        if state.option_index + 1 < option_count:
+        if state.option_index is not None and state.option_index + 1 < option_count:
             return replace(state, option_index=state.option_index + 1)
     next_index = min(state.parameter_index + 1, len(parameters) - 1)
     return EditorState(parameter_index=next_index)
@@ -924,6 +945,8 @@ def select_current(
         return updated, _advance_after_parameter_change(state, parameters, updated, model_choices), None
     if parameter.edit_kind is not None and state.option_index is None:
         return config, _start_inline_edit(config, state, parameter), None
+    if not parameter.options:
+        return config, state, None
     if state.expanded_index != state.parameter_index:
         return config, replace(state, expanded_index=state.parameter_index, option_index=None), None
     if state.option_index is None:
@@ -1511,10 +1534,13 @@ class SidePanel:
             _side_text("TIPS", theme, style_key="panel_title"),
             *tip_lines,
         ]
+        unavailable = any(parameter.value.endswith(" (unavailable)")
+                          or parameter.key.endswith("_unavailable_profiles") for parameter in parameters)
         status: list[FragmentLine] = [
             _side_text("STATUS", theme, style_key="panel_title"),
-            _side_text(f"{symbols.selected} Ready", theme, style_key="green"),
-            _side_text("  Config valid", theme, style_key="muted"),
+            _side_text("  Check model access" if unavailable else f"{symbols.selected} Ready", theme,
+                       style_key="red" if unavailable else "green"),
+            _side_text("  Saved model unavailable" if unavailable else "  Config valid", theme, style_key="muted"),
         ]
         if height < 12:
             content = tips
@@ -2418,12 +2444,16 @@ def _save_config_change(project_root: Path, previous_config: ProjectConfig, conf
 def available_model_choices(project_root: Path) -> tuple[str, ...]:
     _model_effort_catalog.clear()
     models = _available_models_from_app_server(project_root)
-    if not models:
-        models = _available_models_from_cache()
+    # A disk cache or an old saved choice does not establish that its provider
+    # is still connected. Only offer the current execution engines' catalog.
     return _normalize_model_choices(models)
 
 
 def _model_choices_for_config(config: ProjectConfig, model_choices: tuple[str, ...] | None) -> tuple[str, ...]:
+    if model_choices is not None:
+        return _normalize_model_choices(model_choices)
+    # Offline previews may omit discovery; the interactive editor always passes
+    # an explicit tuple, including an empty one when no provider is connected.
     multi_agent_settings = tuple(getattr(config, field) for field in MULTI_AGENT_CONFIG_FIELDS)
     return _normalize_model_choices(
         [
@@ -2460,7 +2490,6 @@ def _normalize_model_choices(models: Any) -> tuple[str, ...]:
         except ModelSelectionError:
             continue
         available.add(candidate)
-    available.update({DEFAULT_MODEL, MODEL_GPT_5_5})
     return (*tuple(model for model in SUPPORTED_MODEL_CHOICES if model in available),
             *sorted(available - set(SUPPORTED_MODEL_CHOICES)))
 
@@ -2515,7 +2544,8 @@ def _available_models_from_app_server(project_root: Path) -> tuple[str, ...]:
 def _extract_model_ids(value: Any) -> set[str]:
     ids: set[str] = set()
     if isinstance(value, dict):
-        if value.get("hidden") is True:
+        if (value.get("hidden") is True or value.get("visibility") == "hidden"
+                or value.get("configured") is False or value.get("available") is False):
             return ids
         qualified = value.get("qualifiedId")
         keys = ("qualifiedId",) if isinstance(qualified, str) and qualified else ("id", "model", "slug")

@@ -186,7 +186,7 @@ platform limitations remain visible until resolved.
   Claude Code use `ToolHost`; native Codex retains its own tools and approvals.
 - Pi 0.85.1 is pinned with its npm lockfile. Its SDK worker has real offline
   bootstrap coverage and structured-schema tests using Bello's actual schemas.
-- The optional official Claude Agent SDK is pinned at 0.2.152. Its adapter has
+- The optional official Claude Agent SDK is pinned at 0.2.159. Its adapter has
   isolated SDK control/auth/schema tests. No subscription tokens are copied.
 - Historical local checkpoint: 1506 pytest tests and six Pi SDK integration tests
   passed. All seven general CI jobs passed at `a99d556`.
