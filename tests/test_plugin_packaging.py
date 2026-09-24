@@ -306,6 +306,36 @@ def test_launcher_unlinked_inode_retry_stays_bounded_and_rejects_unsafe_replacem
     assert calls == expected_calls
 
 
+@pytest.mark.parametrize("previous_status", [None, "running"])
+def test_launcher_reads_only_published_supervisor_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    previous_status: str | None,
+) -> None:
+    from supervisor import state
+
+    launcher = _load_launcher()
+    store = state.StateStore(tmp_path)
+    if previous_status is not None:
+        store.write_json_locked(state.CONFIG, {"status": previous_status})
+    expected_before = {} if previous_status is None else {"status": previous_status}
+    original_replace = state._atomic_replace
+
+    def observe_before_publication(source: str, destination: Path) -> None:
+        assert Path(source) != destination
+        assert json.loads(Path(source).read_text(encoding="utf-8")) == {"status": "complete"}
+        assert launcher._supervisor_summary(tmp_path) == expected_before
+        original_replace(source, destination)
+
+    publish = Mock(side_effect=observe_before_publication)
+    monkeypatch.setattr(state, "_atomic_replace", publish)
+
+    store.write_json_locked(state.CONFIG, {"status": "complete"})
+
+    publish.assert_called_once()
+    assert launcher._supervisor_summary(tmp_path) == {"status": "complete"}
+
+
 @pytest.mark.skipif(os.name == "nt", reason="the test fixture uses a POSIX shebang")
 def test_start_runs_pipx_bello_symlink_in_background_and_reports_durable_result(
     tmp_path: Path,
@@ -324,7 +354,10 @@ def test_start_runs_pipx_bello_symlink_in_background_and_reports_durable_result(
         "from pathlib import Path\n"
         "state = Path.cwd() / '.supervisor'\n"
         "state.mkdir()\n"
-        "(state / 'config.json').write_text(json.dumps({'status': 'complete'}))\n"
+        # Match StateStore's atomic publication while the launcher polls status.
+        "config_tmp = state / '.config.json.tmp'\n"
+        "config_tmp.write_text(json.dumps({'status': 'complete'}), encoding='utf-8')\n"
+        "config_tmp.replace(state / 'config.json')\n"
         "(state / 'FINAL_REPORT.md').write_text('# Final Report\\n\\n- Status: complete\\n')\n"
         "print('fake Bello completed')\n",
         encoding="utf-8",
