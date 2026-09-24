@@ -1,4 +1,4 @@
-"""CI-only ACL diagnostics must expose a mismatch without weakening comparison."""
+"""CI ACL comparisons accept only documented DACL-defaulted normalization."""
 from __future__ import annotations
 
 import json
@@ -33,12 +33,39 @@ def test_acl_mismatch_diagnostics_preserve_strict_checks_and_are_uploaded():
 
 
 @pytest.mark.skipif(PWSH is None, reason="PowerShell is required to execute the CI assertion functions")
-@pytest.mark.parametrize("field", ["identical", "control", "owner", "group", "revision", "aces"])
-def test_real_powershell_acl_comparison_reports_without_changing_input(tmp_path: Path, field: str):
+@pytest.mark.parametrize(
+    ("expected_control", "actual_control", "mutation", "mismatch"),
+    [
+        pytest.param(0x8004, 0x8004, "none", None, id="identical"),
+        pytest.param(0x800E, 0x800E, "none", None, id="identical-defaulted"),
+        pytest.param(0x8004, 0x8404, "none", "control", id="inheritance-flag-changed"),
+        pytest.param(0x8004, 0x8004, "owner", "owner", id="owner-changed"),
+        pytest.param(0x8004, 0x8004, "group", "group", id="group-changed"),
+        pytest.param(0x8004, 0x8004, "revision", "revision", id="revision-changed"),
+        pytest.param(0x8004, 0x8004, "aces", "aces", id="ace-bytes-changed"),
+        pytest.param(0x800E, 0x8006, "none", None, id="defaulted-cleared"),
+        pytest.param(0x940E, 0x9406, "none", None, id="defaulted-cleared-other-flags-preserved"),
+        pytest.param(0x800E, 0x8006, "owner", "owner", id="defaulted-cleared-owner-changed"),
+        pytest.param(0x800E, 0x8006, "group", "group", id="defaulted-cleared-group-changed"),
+        pytest.param(0x800E, 0x8006, "revision", "revision", id="defaulted-cleared-revision-changed"),
+        pytest.param(0x800E, 0x8006, "aces", "aces", id="defaulted-cleared-ace-bytes-changed"),
+        pytest.param(0x800E, 0x8006, "ace_order", "aces", id="defaulted-cleared-ace-order-changed"),
+        pytest.param(0x8006, 0x800E, "none", "control", id="defaulted-set"),
+        pytest.param(0x800A, 0x8002, "none", "control", id="defaulted-cleared-dacl-absent"),
+        pytest.param(0x800E, 0x8002, "none", "control", id="defaulted-cleared-dacl-removed"),
+        pytest.param(0x800A, 0x8006, "none", "control", id="defaulted-cleared-dacl-added"),
+        pytest.param(0x800E, 0x8406, "none", "control", id="defaulted-cleared-other-flag-added"),
+        pytest.param(0x940E, 0x8406, "none", "control", id="defaulted-cleared-protection-removed"),
+        pytest.param(0x800E, 0x8004, "none", "control", id="defaulted-cleared-group-defaulted-removed"),
+    ],
+)
+def test_real_powershell_acl_comparison_reports_without_changing_input(
+    tmp_path: Path, expected_control: int, actual_control: int, mutation: str, mismatch: str | None,
+):
     # Load only these pure assertion/diagnostic functions from the script's AST.
     # Do not execute its host-prepare, host-remove or Get-Acl body.
     probe = r'''
-param([string]$Source, [string]$Output, [string]$Field)
+param([string]$Source, [string]$Output, [string]$Mutation, [int]$ExpectedControl, [int]$ActualControl)
 $ErrorActionPreference = "Stop"
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($Source, [ref]$tokens, [ref]$errors)
@@ -52,14 +79,18 @@ foreach ($name in @("Describe-ControlFlags", "Write-AclMismatch", "Assert-AclEqu
     . ([scriptblock]::Create($definition[0].Extent.Text))
 }
 $Report = $Output; $Phase = "Prepare"; $selectedDrive = "D:"
-$expected = @{ owner = "owner"; group = "group"; control = 0x8004; revision = 2; aces = @(@{ binary = "AA==" }) }
+$expected = @{
+    owner = "owner"; group = "group"; control = $ExpectedControl; revision = 2
+    aces = @(@{ binary = "AA==" }, @{ binary = "AQ==" })
+}
 $actual = $expected | ConvertTo-Json -Depth 8 | ConvertFrom-Json -AsHashtable
-switch ($Field) {
-    "control" { $actual.control = 0x8404 }
+$actual.control = $ActualControl
+switch ($Mutation) {
     "owner" { $actual.owner = "changed-owner" }
     "group" { $actual.group = "changed-group" }
     "revision" { $actual.revision = 4 }
-    "aces" { $actual.aces = @(@{ binary = "AQ==" }) }
+    "aces" { $actual.aces[0].binary = "Ag==" }
+    "ace_order" { $actual.aces = @($actual.aces[1], $actual.aces[0]) }
 }
 $expectedBefore = $expected | ConvertTo-Json -Depth 8 -Compress
 $actualBefore = $actual | ConvertTo-Json -Depth 8 -Compress
@@ -77,25 +108,27 @@ catch { $message = $_.Exception.Message }
     report = tmp_path / "report.json"
     result = subprocess.run(
         [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe_path),
-         str(SCRIPT), str(report), field],
+         str(SCRIPT), str(report), mutation, str(expected_control), str(actual_control)],
         capture_output=True, text=True, timeout=30, check=True,
     )
     observed = json.loads(result.stdout)
     assert observed["expectedUnchanged"] and observed["actualUnchanged"]
     diagnostic_path = Path(str(report) + ".mismatch.json")
-    if field == "identical":
+    if mismatch is None:
         assert observed["message"] is None
         assert not diagnostic_path.exists()
         return
     assert "host setup changed unrelated" in observed["message"]
     assert "target=D:\\" in observed["message"]
     diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8-sig"))
-    assert diagnostic["field"] == field
-    assert diagnostic["expected"]["control"] == 0x8004
-    assert diagnostic["expectedControl"]["hex"] == "0x8004"
+    assert diagnostic["field"] == mismatch
+    assert diagnostic["expected"]["control"] == expected_control
+    assert diagnostic["actual"]["control"] == actual_control
+    assert diagnostic["expectedControl"]["hex"] == f"0x{expected_control:04X}"
+    assert diagnostic["actualControl"]["hex"] == f"0x{actual_control:04X}"
+    assert diagnostic["changedControl"]["value"] == expected_control ^ actual_control
     assert diagnostic["target"] == "D:\\"
-    if field == "control":
-        assert diagnostic["actualControl"]["hex"] == "0x8404"
+    if expected_control == 0x8004 and actual_control == 0x8404:
         assert diagnostic["changedControl"]["hex"] == "0x0400"
         assert "DiscretionaryAclAutoInherited" in diagnostic["changedControl"]["flags"]
         assert "0x8004" in observed["message"] and "0x8404" in observed["message"]
