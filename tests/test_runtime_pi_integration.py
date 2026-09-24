@@ -142,7 +142,11 @@ def _response_chunks(flow: str, step: int, delta: dict[str, Any], finish_reason:
 
 
 class _LocalProviderState:
-    MAX_COMMAND_POLLS = 6
+    # Windows' deadline includes native sandbox setup and cleanup for both
+    # concurrent flows. This is a fixture budget, not a runtime default.
+    COMMAND_TIMEOUT_SECONDS = 50 if os.name == "nt" else 10
+    # Keep bounded five-second polling alive beyond that execution deadline.
+    MAX_COMMAND_POLLS = max(6, COMMAND_TIMEOUT_SECONDS // 5 + 2)
 
     def __init__(self, output_schema: dict[str, Any], final_mode: str, distiller_enabled: bool = False):
         self.output_schema = output_schema
@@ -209,7 +213,9 @@ class _LocalProviderState:
                 if os.name == "nt"
                 else f'test "$(cat {filename})" = "payload-{flow}" && printf "synthetic-%s-%s\\n" noise {flow} && printf "exec-{flow}-ok"'
             )
-            return _tool_chunk(flow, step, "exec_command", {"command": command, "timeout": 10, **focus})
+            return _tool_chunk(flow, step, "exec_command", {
+                "command": command, "timeout": self.COMMAND_TIMEOUT_SECONDS, **focus,
+            })
         polls = self.poll_calls[flow]
         if step == 3 + len(polls):
             result_call = polls[-1] if polls else f"call-{flow.lower()}-exec_command"
@@ -265,6 +271,20 @@ def _polling_fixture_body(state: _LocalProviderState, call_id: str, packet: dict
 
 def _fixture_response_delta(response: bytes) -> dict[str, Any]:
     return json.loads(response.split(b"\n\n", 1)[0].removeprefix(b"data: "))["choices"][0]["delta"]
+
+
+def test_local_provider_command_budget_covers_windows_sandbox_lifecycle() -> None:
+    state = _LocalProviderState({}, "text")
+    state.steps["A"] = 2
+    body = _polling_fixture_body(state, "call-a-read_file", {"text": "payload-A"})
+    delta = _fixture_response_delta(state.response(body, f"Bearer {_DUMMY_KEY}"))
+    call = delta["tool_calls"][0]
+    assert call["function"]["name"] == "exec_command"
+    arguments = json.loads(call["function"]["arguments"])
+    expected_timeout = 50 if os.name == "nt" else 10
+    assert arguments["timeout"] == state.COMMAND_TIMEOUT_SECONDS == expected_timeout
+    assert state.MAX_COMMAND_POLLS == (12 if os.name == "nt" else 6)
+    assert state.MAX_COMMAND_POLLS * 5 >= expected_timeout + 10
 
 
 @pytest.mark.parametrize("final_mode", ["submit_result", "text"])
