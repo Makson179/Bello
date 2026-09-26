@@ -141,6 +141,31 @@ def test_all_expensive_native_preparation_and_snapshot_steps_require_cache_miss(
     assert exercised == {"upstream", "rust", "msvc", "compile", "source", "v8", "snapshot", "paths"}
 
 
+def test_native_test_runner_preflight_precedes_compile_and_persists_private_cargo_bin(workflows):
+    _, _, _, build = workflows
+    steps = _steps(build)
+    install = next(step for step in steps if _action(step) == 'taiki-e/install-action')
+    assert _field(_block(install, 'with'), 'tool') == 'just@1.51.0,nextest@0.9.103'
+    preflight = next(step for step in steps if '$justVersion = just --version' in (_field(step, 'run') or ''))
+    command = _field(preflight, 'run') or ''
+    assert _miss_required(install) and _miss_required(preflight)
+    assert _field(preflight, 'continue-on-error') is None
+    assert "$cargoBin = Join-Path $env:CARGO_HOME 'bin'" in command
+    assert '$cargoBin >> $env:GITHUB_PATH' in command
+    assert '$env:PATH = "$cargoBin;$env:PATH"' in command
+    assert command.index('$env:PATH =') < command.index('$justVersion =')
+    assert "$LASTEXITCODE -ne 0 -or $justVersion -ne 'just 1.51.0'" in command
+    # nextest --version can return several lines; test the first line, not a
+    # PowerShell array comparison which also returns every nonmatching line.
+    assert '$nextestVersion = @(cargo nextest --version)' in command
+    assert r"$LASTEXITCODE -ne 0 -or $nextestVersion.Count -lt 1 -or $nextestVersion[0] -notmatch '^cargo-nextest 0\.9\.103(?:\s|$)'" in command
+    compile_step = next(step for step in steps if re.search(r'\bcargo\s+build\b', _field(step, 'run') or ''))
+    check = next(step for step in steps if 'just test ' in (_field(step, 'run') or ''))
+    test_command = _field(check, 'run') or ''
+    assert test_command.startswith('$env:PATH = "$(Join-Path $env:CARGO_HOME \'bin\');$env:PATH"')
+    assert steps.index(install) < steps.index(preflight) < steps.index(compile_step) < steps.index(check)
+
+
 def test_native_setup_regressions_gate_the_ready_candidate_without_retries(workflows):
     _, _, _, build = workflows
     steps = _steps(build)
