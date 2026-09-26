@@ -2683,7 +2683,7 @@ index d910460..280bea9 100644
  #[derive(Debug, PartialEq, Eq)]
 diff --git a/codex-rs/windows-sandbox-rs/src/setup_transaction.rs b/codex-rs/windows-sandbox-rs/src/setup_transaction.rs
 new file mode 100644
-index 0000000..8e5c8b3
+index 0000000..680aa10
 --- /dev/null
 +++ b/codex-rs/windows-sandbox-rs/src/setup_transaction.rs
 @@ -0,0 +1,226 @@
@@ -2881,7 +2881,7 @@ index 0000000..8e5c8b3
 +        let mut nonce = [0u8; 16];
 +        let status = unsafe {
 +            BCryptGenRandom(
-+                /*halgorithm*/ 0,
++                /*halgorithm*/ null_mut(),
 +                nonce.as_mut_ptr(),
 +                nonce.len() as u32,
 +                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
