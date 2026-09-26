@@ -197,6 +197,27 @@ def test_native_setup_regressions_gate_the_ready_candidate_without_retries(workf
     assert "always()" in (_field(receipts, "if") or "")
 
 
+def test_native_test_harness_budget_and_fresh_workspace_junit_receipts(workflows):
+    _, _, _, build = workflows
+    assert _field(build, "timeout-minutes") == "240"
+    check = next(step for step in _steps(build) if "just test " in (_field(step, "run") or ""))
+    assert _field(check, "working-directory") == "native-source/codex-rs"
+    command = _field(check, "run") or ""
+    assert "$junit = Join-Path (Get-Location).Path 'target/nextest/local/junit.xml'" in command
+    assert "Join-Path $env:CARGO_TARGET_DIR 'nextest/" not in command
+    setup, doctor = command.split("just test ")[1:]
+    before_setup = command.split("just test ")[0]
+    clear = "Remove-Item -LiteralPath $junit -ErrorAction Stop"
+    assert clear in before_setup and clear in setup
+    assert clear not in doctor
+    for result, name, label in ((setup, "setup-transactions.xml", "Setup transaction"),
+                                (doctor, "doctor-report-compatibility.xml", "Doctor report compatibility")):
+        assert f"Copy-Item -LiteralPath $junit -Destination (Join-Path $reports '{name}') -ErrorAction Stop" in result
+        assert f"if (-not (Test-Path -LiteralPath $junit -PathType Leaf)) {{ throw '{label} regressions did not produce JUnit' }}" in result
+        assert result.index("Copy-Item") < result.index("regressions failed:") < result.index("regressions did not produce JUnit")
+    assert setup.index("regressions did not produce JUnit") < setup.index(clear)
+
+
 def test_failed_compile_cache_is_reusable_intermediates_not_a_ready_candidate(workflows):
     _, _, _, build = workflows
     steps = _steps(build)

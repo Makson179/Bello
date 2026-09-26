@@ -13,7 +13,8 @@ permissions:
 jobs:
   build:
     runs-on: windows-2025
-    timeout-minutes: 120
+    # Release executables and scoped test harnesses have separate compile costs.
+    timeout-minutes: 240
     outputs:
       artifact-name: ${{ steps.identity.outputs.artifact-name }}
     defaults:
@@ -138,15 +139,20 @@ jobs:
           $env:PATH = "$(Join-Path $env:CARGO_HOME 'bin');$env:PATH"
           $reports = Join-Path $env:GITHUB_WORKSPACE 'native-setup-test-reports'
           New-Item -ItemType Directory -Path $reports -Force | Out-Null
+          # Nextest 0.9.103 stores reports relative to its workspace, not CARGO_TARGET_DIR.
+          $junit = Join-Path (Get-Location).Path 'target/nextest/local/junit.xml'
+          if (Test-Path -LiteralPath $junit) { Remove-Item -LiteralPath $junit -ErrorAction Stop }
           just test --locked --release --target x86_64-pc-windows-msvc -p codex-windows-sandbox --lib --bin codex-windows-sandbox-setup --test-threads 1 --retries 0 -E 'test(setup_transaction::tests::) | test(report_helper_failure_) | test(setup_version_rejects_) | test(setup_payload_requires_) | test(detached_read_acl_payload_) | test(setup_launch::tests::) | test(win::acl_tests::)'
           $setupExit = $LASTEXITCODE
-          $junit = Join-Path $env:CARGO_TARGET_DIR 'nextest/local/junit.xml'
-          if (Test-Path $junit) { Copy-Item $junit (Join-Path $reports 'setup-transactions.xml') }
+          if (Test-Path -LiteralPath $junit -PathType Leaf) { Copy-Item -LiteralPath $junit -Destination (Join-Path $reports 'setup-transactions.xml') -ErrorAction Stop }
           if ($setupExit -ne 0) { throw "Setup transaction regressions failed: $setupExit" }
+          if (-not (Test-Path -LiteralPath $junit -PathType Leaf)) { throw 'Setup transaction regressions did not produce JUnit' }
+          Remove-Item -LiteralPath $junit -ErrorAction Stop
           just test --locked --release --target x86_64-pc-windows-msvc -p codex-cli --bin codex --test-threads 1 --retries 0 -E 'test(reports_refresh_failure_after_setup_completed) | test(rejects_oversized_setup_failure_reports) | test(reports_setup_transaction_lock_failure_without_reset)'
           $doctorExit = $LASTEXITCODE
-          if (Test-Path $junit) { Copy-Item $junit (Join-Path $reports 'doctor-report-compatibility.xml') }
+          if (Test-Path -LiteralPath $junit -PathType Leaf) { Copy-Item -LiteralPath $junit -Destination (Join-Path $reports 'doctor-report-compatibility.xml') -ErrorAction Stop }
           if ($doctorExit -ne 0) { throw "Doctor report compatibility regressions failed: $doctorExit" }
+          if (-not (Test-Path -LiteralPath $junit -PathType Leaf)) { throw 'Doctor report compatibility regressions did not produce JUnit' }
       - name: Preserve native setup regression receipts
         if: always() && steps.candidate.outputs.cache-hit != 'true'
         uses: actions/upload-artifact@v4
