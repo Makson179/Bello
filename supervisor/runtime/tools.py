@@ -36,7 +36,8 @@ TOOL_DEFINITIONS = json.loads(Path(__file__).with_name("tools.json").read_text(e
 _TEXT_TOOLS = frozenset({"exec_command", "poll_command", "stop_command", "read_file", "search", "list_directory", "write_file", "edit_file"})
 
 
-def tool_definitions(*, distiller: bool = False, runtime_enabled: bool = True) -> list[dict[str, Any]]:
+def tool_definitions(*, distiller: bool = False, runtime_enabled: bool = True,
+                     async_tools: bool = False) -> list[dict[str, Any]]:
     definitions = deepcopy(TOOL_DEFINITIONS)
     for entry in definitions:
         if distiller and entry["name"] in _TEXT_TOOLS:
@@ -51,6 +52,21 @@ def tool_definitions(*, distiller: bool = False, runtime_enabled: bool = True) -
                 "timeout is the execution deadline in seconds (default 120); yield_time_ms controls the initial wait "
                 "(default 10000). Install dependencies in the writable project or temporary directory. "
                 "Outside-sandbox execution is unavailable in this run. No interactive stdin or PTY."
+            )
+        if async_tools and entry["name"] == "exec_command":
+            entry["description"] = (
+                "Execute a shell command in the assigned isolated workspace. Necessary independent calls "
+                "may run concurrently. The final bounded output is delivered automatically; do not poll. "
+                "Use finite commands: for a server check, start, probe, and shut down within the command. "
+                "timeout is the execution deadline in seconds (default 120); yield_time_ms is ignored in this mode. "
+                "No interactive stdin or PTY. "
+                + ("Explicit outside-sandbox requests require approval." if runtime_enabled else
+                   "Network access is enabled; outside-sandbox execution is unavailable.")
+            )
+        if async_tools and entry["name"] == "wait_agent":
+            entry["description"] = (
+                "Wait for a child result when needed. Waiting is managed by the host, not repeated model polls; "
+                "timeout is ignored in async-tools mode. Previously delivered messages are not repeated."
             )
     return definitions
 
@@ -78,6 +94,7 @@ class ToolScope:
     network_access: bool = False
     distiller_enabled: bool = False
     runtime_enabled: bool = True
+    async_tools: bool = False
     task_path: Path | None = None
     temp_root: Path | None = None
 
@@ -102,8 +119,11 @@ class ToolHost:
         self.runner_factory = runner_factory
         self.distill = distill
         self._active: dict[tuple[str, str], asyncio.Task] = {}
+        self._active_turns: dict[tuple[str, str], str] = {}
         self._session_commands: dict[tuple[str, str, str], dict[str, Any]] = {}
         self.sessions = CommandSessionManager(journal.directory / "commands")
+        self._command_slots = asyncio.Semaphore(self.sessions.max_active)
+        self._turn_command_slots: dict[tuple[str, str], asyncio.Semaphore] = {}
 
     async def call(self, request: dict[str, Any]) -> dict[str, Any]:
         identifiers = [request.get(key) for key in ("threadId", "turnId", "callId", "name")]
@@ -124,6 +144,7 @@ class ToolHost:
         task = asyncio.current_task()
         assert task is not None
         self._active[(thread_id, call_id)] = task
+        self._active_turns[(thread_id, call_id)] = turn_id
         try:
             execution_arguments = {k: v for k, v in arguments.items() if k != "focus"}
             if name in _CHILD_TOOLS:
@@ -134,6 +155,14 @@ class ToolHost:
                 snapshot = await operation(thread_id=thread_id, turn_id=turn_id, **session_args)
                 result = self._command_packet(snapshot, stop_requested=name == "stop_command",
                                               max_output_tokens=arguments.get("max_output_tokens"))
+            elif name == "exec_command" and scope.async_tools:
+                # Queue excess work in the host instead of spending an LLM turn
+                # on a session-limit error. OFF keeps its original semantics.
+                slots = self._turn_command_slots.setdefault(
+                    (thread_id, turn_id), asyncio.Semaphore(self.sessions.max_active_per_turn))
+                async with slots, self._command_slots:
+                    self.scope_for(thread_id, turn_id)
+                    result = await self._execute(name, execution_arguments, scope, thread_id, turn_id, call_id)
             else:
                 result = await self._execute(name, execution_arguments, scope, thread_id, turn_id, call_id)
             session_id = result.get("details", {}).get("sessionId")
@@ -160,6 +189,7 @@ class ToolHost:
             return result
         finally:
             self._active.pop((thread_id, call_id), None)
+            self._active_turns.pop((thread_id, call_id), None)
 
     async def cancel_turn(self, thread_id: str) -> None:
         current = asyncio.current_task()
@@ -168,10 +198,20 @@ class ToolHost:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await self.sessions.cancel_thread(thread_id)
+        self._turn_command_slots = {key: slots for key, slots in self._turn_command_slots.items() if key[0] != thread_id}
         self._session_commands = {key: command for key, command in self._session_commands.items() if key[0] != thread_id}
 
     async def finish_turn(self, thread_id: str, turn_id: str) -> None:
+        # Include calls queued on an async slot, not just already-spawned
+        # sessions. Never touch calls belonging to a later turn on this thread.
+        current = asyncio.current_task()
+        tasks = [task for key, task in self._active.items()
+                 if key[0] == thread_id and self._active_turns.get(key) == turn_id and task is not current]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await self.sessions.cancel_turn(thread_id, turn_id)
+        self._turn_command_slots.pop((thread_id, turn_id), None)
         self._session_commands = {key: command for key, command in self._session_commands.items() if key[:2] != (thread_id, turn_id)}
 
     async def close(self) -> None:
@@ -320,7 +360,8 @@ class ToolHost:
 
                 snapshot = await self.sessions.start(thread_id=thread_id, turn_id=turn_id, call_id=call_id,
                     runner=runner, command=command, cwd=cwd, timeout=args.get("timeout", 120),
-                    yield_time_ms=args.get("yield_time_ms", 10_000), on_output=output_delta, on_finished=finished)
+                    yield_time_ms=args.get("yield_time_ms", 10_000), on_output=output_delta, on_finished=finished,
+                    wait_for_completion=scope.async_tools)
                 yielded = True
                 return self._command_packet(snapshot, max_output_tokens=args.get("max_output_tokens"))
 

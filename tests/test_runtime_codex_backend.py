@@ -41,6 +41,7 @@ class FakeNative:
         self.gate = None
         self.actual_effort = None
         self.active_profile = {"id": "bello-native", "extends": None}
+        self.async_tools_supported = False
 
     async def start(self):
         self.started = True
@@ -65,6 +66,8 @@ class FakeNative:
             return {"account": deepcopy(self.account)}
         if method == "model/list":
             return {"data": deepcopy(self.models), "nextCursor": None}
+        if method == "experimentalFeature/list":
+            return {"data": [{"name": "bello_async_tools"}] if self.async_tools_supported else [], "nextCursor": None}
         if method == "thread/start":
             self.next_thread += 1
             native = "native-thread-" + str(self.next_thread)
@@ -126,6 +129,55 @@ async def drain(backend):
     await backend._queue.join()
     for _ in range(3):
         await asyncio.sleep(0)
+
+
+async def test_async_tools_rejects_stock_native_before_creating_thread(tmp_path):
+    backend, _, clients = make_backend(tmp_path)
+    try:
+        with pytest.raises(AppServerError, match="requires a native Codex build"):
+            await backend.request("thread/start", thread_params(tmp_path, asyncTools=True))
+        assert not any(method == "thread/start" for method, _ in clients[0].calls)
+        assert clients[0].options["command"][1] == "app-server"
+    finally:
+        await backend.stop()
+
+
+async def test_async_tools_native_scoped_and_persisted_through_resume(tmp_path):
+    backend, _, clients = make_backend(tmp_path)
+    try:
+        await backend.request("initialize")
+        clients[0].async_tools_supported = True
+        await backend.request("thread/start", thread_params(tmp_path, asyncTools=True))
+        await backend.request("thread/start", thread_params(tmp_path, host="off", asyncTools=False))
+        native = [params for method, params in clients[0].calls if method == "thread/start"]
+        assert [params["config"]["features.bello_async_tools"] for params in native] == [True, False]
+        assert all("asyncTools" not in params for params in native)
+        assert "tty=true" in native[0]["developerInstructions"]
+        assert "no-poll rule does not prohibit" in native[0]["developerInstructions"]
+        assert "tty=true" not in native[1].get("developerInstructions", "")
+        await backend.request("thread/resume", {"threadId": "host-thread"})
+        resumed = next(params for method, params in clients[0].calls if method == "thread/resume")
+        assert resumed["config"]["features.bello_async_tools"] is True
+        with pytest.raises(AppServerError, match="cannot change Async tools mode"):
+            await backend.request("thread/resume", {"threadId": "host-thread", "asyncTools": False})
+        with pytest.raises(AppServerError, match="cannot change Async tools mode"):
+            await backend.request("turn/start", {"threadId": "host-thread", "turnId": "flip", "input": "test", "asyncTools": False})
+    finally:
+        await backend.stop()
+
+
+async def test_async_off_overrides_untrusted_native_config_flag(tmp_path):
+    backend, _, clients = make_backend(tmp_path)
+    try:
+        await backend.request("thread/start", thread_params(tmp_path, config={
+            "features.bello_async_tools": True, "features": {"bello_async_tools": True},
+        }))
+        config = next(params["config"] for method, params in clients[0].calls if method == "thread/start")
+        assert "features.bello_async_tools" not in config
+        assert "bello_async_tools" not in config["features"]
+        assert len([method for method, _ in clients[0].calls if method == "experimentalFeature/list"]) == 1
+    finally:
+        await backend.stop()
 
 
 async def test_native_prompt_tools_and_subscription_are_preserved(tmp_path):

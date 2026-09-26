@@ -470,6 +470,7 @@ class CheapRuntimeReviewer:
 
     def _thread_params(self) -> dict[str, Any]:
         return {
+            "belloRole": "runtime",
             "cwd": str(self.workspace),
             "runtimeWorkspaceRoots": [str(self.workspace)],
             "approvalPolicy": "never",

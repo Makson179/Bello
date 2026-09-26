@@ -12,6 +12,7 @@ on:
       - 'scripts/prepare_native_codex_windows.py'
       - 'scripts/build_native_codex_windows.py'
       - 'scripts/verify_native_codex_selection.py'
+      - 'scripts/verify_native_codex_async.py'
       - 'scripts/verify_native_codex_download.py'
       - 'supervisor/appserver.py'
       - 'supervisor/runtime/codex.py'
@@ -36,6 +37,52 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  smart-execution-regressions:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install offline test dependencies without installing models or credentials
+        id: dependencies
+        run: python -c "import pathlib, subprocess, sys, tomllib; project = tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']; subprocess.run([sys.executable, '-m', 'pip', 'install', *project['dependencies'], *project['optional-dependencies']['test']], check=True)"
+      - name: Run Smart Execution role and SDK lifecycle regressions
+        run: >-
+          python -m pytest -q --junitxml smart-execution-python.xml
+          tests/test_async_tools_policy.py tests/test_reviewer_async_roles.py
+          tests/test_runtime_claude_async.py tests/test_runtime_client.py
+          tests/test_runtime_claude.py tests/test_runtime_codex_backend.py
+          tests/test_runtime_command_sessions.py tests/test_supervisor_agent.py
+          tests/test_completion_context.py tests/test_verify_native_codex_async.py
+      - name: Install exact Pi SDK for offline scripted-provider tests
+        if: always() && steps.dependencies.outcome == 'success'
+        id: pi_dependencies
+        working-directory: supervisor/pi_worker
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Run complete Pi offline suite
+        if: always() && steps.pi_dependencies.outcome == 'success'
+        working-directory: supervisor/pi_worker
+        run: node --test --test-reporter=junit --test-reporter-destination=../../smart-execution-pi.xml
+      - name: Save Windows role and lifecycle test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smart-execution-windows-regressions-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            smart-execution-python.xml
+            smart-execution-pi.xml
+          if-no-files-found: warn
+
   native-build:
     uses: ./.github/workflows/native-codex-windows-build.yml
 
@@ -65,6 +112,8 @@ jobs:
         run: python -m pytest -q tests/test_build_native_codex_windows.py tests/test_native_codex_windows_workflow.py tests/test_verify_native_codex_selection.py tests/test_native_codex_install.py tests/test_native_codex_download_transport.py tests/test_runtime_codex_distiller.py tests/test_runtime_codex_backend.py
       - name: Verify real native direct, code-mode and poll provider boundaries
         run: python scripts/verify_native_codex_selection.py --codex native-candidate/bin/codex.exe --output-dir native-proof
+      - name: Prove async ON/OFF, terminal delivery and append-only history without credentials
+        run: python scripts/verify_native_codex_async.py --codex native-candidate/bin/codex.exe --output-dir native-async-proof
       - name: Package only after all nine proof cases pass
         run: python scripts/build_native_codex_windows.py package-candidate --candidate native-candidate --proof native-proof/report.json --output native-artifact
       - name: Install local artifact into private cache and repeat all nine proof cases
@@ -82,6 +131,18 @@ jobs:
           $downloadRoot = Join-Path $env:LOCALAPPDATA "bello-https-proof-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           python scripts/verify_native_codex_download.py --runtime-root "$downloadRoot" --report native-https-installed.json
           exit $LASTEXITCODE
+      - name: Repeat Smart Execution proof on the freshly installed candidate
+        run: |
+          $receipt = Get-Content -LiteralPath native-artifact/installed-cache.json -Raw | ConvertFrom-Json
+          if (-not $receipt.passed -or -not $receipt.post_proof_cache_reusable) {
+            throw 'Candidate private-cache install proof has not passed'
+          }
+          $binary = [string]$receipt.binary
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw 'Installed candidate binary missing' }
+          $digest = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($digest -ne $receipt.binary_sha256) { throw 'Installed candidate binary changed' }
+          python scripts/verify_native_codex_async.py --codex "$binary" --output-dir native-installed-async-proof
+          exit $LASTEXITCODE
       - name: Upload verified unsigned bundle (no release publication)
         uses: actions/upload-artifact@v4
         with:
@@ -93,6 +154,7 @@ jobs:
             native-artifact/bundle/BUILD-INFO
             native-artifact/installed-cache.json
             native-installed-proof/report.json
+            native-installed-async-proof/report.json
             native-https-installed.json
           if-no-files-found: error
       - name: Upload synthetic diagnostics even on failure
@@ -101,6 +163,8 @@ jobs:
         with:
           name: native-codex-windows-proof-${{ github.sha }}-${{ github.run_attempt }}
           path: |
+            native-async-proof/**
+            native-installed-async-proof/**
             native-proof/report.json
             native-proof/*/result.json
             native-proof/*/provider-request-*.json

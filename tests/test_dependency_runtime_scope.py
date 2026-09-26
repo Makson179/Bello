@@ -310,7 +310,9 @@ async def test_retained_completion_review_uses_source_dependency_roots_without_p
         review = agent.completion_workspace_snapshot
         assert review is not None
         assert review.snapshot_root != snapshot.snapshot_root
-        roots = [str(review.snapshot_root), str(task), str(dependency)]
+        context_store = agent.completion_context_store
+        assert context_store is not None
+        roots = [str(review.snapshot_root), str(task), str(dependency), str(context_store.root)]
         for method, params in backend.calls:
             if method in {"thread/start", "turn/start"}:
                 assert params["runtimeWorkspaceRoots"] == roots
@@ -319,6 +321,10 @@ async def test_retained_completion_review_uses_source_dependency_roots_without_p
         thread = agent.completion_thread_id
         scope = client._scope_for(thread, client._threads[thread]["activeTurnId"])
         assert client._host._path(scope, str(review.snapshot_root / ".venv" / "public.txt")) == dependency / "public.txt"
+        evidence_task = next(context_store.root.glob("wake-*/TASK.md"))
+        assert client._host._path(scope, str(evidence_task)) == evidence_task
+        with pytest.raises(PermissionError, match="outside"):
+            client._host._path(scope, str(evidence_task), writing=True)
         for forbidden in (plan, snapshot.plan_path, private / "private.txt", project / "private-controller.txt"):
             with pytest.raises(PermissionError, match="outside"):
                 client._host._path(scope, str(forbidden))

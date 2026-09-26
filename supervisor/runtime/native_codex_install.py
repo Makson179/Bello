@@ -1,8 +1,8 @@
-"""Pinned, private native Codex helper for log selection, not a global CLI update.
+"""Pinned, private native Codex helpers without changing the global CLI.
 
-Only the native-Codex + distiller path calls this module. Downloads happen before
-starting app-server and outside its RPC deadlines. Explicit host overrides remain
-supported and go through the existing native capability validation.
+The native distiller and Smart Execution paths call this module. Downloads happen
+before starting app-server and outside its RPC deadlines. Explicit host overrides
+remain supported and go through the existing native capability validation.
 """
 
 from __future__ import annotations
@@ -54,6 +54,12 @@ BUNDLES: dict[tuple[str, str], NativeBundle] = {
         manifest_sha256="533450f5c62f89bda3fa228089184e08709f0172b324d44543a14a0c73036723",
     ),
 }
+# Keep capability-specific pins separate: the published selection-v1 binaries do
+# not implement Smart Execution. Add only published archives whose native async,
+# selection and installed-cache proofs pass for the exact pinned files. The same
+# selection manifest/layout covers both capabilities; the backend also requires
+# the executable to advertise bello_async_tools before any model turn.
+ASYNC_BUNDLES: dict[tuple[str, str], NativeBundle] = {}
 _MAX_DOWNLOAD = 1024 * 1024 * 1024
 _MAX_UNPACKED = 2 * _MAX_DOWNLOAD
 _IS_WINDOWS = os.name == "nt"
@@ -401,23 +407,14 @@ def _unpack(archive: Path, destination: Path, *, system: str = "Darwin") -> None
         raise ValueError("Native Codex archive is incomplete")
 
 
-def ensure_native_selection() -> tuple[list[str], Path | None]:
-    """Return native app-server command + manifest, without changing user config."""
-    override = os.environ.get("BELLO_CODEX_BINARY")
-    explicit_manifest = os.environ.get("BELLO_CODEX_SELECTION_MANIFEST")
-    if override or explicit_manifest:
-        return ([override or "codex", "app-server", "--listen", "stdio://"],
-                Path(explicit_manifest).expanduser().absolute() if explicit_manifest else None)
+def _platform_key() -> tuple[str, str]:
     machine = platform.machine().lower()
     machine = {"aarch64": "arm64", "amd64": "x86_64"}.get(machine, machine)
-    key = (platform.system(), machine)
-    bundle = BUNDLES.get(key)
-    if bundle is None:
-        raise RuntimeError(
-            f"No verified native Codex log-distiller download is available for {key[0]}/{key[1]}. "
-            "Set BELLO_CODEX_BINARY and BELLO_CODEX_SELECTION_MANIFEST to a compatible build; "
-            "see docs/native-codex-selection.md. Other engines and distiller-off runs do not need it."
-        )
+    return platform.system(), machine
+
+
+def _ensure_native_bundle(bundle: NativeBundle, *, system: str) -> tuple[list[str], Path]:
+    """Install a pinned capability bundle using the shared verified private cache."""
     base = Path(os.environ.get("BELLO_RUNTIME_DIR", str(Path.home() / ".bello" / "runtime"))).expanduser().absolute()
     _reject_windows_reparse_ancestors(base)
     if _IS_WINDOWS:
@@ -437,7 +434,7 @@ def ensure_native_selection() -> tuple[list[str], Path | None]:
         _owned(lock_path)
         if destination.exists() or is_link_or_reparse(destination):
             # Never repair/replace a changed or active executable underneath a run.
-            _verify(destination, bundle, system=key[0])
+            _verify(destination, bundle, system=system)
         else:
             with tempfile.TemporaryDirectory(prefix=".download-", dir=root) as temporary:
                 staging = Path(temporary)
@@ -446,9 +443,47 @@ def ensure_native_selection() -> tuple[list[str], Path | None]:
                 _download(bundle, archive)
                 unpacked = staging / "unpacked"
                 unpacked.mkdir(mode=0o700)
-                _unpack(archive, unpacked, system=key[0])
-                _verify(unpacked, bundle, system=key[0])
+                _unpack(archive, unpacked, system=system)
+                _verify(unpacked, bundle, system=system)
                 unpacked.rename(destination)
-    executable = "codex.exe" if key[0] == "Windows" else "codex"
+    executable = "codex.exe" if system == "Windows" else "codex"
     return ([str(destination / "bin" / executable), "app-server", "--listen", "stdio://"],
             destination / "selection-manifest.json")
+
+
+def ensure_native_selection() -> tuple[list[str], Path | None]:
+    """Return native app-server command + manifest, without changing user config."""
+    override = os.environ.get("BELLO_CODEX_BINARY")
+    explicit_manifest = os.environ.get("BELLO_CODEX_SELECTION_MANIFEST")
+    if override or explicit_manifest:
+        return ([override or "codex", "app-server", "--listen", "stdio://"],
+                Path(explicit_manifest).expanduser().absolute() if explicit_manifest else None)
+    key = _platform_key()
+    bundle = BUNDLES.get(key)
+    if bundle is None:
+        raise RuntimeError(
+            f"No verified native Codex log-distiller download is available for {key[0]}/{key[1]}. "
+            "Set BELLO_CODEX_BINARY and BELLO_CODEX_SELECTION_MANIFEST to a compatible build; "
+            "see docs/native-codex-selection.md. Other engines and distiller-off runs do not need it."
+        )
+    return _ensure_native_bundle(bundle, system=key[0])
+
+
+def ensure_native_async() -> tuple[list[str], Path | None]:
+    """Prepare Smart Execution from an override, compatible pin, or host binary.
+
+    Never download a selection-only bundle for this mode. Until an async-capable
+    bundle is published for the platform, retain support for compatible host
+    builds. The backend checks the advertised capability before any model turn;
+    a distiller-enabled run additionally validates the selection manifest.
+    """
+    override = os.environ.get("BELLO_CODEX_BINARY", "").strip()
+    manifest = os.environ.get("BELLO_CODEX_SELECTION_MANIFEST", "").strip()
+    if override or manifest:
+        return ([override or "codex", "app-server", "--listen", "stdio://"],
+                Path(manifest).expanduser().absolute() if manifest else None)
+    key = _platform_key()
+    bundle = ASYNC_BUNDLES.get(key)
+    if bundle is not None:
+        return _ensure_native_bundle(bundle, system=key[0])
+    return ["codex", "app-server", "--listen", "stdio://"], None

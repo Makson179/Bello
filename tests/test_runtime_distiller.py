@@ -96,19 +96,111 @@ async def wait_for_worker(distiller):
             await asyncio.sleep(.005)
 
 
+def long_log(prefix):
+    """Keep lifecycle/protocol tests above the small-output bypass boundary."""
+    return prefix + "\n" + "repeated diagnostic detail\n" * 10
+
+
+@pytest.mark.parametrize("text", [
+    "", "x", "x" * 199, "x" * 200, "é" * 100, "😀" * 50,
+    "Ошибка\r\n文件\t😀",
+])
+async def test_small_outputs_bypass_without_loading_or_queueing(tmp_path, monkeypatch, text):
+    distiller = LogDistiller(tmp_path)
+    unexpected_calls = []
+
+    async def unexpected(*_args, **_kwargs):
+        unexpected_calls.append(True)
+        raise AssertionError("small outputs must not acquire a lock or start inference")
+
+    monkeypatch.setattr(distiller._lock, "acquire", unexpected)
+    monkeypatch.setattr(distiller, "_exchange", unexpected)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", unexpected)
+    assert len(text.encode("utf-8")) <= 200
+    assert await distiller.distill(text, "focus", "cmd") == text
+    assert unexpected_calls == []  # Fail-open must not hide a forbidden call.
+    assert distiller._sequence == 0
+    assert distiller._request is None
+    assert distiller._process is None and distiller._spawn is None
+    assert not distiller._unavailable
+    await distiller.close()
+
+
+@pytest.mark.parametrize("text", ["x" * 201, "é" * 101, "😀" * 51])
+async def test_outputs_above_200_utf8_bytes_still_infer(tmp_path, fake_worker, text):
+    processes = fake_worker()
+    distiller = LogDistiller(tmp_path)
+    try:
+        assert len(text.encode("utf-8")) > 200
+        assert await distiller.distill(text, "focus", "cmd") == text[:3]
+        assert len(processes) == 1 and distiller._sequence == 1
+    finally:
+        await distiller.close()
+
+
+async def test_small_output_does_not_wait_for_or_stop_warm_worker(tmp_path, fake_worker):
+    processes = fake_worker()
+    distiller = LogDistiller(tmp_path)
+    try:
+        assert await distiller.distill(long_log("first log"), "focus", "cmd") == "fir"
+        async with distiller._lock:
+            text = "é" * 100
+            assert await asyncio.wait_for(distiller.distill(text, "focus", "cmd"), .5) == text
+        assert len(processes) == 1 and processes[0].returncode is None
+        assert distiller._sequence == 1
+        assert await distiller.distill(long_log("next log"), "focus", "cmd") == "nex"
+        assert distiller._sequence == 2
+    finally:
+        await distiller.close()
+
+
+@pytest.mark.parametrize("route", ["native", "tool_host"])
+@pytest.mark.parametrize("text", ["x" * 199, "x" * 200, "x" * 201, "é" * 100, "é" * 101])
+async def test_cutoff_is_shared_by_native_and_claude_pi_tool_routes(tmp_path, fake_worker, route, text):
+    from types import SimpleNamespace
+
+    from supervisor.runtime.codex_distiller import CodexDistillerBridge
+    from supervisor.runtime.tools import ToolHost
+
+    processes = fake_worker()
+    distiller = LogDistiller(tmp_path)
+    eligible = len(text.encode("utf-8")) > 200
+    try:
+        if route == "native":
+            bridge = CodexDistillerBridge(distiller, tmp_path)
+            selected = await bridge._select({"log": text, "focus": "Find failure", "command": "pytest -q"})
+        else:
+            packet = {"details": {"output": text, "exitCode": 0},
+                      "content": [{"type": "text", "text": "original packet"}], "isError": False}
+            host = SimpleNamespace(distill=distiller.distill)
+            result = await ToolHost._distill_result(host, packet, "exec_command",
+                                                    {"focus": "Find failure", "command": "pytest -q"})
+            selected = result["details"]["output"]
+            assert result["details"]["exitCode"] == 0
+            if not eligible:
+                assert result is packet
+        assert selected == (text[:3] if eligible else text)
+        assert len(processes) == int(eligible)
+        assert distiller._sequence == int(eligible)
+    finally:
+        await distiller.close()
+
+
 async def test_lazy_persistent_worker_and_close(tmp_path, fake_worker):
     processes = fake_worker()
     distiller = LogDistiller(tmp_path)
     assert processes == []
     assert await distiller.distill("", "focus", "cmd") == ""
-    assert await distiller.distill("original", "", "cmd") == "original"
+    original = long_log("original")
+    assert await distiller.distill(original, "", "cmd") == original
     assert processes == []
-    assert await distiller.distill("first log", "focus", "cmd") == "fir"
-    assert await distiller.distill("second log", "focus", "cmd") == "sec"
+    assert await distiller.distill(long_log("first log"), "focus", "cmd") == "fir"
+    assert await distiller.distill(long_log("second log"), "focus", "cmd") == "sec"
     assert len(processes) == 1
     await distiller.close()
     assert processes[0].returncode is not None
-    assert await distiller.distill("after close", "focus", "cmd") == "after close"
+    after_close = long_log("after close")
+    assert await distiller.distill(after_close, "focus", "cmd") == after_close
     await distiller.close()
 
 
@@ -129,7 +221,7 @@ raise SystemExit(worker.main(["--model-path", "."]))
     distiller = LogDistiller(tmp_path)
     try:
         for selected in ("café \u2014 résumé", "Ошибка: 文件 😀", "next ASCII result"):
-            original = selected + "\nignored repeated diagnostic text"
+            original = selected + "\nignored repeated diagnostic text" * 10
             assert await distiller.distill(original, "проверка 文件", "Get-Content café.txt") == selected
         assert len(processes) == 1 and processes[0].returncode is None
     finally:
@@ -140,7 +232,7 @@ async def test_parallel_calls_are_serialized_and_all_selected(tmp_path, fake_wor
     processes = fake_worker()
     distiller = LogDistiller(tmp_path)
     try:
-        results = await asyncio.gather(*(distiller.distill(text, "focus", "slow")
+        results = await asyncio.gather(*(distiller.distill(long_log(text), "focus", "slow")
                                          for text in ("first log", "second log", "third log")))
         assert results == ["fir", "sec", "thi"]
         assert len(processes) == 1
@@ -151,11 +243,12 @@ async def test_parallel_calls_are_serialized_and_all_selected(tmp_path, fake_wor
 async def test_waiting_call_deadline_does_not_kill_active_worker(tmp_path, fake_worker, monkeypatch, caplog):
     processes = fake_worker()
     distiller = LogDistiller(tmp_path)
-    active = asyncio.create_task(distiller.distill("active original", "focus", "slow"))
+    active = asyncio.create_task(distiller.distill(long_log("active original"), "focus", "slow"))
     try:
         await wait_for_worker(distiller)
         monkeypatch.setattr(module, "REQUEST_TIMEOUT_SECONDS", .03)
-        assert await distiller.distill("waiting original", "focus", "cmd") == "waiting original"
+        waiting = long_log("waiting original")
+        assert await distiller.distill(waiting, "focus", "cmd") == waiting
         assert await active == "act"
         assert len(processes) == 1 and processes[0].returncode is None
         assert "TimeoutError" in caplog.text
@@ -169,9 +262,10 @@ async def test_failed_request_returns_original_and_reaps_before_restart(tmp_path
     monkeypatch.setattr(module, "REQUEST_TIMEOUT_SECONDS", .4)
     distiller = LogDistiller(tmp_path)
     try:
-        assert await distiller.distill("original log", "focus", command) == "original log"
+        original = long_log("original log")
+        assert await distiller.distill(original, "focus", command) == original
         assert len(processes) == 1 and processes[0].returncode is not None
-        assert await distiller.distill("next request", "focus", "cmd") == "nex"
+        assert await distiller.distill(long_log("next request"), "focus", "cmd") == "nex"
         assert len(processes) == 2
     finally:
         await distiller.close()
@@ -181,7 +275,8 @@ async def test_hard_deadline_also_covers_initial_model_load(tmp_path, fake_worke
     processes = fake_worker("import time; time.sleep(60)")
     monkeypatch.setattr(module, "REQUEST_TIMEOUT_SECONDS", .4)
     distiller = LogDistiller(tmp_path)
-    assert await distiller.distill("original log", "focus", "cmd") == "original log"
+    original = long_log("original log")
+    assert await distiller.distill(original, "focus", "cmd") == original
     assert len(processes) == 1 and processes[0].returncode is not None
     await distiller.close()
 
@@ -189,8 +284,9 @@ async def test_hard_deadline_also_covers_initial_model_load(tmp_path, fake_worke
 async def test_missing_bundle_disables_repeated_model_start(tmp_path, fake_worker):
     processes = fake_worker('print(\'{"error":"model_bundle_unavailable"}\', flush=True)')
     distiller = LogDistiller(tmp_path)
-    assert await distiller.distill("original log", "focus", "cmd") == "original log"
-    assert await distiller.distill("next request", "focus", "cmd") == "next request"
+    original, next_request = long_log("original log"), long_log("next request")
+    assert await distiller.distill(original, "focus", "cmd") == original
+    assert await distiller.distill(next_request, "focus", "cmd") == next_request
     assert len(processes) == 1 and processes[0].returncode is not None
     await distiller.close()
 
@@ -200,7 +296,8 @@ async def test_non_reducing_output_preserves_exact_input(tmp_path, fake_worker, 
     fake_worker()
     distiller = LogDistiller(tmp_path)
     try:
-        assert await distiller.distill("α\noriginal\r\n", "focus", command) == "α\noriginal\r\n"
+        original = long_log("α\noriginal\r\n")
+        assert await distiller.distill(original, "focus", command) == original
     finally:
         await distiller.close()
 
@@ -208,32 +305,33 @@ async def test_non_reducing_output_preserves_exact_input(tmp_path, fake_worker, 
 async def test_close_interrupts_inflight_model_without_cancelling_caller(tmp_path, fake_worker):
     processes = fake_worker()
     distiller = LogDistiller(tmp_path)
-    active = asyncio.create_task(distiller.distill("original log", "focus", "hang"))
+    original = long_log("original log")
+    active = asyncio.create_task(distiller.distill(original, "focus", "hang"))
     await wait_for_worker(distiller)
     await asyncio.wait_for(distiller.close(), 3)
-    assert await active == "original log"
+    assert await active == original
     assert processes[0].returncode is not None
 
 
 async def test_caller_cancellation_reaps_child_and_remains_cancellation(tmp_path, fake_worker):
     processes = fake_worker()
     distiller = LogDistiller(tmp_path)
-    active = asyncio.create_task(distiller.distill("original log", "focus", "hang"))
+    active = asyncio.create_task(distiller.distill(long_log("original log"), "focus", "hang"))
     await wait_for_worker(distiller)
     active.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(active, 3)
     assert processes[0].returncode is not None
-    assert await distiller.distill("next request", "focus", "cmd") == "nex"
+    assert await distiller.distill(long_log("next request"), "focus", "cmd") == "nex"
     await distiller.close()
 
 
 async def test_cancelled_waiter_preserves_other_call(tmp_path, fake_worker):
     processes = fake_worker()
     distiller = LogDistiller(tmp_path)
-    active = asyncio.create_task(distiller.distill("active request", "focus", "slow"))
+    active = asyncio.create_task(distiller.distill(long_log("active request"), "focus", "slow"))
     await wait_for_worker(distiller)
-    waiting = asyncio.create_task(distiller.distill("waiting request", "focus", "cmd"))
+    waiting = asyncio.create_task(distiller.distill(long_log("waiting request"), "focus", "cmd"))
     await asyncio.sleep(0)
     waiting.cancel()
     with pytest.raises(asyncio.CancelledError):

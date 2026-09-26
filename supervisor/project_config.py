@@ -93,6 +93,7 @@ RUNTIME_SYNC_FIELDS = (
     "adversary_intelligence",
     "speed",
     "runtime_enabled",
+    "async_tools",
     "cheap_runtime",
     "log_distiller",
     "start_over",
@@ -157,6 +158,7 @@ class ProjectConfig:
     adversary_intelligence: str = DEFAULT_INTELLIGENCE
     speed: str = "usual"
     runtime_enabled: bool = True
+    async_tools: bool = False
     cheap_runtime: bool = True
     log_distiller: LogDistillerConfig = field(default_factory=LogDistillerConfig)
     start_over: bool = False
@@ -196,6 +198,7 @@ class ProjectConfig:
             "adversary_intelligence": self.adversary_intelligence,
             "speed": self.speed,
             "runtime_enabled": self.runtime_enabled,
+            "async_tools": self.async_tools,
             "cheap_runtime": self.cheap_runtime,
             "log_distiller": self.log_distiller.to_json_data(),
             "start_over": self.start_over,
@@ -409,6 +412,7 @@ def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfi
         ),
         speed=_speed_from_payload(payload, default.speed, path=path),
         runtime_enabled=_bool(payload.get("runtime_enabled", default.runtime_enabled), "runtime_enabled", path=path),
+        async_tools=_bool(payload.get("async_tools", default.async_tools), "async_tools", path=path),
         cheap_runtime=_bool(
             _first_present(payload, ("cheap_runtime", "cheap_runtime_enabled"), default.cheap_runtime),
             "cheap_runtime",
@@ -723,6 +727,8 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
         updates["fast"] = config.fast
     if "runtime_enabled" in selected:
         updates["runtime_enabled"] = config.runtime_enabled
+    if "async_tools" in selected:
+        updates["async_tools"] = config.async_tools
     if selected.intersection({"cheap_runtime", "runtime_enabled"}):
         updates["cheap_runtime"] = config.effective_cheap_runtime
     if "log_distiller" in selected:

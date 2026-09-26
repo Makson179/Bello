@@ -5854,7 +5854,7 @@ async def test_completion_review_reads_assistant_message_content_from_turns_list
     assert audit["raw_text"] == decision_text
 
 
-async def test_completion_review_no_message_retries_with_ultra_compact_minimal_prompt(tmp_path: Path) -> None:
+async def test_completion_review_no_message_retries_with_selective_context_and_minimal_prompt(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task\nImplement the compiler.\n", encoding="utf-8")
     store = StateStore(tmp_path)
@@ -5944,7 +5944,12 @@ async def test_completion_review_no_message_retries_with_ultra_compact_minimal_p
     assert decision.decision == "return"
     assert len(client.turn_inputs) == 3
     assert "Emergency compact JSON retry" in client.turn_inputs[2]
-    assert "ultra_compact_outputs" in client.turn_inputs[2]
+    assert '"review_context_mode": "selective_files"' in client.turn_inputs[2]
+    retry_context = json.loads(client.turn_inputs[2].split("\n\n# Emergency compact JSON retry", 1)[0])
+    validation_index = Path(retry_context["available_evidence"]["validations"]["index_path"])
+    record = json.loads(validation_index.read_text().splitlines()[0])
+    evidence = json.loads(Path(record["path"]).read_text())
+    assert evidence["captured_output"] == packet.validations[0].captured_output
     assert "supervisor did not produce an agent message" in client.turn_inputs[2]
     assert client.archived == ["completion-thread-1"]
     audit_rows = [

@@ -373,6 +373,7 @@ class BelloController:
         adversary_runs: int | None = None,
         completion_review: bool | None = None,
         runtime_enabled: bool | None = None,
+        async_tools: bool | None = None,
         log_distiller: LogDistillerConfig | None = None,
         declared_grading_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
         project_config: ProjectConfig | None = None,
@@ -432,6 +433,7 @@ class BelloController:
         # rewrites the persisted project config, matching the other run settings.
         self.completion_review = completion_review
         self.runtime_enabled = runtime_enabled
+        self.async_tools = async_tools
         self.log_distiller = log_distiller
         self.project_config = project_config
         self.event_queue: asyncio.Queue[ControllerEvent] = asyncio.Queue()
@@ -537,6 +539,7 @@ class BelloController:
             if callable(configure_run):
                 configure_run(
                     runtime_enabled=self._runtime_enabled(),
+                    async_tools=self._async_tools_enabled(),
                     log_distiller=self._log_distiller_config(),
                 )
             await self.client.start()
@@ -703,6 +706,7 @@ class BelloController:
             completion_review_enabled=project_config.completion_review,
             cheap_runtime=self._runtime_enabled() and project_config.cheap_runtime,
             runtime_enabled=self._runtime_enabled(),
+            async_tools=self._async_tools_enabled(),
             log_distiller=self._log_distiller_config().to_json_data(),
             multi_agent=project_config.multi_agent.to_json_data(),
             completion_multi_agent=project_config.completion_multi_agent.to_json_data(),
@@ -811,6 +815,7 @@ class BelloController:
                     "completion_review_enabled": project_config.completion_review,
                     "cheap_runtime": self._runtime_enabled() and project_config.cheap_runtime,
                     "runtime_enabled": self._runtime_enabled(),
+                    "async_tools": self._async_tools_enabled(),
                     "log_distiller": self._log_distiller_config().to_json_data(),
                     "multi_agent": project_config.multi_agent.to_json_data(),
                     "completion_multi_agent": project_config.completion_multi_agent.to_json_data(),
@@ -1292,6 +1297,15 @@ class BelloController:
     def _post_coder_review_enabled(self) -> bool:
         return self._effective_completion_review() or self._adversary_model_required_for_preflight()
 
+    def _async_tools_enabled(self) -> bool:
+        override = getattr(self, "async_tools", None)
+        if override is not None:
+            return bool(override)
+        config = getattr(self, "project_config", None)
+        if config is not None:
+            return bool(getattr(config, "async_tools", False))
+        return bool(self.store.read_json(CONFIG, {}).get("async_tools", False))
+
     def _log_distiller_config(self) -> LogDistillerConfig:
         override = getattr(self, "log_distiller", None)
         if override is not None:
@@ -1351,6 +1365,7 @@ class BelloController:
             speed="fast" if self._fast_mode() else "usual",
             runtime_enabled=self._runtime_enabled(),
             log_distiller=self._log_distiller_config(),
+            async_tools=self._async_tools_enabled(),
             start_over=self.overwrite_state,
             adversary=self._adversary_enabled_for_config(),
             clean=self.clean_workspace,
@@ -1390,6 +1405,7 @@ class BelloController:
             f"adversary-intelligence={self._adversary_intelligence()} "
             f"speed={speed} "
             f"runtime={_format_bool(self._runtime_enabled())} "
+            f"async-tools={_format_bool(self._async_tools_enabled())} "
             f"log-distiller={_format_bool(self._log_distiller_config().enabled)} "
             f"cheap-runtime={_format_bool(self._cheap_runtime_enabled())} "
             f"multi-agent={multi_agent_summary} "
@@ -1597,8 +1613,6 @@ class BelloController:
         if self.store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE:
             return
         profiles = [(self._coder_model(), self._coder_intelligence())]
-        if self._runtime_enabled():
-            profiles.append((self._runtime_model(), self._runtime_intelligence()))
         policies = [self._multi_agent_config()]
         if self._effective_completion_review():
             profiles.append((self._completion_model(), self._completion_intelligence()))
@@ -1611,6 +1625,9 @@ class BelloController:
         for policy in policies:
             if policy.enabled:
                 profiles.extend((model, effort) for model, efforts in policy.allowed.items() for effort in efforts)
+        async_profiles = set(profiles)
+        if self._runtime_enabled():
+            profiles.append((self._runtime_model(), self._runtime_intelligence()))
         distilled_models = set()
         if self._log_distiller_config().enabled:
             distilled_models.add(parse_model_selection(self._coder_model()).qualified)
@@ -1625,6 +1642,10 @@ class BelloController:
                 "model": model, "effort": effort,
                 "serviceTier": "priority" if self._fast_mode() else None,
             }
+            if (model, effort) not in async_profiles:
+                # A model used only for bounded runtime supervision does not
+                # need the event-driven coder/reviewer loop capability.
+                request["belloRole"] = "runtime"
             if selection.engine == "codex" and selection.qualified in distilled_models:
                 # Check native D capability before runtime's paid startup probe,
                 # but do not require a patched binary for Codex reviewers alone.

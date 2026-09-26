@@ -80,6 +80,8 @@ class CodexBackend:
         self._selection_verified = False
         self._selection_manifest = selection_manifest
         self._selection_lock = asyncio.Lock()
+        self._async_tools_verified = False
+        self._async_tools_checked = False
         self._native_command = None
         self._runtime_read_paths: tuple[Path, ...] = ()
         self._toolchain_read_paths: dict[str, tuple[Path, ...]] = {}
@@ -228,9 +230,46 @@ class CodexBackend:
             raise AppServerError("unsupported native Codex service tier")
         if params.get("distillerEnabled"):
             await self._validate_selection()
+        if params.get("asyncTools"):
+            await self._validate_async_tools(timeout)
+        elif not self._async_tools_checked:
+            # Read-only capability discovery lets OFF mask a global experimental
+            # override without sending unknown flags to stock binaries.
+            try:
+                await self._validate_async_tools(timeout)
+            except AppServerError:
+                self._async_tools_checked = True
         return {"valid": True, "model": descriptor,
                 "requested": {"effort": effort, "serviceTier": params.get("serviceTier")},
                 "execution": {"engine": "codex", "effort": effort}}
+
+    async def _validate_async_tools(self, timeout: float) -> None:
+        """Stock app-server silently ignores unknown flags: require capability."""
+        if self._async_tools_verified:
+            return
+        if self._async_tools_checked:
+            raise AppServerError("Async tools requires a native Codex build with bello_async_tools support")
+        cursor, seen = None, set()
+        while True:
+            params = {"limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            response = await self._client.request("experimentalFeature/list", params, timeout=timeout)
+            if any(feature.get("name") == "bello_async_tools" for feature in response.get("data", [])
+                   if isinstance(feature, dict)):
+                self._async_tools_verified = True
+                self._async_tools_checked = True
+                return
+            cursor = response.get("nextCursor")
+            if not cursor or cursor in seen:
+                break
+            seen.add(cursor)
+        self._async_tools_checked = True
+        raise AppServerError(
+            "Async tools requires a native Codex build with bello_async_tools support. "
+            "This binary cannot run the requested mode; no engine or API fallback was used. "
+            "Set BELLO_CODEX_BINARY to a compatible build or turn async_tools off."
+        )
 
     async def _validate_selection(self) -> None:
         if self._bridge is None:
@@ -311,6 +350,13 @@ class CodexBackend:
         if params.get("provider", "openai-codex") != "openai-codex" or params.get("baseInstructions") is not None:
             raise AppServerError("native Codex retains its native provider and base instructions")
         config = deepcopy(params.get("config") or {})
+        if params.get("asyncTools") and not self._async_tools_verified:
+            raise AppServerError("native Async tools requested without verified capability")
+        if isinstance(config.get("features"), dict):
+            config["features"].pop("bello_async_tools", None)
+        config.pop("features.bello_async_tools", None)
+        if self._async_tools_verified:
+            config["features.bello_async_tools"] = bool(params.get("asyncTools", False))
         config.pop("agents", None)  # Bello's profile schema is not Codex's agent config.
         for key in list(config):
             if key == "model_providers" or key.startswith("model_providers."):
@@ -380,6 +426,14 @@ class CodexBackend:
         if dynamic:
             mapping = "Use Bello's configured delegation tools: " + ", ".join(t["name"] for t in dynamic) + "."
             native["developerInstructions"] = ((native.get("developerInstructions") or "") + "\n" + mapping).strip()
+        if params.get("asyncTools"):
+            interactive = (
+                "Finite non-TTY commands deliver their results automatically when they finish. "
+                "For a server or command deliberately kept running, use exec_command with tty=true. "
+                "That explicit interactive session retains write_stdin for necessary input or reading ongoing output; "
+                "the no-poll rule does not prohibit those interactions. Do not repeatedly check unchanged interactive output."
+            )
+            native["developerInstructions"] = ((native.get("developerInstructions") or "") + "\n" + interactive).strip()
         native.update(model=model, modelProvider="openai", config=config, dynamicTools=dynamic)
         toolchain_paths: tuple[Path, ...] = ()
         if params.get("sandbox", "workspace-write") != "danger-full-access":
@@ -470,6 +524,8 @@ class CodexBackend:
 
     async def _resume(self, record: dict[str, Any], params: dict[str, Any], timeout: float) -> dict[str, Any]:
         combined = {**record["params"], **params}
+        if bool(combined.get("asyncTools", False)) != bool(record["params"].get("asyncTools", False)):
+            raise AppServerError("native resume cannot change Async tools mode; start a new run")
         if _model(combined["model"]) != record["model"] or str(Path(combined["cwd"]).resolve()) != str(Path(record["cwd"]).resolve()):
             raise AppServerError("native resume cannot change the assigned model or workspace")
         await self._subscription(timeout)
@@ -495,10 +551,12 @@ class CodexBackend:
             if record["id"] not in self._loaded:
                 await self._resume(record, {}, timeout)
             await self._subscription(timeout)
+            if "asyncTools" in params and bool(params["asyncTools"]) != bool(record["params"].get("asyncTools", False)):
+                raise AppServerError("native turn cannot change Async tools mode; start a new run")
             model = _model(params.get("model", record["model"]))
             if model != record["model"]:
                 raise AppServerError("native Codex model changes require a new thread")
-            await self._validate({**params, "model": model}, timeout)
+            await self._validate({**record["params"], **params, "model": model}, timeout)
             forwarded = {key: deepcopy(params[key]) for key in _TURN_FIELDS if key in params}
             if record["params"].get("sandbox", "workspace-write") != "danger-full-access":
                 # Preserve the thread's scoped filesystem/network permission profile.

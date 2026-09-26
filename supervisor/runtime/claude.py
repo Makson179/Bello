@@ -34,6 +34,7 @@ from jsonschema.exceptions import SchemaError, ValidationError
 
 from supervisor.appserver import AppServerError, AppServerTimeoutError
 from supervisor.runtime.models import validate_effort
+from supervisor.runtime.claude_async import BATCH_GUIDANCE, BATCH_TOOL_NAME, ClaudeAsyncBatches
 
 
 SUPPORTED_EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -122,6 +123,11 @@ class _Owner:
     task: asyncio.Task[None]
 
 
+@dataclass
+class _AsyncDelivery:
+    content: list[dict[str, Any]]
+
+
 class ClaudeBackend:
     """Normalized thread/turn API over a first-party Claude Code session."""
 
@@ -148,6 +154,8 @@ class ClaudeBackend:
         self._catalog: list[dict[str, Any]] | None = None
         self._threads: dict[str, dict[str, Any]] = {}
         self._owners: dict[str, _Owner] = {}
+        self._async_batches: dict[tuple[str, str], ClaudeAsyncBatches] = {}
+        self._async_usage: dict[tuple[str, str], dict[str, Any]] = {}
         self._closing = False
         self._state_file = self.state_dir / "threads.json"
         if environment is not None and client_factory is None:
@@ -308,6 +316,7 @@ class ClaudeBackend:
             "cwd": str(cwd),
             "tools": tools,
             "developerInstructions": developer or "",
+            "asyncTools": params.get("asyncTools") is True,
             "claudeSessionId": str(uuid4()),
             "hasSession": False,
             "effort": effort,
@@ -329,6 +338,8 @@ class ClaudeBackend:
     async def _thread_resume(self, params: dict[str, Any]) -> dict[str, Any]:
         await self._ensure_initialized()
         record = self._record(params.get("threadId"))
+        if "asyncTools" in params and params["asyncTools"] != record.get("asyncTools", False):
+            raise AppServerError("resuming a Claude Code thread cannot change asyncTools")
         if "model" in params and self._model(params["model"]) != record["model"]:
             raise AppServerError("resuming a Claude Code thread cannot change its model")
         if "tools" in params:
@@ -472,12 +483,16 @@ class ClaudeBackend:
     ) -> bool:
         record = self._record(thread_id)
         turn_id = params["turnId"]
+        async_key = (thread_id, turn_id)
         client = None
         receive_task: asyncio.Task[Any] | None = None
         command_task: asyncio.Task[_Command] | None = None
         result_seen = False
         interrupt_requested = False
         stop_owner = False
+        waiting_async = False
+        if record.get("asyncTools"):
+            self._async_batches[async_key] = ClaudeAsyncBatches()
         try:
             self._assert_subscription_environment()
             options = self._options(record, params)
@@ -530,11 +545,41 @@ class ClaudeBackend:
                         message = receive_task.result()
                     except StopAsyncIteration:
                         raise AppServerError("Claude Code response ended without a result")
-                    result_seen = await self._handle_message(
-                        record, turn_id, message, params.get("outputSchema"), interrupt_requested
-                    )
-                    if not result_seen:
+                    from claude_agent_sdk import ResultMessage
+
+                    batches = self._async_batches.get(async_key)
+                    control = command_task.result() if command_task in done else None
+                    if isinstance(message, _AsyncDelivery) and control is not None and control.kind in {"stop", "interrupt"}:
+                        # A ready result must not start another paid query
+                        # when cancellation is already queued in this tick.
+                        waiting_async = True
+                    elif isinstance(message, _AsyncDelivery):
+                        waiting_async = False
+                        content = [
+                            {"type": "text", "text": "Previously pending Bello tool results are now available. Use these results before finishing the task or review."},
+                            *message.content,
+                        ]
+                        await client.query(self._async_prompt(content))
+                        iterator = client.receive_response().__aiter__()
                         receive_task = asyncio.create_task(anext(iterator))
+                    elif isinstance(message, ResultMessage) and batches and batches.pending and not message.is_error and not interrupt_requested and message.terminal_reason not in {"aborted_streaming", "aborted_tools", "cancelled"}:
+                        # A Claude response may finish while a batch's original
+                        # commands still run. Do not finalize the Bello turn or
+                        # validate an early review verdict; await actual output.
+                        self._async_usage[async_key] = self._merge_usage(self._async_usage.get(async_key, {}), message.usage)
+                        if self._valid_uuid(message.session_id):
+                            record["claudeSessionId"] = message.session_id
+                            record["hasSession"] = True
+                            self._persist()
+                        await iterator.aclose()
+                        waiting_async = True
+                        receive_task = asyncio.create_task(self._wait_async_delivery(batches))
+                    else:
+                        result_seen = await self._handle_message(
+                            record, turn_id, message, params.get("outputSchema"), interrupt_requested
+                        )
+                        if not result_seen:
+                            receive_task = asyncio.create_task(anext(iterator))
                 if command_task in done:
                     command = command_task.result()
                     command_task = None
@@ -543,14 +588,30 @@ class ClaudeBackend:
                             if result_seen or command.params.get("turnId") != turn_id:
                                 self._reject(command, AppServerError("cannot steer a completed or stale turn"))
                             else:
-                                await client.query(command.params["prompt"])
+                                ready_during_steer = []
+                                if waiting_async:
+                                    ready_during_steer = await self._settle_async_wait_for_steer(receive_task)
+                                if ready_during_steer:
+                                    await client.query(self._async_prompt([*ready_during_steer, {"type": "text", "text": command.params["prompt"]}]))
+                                else:
+                                    await client.query(command.params["prompt"])
+                                if waiting_async:
+                                    waiting_async = False
+                                    iterator = client.receive_response().__aiter__()
+                                    receive_task = asyncio.create_task(anext(iterator))
                                 self._resolve(command, {"turn": deepcopy(self._turn(record, turn_id))})
                         elif command.kind == "interrupt":
                             if result_seen or command.params.get("turnId") != turn_id:
                                 self._resolve(command, {})
                             else:
                                 interrupt_requested = True
-                                await client.interrupt()
+                                if waiting_async:
+                                    receive_task.cancel()
+                                    await self._async_batches[async_key].cancel()
+                                    await self._complete_turn(record, turn_id, "interrupted", self._async_usage.get(async_key, {}), "Turn interrupted")
+                                    result_seen = True
+                                else:
+                                    await client.interrupt()
                                 self._resolve(command, {})
                         elif command.kind == "stop":
                             stop_owner = True
@@ -573,17 +634,21 @@ class ClaudeBackend:
                     if not stop_owner:
                         command_task = asyncio.create_task(queue.get())
             if stop_owner and not result_seen:
-                await self._complete_turn(record, turn_id, "interrupted", {}, "Turn interrupted")
+                await self._complete_turn(record, turn_id, "interrupted", self._async_usage.get(async_key, {}), "Turn interrupted")
             return stop_owner
         except asyncio.CancelledError:
             if record.get("activeTurnId") == turn_id:
-                await self._complete_turn(record, turn_id, "interrupted", {}, "Turn interrupted")
+                await self._complete_turn(record, turn_id, "interrupted", self._async_usage.get(async_key, {}), "Turn interrupted")
             raise
         except Exception as exc:
             if record.get("activeTurnId") == turn_id:
-                await self._complete_turn(record, turn_id, "failed", {}, self._safe_failure(exc))
+                await self._complete_turn(record, turn_id, "failed", self._async_usage.get(async_key, {}), self._safe_failure(exc))
             return stop_owner
         finally:
+            batches = self._async_batches.pop(async_key, None)
+            if batches is not None:
+                await batches.cancel()
+            self._async_usage.pop(async_key, None)
             # If response completion raced queue.get(), put an unprocessed
             # command back for the idle owner.  Otherwise a stop/interrupt
             # future could be orphaned after queue.get() had consumed it.
@@ -632,6 +697,7 @@ class ClaudeBackend:
             record["claudeSessionId"] = message.session_id
             record["hasSession"] = True
         usage = self._json_primitives(message.usage) if isinstance(message.usage, dict) else {}
+        usage = self._merge_usage(self._async_usage.get((record["id"], turn_id), {}), usage)
         status = "interrupted" if interrupt_requested or message.terminal_reason in {
             "aborted_streaming", "aborted_tools", "cancelled"
         } else "failed" if message.is_error else "completed"
@@ -659,6 +725,48 @@ class ClaudeBackend:
             error = "Claude Code reported that the turn failed"
         await self._complete_turn(record, turn_id, status, usage, error)
         return True
+
+    @staticmethod
+    async def _wait_async_delivery(batches: ClaudeAsyncBatches) -> _AsyncDelivery:
+        return _AsyncDelivery(await batches.take_ready(wait=True))
+
+    @staticmethod
+    async def _settle_async_wait_for_steer(task: asyncio.Task[Any]) -> list[dict[str, Any]]:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        # Completion may have raced the asyncio.wait done-set and already
+        # claimed late results. Preserve them alongside the real steering
+        # message instead of discarding a successfully completed waiter.
+        if not task.cancelled() and task.exception() is None:
+            delivery = task.result()
+            if isinstance(delivery, _AsyncDelivery):
+                return delivery.content
+        return []
+
+    @staticmethod
+    async def _async_prompt(content: list[dict[str, Any]]):
+        """Append output via the documented SDK streaming-input interface."""
+        blocks = []
+        for block in content:
+            if block.get("type") == "image":
+                blocks.append({"type": "image", "source": {"type": "base64", "media_type": block["mimeType"], "data": block["data"]}})
+            else:
+                blocks.append(deepcopy(block))
+        yield {"type": "user", "message": {"role": "user", "content": blocks}, "parent_tool_use_id": None}
+
+    @staticmethod
+    def _merge_usage(previous: dict[str, Any], current: Any) -> dict[str, Any]:
+        result = deepcopy(previous)
+        if not isinstance(current, dict):
+            return result
+        for key, value in current.items():
+            if isinstance(value, dict):
+                result[key] = ClaudeBackend._merge_usage(result.get(key, {}) if isinstance(result.get(key), dict) else {}, value)
+            elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                result[key] = (result.get(key, 0) if isinstance(result.get(key, 0), (int, float)) else 0) + value
+            else:
+                result[key] = deepcopy(value)
+        return result
 
     async def _append_agent_item(self, record: dict[str, Any], turn_id: str, text: str) -> None:
         item = {"id": str(uuid4()), "type": "agentMessage", "text": text}
@@ -713,6 +821,9 @@ class ClaudeBackend:
         system_prompt = _SYSTEM_PROMPT
         if record.get("developerInstructions"):
             system_prompt += "\n\nBello developer instructions:\n" + record["developerInstructions"]
+        if record.get("asyncTools") and record["tools"]:
+            allowed.append(f"mcp__{_MCP_SERVER}__{BATCH_TOOL_NAME}")
+            system_prompt += "\n\n" + BATCH_GUIDANCE
         kwargs: dict[str, Any] = {
             "tools": [],
             "allowed_tools": allowed,
@@ -846,6 +957,42 @@ class ClaudeBackend:
                     handler=handler,
                 )
             )
+        if record.get("asyncTools") and record["tools"]:
+            if any(definition["name"] == BATCH_TOOL_NAME for definition in record["tools"]):
+                raise AppServerError("run_parallel_tools is reserved by the Claude async adapter")
+            definitions = {definition["name"]: definition for definition in record["tools"]}
+            schema = {
+                "type": "object",
+                "properties": {"calls": {"type": "array", "minItems": 1, "maxItems": 16, "items": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string", "enum": list(definitions)}, "arguments": {"type": "object"}},
+                    "required": ["name", "arguments"], "additionalProperties": False,
+                }}},
+                "required": ["calls"], "additionalProperties": False,
+            }
+
+            async def batch_handler(arguments: dict[str, Any]) -> dict[str, Any]:
+                active = record.get("activeTurnId")
+                coordinator = self._async_batches.get((record["id"], active))
+                batch_id = self._mcp_call_id(record, active, server_ref.get("instance")) if isinstance(active, str) else None
+                if coordinator is None or batch_id is None:
+                    return {"content": [{"type": "text", "text": "Bello rejected a stale or uncorrelated asynchronous batch."}], "is_error": True}
+                try:
+                    Draft202012Validator(schema).validate(arguments)
+                    for call in arguments["calls"]:
+                        Draft202012Validator(definitions[call["name"]]["parameters"]).validate(call["arguments"])
+                except ValidationError:
+                    return {"content": [{"type": "text", "text": "Invalid batch: use supplied tool names and their exact argument schemas. No calls were executed."}], "is_error": True}
+
+                async def dispatch(call_id: str, name: str, args: dict[str, Any]) -> dict[str, Any]:
+                    return await self.tool_handler({"threadId": record["id"], "turnId": active, "callId": call_id, "name": name, "arguments": args})
+
+                try:
+                    return await coordinator.run(batch_id, arguments["calls"], dispatch)
+                except ValueError:
+                    return {"content": [{"type": "text", "text": "Bello rejected a reused batch ID with changed calls."}], "is_error": True}
+
+            result.append(SdkMcpTool(name=BATCH_TOOL_NAME, description=BATCH_GUIDANCE, input_schema=schema, handler=batch_handler))
         return result
 
     def _sdk_server(self, record: dict[str, Any]) -> Any:

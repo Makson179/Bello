@@ -624,6 +624,15 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
         *revision_coder_parameters,
         *multi_agent_parameters,
         EditorParameter(
+            "async_tools",
+            "async-tools",
+            _format_bool(config.async_tools),
+            (EditorOption("true", "async_tools", True), EditorOption("false", "async_tools", False)),
+            help_text=("Deliver completed tool results automatically and run independent tool calls concurrently. "
+                       "Applies to coder, reviewers, and their subagents. Off preserves the existing execution loop. "
+                       "Choose before starting a run; independent of runtime supervision and log distillation."),
+        ),
+        EditorParameter(
             "runtime_enabled",
             "runtime",
             _format_bool(config.runtime_enabled),

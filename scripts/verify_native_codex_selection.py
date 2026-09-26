@@ -478,15 +478,18 @@ class NativeSession:
                         else:
                             future.set_result(message.get("result", {}))
                 elif "id" in message:
-                    await self.send({"id": message["id"], "error": {"code": -32600,
-                                          "message": "Unexpected server request in offline fixture"}})
-                    await self.notifications.put({"method": "fixture/error", "params": message})
+                    await self.server_request(message)
                 else:
                     await self.notifications.put(message)
         finally:
             for future in self.pending.values():
                 if not future.done():
                     future.set_exception(RuntimeError("Native app-server reader ended"))
+
+    async def server_request(self, message):
+        await self.send({"id": message["id"], "error": {"code": -32600,
+                              "message": "Unexpected server request in offline fixture"}})
+        await self.notifications.put({"method": "fixture/error", "params": message})
 
     async def request(self, method, params):
         self.counter += 1
@@ -563,7 +566,8 @@ def output_packets(request: dict[str, Any], mode: str) -> list[dict[str, Any]]:
 
 
 async def run_case(binary: Path, case: Case, output: Path, *, selector=None,
-                   raw_output: str = RAW, turn_timeout: float = 60) -> dict[str, Any]:
+                   raw_output: str = RAW, turn_timeout: float = 60,
+                   async_tools: bool = False) -> dict[str, Any]:
     from supervisor.runtime.codex_distiller import CodexDistillerBridge
 
     output.mkdir(parents=True, exist_ok=False)
@@ -624,6 +628,8 @@ async def run_case(binary: Path, case: Case, output: Path, *, selector=None,
             "ephemeral": True, "developerInstructions": "Add a short focus to each command or poll call.",
             "config": {"features.bello_native_selection": case.enabled, "features.code_mode": case.mode != "direct",
                        "features.code_mode_only": case.mode != "direct", "features.shell_zsh_fork": False}}
+        if async_tools:
+            params["config"]["features.bello_async_tools"] = True
         if os.name == "nt":
             permissions = windows_permission_params(work, home, binary)
             params["config"].update(permissions.pop("config"))

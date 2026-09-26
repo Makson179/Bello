@@ -1,0 +1,2 @@
+# Unified patches encode an empty context line as one required space.
+scripts/native-codex-selection.patch whitespace=-blank-at-eol

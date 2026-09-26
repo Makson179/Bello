@@ -194,6 +194,7 @@ class BelloConfig(BaseModel):
     max_adversary_runs: int = 1
     completion_review_enabled: bool = True
     runtime_enabled: bool = True
+    async_tools: bool = False
     cheap_runtime: bool = True
     log_distiller: dict[str, Any] = Field(default_factory=lambda: {"enabled": False, "model_path": None})
     # Runtime-state mirror of the strictly validated ProjectConfig structure. Keep this

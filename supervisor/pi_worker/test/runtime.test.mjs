@@ -33,10 +33,58 @@ async function startThread(runtime, workspace, overrides = {}) {
     model: "gpt-test",
     effort: overrides.effort ?? "xhigh",
     serviceTier: overrides.serviceTier,
+    asyncTools: overrides.asyncTools,
     tools: overrides.tools ?? [TEST_TOOL],
     developerInstructions: "Use only Bello-hosted tools.",
   });
 }
+
+test("async failed-turn cleanup settles before terminal publication and a new turn", async (t) => {
+  let releaseCancellation;
+  const cancellationGate = new Promise((resolve) => { releaseCancellation = resolve; });
+  let cancellationStarted = false;
+  let releaseNext;
+  const nextGate = new Promise((resolve) => { releaseNext = resolve; });
+  let runtime;
+  let calls = 0;
+  const behavior = async (session, _input, signal) => {
+    if (++calls === 1) {
+      const scheduler = runtime.getRecord("thread-1").active.asyncCoordinator;
+      scheduler.graceMs = 0;
+      scheduler.beginBatch(["fast", "slow"]);
+      const tool = session.state.tools[0];
+      await Promise.all([tool.execute("fast", { command: "fast" }, signal), tool.execute("slow", { command: "slow" }, signal)]);
+      session.emitAssistant("provider failed", { stopReason: "error", errorMessage: "provider failed" });
+    } else {
+      await nextGate;
+      session.emitAssistant("next turn complete");
+    }
+  };
+  const setupResult = await setup(t, { behavior, hostCalls: { async call(params, signal) {
+    if (params.name === "exec_command" && params.arguments.command === "slow") {
+      await new Promise((_resolve, reject) => signal.addEventListener("abort", async () => {
+        cancellationStarted = true;
+        await cancellationGate;
+        reject(new DOMException("Cancelled", "AbortError"));
+      }, { once: true }));
+    }
+    return { content: [{ type: "text", text: "ok" }], details: {}, isError: false };
+  } } });
+  runtime = setupResult.runtime;
+  t.after(async () => { releaseCancellation(); releaseNext(); await runtime.close(); });
+  await startThread(runtime, setupResult.workspace, { asyncTools: true });
+  await runtime.dispatch("turn/start", { threadId: "thread-1", turnId: "first", input: "first" });
+  await waitFor(() => cancellationStarted);
+  assert.equal(runtime.getRecord("thread-1").active.turn.id, "first");
+  assert.equal(setupResult.events.some((event) => event.method === "turn/completed"), false);
+  releaseCancellation();
+  await waitFor(() => setupResult.events.some((event) => event.method === "turn/completed"));
+  await runtime.dispatch("turn/start", { threadId: "thread-1", turnId: "second", input: "second", serviceTier: "priority" });
+  await waitFor(() => calls === 2);
+  assert.equal(runtime.getRecord("thread-1").requestOptions.current.serviceTier, "priority");
+  releaseNext();
+  await waitFor(() => setupResult.events.filter((event) => event.method === "turn/completed").length === 2);
+});
 
 test("model catalog exposes provider identity, effort support, and auth state", async (t) => {
   const { runtime, workspace } = await setup(t);

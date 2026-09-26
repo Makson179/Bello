@@ -11,6 +11,7 @@ import {
 import { isAbsolute, join, relative, resolve } from "node:path";
 
 import { ProtocolError } from "./protocol.mjs";
+import { AsyncToolCoordinator, lateToolMessage } from "./async-tools.mjs";
 
 const STATE_VERSION = 1;
 const ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/;
@@ -621,6 +622,7 @@ export class PiWorkerRuntime {
       effortDefaulted: params.effort === undefined || params.effort === null,
       serviceTier: serviceTier ?? null,
       tools,
+      asyncTools: params.asyncTools === true,
       developerInstructions: typeof params.developerInstructions === "string" ? params.developerInstructions : null,
       systemPrompt: typeof params.systemPrompt === "string" ? params.systemPrompt : null,
       approvalPolicy: typeof params.approvalPolicy === "string" ? params.approvalPolicy : null,
@@ -687,6 +689,15 @@ export class PiWorkerRuntime {
         developerInstructions: meta.developerInstructions,
         systemPrompt: meta.systemPrompt,
         requestOptions: record.requestOptions,
+        asyncAfterTurn: meta.asyncTools ? async (turn, signal) => {
+          const active = record.active;
+          if (!active?.asyncCoordinator || signal?.aborted) return;
+          const hasTools = turn.message.content?.some((block) => block.type === "toolCall");
+          const results = await active.asyncCoordinator.ready({ wait: !hasTools });
+          if (results.length) {
+            await record.session.sendCustomMessage(lateToolMessage(results), { deliverAs: "steer" });
+          }
+        } : undefined,
       });
       record.session = session;
       record.unsubscribe = session.subscribe((event) => this.onAgentEvent(record, event));
@@ -705,8 +716,13 @@ export class PiWorkerRuntime {
       label: tool.name,
       description: tool.description,
       parameters: tool.parameters,
-      executionMode: "sequential",
-      execute: (callId, args, signal) => this.executeHostTool(record, tool.name, callId, args, signal),
+      executionMode: record.meta.asyncTools ? "parallel" : "sequential",
+      execute: (callId, args, signal) => {
+        const execute = (hostSignal) => this.executeHostTool(record, tool.name, callId, args, hostSignal);
+        return record.active?.asyncCoordinator
+          ? record.active.asyncCoordinator.execute(callId, tool.name, execute, signal)
+          : execute(signal);
+      },
     }));
     hostTools.push({
       name: RESERVED_TOOL_NAME,
@@ -717,6 +733,7 @@ export class PiWorkerRuntime {
       execute: async (_callId, args) => {
         const active = record.active;
         if (!active || !active.outputSchema) throw new Error("submit_result is unavailable for this turn");
+        if (active.asyncCoordinator?.pending) throw new Error("Tool results are still pending; wait for their automatic delivery before submitting a final result.");
         if (active.structuredResult !== undefined) throw new Error("submit_result may only be called once");
         const errors = this.sdk.validateSchema(active.outputSchema, args);
         if (errors.length > 0) {
@@ -800,6 +817,12 @@ export class PiWorkerRuntime {
       return;
     }
     if (event.type === "message_end" && event.message?.role === "assistant") {
+      if (active.asyncCoordinator) {
+        const calls = (event.message.content ?? []).filter((block) => block.type === "toolCall");
+        // submit_result is a sequential barrier, so do not wait for a parallel
+        // batch which Pi will deliberately execute one call at a time.
+        active.asyncCoordinator.beginBatch(calls.some((call) => call.name === RESERVED_TOOL_NAME) ? [] : calls.map((call) => call.id));
+      }
       const id = record.currentAssistantItemId ?? `${active.turn.id}-message-${++record.assistantSequence}`;
       record.currentAssistantItemId = undefined;
       const item = { id, type: "agentMessage", text: extractText(event.message), status: "completed" };
@@ -829,6 +852,9 @@ export class PiWorkerRuntime {
   async threadResume(params) {
     const record = this.getRecord(params.threadId);
     const meta = record.meta;
+    if (params.asyncTools !== undefined && params.asyncTools !== (meta.asyncTools === true)) {
+      throw new ProtocolError("thread/resume cannot change asyncTools", "scope_mismatch");
+    }
     if (params.cwd !== undefined && canonicalPath(params.cwd, "cwd") !== meta.cwd) {
       throw new ProtocolError("thread/resume cannot change cwd", "scope_mismatch");
     }
@@ -937,6 +963,7 @@ export class PiWorkerRuntime {
       usageResponses: [],
       interrupted: false,
       lastAssistant: undefined,
+      asyncCoordinator: record.meta.asyncTools ? new AsyncToolCoordinator() : undefined,
     };
     this.save(record);
     this.schedule(() => {
@@ -950,6 +977,8 @@ export class PiWorkerRuntime {
   async runTurn(record) {
     const active = record.active;
     if (!active) return;
+    let status = "completed";
+    let errorMessage;
     await this.emit({
       method: "turn/started",
       params: { threadId: record.meta.threadId, turnId: active.turn.id, turn: publicTurn(active.turn) },
@@ -975,10 +1004,16 @@ export class PiWorkerRuntime {
         serviceTier: active.serviceTier,
       };
       await session.prompt(active.input, { expandPromptTemplates: false });
+      while (active.asyncCoordinator?.pending && !active.interrupted && !["error", "aborted"].includes(active.lastAssistant?.stopReason)) {
+        const results = await active.asyncCoordinator.ready({ wait: true });
+        if (results.length) await session.sendCustomMessage(lateToolMessage(results), { triggerTurn: true });
+      }
       if (active.interrupted || active.lastAssistant?.stopReason === "aborted") {
-        this.finishTurn(record, active, "interrupted", "Turn was interrupted.");
+        status = "interrupted";
+        errorMessage = "Turn was interrupted.";
       } else if (active.lastAssistant?.stopReason === "error") {
-        this.finishTurn(record, active, "failed", active.lastAssistant.errorMessage || "Provider returned an error.");
+        status = "failed";
+        errorMessage = active.lastAssistant.errorMessage || "Provider returned an error.";
       } else {
         // A normal final JSON message is also a valid delivery path, as in
         // Bello 0.5.2. Leave its text intact for the existing Python decision
@@ -1003,14 +1038,16 @@ export class PiWorkerRuntime {
             },
           });
         }
-        this.finishTurn(record, active, "completed");
       }
     } catch (error) {
-      const status = active.interrupted || (error instanceof Error && error.name === "AbortError") ? "interrupted" : "failed";
-      this.finishTurn(record, active, status, error instanceof Error ? error.message : String(error));
+      status = active.interrupted || (error instanceof Error && error.name === "AbortError") ? "interrupted" : "failed";
+      errorMessage = error instanceof Error ? error.message : String(error);
     } finally {
-      record.requestOptions.current = undefined;
+      await active.asyncCoordinator?.cancel();
+      if (record.active === active) record.requestOptions.current = undefined;
     }
+    // Cleanup must finish before the idle/terminal event permits a new turn.
+    this.finishTurn(record, active, status, errorMessage);
   }
 
   finishTurn(record, active, status, errorMessage) {
@@ -1040,6 +1077,7 @@ export class PiWorkerRuntime {
     const text = normalizeInput(params.input);
     const session = await this.loadSession(record);
     await session.steer(text);
+    record.active?.asyncCoordinator?.notifyExternalInput();
     return {};
   }
 
@@ -1048,7 +1086,10 @@ export class PiWorkerRuntime {
     if (!active) return;
     if (active.turn.id !== turnId) throw new ProtocolError("turn id does not match the active turn", "turn_mismatch");
     active.interrupted = true;
+    // Wake the programmatic wait before awaiting Pi's abort settlement.
+    const cancelTools = active.asyncCoordinator?.cancel();
     if (record.session) await record.session.abort();
+    await cancelTools;
     if (active.turn.status === "inProgress") this.finishTurn(record, active, "interrupted", "Turn was interrupted.");
   }
 

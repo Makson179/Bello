@@ -403,6 +403,7 @@ def test_controller_runtime_settings_summary_uses_all_effective_role_values(tmp_
         "adversary-intelligence=ultra "
         "speed=fast "
         "runtime=true "
+        "async-tools=false "
         "log-distiller=false "
         "cheap-runtime=true "
         "multi-agent=off "
