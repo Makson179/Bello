@@ -76,9 +76,10 @@ def unique_tool_resolutions(request):
 
 
 class ScriptedProvider:
-    def __init__(self, *, enabled, code, child_wait=False):
+    def __init__(self, *, enabled, code, child_wait=False, interrupt_probe=False):
         self.enabled, self.code = enabled, code
         self.child_wait = child_wait
+        self.interrupt_probe = interrupt_probe
         self.slow_seconds = 12 if os.name == "nt" else 2.5
         self.requests, self.times, self.errors, self.tools = [], [], [], []
         self.rejected = []
@@ -91,6 +92,17 @@ class ScriptedProvider:
             if os.name == "nt":
                 command = f"Start-Sleep -Seconds {self.slow_seconds}; [Console]::Out.Write('ASYNC_SLOW_DONE')"
                 fast_command = "[Console]::Out.Write('ASYNC_FAST_DONE')"
+            if self.interrupt_probe:
+                if os.name == "nt":
+                    child = (
+                        "[IO.File]::WriteAllText((Join-Path (Get-Location).Path 'cancel.started'), 'started'); "
+                        f"Start-Sleep -Seconds {self.slow_seconds}; "
+                        "[IO.File]::WriteAllText((Join-Path (Get-Location).Path 'cancel.orphan'), 'orphan')")
+                    command = ("& (Join-Path $PSHOME 'powershell.exe') -NoProfile -NonInteractive "
+                               f'-Command "{child}"; [Console]::Out.Write(\'ASYNC_SLOW_DONE\')')
+                else:
+                    command = (f"/bin/sh -c 'printf started > cancel.started; sleep {self.slow_seconds}; "
+                               "printf orphan > cancel.orphan'; printf ASYNC_SLOW_DONE")
             args = {"cmd": command, "yield_time_ms": 1, "max_output_tokens": 200, "login": False}
             shell = {"shell": windows_shell()} if os.name == "nt" else {}
             args.update(shell)
@@ -189,7 +201,8 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
     home, workspace = output / "empty-home", output / "work"
     home.mkdir()
     workspace.mkdir()
-    provider = ScriptedProvider(enabled=enabled, code=code, child_wait=child_wait)
+    provider = ScriptedProvider(enabled=enabled, code=code, child_wait=child_wait,
+                                interrupt_probe=signal == "interrupt")
     server = ThreadingHTTPServer(("127.0.0.1", 0), provider.handler())
     server.daemon_threads = True
     worker = threading.Thread(target=server.serve_forever, daemon=True)
@@ -205,6 +218,8 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
     session = ChildWaitSession(binary, home, isolated_environment(home, binary, port, {}), wait_seconds=provider.slow_seconds)
     failure = None
     interrupted = False
+    interrupted_command_started = False
+    requests_at_interrupt = None
     try:
         if os.name == "nt":
             await provision_windows_sandbox(binary, home, session.env, output)
@@ -215,7 +230,8 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
             raise ValueError("Native binary does not advertise both Bello capabilities")
         params = {
             "model": "gpt-6-astra" if code else "gpt-5.5", "modelProvider": "bello_fixture",
-            "cwd": str(workspace), "sandbox": "read-only", "approvalPolicy": "never", "ephemeral": True,
+            "cwd": str(workspace), "sandbox": "workspace-write" if signal == "interrupt" else "read-only",
+            "approvalPolicy": "never", "ephemeral": True,
             "config": {"features.bello_async_tools": enabled, "features.code_mode": code,
                        "features.code_mode_only": code, "features.shell_zsh_fork": False}}
         if os.name == "nt":
@@ -233,12 +249,18 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
             async with asyncio.timeout(20):
                 while not provider.requests:
                     await asyncio.sleep(0.01)
-            await asyncio.sleep(0.15)
             if signal == "steer":
+                await asyncio.sleep(0.15)
                 await session.request("turn/steer", {"threadId": reply["thread"]["id"],
                     "expectedTurnId": started["turn"]["id"],
                     "input": [{"type": "text", "text": "Acknowledge this steer while the command is running.", "text_elements": []}]})
             else:
+                # Observe a real allowed workspace write before cancellation,
+                # rather than cancelling while native sandbox setup still runs.
+                async with asyncio.timeout(20):
+                    while not (workspace / "cancel.started").is_file():
+                        await asyncio.sleep(0.01)
+                interrupted_command_started = True
                 await session.request("turn/interrupt", {"threadId": reply["thread"]["id"], "turnId": started["turn"]["id"]})
                 async with asyncio.timeout(5):
                     while True:
@@ -246,8 +268,10 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
                         if event.get("method") == "turn/completed":
                             interrupted = event["params"]["turn"]["status"] == "interrupted"
                             break
+                requests_at_interrupt = len(provider.requests)
                 # Keep the session alive beyond the original command lifetime:
-                # cancellation must not allow a deferred model continuation.
+                # cancellation must stop both model continuations and the OS
+                # command's delayed write, even while this session stays alive.
                 await asyncio.sleep(provider.slow_seconds + 0.2)
         if signal != "interrupt":
             await session.complete(reply["thread"]["id"], timeout=60)
@@ -279,7 +303,9 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
     native_instructions = isinstance(instructions, str) and len(instructions) > 1000
     passed = failure is None and not provider.errors and terminal and fast_delivered and native_instructions and unique_resolutions
     if signal == "interrupt":
-        passed = failure is None and not provider.errors and interrupted and len(provider.requests) == 1
+        passed = (failure is None and not provider.errors and interrupted and interrupted_command_started
+                  and not (workspace / "cancel.orphan").exists()
+                  and requests_at_interrupt in (1, 2) and len(provider.requests) == requests_at_interrupt)
     elif enabled:
         passed &= no_polls and len(provider.requests) == expected_requests and prefix_stable
         if not code and len(provider.times) == 3:
@@ -288,7 +314,8 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
             passed &= provider.times[2] - provider.times[0] >= provider.slow_seconds - 0.1
     else:
         passed &= not no_polls
-    return {"enabled": enabled, "code_mode": code, "signal": signal, "interrupted": interrupted, "child_wait": child_wait,
+    return {"case": output.name, "enabled": enabled, "code_mode": code, "signal": signal,
+            "interrupted": interrupted, "child_wait": child_wait,
             "passed": bool(passed), "failure": failure,
             "provider_errors": provider.errors, "provider_requests": len(provider.requests),
             "rejected_network_requests": provider.rejected, "external_proxy_requests_forwarded": 0,
@@ -296,10 +323,15 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
             "fast_output_delivered": fast_delivered, "unique_tool_resolutions": unique_resolutions,
             "native_instructions_preserved": native_instructions,
             "native_instructions_sha256": hashlib.sha256(instructions.encode()).hexdigest(),
+            "interrupted_command_started": interrupted_command_started,
+            "cancelled_command_late_write_absent": not (workspace / "cancel.orphan").exists() if signal == "interrupt" else None,
+            "provider_requests_at_interrupt": requests_at_interrupt,
             "request_offsets": [round(value - provider.times[0], 3) for value in provider.times]}
 
 
-async def verify(binary, output):
+async def verify(binary, output, *, concurrency_repeats=1):
+    if not 1 <= concurrency_repeats <= 10:
+        raise ValueError("concurrency_repeats must be between 1 and 10")
     output.mkdir(parents=True, exist_ok=False)
     results = []
     for code in (False, True):
@@ -321,6 +353,14 @@ async def verify(binary, output):
                   "case": name, "async_tools": True}
         results.append(result)
         print(json.dumps(result), flush=True)
+    # Fresh homes exercise concurrent first-use setup, not merely an already
+    # warmed sandbox. Keep every attempt: a later success cannot hide a race.
+    for repeat in range(2, concurrency_repeats + 1):
+        for signal in (None, "steer"):
+            name = f"{'steer' if signal else 'direct_on'}_repeat_{repeat}"
+            result = await verify_case(binary, output / name, enabled=True, code=False, signal=signal)
+            results.append(result)
+            print(json.dumps({"case": name, **result}), flush=True)
     unchanged_instructions = all(results[index]["native_instructions_sha256"] == results[index + 1]["native_instructions_sha256"]
                                  for index in (0, 2))
     report = {"schema": "bello.native-async-smoke.v1", "paid_model_calls": 0,
@@ -334,6 +374,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--codex", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--concurrency-repeats", type=int, choices=range(1, 11), default=1,
+                        help="Repeat direct ON and steering with separate cold sandbox homes")
     args = parser.parse_args()
-    result = asyncio.run(verify(args.codex.absolute(), args.output_dir.absolute()))
+    result = asyncio.run(verify(args.codex.absolute(), args.output_dir.absolute(),
+                               concurrency_repeats=args.concurrency_repeats))
     raise SystemExit(0 if result["passed"] else 1)

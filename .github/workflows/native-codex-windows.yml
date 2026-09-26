@@ -118,7 +118,7 @@ jobs:
       - name: Verify real native direct, code-mode and poll provider boundaries
         run: python scripts/verify_native_codex_selection.py --codex native-candidate/bin/codex.exe --output-dir native-proof
       - name: Prove async ON/OFF, terminal delivery and append-only history without credentials
-        run: python scripts/verify_native_codex_async.py --codex native-candidate/bin/codex.exe --output-dir native-async-proof
+        run: python scripts/verify_native_codex_async.py --codex native-candidate/bin/codex.exe --output-dir native-async-proof --concurrency-repeats 3
       - name: Package only after all nine proof cases pass
         run: python scripts/build_native_codex_windows.py package-candidate --candidate native-candidate --proof native-proof/report.json --output native-artifact
       - name: Install local artifact into private cache and repeat all nine proof cases
@@ -146,7 +146,7 @@ jobs:
           if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw 'Installed candidate binary missing' }
           $digest = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($digest -ne $receipt.binary_sha256) { throw 'Installed candidate binary changed' }
-          python scripts/verify_native_codex_async.py --codex "$binary" --output-dir native-installed-async-proof
+          python scripts/verify_native_codex_async.py --codex "$binary" --output-dir native-installed-async-proof --concurrency-repeats 3
           exit $LASTEXITCODE
       - name: Upload verified unsigned bundle (no release publication)
         uses: actions/upload-artifact@v4

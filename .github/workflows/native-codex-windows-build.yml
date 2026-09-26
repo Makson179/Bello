@@ -112,7 +112,35 @@ jobs:
             ${{ runner.temp }}/bello-cargo/git
             ${{ runner.temp }}/bello-native-target
           key: ${{ steps.cargo_cache.outputs.cache-primary-key }}
-      - name: Save compiled executables independently of proof success
+      - name: Install pinned upstream native test runners
+        if: steps.candidate.outputs.cache-hit != 'true'
+        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: just@1.51.0,nextest@0.9.103
+      - name: Test setup transactions and report compatibility before caching candidate
+        if: steps.candidate.outputs.cache-hit != 'true'
+        working-directory: native-source/codex-rs
+        run: |
+          $reports = Join-Path $env:GITHUB_WORKSPACE 'native-setup-test-reports'
+          New-Item -ItemType Directory -Path $reports -Force | Out-Null
+          just test --locked --release --target x86_64-pc-windows-msvc -p codex-windows-sandbox --lib --bin codex-windows-sandbox-setup --test-threads 1 --retries 0 -E 'test(setup_transaction::tests::) | test(report_helper_failure_) | test(setup_version_rejects_) | test(setup_payload_requires_) | test(detached_read_acl_payload_)'
+          $setupExit = $LASTEXITCODE
+          $junit = Join-Path $env:CARGO_TARGET_DIR 'nextest/local/junit.xml'
+          if (Test-Path $junit) { Copy-Item $junit (Join-Path $reports 'setup-transactions.xml') }
+          if ($setupExit -ne 0) { throw "Setup transaction regressions failed: $setupExit" }
+          just test --locked --release --target x86_64-pc-windows-msvc -p codex-cli --bin codex --test-threads 1 --retries 0 -E 'test(reports_refresh_failure_after_setup_completed) | test(rejects_oversized_setup_failure_reports)'
+          $doctorExit = $LASTEXITCODE
+          if (Test-Path $junit) { Copy-Item $junit (Join-Path $reports 'doctor-report-compatibility.xml') }
+          if ($doctorExit -ne 0) { throw "Doctor report compatibility regressions failed: $doctorExit" }
+      - name: Preserve native setup regression receipts
+        if: always() && steps.candidate.outputs.cache-hit != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-setup-regressions-${{ github.run_id }}-${{ github.run_attempt }}
+          path: native-setup-test-reports/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Save compiled executables independently of provider proof success
         if: steps.candidate.outputs.cache-hit != 'true'
         run: python scripts/build_native_codex_windows.py snapshot-build --source native-source --patch scripts/native-codex-selection.patch --release "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release" --cargo-home "$env:CARGO_HOME" --output native-candidate
       - name: Validate exact native inputs and every candidate file

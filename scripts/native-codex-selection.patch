@@ -2251,3 +2251,939 @@ index 2ec577e..4725e02 100644
          .env("NODE_REPL_AUTH_TOKEN", "configured-token")
          .env("openai_identity_token_file", "/run/identity-token")
          .env(
+diff --git a/codex-rs/cli/src/doctor/sandbox_tests.rs b/codex-rs/cli/src/doctor/sandbox_tests.rs
+index 1f5a5c8..cc983ec 100644
+--- a/codex-rs/cli/src/doctor/sandbox_tests.rs
++++ b/codex-rs/cli/src/doctor/sandbox_tests.rs
+@@ -66,6 +66,7 @@ async fn reports_refresh_failure_after_setup_completed() {
+         &codex_windows_sandbox::SetupErrorReport {
+             code: codex_windows_sandbox::SetupErrorCode::HelperFirewallPolicyIneffective,
+             message: "firewall policy rejected the refresh".to_string(),
++            request_id: None,
+         },
+     )
+     .expect("write refresh failure");
+@@ -98,6 +99,7 @@ async fn rejects_oversized_setup_failure_reports() {
+         &codex_windows_sandbox::SetupErrorReport {
+             code: codex_windows_sandbox::SetupErrorCode::HelperFirewallPolicyIneffective,
+             message: "x".repeat(64 * 1024),
++            request_id: None,
+         },
+     )
+     .expect("write oversized setup failure");
+diff --git a/codex-rs/windows-sandbox-rs/src/bin/setup_main/win.rs b/codex-rs/windows-sandbox-rs/src/bin/setup_main/win.rs
+index 1d9340c..c6ec8ce 100644
+--- a/codex-rs/windows-sandbox-rs/src/bin/setup_main/win.rs
++++ b/codex-rs/windows-sandbox-rs/src/bin/setup_main/win.rs
+@@ -11,6 +11,7 @@ use codex_windows_sandbox::SETUP_VERSION;
+ use codex_windows_sandbox::SetupErrorCode;
+ use codex_windows_sandbox::SetupErrorReport;
+ use codex_windows_sandbox::SetupFailure;
++use codex_windows_sandbox::acquire_setup_mutation_lock;
+ use codex_windows_sandbox::add_deny_write_ace;
+ use codex_windows_sandbox::convert_string_sid_to_sid;
+ use codex_windows_sandbox::ensure_allow_mask_aces_with_inheritance;
+@@ -105,6 +106,33 @@ struct Payload {
+     mode: SetupMode,
+     #[serde(default)]
+     refresh_only: bool,
++    setup_lock_sid: String,
++    #[serde(default)]
++    setup_request_id: Option<String>,
++}
++
++impl Payload {
++    fn validate_setup_version(&self) -> Result<()> {
++        if self.version != SETUP_VERSION {
++            return Err(anyhow::Error::new(SetupFailure::new(
++                SetupErrorCode::HelperRequestArgsFailed,
++                format!(
++                    "setup version mismatch: expected {SETUP_VERSION}, got {}",
++                    self.version
++                ),
++            )));
++        }
++        Ok(())
++    }
++
++    fn for_read_acl_helper(&self) -> Self {
++        let mut payload = self.clone();
++        payload.mode = SetupMode::ReadAclsOnly;
++        payload.refresh_only = true;
++        // A detached child's late failure is not its parent's helper result.
++        payload.setup_request_id = None;
++        payload
++    }
+ }
+ 
+ #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+@@ -164,9 +192,7 @@ fn workspace_write_cap_sids_for_path(
+ }
+ 
+ fn spawn_read_acl_helper(payload: &Payload, _log: &mut dyn Write) -> Result<()> {
+-    let mut read_payload = payload.clone();
+-    read_payload.mode = SetupMode::ReadAclsOnly;
+-    read_payload.refresh_only = true;
++    let read_payload = payload.for_read_acl_helper();
+     let payload_json = serde_json::to_vec(&read_payload)?;
+     let payload_b64 = BASE64.encode(payload_json);
+     let exe = std::env::current_exe().context("locate setup helper")?;
+@@ -457,15 +483,17 @@ fn real_main() -> Result<()> {
+             format!("failed to parse payload json: {err}"),
+         ))
+     })?;
+-    if payload.version != SETUP_VERSION {
+-        return Err(anyhow::Error::new(SetupFailure::new(
+-            SetupErrorCode::HelperRequestArgsFailed,
+-            format!(
+-                "setup version mismatch: expected {SETUP_VERSION}, got {}",
+-                payload.version
+-            ),
+-        )));
+-    }
++    payload.validate_setup_version()?;
++    // Serialize setup state through report write, but preserve asynchronous read
++    // grants under their existing read_acl_mutex. They do not touch markers,
++    // accounts, firewall or read-deny state; their shared report is locked below.
++    // No helper takes the parent's request lock.
++    let mutation_lock = match payload.mode {
++        SetupMode::ReadAclsOnly => None,
++        SetupMode::Full | SetupMode::ProvisionOnly => {
++            Some(acquire_setup_mutation_lock(&payload.setup_lock_sid)?)
++        }
++    };
+     let sbx_dir = sandbox_dir(&payload.codex_home);
+     std::fs::create_dir_all(&sbx_dir).map_err(|err| {
+         anyhow::Error::new(SetupFailure::new(
+@@ -491,6 +519,12 @@ fn real_main() -> Result<()> {
+         let report = SetupErrorReport {
+             code: failure.code,
+             message: failure.message,
++            request_id: payload.setup_request_id.clone(),
++        };
++        let _report_lock = if mutation_lock.is_none() {
++            Some(acquire_setup_mutation_lock(&payload.setup_lock_sid)?)
++        } else {
++            None
+         };
+         if let Err(write_err) = write_setup_error_report(&payload.codex_home, &report) {
+             let _ = log_line(
+@@ -1071,6 +1105,7 @@ mod tests {
+             "write_roots": [],
+             "proxy_ports": [],
+             "real_user": "User",
++            "setup_lock_sid": "S-1-5-21-1-2-3-1001",
+         })
+     }
+ 
+@@ -1081,6 +1116,46 @@ mod tests {
+         assert_eq!(payload.otel, None);
+     }
+ 
++    #[test]
++    fn setup_version_rejects_mixed_helpers_before_mutation() {
++        let mut payload: Payload = serde_json::from_value(payload_json()).expect("payload");
++        payload.validate_setup_version().expect("matching version");
++        for version in [SETUP_VERSION - 1, SETUP_VERSION + 1] {
++            payload.version = version;
++            let error = payload.validate_setup_version().expect_err("mixed helper");
++            assert_eq!(
++                super::extract_setup_failure(&error),
++                Some(&super::SetupFailure::new(
++                    super::SetupErrorCode::HelperRequestArgsFailed,
++                    format!("setup version mismatch: expected {SETUP_VERSION}, got {version}"),
++                ))
++            );
++        }
++    }
++
++    #[test]
++    fn setup_payload_requires_lock_identity() {
++        let mut payload = payload_json();
++        payload
++            .as_object_mut()
++            .expect("object")
++            .remove("setup_lock_sid");
++        assert!(serde_json::from_value::<Payload>(payload).is_err());
++    }
++
++    #[test]
++    fn detached_read_acl_payload_does_not_reuse_parent_request_id() {
++        let mut payload: Payload = serde_json::from_value(payload_json()).expect("payload");
++        payload.setup_request_id = Some("parent-request".to_string());
++        let child = payload.for_read_acl_helper();
++        let mut expected = serde_json::to_value(&payload).expect("parent json");
++        expected["mode"] = json!("read-acls-only");
++        expected["refresh_only"] = json!(true);
++        expected["setup_request_id"] = serde_json::Value::Null;
++        assert_eq!(serde_json::to_value(child).expect("child json"), expected);
++        assert_eq!(payload.setup_request_id.as_deref(), Some("parent-request"));
++    }
++
+     #[test]
+     fn payload_accepts_provision_only_mode() {
+         let mut payload = payload_json();
+diff --git a/codex-rs/windows-sandbox-rs/src/lib.rs b/codex-rs/windows-sandbox-rs/src/lib.rs
+index 0ca4dca..aea1ebd 100644
+--- a/codex-rs/windows-sandbox-rs/src/lib.rs
++++ b/codex-rs/windows-sandbox-rs/src/lib.rs
+@@ -112,6 +112,14 @@ mod setup;
+ #[cfg(target_os = "windows")]
+ mod setup_error;
+ 
++#[cfg(target_os = "windows")]
++mod setup_transaction;
++
++#[cfg(target_os = "windows")]
++pub use setup_transaction::SetupTransactionLock;
++#[cfg(target_os = "windows")]
++pub use setup_transaction::acquire_setup_mutation_lock;
++
+ #[cfg(target_os = "windows")]
+ mod spawn_prep;
+ 
+diff --git a/codex-rs/windows-sandbox-rs/src/setup.rs b/codex-rs/windows-sandbox-rs/src/setup.rs
+index 5daaa8d..a44709e 100644
+--- a/codex-rs/windows-sandbox-rs/src/setup.rs
++++ b/codex-rs/windows-sandbox-rs/src/setup.rs
+@@ -31,6 +31,8 @@ use crate::setup_error::clear_setup_error_report;
+ use crate::setup_error::extract_failure;
+ use crate::setup_error::failure;
+ use crate::setup_error::read_setup_error_report;
++use crate::setup_transaction::SetupRequest;
++use crate::setup_transaction::acquire_setup_mutation_lock;
+ use crate::ssh_config_dependencies::ssh_config_dependency_paths;
+ use anyhow::Result;
+ use anyhow::anyhow;
+@@ -46,7 +48,9 @@ use windows_sys::Win32::Security::CheckTokenMembership;
+ use windows_sys::Win32::Security::FreeSid;
+ use windows_sys::Win32::Security::SECURITY_NT_AUTHORITY;
+ 
+-pub const SETUP_VERSION: u32 = 5;
++// Version 6 requires helper-owned setup exclusion and correlated error reports.
++// Old helpers must reject new requests instead of silently ignoring lock fields.
++pub const SETUP_VERSION: u32 = 6;
+ pub const OFFLINE_USERNAME: &str = "CodexSandboxOffline";
+ pub const ONLINE_USERNAME: &str = "CodexSandboxOnline";
+ const ERROR_CANCELLED: u32 = 1223;
+@@ -357,6 +361,9 @@ fn run_setup_refresh_inner(
+ }
+ 
+ fn run_setup_refresh_payload(b64: &str, codex_home: &Path) -> Result<()> {
++    let request = SetupRequest::begin(b64)?;
++    let b64 = &request.payload_b64;
++    let mutation_lock = acquire_setup_mutation_lock(&request.sid)?;
+     let exe = find_setup_exe();
+     let sbx_dir = sandbox_dir(codex_home);
+     let log_path = current_log_file_path(&sbx_dir);
+@@ -371,6 +378,7 @@ fn run_setup_refresh_payload(b64: &str, codex_home: &Path) -> Result<()> {
+         }
+     };
+     // Refresh should never request elevation; ensure verb isn't set and we don't trigger UAC.
++    drop(mutation_lock);
+     let mut cmd = Command::new(&exe);
+     cmd.arg(b64)
+         .stdin(Stdio::null())
+@@ -396,6 +404,7 @@ fn run_setup_refresh_payload(b64: &str, codex_home: &Path) -> Result<()> {
+         log_note(&format!("setup refresh: {message}"), Some(&sbx_dir));
+         failure(SetupErrorCode::OrchestratorHelperLaunchFailed, message)
+     })?;
++    let _mutation_lock = acquire_setup_mutation_lock(&request.sid)?;
+     if !status.success() {
+         log_note(
+             &format!("setup refresh: exited with status {status:?}"),
+@@ -405,6 +414,7 @@ fn run_setup_refresh_payload(b64: &str, codex_home: &Path) -> Result<()> {
+             codex_home,
+             cleared_report,
+             status.code(),
++            &request.request_id,
+         ));
+     }
+     if let Err(err) = clear_setup_error_report(codex_home) {
+@@ -866,14 +876,17 @@ fn report_helper_failure(
+     codex_home: &Path,
+     cleared_report: bool,
+     exit_code: Option<i32>,
++    request_id: &str,
+ ) -> anyhow::Error {
+     let exit_detail = format!("setup helper exited with status {exit_code:?}");
+     if !cleared_report {
+         return failure(SetupErrorCode::OrchestratorHelperExitNonzero, exit_detail);
+     }
+     match read_setup_error_report(codex_home) {
+-        Ok(Some(report)) => anyhow::Error::new(SetupFailure::from_report(report)),
+-        Ok(None) => failure(SetupErrorCode::OrchestratorHelperExitNonzero, exit_detail),
++        Ok(Some(report)) if report.request_id.as_deref() == Some(request_id) => {
++            anyhow::Error::new(SetupFailure::from_report(report))
++        }
++        Ok(_) => failure(SetupErrorCode::OrchestratorHelperExitNonzero, exit_detail),
+         Err(err) => failure(
+             SetupErrorCode::OrchestratorHelperReportReadFailed,
+             format!("{exit_detail}; failed to read setup_error.json: {err}"),
+@@ -921,6 +934,9 @@ fn run_setup_exe_payload(
+     use windows_sys::Win32::UI::Shell::SEE_MASK_NOCLOSEPROCESS;
+     use windows_sys::Win32::UI::Shell::SHELLEXECUTEINFOW;
+     use windows_sys::Win32::UI::Shell::ShellExecuteExW;
++    let request = SetupRequest::begin(payload_b64)?;
++    let payload_b64 = &request.payload_b64;
++    let mutation_lock = acquire_setup_mutation_lock(&request.sid)?;
+     let exe = find_setup_exe();
+     let cleared_report = match clear_setup_error_report(codex_home) {
+         Ok(()) => true,
+@@ -935,6 +951,7 @@ fn run_setup_exe_payload(
+         }
+     };
+ 
++    drop(mutation_lock);
+     if !needs_elevation {
+         let status = Command::new(&exe)
+             .arg(payload_b64)
+@@ -949,11 +966,13 @@ fn run_setup_exe_payload(
+                     format!("failed to launch setup helper (non-elevated): {err}"),
+                 )
+             })?;
++        let _mutation_lock = acquire_setup_mutation_lock(&request.sid)?;
+         if !status.success() {
+             return Err(report_helper_failure(
+                 codex_home,
+                 cleared_report,
+                 status.code(),
++                &request.request_id,
+             ));
+         }
+         verify_setup_completed(codex_home)?;
+@@ -995,18 +1014,22 @@ fn run_setup_exe_payload(
+             format!("ShellExecuteExW failed to launch setup helper: {last_error}"),
+         ));
+     }
+-    unsafe {
++    let code = unsafe {
+         WaitForSingleObject(sei.hProcess, INFINITE);
+         let mut code: u32 = 1;
+         GetExitCodeProcess(sei.hProcess, &mut code);
+         CloseHandle(sei.hProcess);
+-        if code != 0 {
+-            return Err(report_helper_failure(
+-                codex_home,
+-                cleared_report,
+-                Some(code as i32),
+-            ));
+-        }
++        code
++    };
++    // A helper orphaned by a crashed parent may still own shared setup state.
++    let _mutation_lock = acquire_setup_mutation_lock(&request.sid)?;
++    if code != 0 {
++        return Err(report_helper_failure(
++            codex_home,
++            cleared_report,
++            Some(code as i32),
++            &request.request_id,
++        ));
+     }
+     verify_setup_completed(codex_home)?;
+     if let Err(err) = clear_setup_error_report(codex_home) {
+@@ -1548,6 +1571,7 @@ mod tests {
+             &SetupErrorReport {
+                 code: super::SetupErrorCode::HelperFirewallPolicyAccessFailed,
+                 message: "firewall policy unavailable".to_string(),
++                request_id: Some("owned-request".to_string()),
+             },
+         )
+         .expect("write setup error report");
+@@ -1556,6 +1580,7 @@ mod tests {
+             codex_home.as_path(),
+             /*cleared_report*/ true,
+             /*exit_code*/ Some(1),
++            "owned-request",
+         );
+ 
+         let failure = extract_failure(&err).expect("structured setup failure");
+@@ -1577,6 +1602,7 @@ mod tests {
+             &SetupErrorReport {
+                 code: super::SetupErrorCode::HelperFirewallPolicyAccessFailed,
+                 message: "stale report".to_string(),
++                request_id: Some("owned-request".to_string()),
+             },
+         )
+         .expect("write setup error report");
+@@ -1585,6 +1611,7 @@ mod tests {
+             codex_home.as_path(),
+             /*cleared_report*/ false,
+             /*exit_code*/ Some(1),
++            "owned-request",
+         );
+ 
+         let failure = extract_failure(&err).expect("structured setup failure");
+@@ -1597,6 +1624,35 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn report_helper_failure_rejects_foreign_and_legacy_reports() {
++        let tmp = TempDir::new().expect("tempdir");
++        for request_id in [None, Some("detached-or-orphaned-request".to_string())] {
++            write_setup_error_report(
++                tmp.path(),
++                &SetupErrorReport {
++                    code: super::SetupErrorCode::HelperFirewallPolicyAccessFailed,
++                    message: "not this child".to_string(),
++                    request_id,
++                },
++            )
++            .expect("write foreign report");
++            let err = super::report_helper_failure(
++                tmp.path(),
++                /*cleared_report*/ true,
++                /*exit_code*/ Some(1),
++                "owned-request",
++            );
++            assert_eq!(
++                extract_failure(&err),
++                Some(&super::SetupFailure::new(
++                    super::SetupErrorCode::OrchestratorHelperExitNonzero,
++                    "setup helper exited with status Some(1)",
++                ))
++            );
++        }
++    }
++
+     #[test]
+     fn setup_refresh_skips_profiles_without_managed_filesystem_permissions() {
+         let tmp = TempDir::new().expect("tempdir");
+diff --git a/codex-rs/windows-sandbox-rs/src/setup_error.rs b/codex-rs/windows-sandbox-rs/src/setup_error.rs
+index d910460..280bea9 100644
+--- a/codex-rs/windows-sandbox-rs/src/setup_error.rs
++++ b/codex-rs/windows-sandbox-rs/src/setup_error.rs
+@@ -14,6 +14,8 @@ use std::path::PathBuf;
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(rename_all = "snake_case")]
+ pub enum SetupErrorCode {
++    /// Setup synchronization failed, timed out, or detected an abandoned owner.
++    SetupTransactionLockFailed,
+     // Orchestrator (run in CLI) failures.
+     /// Failed to create `codex_home/.sandbox` in the orchestrator.
+     OrchestratorSandboxDirCreateFailed,
+@@ -77,6 +79,7 @@ pub enum SetupErrorCode {
+ impl SetupErrorCode {
+     pub fn as_str(self) -> &'static str {
+         match self {
++            Self::SetupTransactionLockFailed => "setup_transaction_lock_failed",
+             Self::OrchestratorSandboxDirCreateFailed => "orchestrator_sandbox_dir_create_failed",
+             Self::OrchestratorElevationCheckFailed => "orchestrator_elevation_check_failed",
+             Self::OrchestratorElevationRequired => "orchestrator_elevation_required",
+@@ -115,6 +118,8 @@ impl SetupErrorCode {
+ pub struct SetupErrorReport {
+     pub code: SetupErrorCode,
+     pub message: String,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub request_id: Option<String>,
+ }
+ 
+ #[derive(Debug, PartialEq, Eq)]
+diff --git a/codex-rs/windows-sandbox-rs/src/setup_transaction.rs b/codex-rs/windows-sandbox-rs/src/setup_transaction.rs
+new file mode 100644
+index 0000000..8e5c8b3
+--- /dev/null
++++ b/codex-rs/windows-sandbox-rs/src/setup_transaction.rs
+@@ -0,0 +1,226 @@
++//! Setup-only cross-process exclusion. Parents own the request lock, helpers own
++//! the mutation lock. A surviving helper therefore remains protected if its
++//! parent dies. Neither lock is held while running a sandboxed command.
++
++use anyhow::Context;
++use anyhow::Result;
++use anyhow::bail;
++use base64::Engine;
++use base64::engine::general_purpose::STANDARD as BASE64;
++use std::io;
++use std::marker::PhantomData;
++use std::os::windows::io::AsRawHandle;
++use std::os::windows::io::FromRawHandle;
++use std::os::windows::io::OwnedHandle;
++use std::ptr::null_mut;
++use windows_sys::Win32::Foundation::HANDLE;
++use windows_sys::Win32::Foundation::HLOCAL;
++use windows_sys::Win32::Foundation::LocalFree;
++use windows_sys::Win32::Foundation::WAIT_ABANDONED;
++use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
++use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
++use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
++use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
++use windows_sys::Win32::Security::Cryptography::BCRYPT_USE_SYSTEM_PREFERRED_RNG;
++use windows_sys::Win32::Security::Cryptography::BCryptGenRandom;
++use windows_sys::Win32::Security::GetLengthSid;
++use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
++use windows_sys::Win32::Security::TOKEN_QUERY;
++use windows_sys::Win32::System::Threading::CreateMutexW;
++use windows_sys::Win32::System::Threading::GetCurrentProcess;
++use windows_sys::Win32::System::Threading::ReleaseMutex;
++use windows_sys::Win32::System::Threading::WaitForSingleObject;
++
++use crate::setup_error::SetupErrorCode;
++use crate::setup_error::failure;
++use crate::token::get_user_sid_bytes;
++use crate::winutil::resolve_sid;
++use crate::winutil::string_from_sid_bytes;
++use crate::winutil::to_wide;
++
++const SETUP_LOCK_TIMEOUT_MS: u32 = 120_000;
++
++/// A non-inheritable mutex owned by its acquiring thread only.
++#[must_use]
++pub struct SetupTransactionLock {
++    handle: OwnedHandle,
++    _thread_bound: PhantomData<*mut ()>,
++}
++
++impl Drop for SetupTransactionLock {
++    fn drop(&mut self) {
++        unsafe { ReleaseMutex(self.handle.as_raw_handle() as HANDLE) };
++    }
++}
++
++fn current_user_sid() -> Result<String> {
++    #[link(name = "advapi32")]
++    unsafe extern "system" {
++        fn OpenProcessToken(process: HANDLE, desired_access: u32, token: *mut HANDLE) -> i32;
++    }
++    let mut token = 0;
++    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
++        return Err(io::Error::last_os_error()).context("query setup caller identity");
++    }
++    let token = unsafe { OwnedHandle::from_raw_handle(token as _) };
++    let bytes = unsafe { get_user_sid_bytes(token.as_raw_handle() as HANDLE) }?;
++    string_from_sid_bytes(&bytes).map_err(anyhow::Error::msg)
++}
++
++fn validate_sid(sid: &str) -> Result<()> {
++    // Accept only canonical numeric SIDs, never account names or SDDL fragments.
++    if !sid.starts_with("S-1-") || !sid[4..].chars().all(|ch| ch.is_ascii_digit() || ch == '-') {
++        bail!("invalid setup lock SID");
++    }
++    let mut raw = null_mut();
++    if unsafe { ConvertStringSidToSidW(to_wide(sid).as_ptr(), &mut raw) } == 0 {
++        return Err(io::Error::last_os_error()).context("parse setup lock SID");
++    }
++    let bytes = unsafe { std::slice::from_raw_parts(raw.cast(), GetLengthSid(raw) as usize) };
++    let canonical = string_from_sid_bytes(bytes).map_err(anyhow::Error::msg);
++    unsafe { LocalFree(raw as HLOCAL) };
++    if canonical? != sid {
++        bail!("setup lock SID is not canonical");
++    }
++    Ok(())
++}
++
++fn request_lock_sid(payload: &serde_json::Value) -> Result<String> {
++    if payload.get("mode").and_then(serde_json::Value::as_str) == Some("provision-only") {
++        // Managed provisioning already requires elevation and explicitly targets
++        // another user. Coordinate with that user's ordinary full/refresh setup,
++        // not with the administrator's own CODEX_HOME.
++        let user = payload
++            .get("real_user")
++            .and_then(serde_json::Value::as_str)
++            .context("provisioning payload requires a target user")?;
++        string_from_sid_bytes(&resolve_sid(user)?).map_err(anyhow::Error::msg)
++    } else {
++        // Never use USERNAME or any other payload-controlled account name for
++        // ordinary setup. UAC helpers retain this original token-derived SID.
++        current_user_sid()
++    }
++}
++
++fn acquire_named_lock(name: &str, sid: &str, timeout_ms: u32) -> Result<SetupTransactionLock> {
++    validate_sid(sid)?;
++    // Explicit medium integrity lets the unelevated parent and UAC-elevated
++    // helper share this synchronization object. Its protected DACL still grants
++    // access only to SYSTEM, administrators, and the originating real user.
++    let sddl = to_wide(format!(
++        "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{sid})S:(ML;;NW;;;ME)"
++    ));
++    let mut descriptor = null_mut();
++    if unsafe {
++        ConvertStringSecurityDescriptorToSecurityDescriptorW(
++            sddl.as_ptr(),
++            /*stringsdrevision*/ 1,
++            &mut descriptor,
++            null_mut(),
++        )
++    } == 0
++    {
++        return Err(io::Error::last_os_error()).context("create setup lock security");
++    }
++    let attributes = SECURITY_ATTRIBUTES {
++        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
++        lpSecurityDescriptor: descriptor,
++        bInheritHandle: 0,
++    };
++    let raw = unsafe {
++        CreateMutexW(
++            &attributes,
++            /*binitialowner*/ 0,
++            to_wide(name).as_ptr(),
++        )
++    };
++    let opened = if raw == 0 {
++        Err(io::Error::last_os_error())
++    } else {
++        Ok(unsafe { OwnedHandle::from_raw_handle(raw as _) })
++    };
++    unsafe { LocalFree(descriptor as HLOCAL) };
++    let handle = opened.context("open setup transaction mutex")?;
++    match unsafe { WaitForSingleObject(handle.as_raw_handle() as HANDLE, timeout_ms) } {
++        WAIT_OBJECT_0 => Ok(SetupTransactionLock {
++            handle,
++            _thread_bound: PhantomData,
++        }),
++        WAIT_ABANDONED => {
++            // Windows grants ownership on abandonment. Release it, but do not
++            // use possibly partial setup state or treat this request as success.
++            unsafe { ReleaseMutex(handle.as_raw_handle() as HANDLE) };
++            bail!("setup transaction mutex was abandoned; refusing this setup request")
++        }
++        WAIT_TIMEOUT => bail!("setup transaction mutex timed out after {timeout_ms} ms"),
++        _ => Err(io::Error::last_os_error()).context("wait for setup transaction mutex"),
++    }
++}
++
++fn acquire_lock(kind: &str, sid: &str) -> Result<SetupTransactionLock> {
++    acquire_named_lock(
++        &format!(r"Global\CodexSandboxSetupV1-{kind}-{sid}"),
++        sid,
++        SETUP_LOCK_TIMEOUT_MS,
++    )
++    .map_err(|err| {
++        failure(
++            SetupErrorCode::SetupTransactionLockFailed,
++            format!("{err:#}"),
++        )
++    })
++}
++
++/// Held by a helper across mutations and its error report write. A parent may
++/// briefly acquire it before launch or after child exit, never across child wait.
++pub fn acquire_setup_mutation_lock(sid: &str) -> Result<SetupTransactionLock> {
++    acquire_lock("Mutation", sid)
++}
++
++pub(crate) struct SetupRequest {
++    pub(crate) payload_b64: String,
++    pub(crate) request_id: String,
++    pub(crate) sid: String,
++    _request_lock: SetupTransactionLock,
++}
++
++impl SetupRequest {
++    pub(crate) fn begin(payload_b64: &str) -> Result<Self> {
++        let mut payload: serde_json::Value = serde_json::from_slice(&BASE64.decode(payload_b64)?)?;
++        let sid = request_lock_sid(&payload)?;
++        let request_lock = acquire_lock("Request", &sid)?;
++        let mut nonce = [0u8; 16];
++        let status = unsafe {
++            BCryptGenRandom(
++                /*halgorithm*/ 0,
++                nonce.as_mut_ptr(),
++                nonce.len() as u32,
++                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
++            )
++        };
++        if status < 0 {
++            bail!("generate setup request id failed: {status}");
++        }
++        let request_id = nonce
++            .iter()
++            .map(|byte| format!("{byte:02x}"))
++            .collect::<String>();
++        // This runs only inside the singleflight leader, so random metadata
++        // cannot change the existing payload-based coalescing key.
++        let object = payload
++            .as_object_mut()
++            .context("setup payload must be an object")?;
++        object.insert("setup_lock_sid".to_string(), sid.clone().into());
++        object.insert("setup_request_id".to_string(), request_id.clone().into());
++        Ok(Self {
++            payload_b64: BASE64.encode(serde_json::to_vec(&payload)?),
++            request_id,
++            sid,
++            _request_lock: request_lock,
++        })
++    }
++}
++
++#[cfg(test)]
++#[path = "setup_transaction_tests.rs"]
++mod tests;
+diff --git a/codex-rs/windows-sandbox-rs/src/setup_transaction_tests.rs b/codex-rs/windows-sandbox-rs/src/setup_transaction_tests.rs
+new file mode 100644
+index 0000000..9176c16
+--- /dev/null
++++ b/codex-rs/windows-sandbox-rs/src/setup_transaction_tests.rs
+@@ -0,0 +1,268 @@
++use super::*;
++use pretty_assertions::assert_eq;
++use std::fs;
++use std::path::Path;
++use std::path::PathBuf;
++use std::process::Child;
++use std::process::Command;
++use std::thread;
++use std::time::Duration;
++use std::time::Instant;
++use windows_sys::Win32::System::Threading::MUTEX_ALL_ACCESS;
++use windows_sys::Win32::System::Threading::OpenMutexW;
++
++const CHILD_TEST: &str = "setup_transaction::tests::setup_mutex_child";
++
++struct Actor {
++    child: Child,
++    release: PathBuf,
++}
++
++impl Actor {
++    fn start(root: &Path, label: &str, name: &str, sid: &str, action: &str) -> Self {
++        let ready = root.join(format!("{label}-ready"));
++        let release = root.join(format!("{label}-release"));
++        let child = Command::new(std::env::current_exe().expect("test binary"))
++            .args(["--exact", CHILD_TEST, "--nocapture"])
++            .env("CODEX_SETUP_MUTEX_TEST_NAME", name)
++            .env("CODEX_SETUP_MUTEX_TEST_SID", sid)
++            .env("CODEX_SETUP_MUTEX_TEST_READY", &ready)
++            .env("CODEX_SETUP_MUTEX_TEST_RELEASE", &release)
++            .env("CODEX_SETUP_MUTEX_TEST_ACTION", action)
++            .spawn()
++            .expect("spawn mutex actor");
++        let actor = Self { child, release };
++        wait_for_file(&ready);
++        actor
++    }
++
++    fn finish(&mut self) {
++        fs::write(&self.release, b"release").expect("release actor");
++        assert!(self.child.wait().expect("wait actor").success());
++    }
++}
++
++impl Drop for Actor {
++    fn drop(&mut self) {
++        // Never leave a process behind if an assertion fails.
++        let _ = self.child.kill();
++        let _ = self.child.wait();
++    }
++}
++
++fn wait_for_file(path: &Path) {
++    let deadline = Instant::now() + Duration::from_secs(15);
++    while !path.exists() {
++        assert!(
++            Instant::now() < deadline,
++            "actor handshake timeout: {path:?}"
++        );
++        thread::sleep(Duration::from_millis(5));
++    }
++}
++
++fn keep_mutex_alive(name: &str) -> OwnedHandle {
++    let raw = unsafe {
++        OpenMutexW(
++            MUTEX_ALL_ACCESS,
++            /*binherithandle*/ 0,
++            to_wide(name).as_ptr(),
++        )
++    };
++    assert_ne!(raw, 0, "open held mutex: {}", io::Error::last_os_error());
++    unsafe { OwnedHandle::from_raw_handle(raw as _) }
++}
++
++#[test]
++fn setup_mutex_child() {
++    let Ok(name) = std::env::var("CODEX_SETUP_MUTEX_TEST_NAME") else {
++        return;
++    };
++    let sid = std::env::var("CODEX_SETUP_MUTEX_TEST_SID").expect("SID");
++    let ready = std::env::var_os("CODEX_SETUP_MUTEX_TEST_READY").expect("ready");
++    let release = std::env::var_os("CODEX_SETUP_MUTEX_TEST_RELEASE").expect("release");
++    let action = std::env::var("CODEX_SETUP_MUTEX_TEST_ACTION").expect("action");
++    let _guard = if action == "production_mutation" {
++        acquire_setup_mutation_lock(&sid).expect("production helper lock")
++    } else {
++        acquire_named_lock(&name, &sid, /*timeout_ms*/ 5_000).expect("child lock")
++    };
++    fs::write(ready, b"held").expect("ready signal");
++    wait_for_file(Path::new(&release));
++    if action == "abandon" {
++        // Intentionally skips RAII, modeling owner process death.
++        std::process::exit(0);
++    }
++}
++
++#[test]
++fn production_helper_lock_excludes_mutations_without_taking_parent_request_lock() {
++    let root = tempfile::tempdir().expect("tempdir");
++    let original = serde_json::json!({"version": crate::setup::SETUP_VERSION});
++    let encoded = BASE64.encode(serde_json::to_vec(&original).expect("serialize"));
++    let request = SetupRequest::begin(&encoded).expect("production parent request lock");
++    let name = format!(r"Global\CodexSandboxSetupV1-Mutation-{}", request.sid);
++    // The actual helper entry point must acquire B while the parent still owns
++    // A. Taking A in the helper would deadlock this bounded ready handshake.
++    let mut helper = Actor::start(
++        root.path(),
++        "helper",
++        &name,
++        &request.sid,
++        "production_mutation",
++    );
++    let error = acquire_named_lock(&name, &request.sid, /*timeout_ms*/ 10)
++        .err()
++        .expect("production helper must exclude another mutation");
++    assert!(error.to_string().contains("timed out"));
++    helper.finish();
++    let mutation = acquire_setup_mutation_lock(&request.sid).expect("parent post-child lock");
++    drop(mutation);
++    drop(request);
++}
++
++#[test]
++fn mutex_excludes_other_process_until_owner_finishes() {
++    let root = tempfile::tempdir().expect("tempdir");
++    let sid = current_user_sid().expect("caller SID");
++    let name = format!(r"Local\CodexSetupTest-{}-exclusion", std::process::id());
++    let mut owner = Actor::start(root.path(), "owner", &name, &sid, "release");
++    let error = acquire_named_lock(&name, &sid, /*timeout_ms*/ 10)
++        .err()
++        .expect("must exclude");
++    assert!(error.to_string().contains("timed out"));
++    owner.finish();
++    let _guard = acquire_named_lock(&name, &sid, /*timeout_ms*/ 1_000).expect("released lock");
++}
++
++#[test]
++fn abandoned_mutex_fails_closed_and_releases_granted_ownership() {
++    let root = tempfile::tempdir().expect("tempdir");
++    let sid = current_user_sid().expect("caller SID");
++    let name = format!(r"Local\CodexSetupTest-{}-abandon", std::process::id());
++    let mut owner = Actor::start(root.path(), "owner", &name, &sid, "abandon");
++    let _keeper = keep_mutex_alive(&name);
++    owner.finish();
++    let error = acquire_named_lock(&name, &sid, /*timeout_ms*/ 1_000)
++        .err()
++        .expect("abandoned");
++    assert!(error.to_string().contains("abandoned"));
++    let mut successor = Actor::start(root.path(), "successor", &name, &sid, "release");
++    successor.finish();
++}
++
++#[test]
++fn helper_mutation_lock_survives_parent_request_owner_death() {
++    let root = tempfile::tempdir().expect("tempdir");
++    let sid = current_user_sid().expect("caller SID");
++    let request_name = format!(r"Local\CodexSetupTest-{}-orphan-A", std::process::id());
++    let mutation_name = format!(r"Local\CodexSetupTest-{}-orphan-B", std::process::id());
++    let mut parent = Actor::start(root.path(), "parent", &request_name, &sid, "abandon");
++    let _keeper = keep_mutex_alive(&request_name);
++    let mut helper = Actor::start(root.path(), "helper", &mutation_name, &sid, "release");
++    parent.finish();
++    assert!(acquire_named_lock(&request_name, &sid, /*timeout_ms*/ 1_000).is_err());
++    let _next_request =
++        acquire_named_lock(&request_name, &sid, /*timeout_ms*/ 1_000).expect("next parent request");
++    let error = acquire_named_lock(&mutation_name, &sid, /*timeout_ms*/ 10)
++        .err()
++        .expect("surviving helper must still exclude mutations");
++    assert!(error.to_string().contains("timed out"));
++    helper.finish();
++    let _mutation =
++        acquire_named_lock(&mutation_name, &sid, /*timeout_ms*/ 1_000).expect("helper completed");
++}
++
++#[test]
++fn sid_validation_rejects_names_and_descriptor_injection() {
++    for sid in [
++        "Everyone",
++        "SY",
++        "S-1-5-18)(A;;GA;;;WD)",
++        "S-1-5-",
++        "S-1-05-18",
++    ] {
++        assert!(validate_sid(sid).is_err(), "accepted {sid}");
++    }
++    validate_sid(&current_user_sid().expect("caller SID")).expect("canonical token SID");
++}
++
++#[test]
++fn inaccessible_existing_mutex_fails_closed() {
++    let sid = current_user_sid().expect("caller SID");
++    let name = format!(r"Local\CodexSetupTest-{}-denied", std::process::id());
++    let mut descriptor = null_mut();
++    let sddl = to_wide("D:P(D;;GA;;;WD)");
++    assert_ne!(
++        unsafe {
++            ConvertStringSecurityDescriptorToSecurityDescriptorW(
++                sddl.as_ptr(),
++                /*stringsdrevision*/ 1,
++                &mut descriptor,
++                null_mut(),
++            )
++        },
++        0
++    );
++    let attributes = SECURITY_ATTRIBUTES {
++        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
++        lpSecurityDescriptor: descriptor,
++        bInheritHandle: 0,
++    };
++    let raw = unsafe {
++        CreateMutexW(
++            &attributes,
++            /*binitialowner*/ 0,
++            to_wide(&name).as_ptr(),
++        )
++    };
++    unsafe { LocalFree(descriptor as HLOCAL) };
++    assert_ne!(
++        raw,
++        0,
++        "create denied mutex: {}",
++        io::Error::last_os_error()
++    );
++    let _keeper = unsafe { OwnedHandle::from_raw_handle(raw as _) };
++    let error = acquire_named_lock(&name, &sid, /*timeout_ms*/ 10)
++        .err()
++        .expect("must not bypass denied mutex");
++    assert!(error.to_string().contains("open setup transaction mutex"));
++}
++
++#[test]
++fn request_metadata_is_fresh_and_does_not_modify_original_payload() {
++    let original = serde_json::json!({
++        "real_user": "ignored-for-lock-identity", "version": crate::setup::SETUP_VERSION
++    });
++    let encoded = BASE64.encode(serde_json::to_vec(&original).expect("serialize"));
++    let first = SetupRequest::begin(&encoded).expect("first request");
++    let decoded: serde_json::Value =
++        serde_json::from_slice(&BASE64.decode(&first.payload_b64).expect("base64")).expect("json");
++    assert_eq!(decoded["setup_lock_sid"], first.sid);
++    assert_eq!(decoded["setup_request_id"], first.request_id);
++    let first_id = first.request_id.clone();
++    drop(first);
++    let second = SetupRequest::begin(&encoded).expect("second request");
++    assert_ne!(first_id, second.request_id);
++    assert_eq!(
++        serde_json::from_slice::<serde_json::Value>(&BASE64.decode(encoded).expect("base64"))
++            .expect("json"),
++        original
++    );
++}
++
++#[test]
++fn provisioning_locks_target_identity_but_normal_setup_ignores_payload_user() {
++    let provisioning = serde_json::json!({"mode": "provision-only", "real_user": "SYSTEM"});
++    assert_eq!(
++        request_lock_sid(&provisioning).expect("target SID"),
++        "S-1-5-18"
++    );
++    let ordinary = serde_json::json!({"mode": "full", "real_user": "not-a-real-user"});
++    assert_eq!(
++        request_lock_sid(&ordinary).expect("ordinary SID"),
++        current_user_sid().expect("token SID")
++    );
++    assert!(request_lock_sid(&serde_json::json!({"mode": "provision-only"})).is_err());
++}

@@ -141,6 +141,35 @@ def test_all_expensive_native_preparation_and_snapshot_steps_require_cache_miss(
     assert exercised == {"upstream", "rust", "msvc", "compile", "source", "v8", "snapshot", "paths"}
 
 
+def test_native_setup_regressions_gate_the_ready_candidate_without_retries(workflows):
+    _, _, _, build = workflows
+    steps = _steps(build)
+    checks = [step for step in steps if "just test " in (_field(step, "run") or "")]
+    assert len(checks) == 1
+    check = checks[0]
+    command = _field(check, "run") or ""
+    assert _miss_required(check)
+    assert _field(check, "continue-on-error") is None
+    assert "-p codex-windows-sandbox --lib --bin codex-windows-sandbox-setup" in command
+    assert "-p codex-cli --bin codex" in command
+    assert command.count("--test-threads 1 --retries 0") == 2
+    for name in ("setup_transaction::tests::", "report_helper_failure_",
+                 "setup_version_rejects_", "setup_payload_requires_",
+                 "detached_read_acl_payload_", "reports_refresh_failure_after_setup_completed",
+                 "rejects_oversized_setup_failure_reports"):
+        assert name in command
+    assert '$setupExit -ne 0' in command and '$doctorExit -ne 0' in command
+    cargo_cache = next(step for step in steps if _action(step) == "actions/cache/save"
+                       and "bello-native-target" in _block(step, "with"))
+    snapshot = next(step for step in steps if " snapshot-build " in (_field(step, "run") or ""))
+    ready_cache = next(step for step in steps if _action(step) == "actions/cache/save"
+                       and _field(_block(step, "with"), "path") == "native-candidate")
+    assert steps.index(cargo_cache) < steps.index(check) < steps.index(snapshot) < steps.index(ready_cache)
+    receipts = next(step for step in steps if _action(step) == "actions/upload-artifact"
+                    and "native-setup-regressions-" in _block(step, "with"))
+    assert "always()" in (_field(receipts, "if") or "")
+
+
 def test_candidate_artifact_is_saved_by_build_then_downloaded_by_dependent_proof(workflows):
     proof_file, build_file, proof, build = workflows
     build_call = _block(_block(proof_file, "jobs"), "native-build")
@@ -150,7 +179,8 @@ def test_candidate_artifact_is_saved_by_build_then_downloaded_by_dependent_proof
     assert _field(_block(output, "artifact-name"), "value") == "${{ jobs.build.outputs.artifact-name }}"
     assert _field(_block(build, "outputs"), "artifact-name") == "${{ steps.identity.outputs.artifact-name }}"
     build_steps = _steps(build)
-    uploaded = next(step for step in build_steps if _action(step) == "actions/upload-artifact")
+    uploaded = next(step for step in build_steps if _action(step) == "actions/upload-artifact"
+                    and _field(_block(step, "with"), "path") == "native-candidate/")
     assert _field(uploaded, "if") is None and _field(uploaded, "continue-on-error") != "true"
     assert _field(_block(uploaded, "with"), "name") == "${{ steps.identity.outputs.artifact-name }}"
     assert any(" verify-build " in (_field(step, "run") or "") and _field(step, "if") is None
