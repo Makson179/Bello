@@ -101,7 +101,7 @@ from supervisor.schemas import (
 )
 from supervisor.schemas.models import ensure_relative_to
 from supervisor.state import CONFIG, DECISIONS, HANDOFF, PROGRESS, StateStore
-from supervisor.supervisor_agent import StatelessSupervisorAgent, SupervisorAgentError
+from supervisor.supervisor_agent import StatelessSupervisorAgent, SupervisorAgentError, SupervisorTurnError
 from supervisor.task_select import resolve_plan, resolve_task
 from supervisor.tui import TerminalTUI, UserCommand
 from supervisor.workspace_snapshot import (
@@ -9307,6 +9307,8 @@ def _validation_freshness_summary(
 
 
 def _classify_supervisor_agent_error(error: BaseException) -> str:
+    if isinstance(error, SupervisorTurnError):
+        return "terminal_turn"
     text = str(error).lower()
     if "did not produce an agent message" in text or "no agent message" in text:
         return "no_message"

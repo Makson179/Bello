@@ -20,6 +20,7 @@ from supervisor.coder import (
 )
 from supervisor.completion_context import CompletionContextStore
 from supervisor.project_config import MultiAgentConfig
+from supervisor.runtime_errors import bounded_provider_error
 from supervisor.prompts import (
     build_adv_report_controller_prompt,
     build_completion_review_prompt,
@@ -89,6 +90,16 @@ class SupervisorAgentError(RuntimeError):
     pass
 
 
+class SupervisorTurnError(SupervisorAgentError):
+    """A terminal failed/interrupted turn is not a malformed model decision."""
+
+    def __init__(self, turn: dict[str, Any]):
+        self.turn_status = turn["status"]
+        self.provider_error = bounded_provider_error(turn)
+        detail = self.provider_error.get("error", {}).get("message")
+        super().__init__(f"supervisor turn {self.turn_status}: {detail or 'no provider detail'}")
+
+
 class StatelessSupervisorAgent:
     def __init__(
         self,
@@ -155,6 +166,8 @@ class StatelessSupervisorAgent:
                 packet,
                 use_case="completion_review",
             )
+        except SupervisorTurnError:
+            raise
         except SupervisorAgentError as exc:
             if _is_input_too_large_error(exc):
                 try:
@@ -163,6 +176,8 @@ class StatelessSupervisorAgent:
                         task_in_file=True,
                         use_case="completion_review_compact_retry",
                     )
+                except SupervisorTurnError:
+                    raise
                 except SupervisorAgentError as compact_exc:
                     if not _is_invalid_supervisor_decision_error(compact_exc):
                         raise
@@ -360,6 +375,7 @@ class StatelessSupervisorAgent:
                 if persistent_completion_thread:
                     self.completion_thread_id = thread_id
             turn_prompt = prompt
+            repairing_claude_schema = False
             for attempt in range(2):
                 turn_response = await self._await_rpc(
                     "supervisor turn/start response",
@@ -399,7 +415,7 @@ class StatelessSupervisorAgent:
                 if not isinstance(turn_id_value, str):
                     raise SupervisorAgentError("supervisor turn/start did not return turn id")
                 turn_id = turn_id_value
-                if turn.get("status") != "completed":
+                if turn.get("status") not in {"completed", "failed", "interrupted"}:
                     try:
                         completed = await self.client.wait_for_notification(
                             lambda message: message.method == "turn/completed"
@@ -418,6 +434,41 @@ class StatelessSupervisorAgent:
                             )
                         ) from exc
                     turn = completed.params.get("turn", {})
+                if turn.get("status") in {"failed", "interrupted"}:
+                    if persistent_completion_thread and self.completion_workspace_snapshot is not None:
+                        await asyncio.to_thread(
+                            self.completion_workspace_snapshot.assert_submission_unchanged
+                        )
+                    if persistent_completion_thread and self.completion_context_store is not None:
+                        self.completion_context_store.assert_unchanged()
+                    if (
+                        attempt == 0
+                        and turn.get("status") == "failed"
+                        and isinstance(self.model, str)
+                        and self.model.startswith("claude-code/")
+                        and isinstance(turn.get("error"), dict)
+                        and turn["error"].get("belloFailureKind") == "output_schema_validation"
+                    ):
+                        # Only Claude's own successful-result schema validator can
+                        # authorize the existing one-shot malformed-output repair.
+                        # A failed answer is a hint, never a candidate decision;
+                        # do not consult history, even if this text looks valid.
+                        raw_text = last_agent_message_text(turn) or ""
+                        audit_error = "Claude adapter rejected the output schema"
+                        self._append_wake_audit(
+                            packet, thread_id=thread_id, turn_id=turn_id,
+                            decision=None, raw_text=raw_text, error=audit_error,
+                            use_case=f"{use_case}_parse_retry",
+                        )
+                        turn_prompt = _repair_json_prompt(
+                            raw_text=raw_text, error=audit_error,
+                            packet=packet, model_cls=model_cls,
+                        )
+                        repairing_claude_schema = True
+                        continue
+                    raise SupervisorTurnError(turn)
+                if repairing_claude_schema and turn.get("status") != "completed":
+                    raise SupervisorAgentError("Claude schema repair did not complete")
                 text = last_agent_message_text(turn)
                 if text is None:
                     turns = await self._await_rpc(
@@ -433,6 +484,12 @@ class StatelessSupervisorAgent:
                         timeout=timeout_seconds,
                     )
                     data = turns.get("data", [])
+                    if repairing_claude_schema and isinstance(data, list):
+                        # The failed-schema answer must not reappear through the
+                        # ordinary legacy fallback to another historical turn.
+                        data = [value for value in data if isinstance(value, dict)
+                                and value.get("id") == turn_id
+                                and value.get("status") == "completed"]
                     text = _agent_message_text_from_turns(data, turn_id=turn_id)
                 if persistent_completion_thread and self.completion_workspace_snapshot is not None:
                     await asyncio.to_thread(
@@ -441,6 +498,8 @@ class StatelessSupervisorAgent:
                 if persistent_completion_thread and self.completion_context_store is not None:
                     self.completion_context_store.assert_unchanged()
                 if text is None:
+                    if repairing_claude_schema:
+                        raise SupervisorAgentError("Claude schema repair did not return current-turn output")
                     audit_error = "supervisor did not produce an agent message"
                     if attempt == 0:
                         self._append_wake_audit(

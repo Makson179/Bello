@@ -155,8 +155,10 @@ def test_native_setup_regressions_gate_the_ready_candidate_without_retries(workf
     assert command.count("--test-threads 1 --retries 0") == 2
     for name in ("setup_transaction::tests::", "report_helper_failure_",
                  "setup_version_rejects_", "setup_payload_requires_",
-                 "detached_read_acl_payload_", "reports_refresh_failure_after_setup_completed",
-                 "rejects_oversized_setup_failure_reports"):
+                 "detached_read_acl_payload_", "setup_launch::tests::", "win::acl_tests::",
+                 "reports_refresh_failure_after_setup_completed",
+                 "rejects_oversized_setup_failure_reports",
+                 "reports_setup_transaction_lock_failure_without_reset"):
         assert name in command
     assert '$setupExit -ne 0' in command and '$doctorExit -ne 0' in command
     cargo_cache = next(step for step in steps if _action(step) == "actions/cache/save"
@@ -168,6 +170,61 @@ def test_native_setup_regressions_gate_the_ready_candidate_without_retries(workf
     receipts = next(step for step in steps if _action(step) == "actions/upload-artifact"
                     and "native-setup-regressions-" in _block(step, "with"))
     assert "always()" in (_field(receipts, "if") or "")
+
+
+def test_failed_compile_cache_is_reusable_intermediates_not_a_ready_candidate(workflows):
+    _, _, _, build = workflows
+    steps = _steps(build)
+    compile_step = next(step for step in steps if re.search(r"\bcargo\s+build\b", _field(step, "run") or ""))
+    assert _field(compile_step, "id") == "native_compile"
+    cache = next(step for step in steps if _action(step) == "actions/cache/save"
+                 and "bello-native-target" in _block(step, "with"))
+    condition = (_field(cache, "if") or "").removeprefix("${{").removesuffix("}}").strip()
+    assert condition == (
+        "!cancelled() && (steps.native_compile.outcome == 'success' || "
+        "steps.native_compile.outcome == 'failure') && "
+        "steps.candidate.outputs.cache-hit != 'true' && steps.cargo_cache.outputs.cache-hit != 'true'"
+    )
+    assert _field(cache, "continue-on-error") == "true"
+    assert "native-candidate" not in _field(_block(cache, "with"), "path")
+    assert _field(_block(cache, "with"), "key") == "${{ steps.cargo_cache.outputs.cache-primary-key }}"
+    assert steps.index(compile_step) < steps.index(cache)
+    # All completed-binary snapshot/cache/upload paths retain implicit success(),
+    # so a cached failed compile cannot be presented as a qualified candidate.
+    for step in steps:
+        command = _field(step, "run") or ""
+        is_snapshot = " snapshot-build " in command
+        is_ready_cache = (_action(step) == "actions/cache/save"
+                          and _field(_block(step, "with"), "path") == "native-candidate")
+        is_candidate_upload = (_action(step) == "actions/upload-artifact"
+                               and _field(_block(step, "with"), "path") == "native-candidate/")
+        if is_snapshot or is_ready_cache or is_candidate_upload:
+            guard = _field(step, "if") or ""
+            assert not any(status in guard for status in ("always()", "failure()", "cancelled()", "native_compile.outcome"))
+
+
+def test_windows_regression_job_runs_terminal_guard_packaging_and_complete_pi_suite(workflows):
+    proof_file, _, _, _ = workflows
+    job = _block(_block(proof_file, "jobs"), "smart-execution-regressions")
+    steps = _steps(job)
+    python = next(step for step in steps if "python -m pytest " in (_field(step, "run") or ""))
+    command = _field(python, "run") or ""
+    for name in ("test_supervisor_terminal_error.py", "test_claude_schema_failure.py",
+                 "test_controller_terminal_error.py", "test_bello_state.py",
+                 "test_pi_plain_json_decisions.py", "test_runtime_errors.py",
+                 "test_runtime_claude.py", "test_runtime_install.py"):
+        assert f"tests/{name}" in command
+    assert _field(python, "continue-on-error") is None
+    helper = next(step for step in steps if "--manifest-path native/windows-sandbox/Cargo.toml" in (_field(step, "run") or ""))
+    assert _field(helper, "continue-on-error") is None
+    assert "--locked --release --target x86_64-pc-windows-msvc" in (_field(helper, "run") or "")
+    assert _field(_block(helper, "env"), "CARGO_TARGET_DIR") == "${{ github.workspace }}/native/windows-sandbox/target"
+    assert _field(_block(helper, "env"), "RUSTFLAGS") == "-C target-feature=+crt-static"
+    assert steps.index(helper) < steps.index(python)
+    node = next(step for step in steps if "node --test " in (_field(step, "run") or ""))
+    assert _field(node, "working-directory") == "supervisor/pi_worker"
+    assert _field(node, "continue-on-error") is None
+    assert "--test-name-pattern" not in (_field(node, "run") or "")
 
 
 def test_candidate_artifact_is_saved_by_build_then_downloaded_by_dependent_proof(workflows):

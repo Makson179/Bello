@@ -702,6 +702,7 @@ class ClaudeBackend:
             "aborted_streaming", "aborted_tools", "cancelled"
         } else "failed" if message.is_error else "completed"
         error: str | None = None
+        output_schema_failure = False
         if schema is not None and status == "completed":
             structured = message.structured_output
             if structured is None and isinstance(message.result, str):
@@ -714,6 +715,7 @@ class ClaudeBackend:
             except ValidationError:
                 status = "failed"
                 error = "Claude Code returned output that did not satisfy outputSchema"
+                output_schema_failure = True
             else:
                 canonical = json.dumps(structured, ensure_ascii=False, separators=(",", ":"))
                 turn = self._turn(record, turn_id)
@@ -723,7 +725,10 @@ class ClaudeBackend:
             await self._append_agent_item(record, turn_id, message.result)
         if status == "failed" and error is None:
             error = "Claude Code reported that the turn failed"
-        await self._complete_turn(record, turn_id, status, usage, error)
+        await self._complete_turn(
+            record, turn_id, status, usage, error,
+            output_schema_failure=output_schema_failure,
+        )
         return True
 
     @staticmethod
@@ -791,6 +796,8 @@ class ClaudeBackend:
         status: str,
         usage: dict[str, Any],
         error: str | None,
+        *,
+        output_schema_failure: bool = False,
     ) -> None:
         turn = self._turn(record, turn_id)
         if turn.get("status") != "inProgress":
@@ -799,6 +806,9 @@ class ClaudeBackend:
         turn["usage"] = usage
         if error:
             turn["error"] = {"message": error}
+            if output_schema_failure:
+                # Adapter-owned classification, never copied from provider text.
+                turn["error"]["belloFailureKind"] = "output_schema_validation"
         if record.get("activeTurnId") == turn_id:
             record.pop("activeTurnId", None)
         self._persist()

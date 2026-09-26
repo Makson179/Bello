@@ -56,6 +56,14 @@ jobs:
       - name: Install offline test dependencies without installing models or credentials
         id: dependencies
         run: python -c "import pathlib, subprocess, sys, tomllib; project = tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']; subprocess.run([sys.executable, '-m', 'pip', 'install', *project['dependencies'], *project['optional-dependencies']['test']], check=True)"
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Prepare the mandatory Bello helper for the real Windows wheel test
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/native/windows-sandbox/target
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc --manifest-path native/windows-sandbox/Cargo.toml
       - name: Run Smart Execution role and SDK lifecycle regressions
         run: >-
           python -m pytest -q --junitxml smart-execution-python.xml
@@ -65,6 +73,10 @@ jobs:
           tests/test_runtime_command_sessions.py tests/test_supervisor_agent.py
           tests/test_completion_context.py tests/test_verify_native_codex_async.py
           tests/test_windows_modernbert_smoke.py
+          tests/test_supervisor_terminal_error.py tests/test_claude_schema_failure.py
+          tests/test_controller_terminal_error.py tests/test_bello_state.py
+          tests/test_pi_plain_json_decisions.py tests/test_runtime_errors.py
+          tests/test_runtime_install.py
       - name: Install exact Pi SDK for offline scripted-provider tests
         if: always() && steps.dependencies.outcome == 'success'
         id: pi_dependencies

@@ -13,8 +13,8 @@ import tomllib
 
 
 ROOT = Path(__file__).resolve().parents[1]
-UPSTREAM_REVISION = "3d2ee51ca2d5db578f328aa75e20aa22c0197c9a"
-VERSION = "0.153.4"
+UPSTREAM_REVISION = "be2951ea34f0d295ed0becf97079f92fa5f6950e"
+VERSION = "0.155.1"
 TARGET = "x86_64-pc-windows-msvc"
 RUST_VERSION = "1.95.0"
 V8_RELEASE = "rusty-v8-v150.4.0"

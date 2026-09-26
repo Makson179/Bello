@@ -59,7 +59,7 @@ jobs:
         if: steps.candidate.outputs.cache-hit != 'true'
         with:
           repository: openai/codex
-          ref: 3d2ee51ca2d5db578f328aa75e20aa22c0197c9a
+          ref: be2951ea34f0d295ed0becf97079f92fa5f6950e
           path: native-source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
@@ -99,11 +99,13 @@ jobs:
           "RUSTY_V8_ARCHIVE=$(Join-Path $v8 $archive)" >> $env:GITHUB_ENV
           "RUSTY_V8_SRC_BINDING_PATH=$(Join-Path $v8 $binding)" >> $env:GITHUB_ENV
       - name: Build four native Windows executables
+        id: native_compile
         if: steps.candidate.outputs.cache-hit != 'true'
         working-directory: native-source/codex-rs
         run: cargo build --locked --release --timings --target x86_64-pc-windows-msvc --bin codex --bin codex-code-mode-host --bin codex-command-runner --bin codex-windows-sandbox-setup
-      - name: Preserve successful Cargo build cache
-        if: steps.candidate.outputs.cache-hit != 'true' && steps.cargo_cache.outputs.cache-hit != 'true'
+      # Cargo validates these intermediates again; they are never a ready candidate.
+      - name: Preserve reusable Cargo intermediates after compile success or failure
+        if: ${{ !cancelled() && (steps.native_compile.outcome == 'success' || steps.native_compile.outcome == 'failure') && steps.candidate.outputs.cache-hit != 'true' && steps.cargo_cache.outputs.cache-hit != 'true' }}
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
@@ -123,12 +125,12 @@ jobs:
         run: |
           $reports = Join-Path $env:GITHUB_WORKSPACE 'native-setup-test-reports'
           New-Item -ItemType Directory -Path $reports -Force | Out-Null
-          just test --locked --release --target x86_64-pc-windows-msvc -p codex-windows-sandbox --lib --bin codex-windows-sandbox-setup --test-threads 1 --retries 0 -E 'test(setup_transaction::tests::) | test(report_helper_failure_) | test(setup_version_rejects_) | test(setup_payload_requires_) | test(detached_read_acl_payload_)'
+          just test --locked --release --target x86_64-pc-windows-msvc -p codex-windows-sandbox --lib --bin codex-windows-sandbox-setup --test-threads 1 --retries 0 -E 'test(setup_transaction::tests::) | test(report_helper_failure_) | test(setup_version_rejects_) | test(setup_payload_requires_) | test(detached_read_acl_payload_) | test(setup_launch::tests::) | test(win::acl_tests::)'
           $setupExit = $LASTEXITCODE
           $junit = Join-Path $env:CARGO_TARGET_DIR 'nextest/local/junit.xml'
           if (Test-Path $junit) { Copy-Item $junit (Join-Path $reports 'setup-transactions.xml') }
           if ($setupExit -ne 0) { throw "Setup transaction regressions failed: $setupExit" }
-          just test --locked --release --target x86_64-pc-windows-msvc -p codex-cli --bin codex --test-threads 1 --retries 0 -E 'test(reports_refresh_failure_after_setup_completed) | test(rejects_oversized_setup_failure_reports)'
+          just test --locked --release --target x86_64-pc-windows-msvc -p codex-cli --bin codex --test-threads 1 --retries 0 -E 'test(reports_refresh_failure_after_setup_completed) | test(rejects_oversized_setup_failure_reports) | test(reports_setup_transaction_lock_failure_without_reset)'
           $doctorExit = $LASTEXITCODE
           if (Test-Path $junit) { Copy-Item $junit (Join-Path $reports 'doctor-report-compatibility.xml') }
           if ($doctorExit -ne 0) { throw "Doctor report compatibility regressions failed: $doctorExit" }

@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { installOpenRouterBackpressure } from "./openrouter-backpressure.mjs";
 
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import {
@@ -137,6 +138,7 @@ export const realPiSdk = {
       session.dispose();
       throw new Error(`Pi unexpectedly selected a fallback model: ${modelFallbackMessage}`);
     }
+    installOpenRouterBackpressure(session.agent);
     session.setActiveToolsByName(activeToolNames);
     if (asyncAfterTurn) {
       const previousStop = session.agent.shouldStopAfterTurn;
