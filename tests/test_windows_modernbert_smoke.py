@@ -69,7 +69,11 @@ async def test_real_exchange_exception_is_recorded_without_error_text_or_payload
     monkeypatch.setattr(smoke.LogDistiller, "_finish_cleanup", AsyncMock())
     monkeypatch.setattr(smoke, "make_entry", lambda *args: ([{}], []))
     selector = smoke.ObservedDistiller(tmp_path, CharacterTokenizer())
-    assert await selector.distill("original private log", "focus", "command") == "original private log"
+    # This checks a worker failure, so the fixture must exceed the short-output
+    # bypass threshold instead of succeeding without ever reaching the worker.
+    raw = "original private log\n" * 20
+    assert len(raw.encode("utf-8")) > 200
+    assert await selector.distill(raw, "focus", "command") == raw
     measurement = selector.measurements[0]
     assert measurement["worker_exchange_attempted"] is True
     assert measurement["worker_response_ok"] is False
@@ -80,7 +84,7 @@ async def test_real_exchange_exception_is_recorded_without_error_text_or_payload
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("text,focus", [("", "focus"), ("log", "  ")])
+@pytest.mark.parametrize("text,focus", [("", "focus"), ("log", "  "), ("x" * 200, "focus")])
 async def test_ineligible_requests_are_not_worker_failures(tmp_path, monkeypatch, text, focus):
     exchange = AsyncMock(side_effect=AssertionError("must not run"))
     monkeypatch.setattr(smoke.LogDistiller, "_exchange", exchange)

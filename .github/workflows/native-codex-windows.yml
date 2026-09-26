@@ -64,6 +64,7 @@ jobs:
           tests/test_runtime_claude.py tests/test_runtime_codex_backend.py
           tests/test_runtime_command_sessions.py tests/test_supervisor_agent.py
           tests/test_completion_context.py tests/test_verify_native_codex_async.py
+          tests/test_windows_modernbert_smoke.py
       - name: Install exact Pi SDK for offline scripted-provider tests
         if: always() && steps.dependencies.outcome == 'success'
         id: pi_dependencies
