@@ -10,6 +10,7 @@ from pathlib import Path
 import ast
 import importlib.util
 import re
+import tomllib
 
 import pytest
 
@@ -216,6 +217,35 @@ def test_native_test_harness_budget_and_fresh_workspace_junit_receipts(workflows
         assert f"if (-not (Test-Path -LiteralPath $junit -PathType Leaf)) {{ throw '{label} regressions did not produce JUnit' }}" in result
         assert result.index("Copy-Item") < result.index("regressions failed:") < result.index("regressions did not produce JUnit")
     assert setup.index("regressions did not produce JUnit") < setup.index(clear)
+
+
+def test_native_local_profile_explicitly_enables_junit_without_changing_test_selection(workflows):
+    _, _, _, build = workflows
+    check = next(step for step in _steps(build) if "just test " in (_field(step, "run") or ""))
+    command = _field(check, "run") or ""
+    before_setup = command.split("just test ")[0]
+    assert "$junitConfig = Join-Path $reports 'nextest-junit.toml'" in before_setup
+    writes = re.findall(
+        r"^@\((.*)\) \| Set-Content -LiteralPath \$junitConfig -Encoding utf8NoBOM -ErrorAction Stop$",
+        before_setup, re.MULTILINE,
+    )
+    assert len(writes) == 1
+    # The literal PowerShell array uses ordinary quoted strings only. Parse its
+    # contents and the resulting TOML so extra settings cannot silently enter.
+    lines = ast.literal_eval(f"[{writes[0]}]")
+    assert tomllib.loads("\n".join(lines)) == {"profile": {"local": {"junit": {"path": "junit.xml"}}}}
+    invocations = [line for line in command.splitlines() if line.startswith("just test ")]
+    assert len(invocations) == 2
+    binding = '--tool-config-file "bello-junit:$junitConfig"'
+    for invocation in invocations:
+        assert invocation.startswith(f"just test {binding} --locked --release --target x86_64-pc-windows-msvc ")
+        assert invocation.count(binding) == 1
+        assert "--test-threads 1 --retries 0 -E " in invocation
+        assert "--config-file" not in invocation and "--profile" not in invocation
+    assert [line.split(" -E ", 1)[1] for line in invocations] == [
+        "'test(setup_transaction::tests::) | test(report_helper_failure_) | test(setup_version_rejects_) | test(setup_payload_requires_) | test(detached_read_acl_payload_) | test(setup_launch::tests::) | test(win::acl_tests::)'",
+        "'test(reports_refresh_failure_after_setup_completed) | test(rejects_oversized_setup_failure_reports) | test(reports_setup_transaction_lock_failure_without_reset)'",
+    ]
 
 
 def test_failed_compile_cache_is_reusable_intermediates_not_a_ready_candidate(workflows):
