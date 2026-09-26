@@ -69,8 +69,12 @@ jobs:
         id: pi_dependencies
         working-directory: supervisor/pi_worker
         run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Provide Python fixture expected by the cross-language schema test
+        if: always() && steps.dependencies.outcome == 'success'
+        id: schema_fixture
+        run: python -m venv --system-site-packages .venv
       - name: Run complete Pi offline suite
-        if: always() && steps.pi_dependencies.outcome == 'success'
+        if: always() && steps.pi_dependencies.outcome == 'success' && steps.schema_fixture.outcome == 'success'
         working-directory: supervisor/pi_worker
         run: node --test --test-reporter=junit --test-reporter-destination=../../smart-execution-pi.xml
       - name: Save Windows role and lifecycle test results
