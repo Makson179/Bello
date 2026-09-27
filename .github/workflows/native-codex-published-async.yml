@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-2022]
+        os: [ubuntu-22.04, windows-2025]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     defaults:
@@ -31,8 +31,13 @@ jobs:
         run: python -m pytest -q tests/test_native_codex_async_download.py tests/test_native_codex_install.py tests/test_native_codex_download_transport.py
       - name: Cold HTTPS install, full async proof and unchanged cache reuse
         run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            runtime_parent="$LOCALAPPDATA"
+          else
+            runtime_parent="$RUNNER_TEMP"
+          fi
           python scripts/verify_native_codex_async_download.py \
-            --runtime-root "$RUNNER_TEMP/bello-async-published-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --runtime-root "$runtime_parent/bello-async-published-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
             --output-dir published-async-proof
       - name: Retain credential-free qualification results
         if: always()

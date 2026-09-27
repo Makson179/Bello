@@ -14,7 +14,13 @@ def test_workflow_is_manual_download_qualification_not_build_or_release():
     assert "workflow_dispatch:" in text and "\n  push:" not in text
     assert "persist-credentials: false" in text and "contents: read" in text
     assert "verify_native_codex_async_download.py" in text
-    assert "ubuntu-22.04" in text and "windows-2022" in text
+    assert "ubuntu-22.04" in text and "windows-2025" in text
+    # Windows RUNNER_TEMP can have a shared writable ACL. Use the same private
+    # per-user anchor as the already-qualified installed-cache workflow.
+    assert 'if [[ "$RUNNER_OS" == "Windows" ]]; then' in text
+    assert 'runtime_parent="$LOCALAPPDATA"' in text
+    assert 'runtime_parent="$RUNNER_TEMP"' in text
+    assert '--runtime-root "$runtime_parent/bello-async-published-' in text
     assert not any(value in text for value in ("secrets.", "cargo ", "gh release", "upload-release"))
 
 
