@@ -21,9 +21,13 @@ from supervisor.approvals import ApprovalManager, normalize_approval_request
 from supervisor.runtime.cleanup import finish_cleanup
 from supervisor.runtime.journal import RuntimeJournal
 from supervisor.runtime.models import parse_model_selection
+from supervisor.runtime.codex_permissions import validate_windows_native_scope
 from supervisor.runtime.sandbox import SandboxPolicy
 from supervisor.runtime.tools import ToolHost, ToolScope, tool_result, tool_definitions
 from supervisor.runtime.transport import WorkerTransport
+
+
+_IS_WINDOWS = os.name == "nt"
 
 
 class RuntimeClient(AppServerClient):
@@ -51,14 +55,21 @@ class RuntimeClient(AppServerClient):
         self._engine_lock = asyncio.Lock()
         self._stop_task: asyncio.Task | None = None
         self.runtime_enabled = True
+        self.async_tools = False
+        self.windows_native_root_read = False
         self._distiller = None
         self._distiller_path: Path | None = None
         self._distiller_auto = False
 
-    def configure_run(self, *, runtime_enabled: bool = True, log_distiller=None) -> None:
+    def configure_run(self, *, runtime_enabled: bool = True, async_tools: bool = False,
+                      windows_native_root_read: bool = False, log_distiller=None) -> None:
         """Controller-owned policy. Never configurable by a provider tool call."""
         if not isinstance(runtime_enabled, bool):
             raise ValueError("runtime_enabled must be a boolean")
+        if not isinstance(async_tools, bool):
+            raise ValueError("async_tools must be a boolean")
+        if type(windows_native_root_read) is not bool:
+            raise ValueError("windows_native_root_read must be a boolean")
         config = log_distiller.to_json_data() if hasattr(log_distiller, "to_json_data") else (log_distiller or {})
         enabled = config.get("enabled", False)
         path = None
@@ -73,7 +84,9 @@ class RuntimeClient(AppServerClient):
             else:
                 path = Path(value).expanduser()
                 path = (self.cwd / path).resolve() if not path.is_absolute() else path.resolve()
-        if self._started and (runtime_enabled != self.runtime_enabled or path != self._distiller_path):
+        if self._started and (runtime_enabled != self.runtime_enabled or async_tools != self.async_tools
+                              or windows_native_root_read != self.windows_native_root_read
+                              or path != self._distiller_path):
             raise AppServerError("run policy changes require stopping the runtime first")
         if path is not None and (path != self._distiller_path or self._distiller is None):
             from supervisor.runtime.distiller import LogDistiller, require_dependencies, validate_bundle
@@ -87,6 +100,8 @@ class RuntimeClient(AppServerClient):
         elif path is None:
             self._distiller = None
         self.runtime_enabled, self._distiller_path = runtime_enabled, path
+        self.async_tools = async_tools
+        self.windows_native_root_read = windows_native_root_read
         self._distiller_auto = automatic
 
     async def start(self, **_kwargs) -> None:
@@ -103,6 +118,8 @@ class RuntimeClient(AppServerClient):
                 ) from exc
         if self._distiller_path is not None and self._distiller is None:
             self.configure_run(runtime_enabled=self.runtime_enabled,
+                               async_tools=self.async_tools,
+                               windows_native_root_read=self.windows_native_root_read,
                                log_distiller={"enabled": True, "model_path": (
                                    None if self._distiller_auto else str(self._distiller_path))})
         self._closing = False
@@ -145,17 +162,21 @@ class RuntimeClient(AppServerClient):
         elif name == "codex":
             from supervisor.runtime.codex import CodexBackend
             command, manifest = None, None
-            if self._distiller is not None:
-                from supervisor.runtime.native_codex_install import ensure_native_selection
+            if self._distiller is not None or self.async_tools:
+                from supervisor.runtime.native_codex_install import ensure_native_async, ensure_native_selection
                 # Installation is not an app-server request and can take longer
                 # than an RPC deadline on the first run. Never change global Codex.
-                command, manifest = await asyncio.to_thread(ensure_native_selection)
+                command, manifest = await asyncio.to_thread(
+                    ensure_native_async if self.async_tools else ensure_native_selection)
             backend = CodexBackend(state_dir=self.state_dir / "codex",
                                    emit=lambda raw: self._emit(raw, engine="codex"),
                                    tool_handler=self._call_tool,
                                    on_error=lambda error: self._engine_failed("codex", error),
                                    distiller=self._distiller, command=command,
-                                   selection_manifest=manifest)
+                                   selection_manifest=manifest,
+                                   private_read_roots=tuple(path for path in (
+                                       self.state_dir, self.cwd / ".supervisor", self.cwd / ".codex" / "bello-run",
+                                   ) if path.is_dir()))
             await backend.request("initialize", {})
         elif name == "claude-code":
             from supervisor.runtime.claude import ClaudeBackend
@@ -204,7 +225,8 @@ class RuntimeClient(AppServerClient):
 
     def _scope_for(self, thread_id: str, turn_id: str) -> ToolScope:
         record = self._record(thread_id)
-        if self._closing or record.get("closed") or record.get("activeTurnId") != turn_id:
+        if (self._closing or record.get("closed") or record.get("activeTurnId") != turn_id
+                or (thread_id, turn_id) in self._terminal_turns_inflight):
             raise AppServerError("tool request belongs to an inactive or stale turn")
         return ToolScope(root=Path(record["cwd"]), mode=record["sandbox"],
                          readable_roots=tuple(Path(p) for p in record.get("runtimeWorkspaceRoots", [])),
@@ -212,6 +234,7 @@ class RuntimeClient(AppServerClient):
                          network_access=record.get("networkAccess", False),
                          distiller_enabled=record.get("distillerEnabled", False),
                          runtime_enabled=self.runtime_enabled,
+                         async_tools=record.get("asyncTools", False),
                          temp_root=Path(record["runtimeScratchRoot"]) if record.get("runtimeScratchRoot") else None,
                          task_path=Path(record["runtimeTaskPath"]) if record.get("runtimeTaskPath") else None)
 
@@ -253,7 +276,9 @@ class RuntimeClient(AppServerClient):
             selection = parse_model_selection(params["model"])
             backend = await self._engine(selection.engine)
             return await backend.request(method, {**params, "provider": selection.provider,
-                                                   "model": selection.model}, timeout=timeout)
+                                                   "model": selection.model,
+                                                   "asyncTools": self.async_tools and params.get("belloRole") != "runtime"},
+                                         timeout=timeout)
         if method in {"model/list", "account/read"}:
             requested_engines = params.pop("engines", None)
             optional = params.pop("optionalEngines", False)
@@ -306,13 +331,21 @@ class RuntimeClient(AppServerClient):
                                      "Bello cannot migrate its conversation into native Codex silently.")
             role = record.get("belloRole", record.get("config", {}).get("agents", {}).get("role"))
             expected_distiller = self._distiller is not None and role == "coder"
+            expected_async = self.async_tools and role != "runtime"
             if (record.get("networkAccess", False) != (not self.runtime_enabled)
                     or record.get("distillerEnabled", False) != expected_distiller
+                    or record.get("asyncTools", False) != expected_async
                     or (params.get("belloRole") is not None and params["belloRole"] != role)):
                 raise AppServerError(
-                    "Saved thread uses a different runtime/distiller tool policy; start a fresh run "
+                    "Saved thread uses a different runtime/distiller/async tool policy; start a fresh run "
                     "instead of resuming it with changed switches."
                 )
+            if _IS_WINDOWS and record["engine"] == "codex":
+                if (type(record.get("windowsNativeRootRead", False)) is not bool or
+                        record.get("windowsNativeRootRead", False) != self.windows_native_root_read):
+                    raise AppServerError("Saved thread uses different Windows root-read consent; start a fresh run")
+                self._validate_scope_overrides(record, params)
+                validate_windows_native_scope(record)
         if not self.runtime_enabled:
             params["approvalPolicy"] = "never"
         engine = await self._engine(record["engine"])
@@ -394,6 +427,7 @@ class RuntimeClient(AppServerClient):
             if record.get("activeTurnId"):
                 raise AppServerError("cannot resume a thread while its turn is active")
             params.update({"tools": record["tools"], "provider": record["provider"], "model": record["model"],
+                           "asyncTools": record.get("asyncTools", False),
                            "developerInstructions": record.get("developerInstructions", "")})
         response = await engine.request(method, params, timeout=timeout)
         if method == "thread/resume":
@@ -420,13 +454,30 @@ class RuntimeClient(AppServerClient):
             # The model must receive a disposable workspace, not the trusted
             # controller directory that stores its sessions and approvals.
             raise AppServerError("agent workspace contains Bello's private runtime state")
+        # Host-run policy only: never accept model/child-supplied opt-in.
+        params.pop("windowsNativeRootRead", None)
+        if _IS_WINDOWS and selection.engine == "codex":
+            params["windowsNativeRootRead"] = self.windows_native_root_read
+        if _IS_WINDOWS and selection.engine == "codex":
+            # Reject before engine installation/initialization, account/model
+            # reads, thread journaling, delegation or any tool dispatch.
+            validate_windows_native_scope({**params, "cwd": str(root), "sandbox": mode})
         thread_id = params.pop("threadId", str(uuid4()))
         if thread_id in self._threads:
             raise AppServerError("duplicate thread id")
         agents = params.get("config", {}).get("agents", {})
         enabled = bool(agents.get("enabled", False))
-        coder = params.get("belloRole", agents.get("role")) == "coder"
+        role = params.get("belloRole", agents.get("role"))
+        coder = role == "coder"
         distill = self._distiller is not None and coder
+        async_mode = self.async_tools and role != "runtime"
+        params["asyncTools"] = async_mode
+        if async_mode:
+            from supervisor.runtime.async_tools import ASYNC_TOOLS_GUIDANCE
+            previous = params.get("developerInstructions") or ""
+            # Cross-provider descendants inherit this exact block once.
+            if ASYNC_TOOLS_GUIDANCE not in previous:
+                params["developerInstructions"] = (previous + "\n" + ASYNC_TOOLS_GUIDANCE).strip()
         params["networkAccess"] = not self.runtime_enabled
         params["distillerEnabled"] = distill
         if not self.runtime_enabled:
@@ -443,7 +494,8 @@ class RuntimeClient(AppServerClient):
             previous = "\n".join(line for line in previous.splitlines()
                                  if line not in {FOCUS_GUIDANCE, "Add a very short focus to each text tool call."})
             params["developerInstructions"] = (previous + "\n" + focus_instruction).strip()
-        tools = [entry for entry in tool_definitions(distiller=distill, runtime_enabled=self.runtime_enabled) if enabled or entry["name"] not in
+        tools = [entry for entry in tool_definitions(distiller=distill, runtime_enabled=self.runtime_enabled,
+                                                   async_tools=async_mode) if enabled or entry["name"] not in
                  {"spawn_agent", "send_message", "wait_agent", "close_agent"}]
         record = {**params, "cwd": str(root), "sandbox": mode, "engine": selection.engine,
                   "qualifiedModel": selection.qualified, "provider": selection.provider,
@@ -481,6 +533,12 @@ class RuntimeClient(AppServerClient):
             raise
 
     def _validate_scope_overrides(self, record: dict[str, Any], params: dict[str, Any]) -> None:
+        if ("windowsNativeRootRead" in params and
+                (type(params["windowsNativeRootRead"]) is not bool or
+                 params["windowsNativeRootRead"] != record.get("windowsNativeRootRead", False))):
+            raise AppServerError("a resumed thread cannot change its Windows root-read consent")
+        if "asyncTools" in params and params["asyncTools"] != record.get("asyncTools", False):
+            raise AppServerError("a resumed thread cannot change its async tools policy")
         if "cwd" in params and Path(params["cwd"]).resolve() != Path(record["cwd"]):
             raise AppServerError("a turn cannot change the thread's assigned workspace")
         if "sandbox" in params and params["sandbox"] != record["sandbox"]:
@@ -674,15 +732,35 @@ class RuntimeClient(AppServerClient):
             return tool_result(json.dumps(response))
         if child_record.get("activeTurnId"):
             expected = child_record["activeTurnId"]
-            try:
-                await self.wait_for_notification(lambda m: m.method == "turn/completed" and m.params.get("threadId") == child
-                    and m.params.get("turn", {}).get("id") == expected, timeout=args.get("timeout", 60))
-            except AppServerTimeoutError:
-                return tool_result("Child is still working.")
+            while child_record.get("activeTurnId") == expected:
+                try:
+                    await self.wait_for_notification(lambda m: m.method == "turn/completed" and m.params.get("threadId") == child
+                        and m.params.get("turn", {}).get("id") == expected, timeout=args.get("timeout", 60)
+                        if not record.get("asyncTools", False) else 60)
+                    break
+                except AppServerTimeoutError:
+                    if not record.get("asyncTools", False):
+                        return tool_result("Child is still working.")
+                    self._scope_for(parent, turn_id)
         response = await self.request("thread/read", {"threadId": child, "includeTurns": True})
         turns = response.get("thread", {}).get("turns", [])
         latest = turns[-1] if turns else {}
         findings = [item.get("text", "") for item in latest.get("items", []) if item.get("type") == "agentMessage"]
+        if record.get("asyncTools", False):
+            # Durable parent-owned delivery cursor: repeated waits must not
+            # append the same completed child messages to the LLM history.
+            deliveries = record.setdefault("childDeliveries", {})
+            delivered = deliveries.get(child, {})
+            child_turn = latest.get("id") or child_record.get("lastTurnId")
+            # A new parent turn may be recovery after interruption before the
+            # previous tool response reached its engine. Replay once there;
+            # never lose a finding by treating dispatch as a delivery ACK.
+            count = delivered.get("count", 0) if (
+                delivered.get("turnId") == child_turn and delivered.get("parentTurnId") == turn_id) else 0
+            total = len(findings)
+            findings = findings[count:]
+            deliveries[child] = {"turnId": child_turn, "parentTurnId": turn_id, "count": total}
+            self._save(parent)
         return tool_result(json.dumps({"agent_id": child, "status": latest.get("status", "idle"),
                                        "messages": findings, "error": latest.get("error")}, ensure_ascii=False))
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 
 import pytest
 
@@ -38,7 +39,10 @@ async def make_client(tmp_path, *, approval_handler=None):
 
 
 async def start(client, workspace, model="gpt-5.6-sol", **extra):
-    response = await client.thread_start({"cwd": str(workspace), "runtimeWorkspaceRoots": [str(workspace)],
+    # Fake-engine protocol cases need a supported assigned scope on Windows;
+    # no-dispatch rejection of the narrower profile is tested separately.
+    roots = [str(workspace), workspace.anchor] if os.name == "nt" else [str(workspace)]
+    response = await client.thread_start({"cwd": str(workspace), "runtimeWorkspaceRoots": roots,
         "model": model, "sandbox": "workspace-write", "approvalPolicy": "on-request", **extra})
     return response["thread"]["id"]
 

@@ -224,11 +224,74 @@ def windows_fixture_acls(output: Path) -> dict[str, Any]:
 
 def windows_permission_params(work: Path, home: Path, binary: Path) -> dict[str, Any]:
     from supervisor.runtime.codex_permissions import native_permission_params
+    # This synthetic Windows proof explicitly opts into the supported root-read
+    # contract. Keep tool scratch outside the denied native/controller homes.
+    scratch = work / ".bello-native-tmp"
+    scratch.mkdir(exist_ok=True)
+    if not scratch.is_dir() or scratch.is_symlink() or scratch.resolve() != scratch.absolute():
+        raise ValueError("Windows proof scratch must be a real workspace directory")
+    private = tuple(path for path in (home, work.parent / "bridge", work.parent / "private-outside-workspace")
+                    if path.is_dir())
+    if home not in private:
+        raise ValueError("Windows proof requires an existing synthetic native home")
     result = native_permission_params(
         {"cwd": str(work), "sandbox": "workspace-write", "networkAccess": False},
-        temp_dir=home / "tmp", runtime_read_paths=(binary,))
+        temp_dir=scratch, runtime_read_paths=(binary,), windows_root_read=True, private_read_roots=private)
     result["config"]["windows"] = {"sandbox": "elevated"}
+    result["config"]["shell_environment_policy"] = {"set": {name: str(scratch) for name in ("TMP", "TEMP", "TMPDIR")}}
     return result
+
+
+WINDOWS_ROOT_READ_FIELDS = ("home_read", "controller_read", "git_write", "agents_write", "codex_write")
+WINDOWS_ROOT_READ_SENTINEL = "synthetic root-read isolation canary"
+
+
+def windows_root_read_fixture(work: Path, home: Path) -> str:
+    """Probe native deny carveouts and retained metadata protection, no secrets."""
+    targets = {"home_read": home / "root-read-canary.txt",
+               "controller_read": work.parent / "bridge" / "root-read-canary.txt"}
+    for label, name in (("git_write", ".git"), ("agents_write", ".agents"), ("codex_write", ".codex")):
+        (work / name).mkdir(exist_ok=False)
+        targets[label] = work / name / "root-read-canary.txt"
+    command = "$ErrorActionPreference='Stop'; $rootProbe=@{}; "
+    for label, path in targets.items():
+        with path.open("x", encoding="ascii") as stream:
+            stream.write(WINDOWS_ROOT_READ_SENTINEL)
+        literal = "'" + str(path).replace("'", "''") + "'"
+        operation = ("[void][IO.File]::ReadAllText(" + literal + ")" if label.endswith("_read")
+                     else "[IO.File]::WriteAllText(" + literal + ", 'forbidden')")
+        command += ("$rootProbe['" + label + "']=$false; try { " + operation + "; $rootProbe['" + label + "']=$true } "
+                    "catch { if (-not ($_.Exception.GetBaseException() -is [UnauthorizedAccessException])) { throw } }; ")
+    command += ("[IO.File]::WriteAllText((Join-Path (Get-Location).Path 'windows-root-read-probe.json'), "
+                "($rootProbe | ConvertTo-Json -Compress)); "
+                "if (@($rootProbe.Values | Where-Object { $_ }).Count) { throw 'Windows root-read private/metadata boundary failed' }; ")
+    return command
+
+
+def windows_root_read_result(output: Path) -> dict[str, Any]:
+    passed, observed = False, None
+    try:
+        path = output / "work/windows-root-read-probe.json"
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400 or info.st_size > 4096:
+            raise ValueError("Invalid synthetic root-read observation")
+        observed = json.loads(path.read_text(encoding="utf-8-sig"))
+        if not isinstance(observed, dict) or set(observed) != set(WINDOWS_ROOT_READ_FIELDS):
+            raise ValueError("Missing root-read observation")
+        targets = ("empty-home/root-read-canary.txt", "bridge/root-read-canary.txt",
+                   "work/.git/root-read-canary.txt", "work/.agents/root-read-canary.txt", "work/.codex/root-read-canary.txt")
+        intact = True
+        for name in targets:
+            target = output / name
+            info = target.lstat()
+            if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                raise ValueError("Redirected root-read fixture")
+            intact = intact and target.read_text(encoding="ascii") == WINDOWS_ROOT_READ_SENTINEL
+        passed = intact and all(type(value) is bool and not value for value in observed.values())
+    except (OSError, ValueError, UnicodeError):
+        pass
+    return {"windows_explicit_root_read": True, "windows_private_and_metadata_proof": observed,
+            "windows_private_and_metadata_enforced": passed}
 
 
 async def terminate_windows_setup(process, env: dict[str, str]) -> None:
@@ -478,15 +541,18 @@ class NativeSession:
                         else:
                             future.set_result(message.get("result", {}))
                 elif "id" in message:
-                    await self.send({"id": message["id"], "error": {"code": -32600,
-                                          "message": "Unexpected server request in offline fixture"}})
-                    await self.notifications.put({"method": "fixture/error", "params": message})
+                    await self.server_request(message)
                 else:
                     await self.notifications.put(message)
         finally:
             for future in self.pending.values():
                 if not future.done():
                     future.set_exception(RuntimeError("Native app-server reader ended"))
+
+    async def server_request(self, message):
+        await self.send({"id": message["id"], "error": {"code": -32600,
+                              "message": "Unexpected server request in offline fixture"}})
+        await self.notifications.put({"method": "fixture/error", "params": message})
 
     async def request(self, method, params):
         self.counter += 1
@@ -563,7 +629,8 @@ def output_packets(request: dict[str, Any], mode: str) -> list[dict[str, Any]]:
 
 
 async def run_case(binary: Path, case: Case, output: Path, *, selector=None,
-                   raw_output: str = RAW, turn_timeout: float = 60) -> dict[str, Any]:
+                   raw_output: str = RAW, turn_timeout: float = 60,
+                   async_tools: bool = False) -> dict[str, Any]:
     from supervisor.runtime.codex_distiller import CodexDistillerBridge
 
     output.mkdir(parents=True, exist_ok=False)
@@ -597,7 +664,9 @@ async def run_case(binary: Path, case: Case, output: Path, *, selector=None,
     # the generic TASK.md/README name exclusion.
     bridge = CodexDistillerBridge(RecordingSelector(), output / "bridge", work, work / "fixture-requirements.data")
     await bridge.start()
-    tool, command = invocation(case, command_prefix=windows_filesystem_probe(outside, private) if os.name == "nt" else "")
+    prefix = (windows_root_read_fixture(work, home) + windows_filesystem_probe(outside, private)
+              if os.name == "nt" else "")
+    tool, command = invocation(case, command_prefix=prefix)
     provider = Provider(tool)
     server = ThreadingHTTPServer(("127.0.0.1", 0), provider.handler())
     server.daemon_threads = True
@@ -624,6 +693,8 @@ async def run_case(binary: Path, case: Case, output: Path, *, selector=None,
             "ephemeral": True, "developerInstructions": "Add a short focus to each command or poll call.",
             "config": {"features.bello_native_selection": case.enabled, "features.code_mode": case.mode != "direct",
                        "features.code_mode_only": case.mode != "direct", "features.shell_zsh_fork": False}}
+        if async_tools:
+            params["config"]["features.bello_async_tools"] = True
         if os.name == "nt":
             permissions = windows_permission_params(work, home, binary)
             params["config"].update(permissions.pop("config"))
@@ -658,7 +729,9 @@ async def run_case(binary: Path, case: Case, output: Path, *, selector=None,
     windows_probe_result = {}
     if os.name == "nt":
         windows_probe_result = windows_filesystem_result(output, private_before_sha256, exact=exact)
-        windows_isolated = windows_probe_result["windows_filesystem_sandbox_enforced"]
+        windows_probe_result.update(windows_root_read_result(output))
+        windows_isolated = (windows_probe_result["windows_filesystem_sandbox_enforced"]
+                            and windows_probe_result["windows_private_and_metadata_enforced"])
     focus_ok = (len(selections) == 1 and selections[0]["focus"] == (POLL_FOCUS if case.mode == "poll" else FOCUS)
                 and selections[0]["command"] == command) if selected else not selections
     # Native startup may attempt update/catalog discovery. The loopback proxy

@@ -624,6 +624,25 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
         *revision_coder_parameters,
         *multi_agent_parameters,
         EditorParameter(
+            "async_tools",
+            "async-tools",
+            _format_bool(config.async_tools),
+            (EditorOption("true", "async_tools", True), EditorOption("false", "async_tools", False)),
+            help_text=("Deliver completed tool results automatically and run independent tool calls concurrently. "
+                       "Applies to coder, reviewers, and their subagents. Off preserves the existing execution loop. "
+                       "Choose before starting a run; independent of runtime supervision and log distillation."),
+        ),
+        EditorParameter(
+            "windows_native_root_read",
+            "Windows native root read",
+            _format_bool(config.windows_native_root_read),
+            (EditorOption("true", "windows_native_root_read", True),
+             EditorOption("false", "windows_native_root_read", False)),
+            help_text=("Explicit opt-in for native Codex on Windows to read the workspace's drive/share root. "
+                       "Writes stay scoped to the assigned workspace; known private controller and Codex homes remain denied. "
+                       "Off by default. Choose before starting a run; ignored on other platforms and engines."),
+        ),
+        EditorParameter(
             "runtime_enabled",
             "runtime",
             _format_bool(config.runtime_enabled),

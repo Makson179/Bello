@@ -16,6 +16,7 @@ from supervisor.runtime.distiller_bundle import validate_bundle
 logger = logging.getLogger(__name__)
 REQUEST_TIMEOUT_SECONDS = 300.0
 MAX_INPUT_BYTES = 16 * 1024 * 1024
+SMALL_OUTPUT_MAX_BYTES = 200
 
 
 def require_dependencies() -> None:
@@ -51,12 +52,14 @@ class LogDistiller:
         self._sequence = 0
 
     async def distill(self, text: str, focus: str, command: str) -> str:
-        """Return selected excerpts, or the exact input when selection fails."""
+        """Keep outputs up to 200 UTF-8 bytes; otherwise select or fail open."""
         if (not text or self._closed or self._unavailable
                 or not isinstance(focus, str) or not focus.strip()
                 or not isinstance(command, str)):
             return text
-        if len(text.encode("utf-8")) > MAX_INPUT_BYTES:
+        input_bytes = len(text.encode("utf-8"))
+        # Bypass before acquiring the serial worker lock or loading the model.
+        if input_bytes <= SMALL_OUTPUT_MAX_BYTES or input_bytes > MAX_INPUT_BYTES:
             return text
         acquired = False
         try:
@@ -72,7 +75,7 @@ class LogDistiller:
                 self._request = asyncio.create_task(self._exchange(request))
                 result = await asyncio.shield(self._request)
                 # Preserve native output when selection cannot make it smaller.
-                return result if len(result.encode("utf-8")) < len(text.encode("utf-8")) else text
+                return result if len(result.encode("utf-8")) < input_bytes else text
         except asyncio.CancelledError:
             if acquired:
                 await self._finish_cleanup()

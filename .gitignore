@@ -13,3 +13,4 @@ dist/
 node_modules/
 native/windows-sandbox/target/
 supervisor/runtime/bin/*.exe
+tmp/native-async-*/

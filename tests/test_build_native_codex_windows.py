@@ -42,7 +42,7 @@ def test_lock_normalization_does_not_update_external_dependencies():
                 'version = "0.0.0"\nsource = "registry+pinned"\nchecksum = "abc"\n')
     updated = build.normalize_workspace_versions(original)
     packages = tomllib.loads(updated)["package"]
-    assert packages[0] == {"name": "codex-core", "version": "0.153.4", "dependencies": ["sha2 0.10.9"]}
+    assert packages[0] == {"name": "codex-core", "version": "0.155.1", "dependencies": ["sha2 0.10.9"]}
     assert packages[1] == tomllib.loads(original)["package"][1]
     assert build.normalize_workspace_versions(updated) == updated
 

@@ -56,7 +56,7 @@ jobs:
         if: steps.candidate.outputs.cache-hit != 'true'
         with:
           repository: openai/codex
-          ref: 3d2ee51ca2d5db578f328aa75e20aa22c0197c9a
+          ref: be2951ea34f0d295ed0becf97079f92fa5f6950e
           path: native-source
           persist-credentials: false
       - name: Install Linux native build dependencies

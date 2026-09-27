@@ -165,8 +165,9 @@ class CommandSessionManager:
         yield_time_ms: int = 10_000,
         on_output: OutputCallback | None = None,
         on_finished: FinishedCallback | None = None,
+        wait_for_completion: bool = False,
     ) -> dict[str, Any]:
-        """Start exactly one managed runner call and wait at most ``yield_time_ms``."""
+        """Start one runner; yield by deadline or await completion in async mode."""
 
         thread_id = self._identifier(thread_id, "thread_id")
         turn_id = self._identifier(turn_id, "turn_id")
@@ -232,7 +233,11 @@ class CommandSessionManager:
             )
 
         try:
-            if wait_seconds:
+            if wait_for_completion:
+                # Execution timeout and cancellation remain owned by the runner.
+                # Output deltas update the UI, but never wake an LLM just to poll.
+                await session.done.wait()
+            elif wait_seconds:
                 try:
                     await asyncio.wait_for(session.done.wait(), wait_seconds)
                 except asyncio.TimeoutError:

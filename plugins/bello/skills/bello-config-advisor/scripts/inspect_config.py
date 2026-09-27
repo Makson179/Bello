@@ -196,6 +196,8 @@ def _normalize(payload: dict[str, Any], *, config_exists: bool) -> dict[str, Any
         ),
         "speed": speed,
         "runtime_enabled": payload.get("runtime_enabled", True),
+        "async_tools": payload.get("async_tools", False),
+        "windows_native_root_read": payload.get("windows_native_root_read", False),
         "cheap_runtime": _first(payload, ("cheap_runtime", "cheap_runtime_enabled"), True),
         "log_distiller": log_distiller,
         "start_over": payload.get("start_over", False),
@@ -301,6 +303,8 @@ def _source_config_errors(payload: dict[str, Any], current: dict[str, Any], *, c
     for field in (
         "revision_coder_enabled",
         "runtime_enabled",
+        "async_tools",
+        "windows_native_root_read",
         "cheap_runtime",
         "start_over",
         "completion_review",

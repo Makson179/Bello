@@ -255,6 +255,94 @@ def test_venv_descendants_are_redundant_only_on_linux(host, monkeypatch, platfor
     assert str(binary.parent) not in filesystem
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX system-tool symlink layout")
+@pytest.mark.parametrize("platform", ["linux", "macos", "windows"])
+def test_native_minimal_covered_aliases_are_redundant_only_on_linux(host, monkeypatch, platform):
+    home, work = host
+    system = home.parent / "system"
+    usr, etc = system / "usr", system / "etc"
+    compiler = executable(usr / "bin" / "gcc-real")
+    gcc = usr / "bin" / "gcc"
+    gcc.symlink_to("gcc-real")
+    alternatives = etc / "alternatives" / "cc"
+    alternatives.parent.mkdir(parents=True)
+    alternatives.symlink_to(gcc)
+    cc = usr / "bin" / "cc"
+    cc.symlink_to(alternatives)
+    # /usr/local/bin/node commonly points outside :minimal to a user toolchain.
+    node = executable(home / "node-runtime" / "bin" / "node")
+    node_alias = usr / "local" / "bin" / "node"
+    node_alias.parent.mkdir(parents=True)
+    node_alias.symlink_to(node)
+    monkeypatch.setattr(tools, "_IS_LINUX", platform == "linux")
+    monkeypatch.setattr(tools, "_IS_MACOS", platform == "macos")
+    monkeypatch.setattr(tools, "_IS_WINDOWS", platform == "windows")
+    monkeypatch.setattr(tools, "_LINUX_NATIVE_MINIMAL_READ_ROOTS", (usr, etc))
+    monkeypatch.setattr(tools.sandbox, "_discover_toolchain", lambda policy: tools.sandbox._Toolchain((), ()))
+    monkeypatch.setattr(tools.sandbox, "_TOOLCHAIN_COMMANDS", ("cc", "node"))
+    monkeypatch.setattr(tools, "resolve_trusted_executable", lambda name, **kwargs:
+                        str(cc if name == "cc" else node_alias))
+    result = tools.native_toolchain_read_paths(work)
+    if platform == "linux":
+        assert result == (node,)
+    else:
+        assert set(result) == {cc, compiler, node_alias, node}
+    filesystem = native_permission_params({"cwd": str(work)}, runtime_read_paths=result)[
+        "config"]["permissions"][PROFILE_ID]["filesystem"]
+    assert filesystem[":minimal"] == "read"
+    assert str(usr) not in filesystem and str(etc) not in filesystem
+    assert str(home) not in filesystem and str(node.parent) not in filesystem
+    assert filesystem[str(node)] == "read"
+
+
+def test_linux_implicit_root_itself_is_not_emitted_and_only_directories_cover(host, monkeypatch):
+    home, work = host
+    system = home.parent / "system"
+    system.mkdir()
+    external = executable(home / "external" / "tool")
+    monkeypatch.setattr(tools, "_IS_LINUX", True)
+    monkeypatch.setattr(tools, "_IS_MACOS", False)
+    monkeypatch.setattr(tools, "_IS_WINDOWS", False)
+    monkeypatch.setattr(tools, "_LINUX_NATIVE_MINIMAL_READ_ROOTS", (
+        system, external, home.parent / "missing",
+    ))
+    monkeypatch.setattr(tools.sandbox, "_discover_toolchain", lambda policy: tools.sandbox._Toolchain(
+        (("external", external),), (system,),
+    ))
+    assert tools.native_toolchain_read_paths(work) == (external,)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux bubblewrap regression")
+def test_linux_minimal_grants_execute_absolute_alternatives_symlink(host, monkeypatch):
+    bwrap = Path(os.environ.get("BELLO_TEST_NATIVE_BWRAP", "/usr/bin/bwrap"))
+    if not bwrap.is_file():
+        if os.environ.get("BELLO_REQUIRE_NATIVE_SANDBOX") == "1":
+            pytest.fail("required native bubblewrap executable is unavailable")
+        pytest.skip("bubblewrap unavailable in this environment")
+    if not Path("/usr/bin/cc").is_symlink():
+        pytest.skip("host has no cc alternatives symlink")
+    _, work = host
+    monkeypatch.setattr(tools.sandbox, "_TOOLCHAIN_COMMANDS", ("cc",))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    grants = tools.native_toolchain_read_paths(work)
+    assert Path("/usr/bin/cc") not in grants
+    base = [str(bwrap), "--die-with-parent", "--unshare-all", "--tmpfs", "/", "--dev", "/dev"]
+    for path in sorted(tools._LINUX_NATIVE_MINIMAL_READ_ROOTS):
+        if path.is_dir():
+            base.extend(("--ro-bind", str(path), str(path)))
+    probe = subprocess.run([*base, "/usr/bin/true"], capture_output=True, text=True, timeout=10)
+    if probe.returncode:
+        if os.environ.get("BELLO_REQUIRE_NATIVE_SANDBOX") == "1":
+            pytest.fail(probe.stderr)
+        pytest.skip(f"bubblewrap unavailable in this environment: {probe.stderr}")
+    for path in grants:
+        base.extend(("--ro-bind", str(path), str(path)))
+    completed = subprocess.run([*base, "/usr/bin/cc", "--version"],
+                               capture_output=True, text=True, timeout=10)
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip()
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux") or not Path("/usr/bin/bwrap").exists(),
                     reason="Linux bubblewrap regression")
 def test_linux_native_grants_execute_symlinked_venv_python(host, monkeypatch):

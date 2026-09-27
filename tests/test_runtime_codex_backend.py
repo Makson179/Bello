@@ -12,6 +12,7 @@ import pytest
 
 from supervisor.appserver import AppServerError, AppServerMessage, AppServerTimeoutError
 from supervisor.runtime.codex import CodexBackend
+from supervisor.runtime import codex as codex_backend
 
 
 MODELS = [{"id": "astra-picker", "model": "gpt-6-astra", "displayName": "Astra",
@@ -41,6 +42,7 @@ class FakeNative:
         self.gate = None
         self.actual_effort = None
         self.active_profile = {"id": "bello-native", "extends": None}
+        self.async_tools_supported = False
 
     async def start(self):
         self.started = True
@@ -65,6 +67,8 @@ class FakeNative:
             return {"account": deepcopy(self.account)}
         if method == "model/list":
             return {"data": deepcopy(self.models), "nextCursor": None}
+        if method == "experimentalFeature/list":
+            return {"data": [{"name": "bello_async_tools"}] if self.async_tools_supported else [], "nextCursor": None}
         if method == "thread/start":
             self.next_thread += 1
             native = "native-thread-" + str(self.next_thread)
@@ -119,6 +123,9 @@ def make_backend(tmp_path, **kwargs):
 def thread_params(tmp_path, host="host-thread", **overrides):
     return {"threadId": host, "cwd": str(tmp_path), "model": "gpt-6-astra", "provider": "openai-codex",
         "sandbox": "workspace-write", "approvalPolicy": "on-request", "effort": "xhigh", "tools": deepcopy(TOOLS),
+        # Windows positive protocol tests explicitly assign effective root read.
+        # Restricted-root rejection has separate no-dispatch regression tests.
+        **({"runtimeWorkspaceRoots": [tmp_path.anchor]} if codex_backend._IS_WINDOWS else {}),
         "config": {"agents": {"enabled": False}}, "networkAccess": True, **overrides}
 
 
@@ -128,7 +135,58 @@ async def drain(backend):
         await asyncio.sleep(0)
 
 
-async def test_native_prompt_tools_and_subscription_are_preserved(tmp_path):
+async def test_async_tools_rejects_stock_native_before_creating_thread(tmp_path):
+    backend, _, clients = make_backend(tmp_path)
+    try:
+        with pytest.raises(AppServerError, match="requires a native Codex build"):
+            await backend.request("thread/start", thread_params(tmp_path, asyncTools=True))
+        assert not any(method == "thread/start" for method, _ in clients[0].calls)
+        assert clients[0].options["command"][1] == "app-server"
+    finally:
+        await backend.stop()
+
+
+async def test_async_tools_native_scoped_and_persisted_through_resume(tmp_path):
+    backend, _, clients = make_backend(tmp_path)
+    try:
+        await backend.request("initialize")
+        clients[0].async_tools_supported = True
+        await backend.request("thread/start", thread_params(tmp_path, asyncTools=True))
+        await backend.request("thread/start", thread_params(tmp_path, host="off", asyncTools=False))
+        native = [params for method, params in clients[0].calls if method == "thread/start"]
+        assert [params["config"]["features.bello_async_tools"] for params in native] == [True, False]
+        assert all("asyncTools" not in params for params in native)
+        assert "tty=true" in native[0]["developerInstructions"]
+        assert "no-poll rule does not prohibit" in native[0]["developerInstructions"]
+        assert "tty=true" not in native[1].get("developerInstructions", "")
+        await backend.request("thread/resume", {"threadId": "host-thread"})
+        resumed = next(params for method, params in clients[0].calls if method == "thread/resume")
+        assert resumed["config"]["features.bello_async_tools"] is True
+        with pytest.raises(AppServerError, match="cannot change Async tools mode"):
+            await backend.request("thread/resume", {"threadId": "host-thread", "asyncTools": False})
+        with pytest.raises(AppServerError, match="cannot change Async tools mode"):
+            await backend.request("turn/start", {"threadId": "host-thread", "turnId": "flip", "input": "test", "asyncTools": False})
+    finally:
+        await backend.stop()
+
+
+async def test_async_off_overrides_untrusted_native_config_flag(tmp_path):
+    backend, _, clients = make_backend(tmp_path)
+    try:
+        await backend.request("thread/start", thread_params(tmp_path, config={
+            "features.bello_async_tools": True, "features": {"bello_async_tools": True},
+        }))
+        config = next(params["config"] for method, params in clients[0].calls if method == "thread/start")
+        assert "features.bello_async_tools" not in config
+        assert "bello_async_tools" not in config["features"]
+        assert len([method for method, _ in clients[0].calls if method == "experimentalFeature/list"]) == 1
+    finally:
+        await backend.stop()
+
+
+@pytest.mark.parametrize("windows", [False, True])
+async def test_native_prompt_tools_and_subscription_are_preserved(tmp_path, monkeypatch, windows):
+    monkeypatch.setattr(codex_backend, "_IS_WINDOWS", windows)
     backend, events, clients = make_backend(tmp_path)
     try:
         reply = await backend.request("thread/start", thread_params(tmp_path, developerInstructions="Only an extra instruction."))
@@ -151,7 +209,7 @@ async def test_native_prompt_tools_and_subscription_are_preserved(tmp_path):
         assert profile["filesystem"][str(tmp_path)] == "write"
         assert profile["filesystem"][str(backend._tool_tmp)] == "write"
         assert profile["filesystem"][":workspace_roots"] == "read"
-        assert native["runtimeWorkspaceRoots"] == [str(tmp_path)]
+        assert native["runtimeWorkspaceRoots"] == [str(tmp_path), *([tmp_path.anchor] if windows else [])]
         assert native["serviceTier"] == "default"
         assert not ({"threadId", "runtimeTaskPath", "distillerEnabled", "provider"} & native.keys())
         command = client.options["command"]
@@ -905,11 +963,14 @@ async def test_disabled_distiller_ignores_invalid_manifest(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize("mode", ["read-only", "workspace-write", "danger-full-access"])
-async def test_native_scope_is_preserved_across_resume_and_turn(tmp_path, mode):
+@pytest.mark.parametrize("windows", [False, True])
+async def test_native_scope_is_preserved_across_resume_and_turn(tmp_path, monkeypatch, mode, windows):
+    monkeypatch.setattr(codex_backend, "_IS_WINDOWS", windows)
     backend, _, clients = make_backend(tmp_path)
     try:
+        read_roots = [str(tmp_path / "read-dependency"), *([tmp_path.anchor] if windows else [])]
         params = thread_params(tmp_path, sandbox=mode, networkAccess=False,
-            runtimeWorkspaceRoots=[str(tmp_path / "read-dependency")],
+            runtimeWorkspaceRoots=read_roots,
             config={"sandbox_workspace_write.network_access": True})
         await backend.request("thread/start", params)
         await backend.request("thread/resume", {"threadId": "host-thread"})
@@ -921,7 +982,7 @@ async def test_native_scope_is_preserved_across_resume_and_turn(tmp_path, mode):
                     assert native["sandbox"] == mode and "permissions" not in native
                 else:
                     assert "sandbox" not in native and native["permissions"] == "bello-native"
-                    assert native["runtimeWorkspaceRoots"] == [str(tmp_path), str(tmp_path / "read-dependency")]
+                    assert native["runtimeWorkspaceRoots"] == [str(tmp_path), *read_roots]
                     assert "sandbox_workspace_write.network_access" not in native["config"]
                     profile = native["config"]["permissions"]["bello-native"]
                     assert profile["network"] == {"enabled": False}

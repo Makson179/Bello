@@ -19,6 +19,38 @@ PROOF = ROOT / ".github/workflows/native-codex-windows.yml"
 BUILD = ROOT / ".github/workflows/native-codex-windows-build.yml"
 
 
+def test_portable_windows_workflow_keeps_scope_and_runs_root_read_regressions():
+    proof, build = PROOF.read_text(), BUILD.read_text()
+    assert _field(_block(_block(build, "jobs"), "build"), "timeout-minutes") == "240"
+    assert set(re.findall(r"^  ([a-z][a-z-]+):$", _block(proof, "jobs"), re.M)) == {"native-build", "native-proof"}
+    assert "private-smoke" not in proof and "root-read-proof:" not in proof
+    paths = _block(_block(proof, "on"), "push")
+    job = _block(_block(proof, "jobs"), "native-proof")
+    tests = next(step for step in _steps(job) if "python -m pytest" in (_field(step, "run") or ""))
+    for filename in ("test_windows_native_root_read.py", "test_windows_native_root_read_editor.py",
+                     "test_windows_native_scope_preflight.py", "test_windows_native_scratch.py"):
+        assert f"tests/{filename}" in paths and f"tests/{filename}" in (_field(tests, "run") or "")
+
+
+def test_portable_installed_async_binds_cache_receipt_and_archive():
+    proof = PROOF.read_text()
+    steps = _steps(_block(_block(proof, "jobs"), "native-proof"))
+    runs = [_field(step, "run") or "" for step in steps]
+    install = next(i for i, run in enumerate(runs) if "build_native_codex_windows.py install-local" in run)
+    repeated = next(i for i, run in enumerate(runs) if "--output-dir native-installed-async-proof" in run)
+    verify = runs[repeated]
+    assert repeated > install
+    for guard in ("native-artifact/installed-cache.json", "$receipt.passed",
+                  "$receipt.post_proof_cache_reusable", "Test-Path -LiteralPath $binary -PathType Leaf",
+                  "Get-FileHash -LiteralPath $binary -Algorithm SHA256", "$receipt.binary_sha256"):
+        assert guard in verify
+    assert '--codex "$binary"' in verify and "--concurrency-repeats 3" in verify
+    assert verify.index("$receipt.binary_sha256") < verify.index("python scripts/verify_native_codex_async.py")
+    uploads = [step for step in steps if _action(step) == "actions/upload-artifact"]
+    assert any("native-installed-async-proof/report.json" in step and _field(step, "if") is None for step in uploads)
+    assert any("native-installed-async-proof/**" in step and _field(step, "if") == "always()" for step in uploads)
+
+
 def _block(text: str, key: str) -> str:
     lines = text.splitlines()
     matches = [(index, len(match[1])) for index, line in enumerate(lines)

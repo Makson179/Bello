@@ -137,6 +137,7 @@ def test_built_wheel_contains_runtime_sources_but_not_node_modules(tmp_path: Pat
         "supervisor/pi_worker/package.json",
         "supervisor/pi_worker/worker.mjs",
         "supervisor/pi_worker/src/auth-cli.mjs",
+        "supervisor/pi_worker/src/openrouter-backpressure.mjs",
         "supervisor/pi_worker/src/pi-sdk.mjs",
         "supervisor/pi_worker/src/protocol.mjs",
         "supervisor/pi_worker/src/runtime.mjs",

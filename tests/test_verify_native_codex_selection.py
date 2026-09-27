@@ -105,6 +105,7 @@ def test_windows_environment_only_inherits_required_os_paths(tmp_path, monkeypat
 
 def test_windows_native_proof_preserves_exact_production_filesystem_scope(tmp_path):
     work, home, binary = tmp_path / "work", tmp_path / "home", tmp_path / "bin/codex.exe"
+    work.mkdir(); home.mkdir()
     params = proof.windows_permission_params(work, home, binary)
     assert params["permissions"] == "bello-native"
     assert params["config"]["windows"] == {"sandbox": "elevated"}
@@ -113,7 +114,10 @@ def test_windows_native_proof_preserves_exact_production_filesystem_scope(tmp_pa
     assert profile["filesystem"][str(work)] == "write"
     assert profile["filesystem"][str(work / ".git")] == "read"
     assert ":root" not in profile["filesystem"]
-    assert str(home) not in profile["filesystem"]
+    assert profile["filesystem"][str(home)] == "deny"
+    assert profile["filesystem"][str(work.anchor)] == "read"
+    assert profile["filesystem"][str(work / ".bello-native-tmp")] == "write"
+    assert str(home / "tmp") not in profile["filesystem"]
 
 
 def test_windows_probe_requires_actual_access_denial_and_preserves_original_command(tmp_path):

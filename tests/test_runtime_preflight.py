@@ -110,3 +110,15 @@ async def test_native_distiller_capability_only_required_for_coder_profiles(tmp_
     validations = [params for method, params in (e for e in events if isinstance(e, tuple))]
     requiring = [params["model"] for params in validations if params.get("distillerEnabled")]
     assert requiring == (["gpt-6-astra"] if native_coder else [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared_model", [False, True])
+async def test_runtime_only_profile_does_not_require_async_capability(tmp_path, monkeypatch, shared_model):
+    controller, events = controller_for(tmp_path, monkeypatch, completion=True, adversary=True)
+    if shared_model:
+        controller._runtime_model = controller._coder_model
+    await controller._runtime_preflight()
+    validations = [params for method, params in (e for e in events if isinstance(e, tuple))]
+    runtime_only = [params["model"] for params in validations if params.get("belloRole") == "runtime"]
+    assert runtime_only == ([] if shared_model else ["test/runtime"])

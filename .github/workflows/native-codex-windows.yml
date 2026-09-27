@@ -12,6 +12,7 @@ on:
       - 'scripts/prepare_native_codex_windows.py'
       - 'scripts/build_native_codex_windows.py'
       - 'scripts/verify_native_codex_selection.py'
+      - 'scripts/verify_native_codex_async.py'
       - 'scripts/verify_native_codex_download.py'
       - 'supervisor/appserver.py'
       - 'supervisor/runtime/codex.py'
@@ -27,6 +28,10 @@ on:
       - 'tests/test_native_codex_download_transport.py'
       - 'tests/test_runtime_codex_distiller.py'
       - 'tests/test_runtime_codex_backend.py'
+      - 'tests/test_windows_native_root_read.py'
+      - 'tests/test_windows_native_root_read_editor.py'
+      - 'tests/test_windows_native_scope_preflight.py'
+      - 'tests/test_windows_native_scratch.py'
 
 permissions:
   contents: read
@@ -62,9 +67,11 @@ jobs:
       - name: Install host and offline test dependencies, without optional models
         run: python -c "import pathlib, subprocess, sys, tomllib; deps = tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['dependencies']; subprocess.run([sys.executable, '-m', 'pip', 'install', 'pytest', 'pytest-asyncio', *deps], check=True)"
       - name: Run installer ACL, native bridge, backend and proof regressions
-        run: python -m pytest -q tests/test_build_native_codex_windows.py tests/test_native_codex_windows_workflow.py tests/test_verify_native_codex_selection.py tests/test_native_codex_install.py tests/test_native_codex_download_transport.py tests/test_runtime_codex_distiller.py tests/test_runtime_codex_backend.py
+        run: python -m pytest -q tests/test_build_native_codex_windows.py tests/test_native_codex_windows_workflow.py tests/test_verify_native_codex_selection.py tests/test_native_codex_install.py tests/test_native_codex_download_transport.py tests/test_runtime_codex_distiller.py tests/test_runtime_codex_backend.py tests/test_windows_native_root_read.py tests/test_windows_native_root_read_editor.py tests/test_windows_native_scope_preflight.py tests/test_windows_native_scratch.py
       - name: Verify real native direct, code-mode and poll provider boundaries
         run: python scripts/verify_native_codex_selection.py --codex native-candidate/bin/codex.exe --output-dir native-proof
+      - name: Prove async ON/OFF, terminal delivery and append-only history without credentials
+        run: python scripts/verify_native_codex_async.py --codex native-candidate/bin/codex.exe --output-dir native-async-proof --concurrency-repeats 3
       - name: Package only after all nine proof cases pass
         run: python scripts/build_native_codex_windows.py package-candidate --candidate native-candidate --proof native-proof/report.json --output native-artifact
       - name: Install local artifact into private cache and repeat all nine proof cases
@@ -77,7 +84,19 @@ jobs:
             Copy-Item -LiteralPath $receipt -Destination native-artifact/installed-cache.json
           }
           exit $proofExit
-      - name: Verify published HTTPS cold install and unchanged cache reuse
+      - name: Repeat Smart Execution proof on the freshly installed candidate
+        run: |
+          $receipt = Get-Content -LiteralPath native-artifact/installed-cache.json -Raw | ConvertFrom-Json
+          if (-not $receipt.passed -or -not $receipt.post_proof_cache_reusable) {
+            throw 'Candidate private-cache install proof has not passed'
+          }
+          $binary = [string]$receipt.binary
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw 'Installed candidate binary missing' }
+          $digest = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($digest -ne $receipt.binary_sha256) { throw 'Installed candidate binary changed' }
+          python scripts/verify_native_codex_async.py --codex "$binary" --output-dir native-installed-async-proof --concurrency-repeats 3
+          exit $LASTEXITCODE
+      - name: Verify previously published HTTPS cold install and unchanged cache reuse
         run: |
           $downloadRoot = Join-Path $env:LOCALAPPDATA "bello-https-proof-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           python scripts/verify_native_codex_download.py --runtime-root "$downloadRoot" --report native-https-installed.json
@@ -93,6 +112,7 @@ jobs:
             native-artifact/bundle/BUILD-INFO
             native-artifact/installed-cache.json
             native-installed-proof/report.json
+            native-installed-async-proof/report.json
             native-https-installed.json
           if-no-files-found: error
       - name: Upload synthetic diagnostics even on failure
@@ -101,6 +121,8 @@ jobs:
         with:
           name: native-codex-windows-proof-${{ github.sha }}-${{ github.run_attempt }}
           path: |
+            native-async-proof/**
+            native-installed-async-proof/**
             native-proof/report.json
             native-proof/*/result.json
             native-proof/*/provider-request-*.json

@@ -11,6 +11,7 @@ on:
       - 'scripts/build_native_codex_windows.py'
       - 'scripts/native-codex-selection.patch'
       - 'scripts/verify_native_codex_selection.py'
+      - 'scripts/verify_native_codex_async.py'
       - 'supervisor/runtime/native_codex_install.py'
       - 'supervisor/runtime/codex_distiller.py'
       - 'supervisor/runtime/distiller_policy.py'
@@ -58,6 +59,8 @@ jobs:
         run: python scripts/build_native_codex_linux.py sandbox-proof --binary native-candidate/bin/codex --output native-sandbox-proof
       - name: Prove all nine direct, code-mode and poll provider boundaries
         run: python scripts/verify_native_codex_selection.py --codex native-candidate/bin/codex --output-dir native-proof
+      - name: Prove async ON/OFF, terminal delivery and append-only history without credentials
+        run: python scripts/verify_native_codex_async.py --codex native-candidate/bin/codex --output-dir native-async-proof
       - name: Package only after sandbox and all nine cases pass
         run: python scripts/build_native_codex_linux.py package-candidate --candidate native-candidate --proof native-proof/report.json --sandbox-proof native-sandbox-proof/report.json --output native-artifact
       - name: Install archive through actual cache and repeat native proofs
@@ -89,6 +92,7 @@ jobs:
         with:
           name: native-codex-linux-proof-${{ github.sha }}-${{ github.run_attempt }}
           path: |
+            native-async-proof/**
             native-proof/report.json
             native-proof/*/result.json
             native-proof/*/provider-request-*.json

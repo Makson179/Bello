@@ -24,6 +24,13 @@ _XCODE_SELECT = Path("/usr/bin/xcode-select")
 _COMMAND_LINE_TOOLS = Path("/Library/Developer/CommandLineTools")
 _APPLICATIONS = Path("/Applications")
 _MAC_CRYPTEX_ALIASES = Path("/System/Cryptexes")
+# Already mounted read-only by native Codex's Linux :minimal profile. Keep in
+# sync with the pinned linux-sandbox/src/bwrap.rs platform-default roots. These
+# are used only to omit redundant grants, never to add filesystem authority.
+_LINUX_NATIVE_MINIMAL_READ_ROOTS = tuple(map(Path, (
+    "/bin", "/sbin", "/usr", "/etc", "/lib", "/lib64", "/nix/store",
+    "/run/current-system/sw",
+)))
 
 
 def _mac_cryptex_alias_directory() -> Path | None:
@@ -189,13 +196,15 @@ def native_toolchain_read_paths(workspace: Path) -> tuple[Path, ...]:
         if cryptex_aliases is not None:
             append(cryptex_aliases)
     if _IS_LINUX and not (_IS_MACOS or _IS_WINDOWS):
-        # Native bubblewrap cannot bind a venv's python symlink again after
-        # mounting the containing venv directory. These descendants already
-        # have the same read authority; retain canonical targets outside the
-        # directory, but avoid redundant mounts inside it. Seatbelt's lexical
-        # alias grants are intentionally unchanged.
+        # Rebinding an absolute symlink below an already mounted directory
+        # fails during bubblewrap's intermediate /newroot setup (e.g. Debian's
+        # /usr/bin/cc -> /etc/alternatives/cc). Account for :minimal's implicit
+        # system mounts as well as explicit toolchain/venv directory grants.
+        # External canonical targets still need their own grants; Seatbelt's
+        # lexical alias grants are intentionally unchanged.
+        implicit = tuple(path for path in _LINUX_NATIVE_MINIMAL_READ_ROOTS if path.is_dir())
         directories = tuple(path for path in selected if path.is_dir())
-        selected = [path for path in selected if not any(
-            path != root and path.is_relative_to(root) for root in directories
-        )]
+        selected = [path for path in selected
+                    if not any(path.is_relative_to(root) for root in implicit)
+                    and not any(path != root and path.is_relative_to(root) for root in directories)]
     return tuple(selected)
