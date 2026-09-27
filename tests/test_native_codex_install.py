@@ -738,6 +738,24 @@ def test_linux_x64_bundle_pins_verified_native_artifact():
     )
 
 
+@pytest.mark.parametrize("key,filename,archive_sha,manifest_sha", [
+    (("Linux", "x86_64"), "x86_64-unknown-linux-gnu",
+     "ba27107574789187a147e3a3caa159e0f5d435bd071759be623fe5745c5bdc07",
+     "e48fdaddd736198010c8ae1cfd073fa8f511cb27ab6534e89d8405b2f8673407"),
+    (("Darwin", "arm64"), "aarch64-apple-darwin",
+     "8614648cf79bf5582879b2c899cdb515e6da01687f4b65ee9d529cca25023029",
+     "792dbcd8df2672df020a63115dddd1af86e31ff5e1ca6c2008ff627be1057a1c"),
+])
+def test_async_bundle_pins_qualified_complete_artifact(key, filename, archive_sha, manifest_sha):
+    assert install.ASYNC_BUNDLES[key] == install.NativeBundle(
+        url=("https://github.com/Makson179/Bello/releases/download/"
+             "native-codex-0.155.1-smart-execution-v1/"
+             f"bello-native-codex-0.155.1-{filename}.tar.gz"),
+        archive_sha256=archive_sha, manifest_sha256=manifest_sha,
+    )
+    assert install.ASYNC_BUNDLES[key] != install.BUNDLES[key]
+
+
 def test_windows_x64_bundle_pins_verified_native_artifact():
     # Native provider proof and installed-cache proof both passed for this exact
     # archive; Windows ARM and other builds still require separate verification.

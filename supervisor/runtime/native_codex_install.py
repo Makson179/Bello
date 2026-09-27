@@ -59,7 +59,22 @@ BUNDLES: dict[tuple[str, str], NativeBundle] = {
 # selection and installed-cache proofs pass for the exact pinned files. The same
 # selection manifest/layout covers both capabilities; the backend also requires
 # the executable to advertise bello_async_tools before any model turn.
-ASYNC_BUNDLES: dict[tuple[str, str], NativeBundle] = {}
+ASYNC_BUNDLES: dict[tuple[str, str], NativeBundle] = {
+    ("Linux", "x86_64"): NativeBundle(
+        url=("https://github.com/Makson179/Bello/releases/download/"
+             "native-codex-0.155.1-smart-execution-v1/"
+             "bello-native-codex-0.155.1-x86_64-unknown-linux-gnu.tar.gz"),
+        archive_sha256="ba27107574789187a147e3a3caa159e0f5d435bd071759be623fe5745c5bdc07",
+        manifest_sha256="e48fdaddd736198010c8ae1cfd073fa8f511cb27ab6534e89d8405b2f8673407",
+    ),
+    ("Darwin", "arm64"): NativeBundle(
+        url=("https://github.com/Makson179/Bello/releases/download/"
+             "native-codex-0.155.1-smart-execution-v1/"
+             "bello-native-codex-0.155.1-aarch64-apple-darwin.tar.gz"),
+        archive_sha256="8614648cf79bf5582879b2c899cdb515e6da01687f4b65ee9d529cca25023029",
+        manifest_sha256="792dbcd8df2672df020a63115dddd1af86e31ff5e1ca6c2008ff627be1057a1c",
+    ),
+}
 _MAX_DOWNLOAD = 1024 * 1024 * 1024
 _MAX_UNPACKED = 2 * _MAX_DOWNLOAD
 _IS_WINDOWS = os.name == "nt"
