@@ -44,7 +44,8 @@ jobs:
       - name: Fresh final-code install, nine selection cases and thirteen async cases
         run: |
           $runtimeRoot = Join-Path $env:LOCALAPPDATA "bello-native-repackage-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          python -B scripts/repackage_native_codex_windows_candidate.py qualify --artifact ../native-repackaged --runtime-root "$runtimeRoot" --output ../repackage-proof
+          # Native provisioning intentionally rejects ParentDir, even in absolute paths.
+          python -B scripts/repackage_native_codex_windows_candidate.py qualify --artifact "$env:GITHUB_WORKSPACE/native-repackaged" --runtime-root "$runtimeRoot" --output "$env:GITHUB_WORKSPACE/repackage-proof"
           exit $LASTEXITCODE
       - name: Preserve full qualified archive, manifest and proof bindings
         uses: actions/upload-artifact@v4

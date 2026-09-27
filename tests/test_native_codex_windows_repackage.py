@@ -2,7 +2,7 @@
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import subprocess
 import zipfile
 
@@ -22,11 +22,29 @@ def test_manual_workflow_has_two_distinct_checkouts_and_no_build_or_publication(
     assert text.count("GH_TOKEN:") == 1 and "secrets." not in text
     assert not any(term in text for term in ("cargo ", "gh release", "publish:", "write-all", "npm "))
     assert "--historical ../provenance --inputs ../repackage-inputs" in text
-    assert "--artifact ../native-repackaged" in text
+    assert '--artifact "$env:GITHUB_WORKSPACE/native-repackaged"' in text
     assert "native-repackaged/*.tar.gz" in text and "native-repackaged/bundle/selection-manifest.json" in text
     assert "repackage-proof/async/report.json" in text and "repackage-proof/selection/report.json" in text
     for name in ("test_native_codex_windows_repackage.py", "test_native_codex_async_download.py", "test_build_native_codex_windows.py"):
         assert (repack.ROOT / "tests" / name).is_file()
+
+
+def test_qualification_paths_have_no_parent_components_for_native_setup():
+    text = (repack.ROOT / ".github/workflows/native-codex-windows-repackage.yml").read_text()
+    command = next(line.strip() for line in text.splitlines()
+                   if "repackage_native_codex_windows_candidate.py qualify " in line)
+    workspace = PureWindowsPath(r"D:\a\Bello\Bello")
+    # Path.absolute() retained this old ParentDir; native's no-reparse validator
+    # rejects it before the helper opens its log or writes a structured report.
+    old_home = workspace / "final" / ".." / "repackage-proof" / "selection" / "direct_on" / "empty-home"
+    assert old_home.is_absolute() and ".." in old_home.parts
+    for flag, leaf in (("artifact", "native-repackaged"), ("output", "repackage-proof")):
+        argument = f'--{flag} "$env:GITHUB_WORKSPACE/{leaf}"'
+        assert argument in command
+        actual = PureWindowsPath(str(workspace) + "/" + leaf)
+        assert actual.is_absolute() and ".." not in actual.parts
+        assert actual == workspace / leaf
+    assert "../" not in command and "Resolve-Path" not in command
 
 
 def test_failure_retention_is_unqualified_and_excludes_private_setup_state(tmp_path):
