@@ -187,6 +187,9 @@ class CodexBackend:
             manifest = os.environ.get("BELLO_CODEX_SELECTION_MANIFEST", "").strip()
             if self._selection_manifest is None and manifest:
                 self._selection_manifest = Path(manifest).expanduser().absolute()
+            if self._selection_manifest is not None:
+                from supervisor.runtime.native_codex_layout import validate_native_package
+                await validate_native_package(command, self._selection_manifest)
             executable = shutil.which(command[0])
             if executable is not None:
                 launcher = Path(executable).absolute()

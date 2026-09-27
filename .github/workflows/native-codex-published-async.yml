@@ -1,0 +1,45 @@
+name: Published Native Codex Smart Execution smoke
+
+# Qualification only: never builds or publishes a release, and never runs on push.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  published-async:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install host and offline test dependencies without model extras
+        run: python -c "import pathlib, subprocess, sys, tomllib; deps = tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['dependencies']; subprocess.run([sys.executable, '-m', 'pip', 'install', 'pytest', 'pytest-asyncio', *deps], check=True)"
+      - name: Check download qualification regressions
+        run: python -m pytest -q tests/test_native_codex_async_download.py tests/test_native_codex_install.py tests/test_native_codex_download_transport.py
+      - name: Cold HTTPS install, full async proof and unchanged cache reuse
+        run: |
+          python scripts/verify_native_codex_async_download.py \
+            --runtime-root "$RUNNER_TEMP/bello-async-published-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --output-dir published-async-proof
+      - name: Retain credential-free qualification results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-native-async-${{ matrix.os }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            published-async-proof/report.json
+            published-async-proof/async/report.json
+          if-no-files-found: warn

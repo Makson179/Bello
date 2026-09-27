@@ -93,6 +93,8 @@ async def validate_native_selection(
             ) from exc
         if not isinstance(manifest, dict) or manifest.get("binary_sha256") != sha256:
             raise RuntimeError("Native Codex selection manifest does not match the executable")
+        from supervisor.runtime.native_codex_layout import validate_manifest_bundle
+        await asyncio.to_thread(validate_manifest_bundle, path, Path(manifest_path), manifest)
         capability = manifest
     if (not capability or type(capability.get("protocol")) is not int or capability.get("protocol") != 1
             or capability.get("feature") != _FEATURE_NAME
