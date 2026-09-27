@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 
 import pytest
 
@@ -34,15 +33,15 @@ async def make_client(tmp_path, *, approval_handler=None):
     workspace.mkdir()
     codex, claude = FakeBackend(), FakeBackend()
     client = RuntimeClient(cwd=root, backends={"codex": codex, "claude-code": claude}, server_request_handler=approval_handler)
+    client.configure_run(windows_native_root_read=True)
     await client.start()
     return client, workspace, codex, claude
 
 
 async def start(client, workspace, model="gpt-5.6-sol", **extra):
-    # Fake-engine protocol cases need a supported assigned scope on Windows;
-    # no-dispatch rejection of the narrower profile is tested separately.
-    roots = [str(workspace), workspace.anchor] if os.name == "nt" else [str(workspace)]
-    response = await client.thread_start({"cwd": str(workspace), "runtimeWorkspaceRoots": roots,
+    # Native consent belongs to configure_run, not shared host-tool dependencies.
+    # A drive root here would invalidate the separate Pi/Claude sandbox policy.
+    response = await client.thread_start({"cwd": str(workspace), "runtimeWorkspaceRoots": [str(workspace)],
         "model": model, "sandbox": "workspace-write", "approvalPolicy": "on-request", **extra})
     return response["thread"]["id"]
 

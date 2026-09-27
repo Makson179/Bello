@@ -38,7 +38,8 @@ def make_client(tmp_path, *, runtime=True, distiller=False):
     workspace.mkdir()
     codex, claude = FakeBackend(), FakeBackend()
     client = RuntimeClient(cwd=root, backends={"codex": codex, "claude-code": claude, "pi": FakeBackend()})
-    client.configure_run(runtime_enabled=runtime, log_distiller={"enabled": distiller, "model_path": "bundle"})
+    client.configure_run(runtime_enabled=runtime, windows_native_root_read=True,
+                         log_distiller={"enabled": distiller, "model_path": "bundle"})
     return client, workspace, codex, claude
 
 
@@ -213,7 +214,8 @@ async def test_restart_recreates_closed_distiller(tmp_path, selector, reconfigur
         await client.stop()
         assert old.closed
         if reconfigure:
-            client.configure_run(log_distiller={"enabled": True, "model_path": "bundle"})
+            client.configure_run(windows_native_root_read=True,
+                                 log_distiller={"enabled": True, "model_path": "bundle"})
         await client.start()
         client._engines["codex"] = codex
         await client.request("thread/resume", {"threadId": thread, "belloRole": "coder"})
@@ -231,7 +233,8 @@ async def test_saved_thread_cannot_silently_keep_outdated_tool_policy(tmp_path, 
     await start(client, workspace, belloRole="coder")
     thread = next(iter(client._threads))
     await client.stop()
-    client.configure_run(runtime_enabled=changed != "runtime", log_distiller={"enabled": changed == "distiller", "model_path": "bundle"})
+    client.configure_run(runtime_enabled=changed != "runtime", windows_native_root_read=True,
+                         log_distiller={"enabled": changed == "distiller", "model_path": "bundle"})
     try:
         await client.start()
         with pytest.raises(AppServerError, match="start a fresh run"):

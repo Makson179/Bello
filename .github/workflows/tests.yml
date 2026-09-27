@@ -176,7 +176,7 @@ jobs:
       - name: Run full applicable Python suite except the separately gated Pi integration
         env:
           BELLO_REQUIRE_PI_INTEGRATION: "1"
-        run: python -m pytest -v -o faulthandler_timeout=120 --ignore=tests/test_runtime_pi_integration.py
+        run: python -m pytest -v --maxfail=1 -o faulthandler_timeout=120 --ignore=tests/test_runtime_pi_integration.py
       - name: Run real offline Pi SDK and native sandbox integration
         env:
           BELLO_REQUIRE_NATIVE_SANDBOX: "1"

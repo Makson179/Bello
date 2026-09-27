@@ -13,6 +13,11 @@ from supervisor.supervisor_agent import StatelessSupervisorAgent
 from tests.test_runtime_client import FakeBackend
 
 
+@pytest.fixture(autouse=True, params=[False, True], ids=["unix-gate", "windows-gate"])
+def native_scope_gate(request, monkeypatch):
+    monkeypatch.setattr("supervisor.runtime.client._IS_WINDOWS", request.param)
+
+
 class DecisionBackend(FakeBackend):
     async def request(self, method, params, timeout=30):
         response = await super().request(method, params, timeout)
@@ -47,7 +52,7 @@ async def test_actual_reviewer_threads_receive_their_async_policy(tmp_path, mode
     store.initialize_bello(BelloConfig(project_root=str(workspace), task_path=str(task)), overwrite=True)
     backends = {name: DecisionBackend() for name in ("codex", "claude-code", "pi")}
     client = RuntimeClient(cwd=tmp_path, state_dir=tmp_path / "runtime-state", backends=backends)
-    client.configure_run(async_tools=enabled)
+    client.configure_run(async_tools=enabled, windows_native_root_read=True)
     agent = StatelessSupervisorAgent(client, store, task, model=model)
     packet = agent.build_packet(wake_sequence=7, current_summary="check")
     try:

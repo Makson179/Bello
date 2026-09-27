@@ -24,6 +24,13 @@ from tests.test_runtime_command_sessions import QueueRunner, THREAD, TURN, CALL
 MODELS = ("gpt-5.6-sol", "claude-code/claude-sonnet-4-6", "openai/gpt-5.6-sol")
 
 
+@pytest.fixture(autouse=True, params=[False, True], ids=["unix-gate", "windows-gate"])
+def native_scope_gate(request, monkeypatch):
+    # Exercise the Windows admission gate even on Unix test hosts. Native
+    # execution is fake; shared host-tool policy validation remains real.
+    monkeypatch.setattr("supervisor.runtime.client._IS_WINDOWS", request.param)
+
+
 @pytest.fixture
 def policy_distiller(monkeypatch):
     """Exercise the public switch without weights, worker startup, or network."""
@@ -53,7 +60,7 @@ def test_async_switch_defaults_roundtrip_editor_and_cli(tmp_path):
 async def test_model_validation_excludes_runtime_only_async_capability(tmp_path):
     backend = FakeBackend()
     client = RuntimeClient(cwd=tmp_path, backends={"codex": backend})
-    client.configure_run(async_tools=True)
+    client.configure_run(async_tools=True, windows_native_root_read=True)
     try:
         for role in ("runtime", "coder", "completion_review", "adversary"):
             await client.request("model/validate", {"model": "gpt-5.6-sol", "belloRole": role})
@@ -71,7 +78,7 @@ async def test_async_policy_reaches_all_roles_and_survives_resume(tmp_path, enab
     root.mkdir()
     workspace.mkdir()
     client = RuntimeClient(cwd=root, backends={key: FakeBackend() for key in ("codex", "claude-code", "pi")})
-    client.configure_run(runtime_enabled=runtime, async_tools=enabled)
+    client.configure_run(runtime_enabled=runtime, async_tools=enabled, windows_native_root_read=True)
     try:
         for role in ("coder", "completion_review", "adversary", "runtime"):
             thread = await start(client, workspace, model, belloRole=role, developerInstructions="Original instructions.")
@@ -86,7 +93,7 @@ async def test_async_policy_reaches_all_roles_and_survives_resume(tmp_path, enab
             with pytest.raises(AppServerError, match="async tools policy"):
                 await client.request("thread/resume", {"threadId": thread, "asyncTools": not active})
         with pytest.raises(AppServerError, match="stopping"):
-            client.configure_run(runtime_enabled=runtime, async_tools=not enabled)
+            client.configure_run(runtime_enabled=runtime, async_tools=not enabled, windows_native_root_read=True)
     finally:
         await client.stop()
 
@@ -102,7 +109,7 @@ async def test_children_inherit_async_across_engines_and_revision(
     root.mkdir()
     workspace.mkdir()
     client = RuntimeClient(cwd=root, backends={key: FakeBackend() for key in ("codex", "claude-code", "pi")})
-    client.configure_run(async_tools=enabled, log_distiller={
+    client.configure_run(async_tools=enabled, windows_native_root_read=True, log_distiller={
         "enabled": True, "model_path": str(tmp_path / "offline-bundle"),
     })
     try:
@@ -153,7 +160,7 @@ async def test_parent_cleanup_stops_mixed_provider_child_and_queued_tools(
     root.mkdir()
     workspace.mkdir()
     client = RuntimeClient(cwd=root, backends={key: FakeBackend() for key in ("codex", "claude-code", "pi")})
-    client.configure_run(async_tools=True)
+    client.configure_run(async_tools=True, windows_native_root_read=True)
     child_model = MODELS[(MODELS.index(parent_model) + 1) % len(MODELS)]
     runner = QueueRunner()
     created = []
@@ -175,6 +182,7 @@ async def test_parent_cleanup_stops_mixed_provider_child_and_queued_tools(
         child = json.loads(reply["content"][0]["text"])["agent_id"]
         child_turn = client._threads[child]["activeTurnId"]
         assert client._threads[child]["engine"] != client._threads[parent]["engine"]
+        assert client._scope_for(child, child_turn).readable_roots == (workspace,)
         client._host.runner_factory = factory
         client._host.sessions.max_active_per_turn = 1
         calls = [asyncio.create_task(client._call_tool({
@@ -221,7 +229,7 @@ async def test_completion_cycle_preserves_coder_resume_and_fresh_revision_policy
     store.initialize_bello(BelloConfig(project_root=str(workspace), task_path=str(task)), overwrite=True)
     backends = {name: DecisionBackend() for name in ("codex", "claude-code", "pi")}
     client = RuntimeClient(cwd=root, backends=backends)
-    client.configure_run(async_tools=enabled, log_distiller={
+    client.configure_run(async_tools=enabled, windows_native_root_read=True, log_distiller={
         "enabled": True, "model_path": str(tmp_path / "offline-bundle"),
     })
     agent = StatelessSupervisorAgent(client, store, task, model=model)
@@ -273,7 +281,7 @@ async def test_command_waits_for_terminal_not_intermediate_output(tmp_path):
     operation = asyncio.create_task(manager.start(thread_id=THREAD, turn_id=TURN, call_id=CALL,
         runner=runner, command="tests", cwd=tmp_path, timeout=120, yield_time_ms=0, wait_for_completion=True))
     try:
-        await runner.started.wait()
+        await asyncio.wait_for(runner.started.wait(), 5)
         runner.emit("first\n")
         await asyncio.sleep(0.01)
         assert not operation.done()
@@ -294,7 +302,7 @@ async def test_command_cancellation_stops_owned_process(tmp_path):
     operation = asyncio.create_task(manager.start(thread_id=THREAD, turn_id=TURN, call_id=CALL,
         runner=runner, command="tests", cwd=tmp_path, timeout=120, wait_for_completion=True))
     try:
-        await runner.started.wait()
+        await asyncio.wait_for(runner.started.wait(), 5)
         operation.cancel()
         with pytest.raises(asyncio.CancelledError):
             await operation
@@ -321,7 +329,7 @@ async def test_host_distills_once_after_complete_output(tmp_path):
     operation = asyncio.create_task(host.call({"threadId": THREAD, "turnId": TURN, "callId": CALL,
         "name": "exec_command", "arguments": {"command": "run tests", "focus": "test errors", "yield_time_ms": 0}}))
     try:
-        await runner.started.wait()
+        await asyncio.wait_for(runner.started.wait(), 5)
         runner.emit("first line\n")
         await asyncio.sleep(0.01)
         assert not operation.done() and not distilled
@@ -362,7 +370,7 @@ async def test_host_queues_excess_commands_without_model_limit_errors(tmp_path):
     operations = [asyncio.create_task(host.call({"threadId": THREAD, "turnId": TURN, "callId": str(index),
         "name": "exec_command", "arguments": {"command": "tests", "yield_time_ms": 0}})) for index in range(2)]
     try:
-        await runners[0].started.wait()
+        await asyncio.wait_for(runners[0].started.wait(), 5)
         await asyncio.sleep(0.01)
         assert len(created) == 1 and not any(task.done() for task in operations)
         runners[0].finish()
@@ -382,7 +390,7 @@ async def test_child_wait_timeout_is_internal_and_delivery_is_once(tmp_path, mon
     workspace.mkdir()
     backend = FakeBackend()
     client = RuntimeClient(cwd=root, backends={"codex": backend})
-    client.configure_run(async_tools=True)
+    client.configure_run(async_tools=True, windows_native_root_read=True)
     try:
         parent = await start(client, workspace, belloRole="coder", config={"agents": {
             "enabled": True, "role": "coder", "max_concurrent_threads_per_session": 2,
@@ -431,7 +439,7 @@ async def test_terminal_event_fences_and_cancels_queued_host_commands(tmp_path, 
     root.mkdir()
     workspace.mkdir()
     client = RuntimeClient(cwd=root, backends={"codex": FakeBackend()})
-    client.configure_run(async_tools=True)
+    client.configure_run(async_tools=True, windows_native_root_read=True)
     runner = QueueRunner()
     created = []
     def factory(_):
@@ -440,12 +448,13 @@ async def test_terminal_event_fences_and_cancels_queued_host_commands(tmp_path, 
     try:
         thread = await start(client, workspace, belloRole="coder")
         turn = (await client.turn_start({"threadId": thread}))["turn"]["id"]
+        assert client._scope_for(thread, turn).readable_roots == (workspace,)
         client._host.sessions.max_active_per_turn = 1
         client._host.runner_factory = factory
         calls = [asyncio.create_task(client._call_tool({"threadId": thread, "turnId": turn,
             "callId": str(index), "name": "exec_command", "arguments": {"command": "tests"}}))
             for index in range(2)]
-        await runner.started.wait()
+        await asyncio.wait_for(runner.started.wait(), 5)
         await asyncio.sleep(0.01)
         assert len(created) == 1
         await asyncio.wait_for(client._emit({"method": "turn/completed", "params": {
