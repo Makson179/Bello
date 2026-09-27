@@ -19,7 +19,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from inspect_models import qualified_model
 
-TARGET_VERSION = "0.6.0"
+TARGET_VERSION = "0.7.0"
 ACTIVE_STATUSES = {"starting", "running", "paused", "restarting"}
 TERMINAL_STATUSES = {"complete", "escalated", "stuck", "provider_failure", "exited"}
 LEGACY_MODELS = {"gpt-6-astra", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.5"}

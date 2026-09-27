@@ -7,7 +7,7 @@ description: Inspect a coding task, repository, and user preferences, then recom
 
 Use the task file, production repository, current model/effort information, and the user's quality, cost, and time preferences to choose one usable Bello setup. Include an explicit planning decision. With no stated preference, favor the least expensive setup that still has strong expected quality.
 
-This skill targets Bello 0.6.0. The host where the user talks to you does not determine Bello's models or billing routes. Advice is read-only: do not apply settings, authenticate, install dependencies, create a plan, or start a run until the user asks.
+This skill targets Bello 0.7.0. The host where the user talks to you does not determine Bello's models or billing routes. Advice is read-only: do not apply settings, authenticate, install dependencies, create a plan, or start a run until the user asks.
 
 ## Inspect
 

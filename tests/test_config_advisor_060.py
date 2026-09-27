@@ -546,8 +546,8 @@ class ConfigInspectionTests(unittest.TestCase):
             "max_completion_returns_before_adversary": 0, "max_completion_returns_after_adversary": 0}),
             ("unlimited", "unlimited"))
 
-    def test_version_target_recognizes_060_development(self):
-        for value in ("0.6.0", "0.6.0.dev0", "0.6.0.dev12"):
+    def test_version_target_recognizes_070_development(self):
+        for value in ("0.7.0", "0.7.0.dev0", "0.7.0.dev12"):
             self.assertEqual(INSPECTOR._version_compatibility(value), "verified")
         self.assertEqual(INSPECTOR._version_compatibility("0.5.2"), "update_required")
         self.assertEqual(INSPECTOR._version_compatibility("garbage"), "unverified")
