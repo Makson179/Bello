@@ -745,6 +745,9 @@ def test_linux_x64_bundle_pins_verified_native_artifact():
     (("Darwin", "arm64"), "aarch64-apple-darwin",
      "8614648cf79bf5582879b2c899cdb515e6da01687f4b65ee9d529cca25023029",
      "792dbcd8df2672df020a63115dddd1af86e31ff5e1ca6c2008ff627be1057a1c"),
+    (("Windows", "x86_64"), "x86_64-pc-windows-msvc",
+     "8993eea58f8d4f3466f72713eba62bd4842e702d92d8552ab79c3a2d4b7308b8",
+     "d6b859995d238de668cd9bb533d23d3c2a7c96b1940808295a197e2360830ccd"),
 ])
 def test_async_bundle_pins_qualified_complete_artifact(key, filename, archive_sha, manifest_sha):
     assert install.ASYNC_BUNDLES[key] == install.NativeBundle(
