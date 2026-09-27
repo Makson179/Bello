@@ -82,7 +82,10 @@ def clean_environment() -> dict[str, str]:
 def validate_provenance(historical: Path) -> None:
     env = clean_environment()
     head = subprocess.check_output(["git", "-C", str(historical), "rev-parse", "HEAD"], env=env, text=True).strip()
-    dirty = subprocess.check_output(["git", "-C", str(historical), "status", "--porcelain", "--untracked-files=all"], env=env, text=True)
+    # Windows checkout uses CRLF; removing global/system configuration must not
+    # reinterpret those transport bytes as edits. This does not restore any auth/config.
+    eol = ["-c", "core.autocrlf=true"] if platform.system() == "Windows" else []
+    dirty = subprocess.check_output(["git", *eol, "-C", str(historical), "status", "--porcelain", "--untracked-files=all"], env=env, text=True)
     require(head == PROVENANCE and not dirty.strip(), "Historical checkout identity changed")
     for name, expected in INPUTS.items():
         path = historical / name

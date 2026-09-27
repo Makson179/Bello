@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import zipfile
 
 import pytest
@@ -114,6 +115,36 @@ def test_historical_identity_requires_exact_clean_commit_and_pins(tmp_path, monk
     if mode == "good": repack.validate_provenance(tmp_path)
     else:
         with pytest.raises(ValueError): repack.validate_provenance(tmp_path)
+
+
+@pytest.mark.parametrize("mode", ["clean", "modified", "untracked"])
+def test_windows_crlf_checkout_under_sanitized_git_config(tmp_path, monkeypatch, mode):
+    """Real Git reproducer: dropping the host's autocrlf config falsely dirties CRLF files."""
+    root = tmp_path / "public-fixture"
+    root.mkdir()
+    text = b"public fixture line\nsecond line\n"
+    (root / "input.txt").write_bytes(text)
+    env = repack.clean_environment()
+    def git(*arguments):
+        return subprocess.check_output(["git", "-C", str(root), *arguments], env=env, text=True, stderr=subprocess.DEVNULL)
+    git("init", "--quiet")
+    git("add", "input.txt")
+    git("-c", "user.name=Public fixture", "-c", "user.email=fixture@localhost",
+        "commit", "--quiet", "-m", "public fixture")
+    checkout = tmp_path / "crlf-checkout"
+    git("-c", "core.autocrlf=true", "clone", "--quiet", "--local", str(root), str(checkout))
+    root = checkout
+    monkeypatch.setattr(repack, "PROVENANCE", git("rev-parse", "HEAD").strip())
+    monkeypatch.setattr(repack, "INPUTS", {"input.txt": hashlib.sha256(text).hexdigest()})
+    assert (root / "input.txt").read_bytes() == text.replace(b"\n", b"\r\n")
+    assert git("-c", "core.autocrlf=true", "status", "--porcelain", "--untracked-files=all") == ""
+    assert git("status", "--porcelain", "--untracked-files=all").strip() == "M input.txt"
+    monkeypatch.setattr(repack.platform, "system", lambda: "Windows")
+    if mode == "modified": (root / "input.txt").write_bytes(b"changed content\r\n")
+    if mode == "untracked": (root / "unexpected.txt").write_text("unexpected")
+    if mode == "clean": repack.validate_provenance(root)
+    else:
+        with pytest.raises(ValueError): repack.validate_provenance(root)
 
 
 def test_clean_environment_excludes_auth_proxy_python_and_native_overrides(monkeypatch):
