@@ -50,8 +50,10 @@ def test_dependency_preflight_lists_missing_packages_and_install_extra(monkeypat
 
 FAKE_WORKER = r'''
 import json, os, sys, time
+# Match the real byte-oriented protocol, even with a non-UTF-8 Windows locale.
+sys.stdin.reconfigure(encoding="cp1252", errors="strict")
 print(json.dumps({"ready": True}), flush=True)
-for line in sys.stdin:
+for line in sys.stdin.buffer:
     request = json.loads(line)
     if request["command"] == "hang":
         time.sleep(60)
