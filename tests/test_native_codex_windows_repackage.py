@@ -15,7 +15,7 @@ def test_manual_workflow_has_two_distinct_checkouts_and_no_build_or_publication(
     text = (repack.ROOT / ".github/workflows/native-codex-windows-repackage.yml").read_text()
     assert "workflow_dispatch:" in text and "\n  push:" not in text and "\n  pull_request:" not in text
     assert "contents: read" in text and "actions: read" in text
-    assert "runs-on: windows-2022" in text and "timeout-minutes: 25" in text
+    assert "runs-on: windows-2025" in text and "timeout-minutes: 25" in text
     assert text.count("persist-credentials: false") == 2
     assert "path: final" in text and "working-directory: final" in text
     assert f"ref: {repack.PROVENANCE}" in text and "path: provenance" in text
@@ -27,6 +27,40 @@ def test_manual_workflow_has_two_distinct_checkouts_and_no_build_or_publication(
     assert "repackage-proof/async/report.json" in text and "repackage-proof/selection/report.json" in text
     for name in ("test_native_codex_windows_repackage.py", "test_native_codex_async_download.py", "test_build_native_codex_windows.py"):
         assert (repack.ROOT / "tests" / name).is_file()
+
+
+def test_failure_retention_is_unqualified_and_excludes_private_setup_state(tmp_path):
+    text = (repack.ROOT / ".github/workflows/native-codex-windows-repackage.yml").read_text()
+    failure = text.split("      - name: Preserve UNQUALIFIED archive and scoped setup diagnostics\n")[1]
+    assert "if: failure()" in failure
+    assert "name: native-windows-repackage-UNQUALIFIED-${{ github.sha }}-${{ github.run_attempt }}" in failure
+    paths = {line.strip() for line in failure.split("          path: |\n")[1].split("          if-no-files-found:")[0].splitlines()}
+    assert paths == {
+        "native-repackaged/*.tar.gz", "native-repackaged/bundle/selection-manifest.json",
+        "native-repackaged/checksums.json", "native-repackaged/provenance.json",
+        "repackage-proof/report.json", "repackage-proof/selection/report.json",
+        "repackage-proof/async/report.json",
+        "repackage-proof/selection/*/windows-setup-stdout.txt",
+        "repackage-proof/selection/*/windows-setup-stderr.txt",
+    }
+    allowed = {
+        "native-repackaged/candidate.tar.gz", "native-repackaged/bundle/selection-manifest.json",
+        "repackage-proof/selection/direct_on/windows-setup-stdout.txt",
+        "repackage-proof/selection/direct_on/windows-setup-stderr.txt",
+    }
+    forbidden = {
+        "repackage-proof/selection/direct_on/empty-home/.sandbox/secrets.json",
+        "repackage-proof/selection/direct_on/empty-home/auth.json",
+        "repackage-proof/selection/direct_on/raw-rpc.jsonl",
+        "repackage-proof/selection/direct_on/empty-home/windows-setup-stderr.txt",
+        "native-repackaged/bundle/auth.json",
+    }
+    for name in allowed | forbidden:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("synthetic fixture only")
+    selected = {file.relative_to(tmp_path).as_posix() for pattern in paths for file in tmp_path.glob(pattern)}
+    assert selected == allowed
 
 
 @pytest.fixture

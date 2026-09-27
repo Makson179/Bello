@@ -11,7 +11,8 @@ permissions:
 jobs:
   repackage:
     if: ${{ github.repository == 'Makson179/Bello' && github.event_name == 'workflow_dispatch' }}
-    runs-on: windows-2022
+    # Match the preserved candidate's successful selection/async qualification.
+    runs-on: windows-2025
     timeout-minutes: 25
     defaults:
       run:
@@ -59,15 +60,19 @@ jobs:
             repackage-proof/selection/report.json
             repackage-proof/async/report.json
           if-no-files-found: error
-      - name: Preserve scalar qualification failures
+      - name: Preserve UNQUALIFIED archive and scoped setup diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: native-windows-repackage-failure-${{ github.sha }}-${{ github.run_attempt }}
+          name: native-windows-repackage-UNQUALIFIED-${{ github.sha }}-${{ github.run_attempt }}
           path: |
+            native-repackaged/*.tar.gz
+            native-repackaged/bundle/selection-manifest.json
             native-repackaged/checksums.json
             native-repackaged/provenance.json
             repackage-proof/report.json
             repackage-proof/selection/report.json
             repackage-proof/async/report.json
+            repackage-proof/selection/*/windows-setup-stdout.txt
+            repackage-proof/selection/*/windows-setup-stderr.txt
           if-no-files-found: warn
