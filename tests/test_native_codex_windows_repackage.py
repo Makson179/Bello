@@ -153,7 +153,7 @@ def test_historical_identity_requires_exact_clean_commit_and_pins(tmp_path, monk
 
 @pytest.mark.parametrize("mode", ["clean", "modified", "untracked"])
 def test_windows_crlf_checkout_under_sanitized_git_config(tmp_path, monkeypatch, mode):
-    """Real Git reproducer: dropping the host's autocrlf config falsely dirties CRLF files."""
+    """Real Git: accept clean CRLF checkout, reject modified or untracked files."""
     root = tmp_path / "public-fixture"
     root.mkdir()
     text = b"public fixture line\nsecond line\n"
@@ -172,7 +172,9 @@ def test_windows_crlf_checkout_under_sanitized_git_config(tmp_path, monkeypatch,
     monkeypatch.setattr(repack, "INPUTS", {"input.txt": hashlib.sha256(text).hexdigest()})
     assert (root / "input.txt").read_bytes() == text.replace(b"\n", b"\r\n")
     assert git("-c", "core.autocrlf=true", "status", "--porcelain", "--untracked-files=all") == ""
-    assert git("status", "--porcelain", "--untracked-files=all").strip() == "M input.txt"
+    # Do not assert how an unconfigured status classifies identical CRLF bytes:
+    # Git's stat cache can make that observation vary across filesystems.
+    # The contract below tests our configured validator, including real edits.
     monkeypatch.setattr(repack.platform, "system", lambda: "Windows")
     if mode == "modified": (root / "input.txt").write_bytes(b"changed content\r\n")
     if mode == "untracked": (root / "unexpected.txt").write_text("unexpected")
