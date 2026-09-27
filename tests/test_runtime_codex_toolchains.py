@@ -423,7 +423,9 @@ def test_non_macos_never_queries_xcode(monkeypatch):
     assert tools._mac_developer_directory() is None
 
 
-def test_backend_discovers_once_per_cwd_and_skips_full_access(tmp_path, monkeypatch):
+@pytest.mark.parametrize("windows", [False, True])
+def test_backend_discovers_once_per_cwd_and_skips_full_access(tmp_path, monkeypatch, windows):
+    monkeypatch.setattr("supervisor.runtime.codex._IS_WINDOWS", windows)
     calls = []
     dependency = tmp_path / "runtime"
     def discover(path):
@@ -431,7 +433,10 @@ def test_backend_discovers_once_per_cwd_and_skips_full_access(tmp_path, monkeypa
         return (dependency,)
     monkeypatch.setattr("supervisor.runtime.codex.native_toolchain_read_paths", discover)
     backend = CodexBackend(state_dir=tmp_path / "state", emit=lambda raw: None)
-    params = {"cwd": str(tmp_path / "work"), "model": "gpt-6-astra"}
+    # This exercises only the native permission mapper/cache, not ToolHost.
+    # Give the Windows mapper its explicit effective root-read prerequisite.
+    params = {"cwd": str(tmp_path / "work"), "model": "gpt-6-astra",
+              "runtimeWorkspaceRoots": [tmp_path.anchor] if windows else []}
     first = backend._thread_params(params)
     assert backend._thread_params(params) == first
     filesystem = first["config"]["permissions"][PROFILE_ID]["filesystem"]
