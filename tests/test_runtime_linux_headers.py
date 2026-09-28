@@ -53,11 +53,11 @@ def test_header_addition_is_readonly_and_preserves_private_namespace_contract(mo
     invocation = sandbox._linux_invocation(policy, root, ("/usr/bin/true",))
     readonly = pairs(invocation.argv, "--ro-bind")
     writable = pairs(invocation.argv, "--bind")
-    assert ("/usr/include", "/usr/include") in readonly
-    assert ("/usr/include", "/usr/include") not in writable
-    assert ("/usr", "/usr") not in readonly | writable
+    assert (str(HEADERS), str(HEADERS)) in readonly
+    assert (str(HEADERS), str(HEADERS)) not in writable
+    assert (str(Path("/usr")), str(Path("/usr"))) not in readonly | writable
     for private in ("/provider-auth", "/controller-home", "/state", "/opt/bello-sonnet", "/run", "/var/run/docker.sock", "/home"):
-        assert not any(source == private or source.startswith(private + "/") for source, _ in readonly | writable)
+        assert not any(Path(source).is_relative_to(Path(private)) for source, _ in readonly | writable)
     assert ("dir", (root / ".supervisor").resolve()) in sandbox._linux_masks(policy)
     assert str(root / ".supervisor") in invocation.argv
     for option in ("--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--cap-drop", "--clearenv", "--proc"):
