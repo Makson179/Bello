@@ -11,6 +11,15 @@ from supervisor.runtime.codex import CodexBackend
 from tests.test_runtime_codex_backend import FakeNative, drain
 
 
+@pytest.fixture(autouse=True, params=[False, True])
+def native_platform_gate(request, monkeypatch, tmp_path):
+    monkeypatch.setattr("supervisor.runtime.client._IS_WINDOWS", request.param)
+    monkeypatch.setattr("supervisor.runtime.codex._IS_WINDOWS", request.param)
+    source_home = tmp_path / "fake-source-home"
+    source_home.mkdir(mode=0o700)
+    monkeypatch.setattr("supervisor.runtime.codex._codex_home_from_environment", lambda env: source_home)
+
+
 async def active_runtime(tmp_path):
     project, workspace = tmp_path / "project", tmp_path / "snapshot"
     project.mkdir()
@@ -21,11 +30,14 @@ async def active_runtime(tmp_path):
         notifications.append(message)
 
     def factory(**options):
+        # The real AppServerClient prepares this before native requests.
+        options["persistent_isolated_home"].mkdir(mode=0o700, exist_ok=True)
         native = FakeNative(**options)
         natives.append(native)
         return native
 
     client = RuntimeClient(cwd=project, notification_handler=notify)
+    client.configure_run(windows_native_root_read=True)
     await client.start()
     backend = CodexBackend(state_dir=client.state_dir / "codex", client_factory=factory,
                            emit=lambda raw: client._emit(raw, engine="codex"))
