@@ -36,6 +36,14 @@ DISTILLER = [
     ("Astra XHigh", 10.31219067, 8.04112333, 62.22146430, 60.57298772),
     ("Luna Max", 1.71064142, 1.45788090, 56.74738518, 55.45134152),
 ]
+SMART_EXECUTION = [
+    # Model, RAW/SE cost totals (API-equivalent USD), solver totals (seconds),
+    # passed-test counts. Three runs per arm, each scored against 1,978 tests.
+    ("Sonnet 5", (16.357597, 11.418875), (7639.443345, 3819.697547),
+     ((888, 875, 847), (811, 821, 882))),
+    ("Astra", (28.114000, 19.227482), (5640.171452, 4790.572039),
+     ((1170, 1133, 1191), (1202, 1124, 1142))),
+]
 
 CSS = """
 svg { --bg:#fff; --ink:#26323e; --muted:#64707c; --grid:#e4e9ee;
@@ -276,11 +284,73 @@ def distiller(mobile):
     p.save()
 
 
+def smart_execution(mobile):
+    rows = []
+    for name, costs, seconds, passed in SMART_EXECUTION:
+        rows.append((name, [value / 3 for value in costs],
+                     [value / 180 for value in seconds],
+                     [sum(arm) / (3 * 1978) * 100 for arm in passed]))
+    desc = "; ".join(
+        f"{name}: mean API-equivalent cost ${cost[0]:.6f} to ${cost[1]:.6f}, "
+        f"solver time {time[0]:.6f} to {time[1]:.6f} minutes, "
+        f"score {score[0]:.6f}% to {score[1]:.6f}%"
+        for name, cost, time, score in rows)
+    p = Chart("readme-smart-execution", 1030 if mobile else 476,
+              "Smart Execution: cost, solution time, and quality", desc +
+              ". RAW versus Smart Execution, three runs per model and setup. "
+              "All bar axes start at zero. Changes are relative to RAW; "
+              "cost and time are lower in both cases, as are mean scores.", mobile)
+    p.legend("Raw", "Smart Execution")
+    p.text(24 if mobile else 42, 67 if mobile else 31,
+           "Mean per run · 3 runs per setup", 16 if mobile else 17, "muted")
+
+    def minutes_label(minutes):
+        seconds = round(minutes * 60)
+        return f"{seconds // 60}:{seconds % 60:02d}"
+
+    metrics = [
+        ("API-equivalent cost ($)", "Lower is better", 12, [0, 6, 12],
+         lambda value: f"{value:.2f}"),
+        ("Solution time (min)", "Lower is better", 50, [0, 25, 50], minutes_label),
+        ("Score (%)", "Higher is better", 100, [0, 50, 100],
+         lambda value: f"{value:.2f}"),
+    ]
+    for metric, (title, direction, maximum, ticks, label) in enumerate(metrics, 1):
+        x = 55 if mobile else 63 + (metric - 1) * 355
+        y = 105 + (metric - 1) * 310 if mobile else 78
+        width, height = (399, 180) if mobile else (285, 250)
+        top = y + (50 if mobile else 52)
+        bottom = top + height
+        scale = lambda value: bottom - value / maximum * height
+        p.text(x, y, title, 21)
+        p.text(x, y + 22, direction, 14, "muted")
+        for tick in ticks:
+            p.line(x, scale(tick), x + width, scale(tick))
+            p.text(x - 10, scale(tick) + 5, tick, 14, "muted", "end")
+        for index, row in enumerate(rows):
+            name, values = row[0], row[metric]
+            center = x + width * (index + .5) / 2
+            offset, bar_width = (28, 40) if mobile else (23, 34)
+            for value, shift, series in zip(values, [-offset, offset], ["raw", "bello"]):
+                xx = center + shift
+                p.rect(xx - bar_width / 2, scale(value), bar_width,
+                       bottom - scale(value), series + "-bar")
+                p.text(xx, scale(value) - 10, label(value),
+                       18 if mobile else 16, series, "middle", 500)
+            p.text(center, bottom + 29, name, 18 if mobile else 17, anchor="middle")
+            change = (values[1] / values[0] - 1) * 100
+            p.text(center, bottom + 54, f"{change:+.2f}%".replace("-", "−"),
+                   19 if mobile else 18, "bello", "middle", 600)
+        if not mobile and metric < len(metrics):
+            p.line(x + width + 35, 67, x + width + 35, 449)
+    p.save()
+
+
 def main():
     for mobile in [False,True]:
-        for render in [model_comparison,distiller,budget,ultra,runtime]:
+        for render in [model_comparison,distiller,budget,ultra,runtime,smart_execution]:
             render(mobile)
-    print("Rendered 5 minimal charts × 2 layouts.")
+    print("Rendered 6 minimal charts × 2 layouts.")
 
 
 if __name__=="__main__":

@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="476" viewBox="0 0 1080 476" role="img" aria-labelledby="readme-smart-execution-title readme-smart-execution-desc">
+<title id="readme-smart-execution-title">Smart Execution: cost, solution time, and quality</title>
+<desc id="readme-smart-execution-desc">Sonnet 5: mean API-equivalent cost $5.452532 to $3.806292, solver time 42.441352 to 21.220542 minutes, score 43.983822% to 42.366026%; Astra: mean API-equivalent cost $9.371333 to $6.409161, solver time 31.334286 to 26.614289 minutes, score 58.881025% to 58.442872%. RAW versus Smart Execution, three runs per model and setup. All bar axes start at zero. Changes are relative to RAW; cost and time are lower in both cases, as are mean scores.</desc>
+<style>
+svg { --bg:#fff; --ink:#26323e; --muted:#64707c; --grid:#e4e9ee;
+  --raw:#557ca6; --bello:#c84b32; }
+@media (prefers-color-scheme:dark) {
+  svg { --bg:#0d1117; --ink:#edf2f7; --muted:#a6b2bf; --grid:#2b3542;
+    --raw:#8dadd2; --bello:#ef987e; }
+}
+.paper { fill:var(--bg); }
+text { font-family:Arial,Helvetica,sans-serif; fill:var(--ink);
+  font-variant-numeric:tabular-nums; }
+.muted { fill:var(--muted); }
+.raw { fill:var(--raw); }
+.bello { fill:var(--bello); }
+.halo { paint-order:stroke; stroke:var(--bg); stroke-width:5; stroke-linejoin:round; }
+.grid { stroke:var(--grid); stroke-width:1; }
+.raw-line { stroke:var(--raw); fill:none; stroke-width:2.5; stroke-dasharray:7 5; }
+.bello-line { stroke:var(--bello); fill:none; stroke-width:3; }
+.raw-point { fill:var(--bg); stroke:var(--raw); stroke-width:2; }
+.bello-point { fill:var(--bello); }
+.raw-bar { fill:var(--raw); fill-opacity:.22; stroke:var(--raw); stroke-width:1.3; }
+.bello-bar { fill:var(--bello); }
+</style>
+<rect class="paper" width="1080" height="476"/>
+<rect x="650.00" y="16.00" width="16.00" height="13.00" class="raw-bar"/>
+<text x="680.00" y="30.00" font-size="19" font-weight="400" class="raw" text-anchor="start">Raw</text>
+<rect x="850.00" y="16.00" width="16.00" height="13.00" class="bello-bar"/>
+<text x="880.00" y="30.00" font-size="19" font-weight="400" class="bello" text-anchor="start">Smart Execution</text>
+<text x="42.00" y="31.00" font-size="17" font-weight="400" class="muted" text-anchor="start">Mean per run · 3 runs per setup</text>
+<text x="63.00" y="78.00" font-size="21" font-weight="400" class="" text-anchor="start">API-equivalent cost ($)</text>
+<text x="63.00" y="100.00" font-size="14" font-weight="400" class="muted" text-anchor="start">Lower is better</text>
+<line x1="63.00" y1="380.00" x2="348.00" y2="380.00" class="grid"/>
+<text x="53.00" y="385.00" font-size="14" font-weight="400" class="muted" text-anchor="end">0</text>
+<line x1="63.00" y1="255.00" x2="348.00" y2="255.00" class="grid"/>
+<text x="53.00" y="260.00" font-size="14" font-weight="400" class="muted" text-anchor="end">6</text>
+<line x1="63.00" y1="130.00" x2="348.00" y2="130.00" class="grid"/>
+<text x="53.00" y="135.00" font-size="14" font-weight="400" class="muted" text-anchor="end">12</text>
+<rect x="94.25" y="266.41" width="34.00" height="113.59" class="raw-bar"/>
+<text x="111.25" y="256.41" font-size="16" font-weight="500" class="raw" text-anchor="middle">5.45</text>
+<rect x="140.25" y="300.70" width="34.00" height="79.30" class="bello-bar"/>
+<text x="157.25" y="290.70" font-size="16" font-weight="500" class="bello" text-anchor="middle">3.81</text>
+<text x="134.25" y="409.00" font-size="17" font-weight="400" class="" text-anchor="middle">Sonnet 5</text>
+<text x="134.25" y="434.00" font-size="18" font-weight="600" class="bello" text-anchor="middle">−30.19%</text>
+<rect x="236.75" y="184.76" width="34.00" height="195.24" class="raw-bar"/>
+<text x="253.75" y="174.76" font-size="16" font-weight="500" class="raw" text-anchor="middle">9.37</text>
+<rect x="282.75" y="246.48" width="34.00" height="133.52" class="bello-bar"/>
+<text x="299.75" y="236.48" font-size="16" font-weight="500" class="bello" text-anchor="middle">6.41</text>
+<text x="276.75" y="409.00" font-size="17" font-weight="400" class="" text-anchor="middle">Astra</text>
+<text x="276.75" y="434.00" font-size="18" font-weight="600" class="bello" text-anchor="middle">−31.61%</text>
+<line x1="383.00" y1="67.00" x2="383.00" y2="449.00" class="grid"/>
+<text x="418.00" y="78.00" font-size="21" font-weight="400" class="" text-anchor="start">Solution time (min)</text>
+<text x="418.00" y="100.00" font-size="14" font-weight="400" class="muted" text-anchor="start">Lower is better</text>
+<line x1="418.00" y1="380.00" x2="703.00" y2="380.00" class="grid"/>
+<text x="408.00" y="385.00" font-size="14" font-weight="400" class="muted" text-anchor="end">0</text>
+<line x1="418.00" y1="255.00" x2="703.00" y2="255.00" class="grid"/>
+<text x="408.00" y="260.00" font-size="14" font-weight="400" class="muted" text-anchor="end">25</text>
+<line x1="418.00" y1="130.00" x2="703.00" y2="130.00" class="grid"/>
+<text x="408.00" y="135.00" font-size="14" font-weight="400" class="muted" text-anchor="end">50</text>
+<rect x="449.25" y="167.79" width="34.00" height="212.21" class="raw-bar"/>
+<text x="466.25" y="157.79" font-size="16" font-weight="500" class="raw" text-anchor="middle">42:26</text>
+<rect x="495.25" y="273.90" width="34.00" height="106.10" class="bello-bar"/>
+<text x="512.25" y="263.90" font-size="16" font-weight="500" class="bello" text-anchor="middle">21:13</text>
+<text x="489.25" y="409.00" font-size="17" font-weight="400" class="" text-anchor="middle">Sonnet 5</text>
+<text x="489.25" y="434.00" font-size="18" font-weight="600" class="bello" text-anchor="middle">−50.00%</text>
+<rect x="591.75" y="223.33" width="34.00" height="156.67" class="raw-bar"/>
+<text x="608.75" y="213.33" font-size="16" font-weight="500" class="raw" text-anchor="middle">31:20</text>
+<rect x="637.75" y="246.93" width="34.00" height="133.07" class="bello-bar"/>
+<text x="654.75" y="236.93" font-size="16" font-weight="500" class="bello" text-anchor="middle">26:37</text>
+<text x="631.75" y="409.00" font-size="17" font-weight="400" class="" text-anchor="middle">Astra</text>
+<text x="631.75" y="434.00" font-size="18" font-weight="600" class="bello" text-anchor="middle">−15.06%</text>
+<line x1="738.00" y1="67.00" x2="738.00" y2="449.00" class="grid"/>
+<text x="773.00" y="78.00" font-size="21" font-weight="400" class="" text-anchor="start">Score (%)</text>
+<text x="773.00" y="100.00" font-size="14" font-weight="400" class="muted" text-anchor="start">Higher is better</text>
+<line x1="773.00" y1="380.00" x2="1058.00" y2="380.00" class="grid"/>
+<text x="763.00" y="385.00" font-size="14" font-weight="400" class="muted" text-anchor="end">0</text>
+<line x1="773.00" y1="255.00" x2="1058.00" y2="255.00" class="grid"/>
+<text x="763.00" y="260.00" font-size="14" font-weight="400" class="muted" text-anchor="end">50</text>
+<line x1="773.00" y1="130.00" x2="1058.00" y2="130.00" class="grid"/>
+<text x="763.00" y="135.00" font-size="14" font-weight="400" class="muted" text-anchor="end">100</text>
+<rect x="804.25" y="270.04" width="34.00" height="109.96" class="raw-bar"/>
+<text x="821.25" y="260.04" font-size="16" font-weight="500" class="raw" text-anchor="middle">43.98</text>
+<rect x="850.25" y="274.08" width="34.00" height="105.92" class="bello-bar"/>
+<text x="867.25" y="264.08" font-size="16" font-weight="500" class="bello" text-anchor="middle">42.37</text>
+<text x="844.25" y="409.00" font-size="17" font-weight="400" class="" text-anchor="middle">Sonnet 5</text>
+<text x="844.25" y="434.00" font-size="18" font-weight="600" class="bello" text-anchor="middle">−3.68%</text>
+<rect x="946.75" y="232.80" width="34.00" height="147.20" class="raw-bar"/>
+<text x="963.75" y="222.80" font-size="16" font-weight="500" class="raw" text-anchor="middle">58.88</text>
+<rect x="992.75" y="233.89" width="34.00" height="146.11" class="bello-bar"/>
+<text x="1009.75" y="223.89" font-size="16" font-weight="500" class="bello" text-anchor="middle">58.44</text>
+<text x="986.75" y="409.00" font-size="17" font-weight="400" class="" text-anchor="middle">Astra</text>
+<text x="986.75" y="434.00" font-size="18" font-weight="600" class="bello" text-anchor="middle">−0.74%</text>
+</svg>
