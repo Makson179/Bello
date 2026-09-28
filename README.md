@@ -20,7 +20,6 @@
 - [TL;DR](#tldr)
 - [Install](#install)
 - [Quick start](#quick-start)
-- [Bello in 42 seconds](#bello-in-42-seconds)
 - [How Bello runs a task](#how-bello-runs-a-task)
 - [Results](#results)
 - [Configuration](#configuration)
@@ -104,11 +103,6 @@ You can also ask a stronger model to prepare an advisory `PLAN.md`, then have a
 less expensive Bello configuration execute it. The coder receives the plan as
 guidance, while completion review and adversarial testing remain independent.
 
-## Bello in 42 seconds
-
-https://github.com/user-attachments/assets/f0324432-f616-45f6-beca-9bd8282f06ef
-
-
 ## How Bello runs a task
 
 The coder implements the task in a disposable workspace and runs its own
@@ -152,7 +146,7 @@ complete setup for the priority you name. Every setting is also in
 ## Results
 
 Scores are ProgramBench completion scores unless a task has its own evaluator.
-Raw means a model run through Codex alone, without Bello.
+Raw denotes the baseline without the Bello features being compared.
 
 ### Four models, raw and with Bello
 
@@ -167,6 +161,31 @@ raw and through Bello: 24 runs in total. Sol ran at `xhigh` here.
 Bello scored higher with every model. The gap is 13.6 points on Luna, 9.5 on
 Terra, 6.5 on Sol, and 6.0 on Astra.
 [Solutions for all 24 runs.](https://drive.google.com/drive/folders/1QkyIFUp4QwLSMtVYAOqbjSdmOIiaTnch)
+
+### Smart Execution: fewer model calls, lower cost
+
+Smart Execution runs independent tool calls in parallel and delivers results as
+they become ready. The agent can continue other necessary work while commands
+run; when it needs to wait, Bello handles the wait without repeated model calls
+to check progress. Unlike the log distiller, Smart Execution does not itself
+compress tool output.
+
+We compared RAW with Smart Execution on Sonnet 5 and Astra, with three runs per
+model and setup, twelve in total. The table shows means; times cover the solver.
+
+<picture>
+  <source media="(max-width: 600px)" srcset="./docs/assets/readme-smart-execution-mobile.svg">
+  <img src="./docs/assets/readme-smart-execution.svg" alt="Smart Execution versus RAW: API-equivalent cost falls 30.19% on Sonnet 5 and 31.61% on Astra; solution time falls 50.00% and 15.06%. Mean scores change from 43.98% to 42.37% and from 58.88% to 58.44%. Three runs per model and setup." width="100%">
+</picture>
+
+| Model | API-equivalent cost, RAW → SE | Solution time, RAW → SE | Score, RAW → SE |
+| --- | ---: | ---: | ---: |
+| Sonnet 5 | $5.45 → $3.81 (−30.19%) | 42:26 → 21:13 (−50.00%) | 43.98% → 42.37% (−3.68%) |
+| Astra | $9.37 → $6.41 (−31.61%) | 31:20 → 26:37 (−15.06%) | 58.88% → 58.44% (−0.74%) |
+
+Both models cost less and finished sooner on average, with a small decrease in
+score. Every Smart Execution run cost less than every RAW run of the same model
+in this comparison.
 
 ### Efficient Budget: less usage at the same quality
 
