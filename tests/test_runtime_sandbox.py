@@ -1169,20 +1169,57 @@ async def test_task_cancellation_kills_background_descendant(tmp_path: Path) -> 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group behavior")
 @pytest.mark.asyncio
-async def test_callback_failure_kills_command_tree(tmp_path: Path) -> None:
+@pytest.mark.parametrize("spawn_return_delay", [0, 0.5])
+async def test_callback_failure_kills_command_tree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, spawn_return_delay: float
+) -> None:
     marker = tmp_path / "late"
+    release = tmp_path / "release"
+    spawn = sandbox._spawn_owned_process
+    owned: list[asyncio.subprocess.Process] = []
+    callback_observed = False
 
-    async def fail(_chunk: str) -> None:
+    async def delayed_spawn(*args, **kwargs):
+        process = await spawn(*args, **kwargs)
+        owned.append(process)
+        # Prove that delayed observation cannot release the child's write
+        # before the callback is called, unlike a child-side fixed sleep.
+        if spawn_return_delay:
+            await asyncio.sleep(spawn_return_delay)
+        return process
+
+    async def fail(chunk: str) -> None:
+        nonlocal callback_observed
+        assert "ready" in chunk
+        assert not release.exists()
+        assert not marker.exists()
+        callback_observed = True
         raise ValueError("consumer failed")
 
-    command = f"printf now; (sleep 0.4; printf escaped > {shlex.quote(str(marker))}) & wait"
-    with pytest.raises(ValueError, match="consumer failed"):
-        await SandboxRunner(SandboxPolicy(tmp_path, mode="danger-full-access")).run(
-            command, tmp_path, 2, on_output=fail
-        )
-    await asyncio.sleep(0.45)
-    assert not marker.exists()
-
+    monkeypatch.setattr(sandbox, "_spawn_owned_process", delayed_spawn)
+    command = (
+        f"(printf ready; while [ ! -f {shlex.quote(str(release))} ]; "
+        f"do sleep 0.01; done; printf escaped > {shlex.quote(str(marker))}) & wait"
+    )
+    try:
+        with pytest.raises(ValueError, match="consumer failed"):
+            # The outer deadline also catches a reader failure ignored until
+            # run()'s command timeout; callback cleanup must finish first.
+            await asyncio.wait_for(
+                SandboxRunner(SandboxPolicy(tmp_path, mode="danger-full-access")).run(
+                    command, tmp_path, 10, on_output=fail
+                ),
+                3,
+            )
+        assert callback_observed
+        # Only a surviving descendant can act on this post-cleanup signal.
+        release.touch()
+        await asyncio.sleep(0.45)
+        assert not marker.exists()
+    finally:
+        release.touch()
+        for process in owned:
+            await sandbox._terminate_process_tree(process)
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group behavior")
 @pytest.mark.asyncio

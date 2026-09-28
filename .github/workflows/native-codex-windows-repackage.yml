@@ -1,0 +1,79 @@
+name: Repackage preserved Windows native candidate
+
+# Manual qualification only. No native compilation, release, upload to a release, or auth.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  repackage:
+    if: ${{ github.repository == 'Makson179/Bello' && github.event_name == 'workflow_dispatch' }}
+    # Match the preserved candidate's successful selection/async qualification.
+    runs-on: windows-2025
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: final
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: final
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: de7aa1f89ef9ab624a66cba0a22c6012a5e156ac
+          path: provenance
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install host and offline regression dependencies
+        run: python -c "import pathlib, subprocess, sys, tomllib; deps = tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['dependencies']; subprocess.run([sys.executable, '-m', 'pip', 'install', 'pytest', 'pytest-asyncio', *deps], check=True)"
+      - name: Check artifact provenance and qualification regressions
+        run: python -B -m pytest -q tests/test_native_codex_windows_repackage.py tests/test_native_codex_async_download.py tests/test_build_native_codex_windows.py
+      - name: Download only the pinned historical candidate and proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python -B scripts/repackage_native_codex_windows_candidate.py download --historical ../provenance --output ../repackage-inputs
+      - name: Verify and package using the original native build identity
+        run: python -B scripts/repackage_native_codex_windows_candidate.py package --historical ../provenance --inputs ../repackage-inputs --output ../native-repackaged
+      - name: Fresh final-code install, nine selection cases and thirteen async cases
+        run: |
+          $runtimeRoot = Join-Path $env:LOCALAPPDATA "bello-native-repackage-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          # Native provisioning intentionally rejects ParentDir, even in absolute paths.
+          python -B scripts/repackage_native_codex_windows_candidate.py qualify --artifact "$env:GITHUB_WORKSPACE/native-repackaged" --runtime-root "$runtimeRoot" --output "$env:GITHUB_WORKSPACE/repackage-proof"
+          exit $LASTEXITCODE
+      - name: Preserve full qualified archive, manifest and proof bindings
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-windows-repackaged-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            native-repackaged/*.tar.gz
+            native-repackaged/bundle/selection-manifest.json
+            native-repackaged/checksums.json
+            native-repackaged/provenance.json
+            repackage-proof/report.json
+            repackage-proof/installed-cache.json
+            repackage-proof/selection/report.json
+            repackage-proof/async/report.json
+          if-no-files-found: error
+      - name: Preserve UNQUALIFIED archive and scoped setup diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-windows-repackage-UNQUALIFIED-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            native-repackaged/*.tar.gz
+            native-repackaged/bundle/selection-manifest.json
+            native-repackaged/checksums.json
+            native-repackaged/provenance.json
+            repackage-proof/report.json
+            repackage-proof/selection/report.json
+            repackage-proof/async/report.json
+            repackage-proof/selection/*/windows-setup-stdout.txt
+            repackage-proof/selection/*/windows-setup-stderr.txt
+          if-no-files-found: warn

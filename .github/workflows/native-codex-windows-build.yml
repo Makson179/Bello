@@ -13,7 +13,7 @@ permissions:
 jobs:
   build:
     runs-on: windows-2025
-    timeout-minutes: 120
+    timeout-minutes: 240
     outputs:
       artifact-name: ${{ steps.identity.outputs.artifact-name }}
     defaults:
@@ -59,7 +59,7 @@ jobs:
         if: steps.candidate.outputs.cache-hit != 'true'
         with:
           repository: openai/codex
-          ref: 3d2ee51ca2d5db578f328aa75e20aa22c0197c9a
+          ref: be2951ea34f0d295ed0becf97079f92fa5f6950e
           path: native-source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0

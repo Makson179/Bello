@@ -19,6 +19,18 @@ from supervisor.runtime import native_codex_install as install
 from supervisor.runtime.client import RuntimeClient
 
 
+def test_async_native_selection_never_downloads_legacy_bundle(tmp_path, monkeypatch):
+    monkeypatch.delenv("BELLO_CODEX_BINARY", raising=False)
+    monkeypatch.delenv("BELLO_CODEX_SELECTION_MANIFEST", raising=False)
+    monkeypatch.setattr(install, "ASYNC_BUNDLES", {})
+    monkeypatch.setattr(install, "_download", lambda *_: pytest.fail("Legacy bundle cannot enable Async tools"))
+    assert install.ensure_native_async() == (["codex", "app-server", "--listen", "stdio://"], None)
+    binary, manifest = tmp_path / "codex", tmp_path / "manifest.json"
+    monkeypatch.setenv("BELLO_CODEX_BINARY", str(binary))
+    monkeypatch.setenv("BELLO_CODEX_SELECTION_MANIFEST", str(manifest))
+    assert install.ensure_native_async() == ([str(binary), "app-server", "--listen", "stdio://"], manifest)
+
+
 @pytest.fixture
 def release(tmp_path, monkeypatch, request):
     monkeypatch.delenv("BELLO_CODEX_BINARY", raising=False)
@@ -57,6 +69,70 @@ def release(tmp_path, monkeypatch, request):
         shutil.copyfile(archive, target)
     monkeypatch.setattr(install, "_download", download)
     return bundle, archive, calls
+
+
+@pytest.mark.parametrize("release", ["Darwin", "Linux", "Windows"], indirect=True)
+def test_async_pinned_bundle_cold_install_and_cache_reuse(release, monkeypatch):
+    bundle, _, calls = release
+    monkeypatch.setattr(install, "ASYNC_BUNDLES", dict(install.BUNDLES))
+    monkeypatch.setattr(install, "BUNDLES", {})
+    command, manifest = install.ensure_native_async()
+    assert command[1:] == ["app-server", "--listen", "stdio://"]
+    assert manifest.parent.name == bundle.archive_sha256
+    assert install._sha256(manifest) == bundle.manifest_sha256
+    system = install.platform.system()
+    assert Path(command[0]).name == ("codex.exe" if system == "Windows" else "codex")
+    before = {name: install._sha256(manifest.parent / name) for name in install._bundle_files(system)}
+    assert install.ensure_native_async() == (command, manifest)
+    assert {name: install._sha256(manifest.parent / name) for name in before} == before
+    assert len(calls) == 1
+
+
+def test_async_and_selection_reuse_identical_pinned_bundle_cache(release, monkeypatch):
+    monkeypatch.setattr(install, "ASYNC_BUNDLES", dict(install.BUNDLES))
+    command, manifest = install.ensure_native_async()
+    assert install.ensure_native_selection() == (command, manifest)
+    assert len(release[2]) == 1
+
+
+def test_async_pinned_manifest_identity_is_checked_even_with_existing_selection_cache(release, monkeypatch):
+    bundle, _, calls = release
+    _, manifest = install.ensure_native_selection()
+    original = manifest.read_bytes()
+    monkeypatch.setattr(install, "ASYNC_BUNDLES", {
+        install._platform_key(): replace(bundle, manifest_sha256=hashlib.sha256(b"different manifest").hexdigest()),
+    })
+    with pytest.raises(ValueError, match="manifest checksum"):
+        install.ensure_native_async()
+    assert manifest.read_bytes() == original
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("release", ["Darwin", "Linux", "Windows"], indirect=True)
+def test_async_corrupted_cache_fails_without_host_fallback_or_replacement(release, monkeypatch):
+    monkeypatch.setattr(install, "ASYNC_BUNDLES", dict(install.BUNDLES))
+    command, _ = install.ensure_native_async()
+    executable = Path(command[0])
+    executable.write_bytes(b"changed cached executable")
+    with pytest.raises(ValueError, match="checksum"):
+        install.ensure_native_async()
+    assert executable.read_bytes() == b"changed cached executable"
+    assert len(release[2]) == 1
+
+
+def test_async_unavailable_platform_retains_host_validation_without_downloading(release, monkeypatch):
+    monkeypatch.setattr(install, "ASYNC_BUNDLES", dict(install.BUNDLES))
+    monkeypatch.setattr(install.platform, "machine", lambda: "unsupported")
+    assert install.ensure_native_async() == (["codex", "app-server", "--listen", "stdio://"], None)
+    assert not release[2]
+
+
+def test_concurrent_async_clean_installs_download_once(release, monkeypatch):
+    monkeypatch.setattr(install, "ASYNC_BUNDLES", dict(install.BUNDLES))
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(lambda _: install.ensure_native_async(), range(3)))
+    assert results[0] == results[1] == results[2]
+    assert len(release[2]) == 1
 
 
 def test_install_cache_and_two_helpers(release):
@@ -617,9 +693,11 @@ def test_download_checksum_rejected_without_publishing_cache(release, monkeypatc
     assert not list(cache.glob(".download-*"))
 
 
+@pytest.mark.parametrize("prepare", [install.ensure_native_selection, install.ensure_native_async])
 @pytest.mark.parametrize("relative_manifest", [False, True])
 @pytest.mark.parametrize("binary_name", ["custom-codex", "custom-codex.exe"])
-def test_explicit_host_build_does_not_download_or_probe_platform(tmp_path, monkeypatch, relative_manifest, binary_name):
+def test_explicit_host_build_does_not_download_or_probe_platform(tmp_path, monkeypatch, prepare,
+                                                               relative_manifest, binary_name):
     binary = tmp_path / "host" / binary_name
     manifest = tmp_path / "host" / "manifest.json"
     monkeypatch.chdir(tmp_path)
@@ -629,7 +707,7 @@ def test_explicit_host_build_does_not_download_or_probe_platform(tmp_path, monke
     monkeypatch.setattr(install.platform, "system", lambda: pytest.fail("explicit build"))
     monkeypatch.setattr(install.platform, "machine", lambda: pytest.fail("explicit build"))
     monkeypatch.setattr(install, "_download", lambda *a: pytest.fail("explicit build"))
-    assert install.ensure_native_selection() == (
+    assert prepare() == (
         [str(binary), "app-server", "--listen", "stdio://"], manifest)
 
 
@@ -658,6 +736,27 @@ def test_linux_x64_bundle_pins_verified_native_artifact():
         archive_sha256="887bb0ca1b4f04598e899fef184b40faa4b4361f7a9ff914ddce9fd5972beb0e",
         manifest_sha256="cc3be17f14331159297e99cabb63d84fb0de09af7f24d53879a0904453a90f5a",
     )
+
+
+@pytest.mark.parametrize("key,filename,archive_sha,manifest_sha", [
+    (("Linux", "x86_64"), "x86_64-unknown-linux-gnu",
+     "ba27107574789187a147e3a3caa159e0f5d435bd071759be623fe5745c5bdc07",
+     "e48fdaddd736198010c8ae1cfd073fa8f511cb27ab6534e89d8405b2f8673407"),
+    (("Darwin", "arm64"), "aarch64-apple-darwin",
+     "8614648cf79bf5582879b2c899cdb515e6da01687f4b65ee9d529cca25023029",
+     "792dbcd8df2672df020a63115dddd1af86e31ff5e1ca6c2008ff627be1057a1c"),
+    (("Windows", "x86_64"), "x86_64-pc-windows-msvc",
+     "8993eea58f8d4f3466f72713eba62bd4842e702d92d8552ab79c3a2d4b7308b8",
+     "d6b859995d238de668cd9bb533d23d3c2a7c96b1940808295a197e2360830ccd"),
+])
+def test_async_bundle_pins_qualified_complete_artifact(key, filename, archive_sha, manifest_sha):
+    assert install.ASYNC_BUNDLES[key] == install.NativeBundle(
+        url=("https://github.com/Makson179/Bello/releases/download/"
+             "native-codex-0.155.1-smart-execution-v1/"
+             f"bello-native-codex-0.155.1-{filename}.tar.gz"),
+        archive_sha256=archive_sha, manifest_sha256=manifest_sha,
+    )
+    assert install.ASYNC_BUNDLES[key] != install.BUNDLES[key]
 
 
 def test_windows_x64_bundle_pins_verified_native_artifact():
@@ -695,6 +794,41 @@ async def test_runtime_prepares_native_before_backend_rpc_only_with_distiller(tm
     assert events == (["prepare"] if enabled else []) + ["construct", "initialize"]
     assert backend.settings["command"] == (["/cache/codex", "app-server"] if enabled else None)
     assert backend.settings["selection_manifest"] == (Path("/cache/selection-manifest.json") if enabled else None)
+    assert await client._load_engine("codex") is backend
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("distiller_enabled", [True, False])
+async def test_runtime_prepares_async_bundle_before_backend_with_optional_distiller(
+        tmp_path, monkeypatch, distiller_enabled):
+    events = []
+    command = ["/cache/async-codex", "app-server"]
+    manifest = Path("/cache/selection-manifest.json")
+
+    def prepare():
+        events.append("prepare_async")
+        return command, manifest
+
+    class Backend:
+        def __init__(self, **kwargs):
+            events.append("construct")
+            self.settings = kwargs
+
+        async def request(self, method, params):
+            events.append(method)
+            return {}
+
+    monkeypatch.setattr(install, "ensure_native_async", prepare)
+    monkeypatch.setattr(install, "ensure_native_selection", lambda: pytest.fail("Async requires its own bundle"))
+    monkeypatch.setattr("supervisor.runtime.codex.CodexBackend", Backend)
+    client = RuntimeClient(cwd=tmp_path)
+    client.async_tools = True
+    client._distiller = object() if distiller_enabled else None
+    backend = await client._load_engine("codex")
+    assert events == ["prepare_async", "construct", "initialize"]
+    assert backend.settings["command"] == command
+    assert backend.settings["selection_manifest"] == manifest
+    assert backend.settings["distiller"] is client._distiller
     assert await client._load_engine("codex") is backend
 
 

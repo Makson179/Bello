@@ -18,7 +18,9 @@ from supervisor.coder import (
     codex_service_tier,
     task_runtime_workspace_roots,
 )
+from supervisor.completion_context import CompletionContextStore
 from supervisor.project_config import MultiAgentConfig
+from supervisor.runtime_errors import bounded_provider_error
 from supervisor.prompts import (
     build_adv_report_controller_prompt,
     build_completion_review_prompt,
@@ -70,12 +72,9 @@ DEFAULT_SUPERVISOR_TIMEOUT_SECONDS = 360.0
 # large tasks were observed needing >900s (a 711k-token read died at the old cap and killed a
 # 4.5h run). Keep this above the coder RPC budget, not below it.
 DEFAULT_COMPLETION_REVIEW_TIMEOUT_SECONDS = 4800.0
-# Prompt-size budgets (characters). Compaction triggers above the target so the
-# assembled wake packet never approaches the model context window (~4 chars/token).
-# Both runtime and completion wakes go through a budget; runtime is kept small so it
-# never bloats over a long run, completion keeps real headroom below the context cap.
+# Runtime prompt-size budgets (characters). Completion now loads detailed evidence
+# from separate files instead of compacting a large inlined wake packet.
 COMPLETION_PROMPT_TARGET_CHARS = 500_000
-COMPLETION_PROMPT_ULTRA_TARGET_CHARS = 380_000
 RUNTIME_PROMPT_TARGET_CHARS = 120_000
 RUNTIME_PROMPT_ULTRA_TARGET_CHARS = 80_000
 RUNTIME_PROGRESS_ENTRY_LIMIT = 30
@@ -89,6 +88,16 @@ RUNTIME_INTERVENTION_LIMIT = 10
 
 class SupervisorAgentError(RuntimeError):
     pass
+
+
+class SupervisorTurnError(SupervisorAgentError):
+    """A terminal failed/interrupted turn is not a malformed model decision."""
+
+    def __init__(self, turn: dict[str, Any]):
+        self.turn_status = turn["status"]
+        self.provider_error = bounded_provider_error(turn)
+        detail = self.provider_error.get("error", {}).get("message")
+        super().__init__(f"supervisor turn {self.turn_status}: {detail or 'no provider detail'}")
 
 
 class StatelessSupervisorAgent:
@@ -128,6 +137,7 @@ class StatelessSupervisorAgent:
         self.on_thread_start = on_thread_start
         self.completion_thread_id: str | None = None
         self.completion_workspace_snapshot: VerificationWorkspaceSnapshot | None = None
+        self.completion_context_store: CompletionContextStore | None = None
 
     async def decide(self, packet: SupervisorWakePacket) -> SupervisorDecision:
         packet = _prepare_runtime_packet(packet)
@@ -142,56 +152,52 @@ class StatelessSupervisorAgent:
         )
 
     async def decide_completion(self, packet: SupervisorWakePacket) -> CompletionReviewDecision:
-        packet = _slim_completion_packet(packet)
-        prompt_packet, prompt = _completion_prompt_with_budget(packet)
+        try:
+            return await self._decide_completion_with_retries(packet)
+        except BaseException:
+            # Preserve inputs between recoverable attempts, but not after a failed
+            # review has been handed back to the controller (including cancellation).
+            await self.close_completion_review()
+            raise
+
+    async def _decide_completion_with_retries(self, packet: SupervisorWakePacket) -> CompletionReviewDecision:
         try:
             return await self._decide_completion_with_prompt(
-                prompt_packet,
-                prompt=prompt,
+                packet,
                 use_case="completion_review",
             )
+        except SupervisorTurnError:
+            raise
         except SupervisorAgentError as exc:
             if _is_input_too_large_error(exc):
-                prompt_packet, prompt = _completion_prompt_with_budget(packet, ultra=True)
                 try:
                     return await self._decide_completion_with_prompt(
-                        prompt_packet,
-                        prompt=prompt,
+                        packet,
+                        task_in_file=True,
                         use_case="completion_review_compact_retry",
                     )
+                except SupervisorTurnError:
+                    raise
                 except SupervisorAgentError as compact_exc:
                     if not _is_invalid_supervisor_decision_error(compact_exc):
                         raise
                     return await self._decide_completion_with_prompt(
-                        prompt_packet,
-                        prompt=_minimal_completion_review_retry_prompt(
-                            context_prompt=prompt,
-                            error=str(compact_exc),
-                            packet=prompt_packet,
-                        ),
+                        packet,
+                        task_in_file=True,
+                        retry_error=str(compact_exc),
                         use_case="completion_review_minimal_retry",
                     )
             if _is_no_message_error(exc):
-                prompt_packet, prompt = _completion_prompt_with_budget(packet, ultra=True)
                 return await self._decide_completion_with_prompt(
-                    prompt_packet,
-                    prompt=_minimal_completion_review_retry_prompt(
-                        context_prompt=prompt,
-                        error=str(exc),
-                        packet=prompt_packet,
-                    ),
+                    packet,
+                    retry_error=str(exc),
                     use_case="completion_review_no_message_minimal_retry",
                 )
             if not _is_invalid_supervisor_decision_error(exc):
                 raise
-            prompt_packet, prompt = _completion_prompt_with_budget(packet, ultra=True)
             return await self._decide_completion_with_prompt(
-                prompt_packet,
-                prompt=_minimal_completion_review_retry_prompt(
-                    context_prompt=prompt,
-                    error=str(exc),
-                    packet=prompt_packet,
-                ),
+                packet,
+                retry_error=str(exc),
                 use_case="completion_review_minimal_retry",
             )
 
@@ -257,9 +263,24 @@ class StatelessSupervisorAgent:
         self,
         packet: SupervisorWakePacket,
         *,
-        prompt: str,
         use_case: str,
+        task_in_file: bool = False,
+        retry_error: str | None = None,
     ) -> CompletionReviewDecision:
+        try:
+            if self.completion_context_store is None:
+                self.completion_context_store = CompletionContextStore()
+            selective_context = self.completion_context_store.write_packet(
+                packet, task_in_file=task_in_file,
+            )
+            prompt = build_completion_review_prompt(packet, selective_context=selective_context)
+            if retry_error is not None:
+                prompt = _minimal_completion_review_retry_prompt(
+                    context_prompt=prompt, error=retry_error, packet=packet,
+                )
+        except OSError as exc:
+            await self.close_completion_review()
+            raise SupervisorAgentError("failed to prepare protected completion evidence") from exc
         decision = await self._decide(
             packet,
             prompt=prompt,
@@ -268,6 +289,7 @@ class StatelessSupervisorAgent:
             use_case=use_case,
             timeout_seconds=self.completion_timeout_seconds,
             persistent_completion_thread=True,
+            additional_runtime_roots=[self.completion_context_store.root],
         )
         if not isinstance(decision, CompletionReviewDecision):
             raise SupervisorAgentError("completion review returned non-completion decision")
@@ -325,6 +347,8 @@ class StatelessSupervisorAgent:
                     "supervisor thread/start response",
                     self.client.thread_start(
                         self._thread_params(
+                            role=("completion_review" if persistent_completion_thread
+                                  or use_case.startswith("adv_report_controller") else "runtime"),
                             workspace_root=decision_workspace_root,
                             writable=persistent_completion_thread
                             and self.completion_workspace_write,
@@ -351,6 +375,7 @@ class StatelessSupervisorAgent:
                 if persistent_completion_thread:
                     self.completion_thread_id = thread_id
             turn_prompt = prompt
+            repairing_claude_schema = False
             for attempt in range(2):
                 turn_response = await self._await_rpc(
                     "supervisor turn/start response",
@@ -390,7 +415,7 @@ class StatelessSupervisorAgent:
                 if not isinstance(turn_id_value, str):
                     raise SupervisorAgentError("supervisor turn/start did not return turn id")
                 turn_id = turn_id_value
-                if turn.get("status") != "completed":
+                if turn.get("status") not in {"completed", "failed", "interrupted"}:
                     try:
                         completed = await self.client.wait_for_notification(
                             lambda message: message.method == "turn/completed"
@@ -409,6 +434,41 @@ class StatelessSupervisorAgent:
                             )
                         ) from exc
                     turn = completed.params.get("turn", {})
+                if turn.get("status") in {"failed", "interrupted"}:
+                    if persistent_completion_thread and self.completion_workspace_snapshot is not None:
+                        await asyncio.to_thread(
+                            self.completion_workspace_snapshot.assert_submission_unchanged
+                        )
+                    if persistent_completion_thread and self.completion_context_store is not None:
+                        self.completion_context_store.assert_unchanged()
+                    if (
+                        attempt == 0
+                        and turn.get("status") == "failed"
+                        and isinstance(self.model, str)
+                        and self.model.startswith("claude-code/")
+                        and isinstance(turn.get("error"), dict)
+                        and turn["error"].get("belloFailureKind") == "output_schema_validation"
+                    ):
+                        # Only Claude's own successful-result schema validator can
+                        # authorize the existing one-shot malformed-output repair.
+                        # A failed answer is a hint, never a candidate decision;
+                        # do not consult history, even if this text looks valid.
+                        raw_text = last_agent_message_text(turn) or ""
+                        audit_error = "Claude adapter rejected the output schema"
+                        self._append_wake_audit(
+                            packet, thread_id=thread_id, turn_id=turn_id,
+                            decision=None, raw_text=raw_text, error=audit_error,
+                            use_case=f"{use_case}_parse_retry",
+                        )
+                        turn_prompt = _repair_json_prompt(
+                            raw_text=raw_text, error=audit_error,
+                            packet=packet, model_cls=model_cls,
+                        )
+                        repairing_claude_schema = True
+                        continue
+                    raise SupervisorTurnError(turn)
+                if repairing_claude_schema and turn.get("status") != "completed":
+                    raise SupervisorAgentError("Claude schema repair did not complete")
                 text = last_agent_message_text(turn)
                 if text is None:
                     turns = await self._await_rpc(
@@ -424,12 +484,22 @@ class StatelessSupervisorAgent:
                         timeout=timeout_seconds,
                     )
                     data = turns.get("data", [])
+                    if repairing_claude_schema and isinstance(data, list):
+                        # The failed-schema answer must not reappear through the
+                        # ordinary legacy fallback to another historical turn.
+                        data = [value for value in data if isinstance(value, dict)
+                                and value.get("id") == turn_id
+                                and value.get("status") == "completed"]
                     text = _agent_message_text_from_turns(data, turn_id=turn_id)
                 if persistent_completion_thread and self.completion_workspace_snapshot is not None:
                     await asyncio.to_thread(
                         self.completion_workspace_snapshot.assert_submission_unchanged
                     )
+                if persistent_completion_thread and self.completion_context_store is not None:
+                    self.completion_context_store.assert_unchanged()
                 if text is None:
+                    if repairing_claude_schema:
+                        raise SupervisorAgentError("Claude schema repair did not return current-turn output")
                     audit_error = "supervisor did not produce an agent message"
                     if attempt == 0:
                         self._append_wake_audit(
@@ -498,11 +568,11 @@ class StatelessSupervisorAgent:
                         await self._cleanup_thread(thread_id, turn_id, timeout_seconds)
                         if self.completion_thread_id == thread_id:
                             self.completion_thread_id = None
-                        await self._cleanup_completion_workspace_snapshot()
+                        await self._cleanup_completion_workspace_snapshot(preserve_context=True)
                 else:
                     await self._cleanup_thread(thread_id, turn_id, timeout_seconds)
             elif persistent_completion_thread and audit_error is not None:
-                await self._cleanup_completion_workspace_snapshot()
+                await self._cleanup_completion_workspace_snapshot(preserve_context=True)
 
     async def _create_completion_workspace_snapshot(self) -> VerificationWorkspaceSnapshot:
         creation = asyncio.create_task(
@@ -580,12 +650,19 @@ class StatelessSupervisorAgent:
         workspace_root = snapshot.snapshot_root if snapshot is not None else self.workspace_root
         await callback(thread_id, workspace_root)
 
-    async def _cleanup_completion_workspace_snapshot(self) -> None:
-        snapshot = self.completion_workspace_snapshot
-        if snapshot is not None:
-            await asyncio.to_thread(snapshot.cleanup)
-            if self.completion_workspace_snapshot is snapshot:
-                self.completion_workspace_snapshot = None
+    async def _cleanup_completion_workspace_snapshot(self, *, preserve_context: bool = False) -> None:
+        try:
+            snapshot = self.completion_workspace_snapshot
+            if snapshot is not None:
+                await asyncio.to_thread(snapshot.cleanup)
+                if self.completion_workspace_snapshot is snapshot:
+                    self.completion_workspace_snapshot = None
+        finally:
+            context_store = self.completion_context_store
+            if context_store is not None and not preserve_context:
+                context_store.cleanup()
+                if self.completion_context_store is context_store:
+                    self.completion_context_store = None
 
     async def _await_rpc(
         self,
@@ -794,6 +871,7 @@ class StatelessSupervisorAgent:
     def _thread_params(
         self,
         *,
+        role: Literal["runtime", "completion_review"] = "runtime",
         workspace_root: Path | None = None,
         writable: bool = False,
         runtime_workspace_roots: list[Path] | None = None,
@@ -814,11 +892,15 @@ class StatelessSupervisorAgent:
             "persistExtendedHistory": False,
             "config": {},
         }
-        apply_multi_agent_thread_start_params(
-            params,
-            multi_agent or MultiAgentConfig(),
-            role="completion_review",
-        )
+        if role == "completion_review":
+            apply_multi_agent_thread_start_params(
+                params,
+                multi_agent or MultiAgentConfig(),
+                role="completion_review",
+            )
+        else:
+            params["belloRole"] = "runtime"
+            params["config"]["agents"] = {"enabled": False}
         if scratch_root is not None:
             params["runtimeScratchRoot"] = str(scratch_root)
             temp_guidance = "TMPDIR points here. " if os.name != "nt" else "Use this explicit path for temporary files. "
@@ -1057,20 +1139,6 @@ def _prompt_with_budget(
     return compact_packet, _hard_cap_prompt(compact_prompt)
 
 
-def _completion_prompt_with_budget(
-    packet: SupervisorWakePacket,
-    *,
-    ultra: bool = False,
-) -> tuple[SupervisorWakePacket, str]:
-    return _prompt_with_budget(
-        packet,
-        builder=build_completion_review_prompt,
-        target=COMPLETION_PROMPT_TARGET_CHARS,
-        ultra_target=COMPLETION_PROMPT_ULTRA_TARGET_CHARS,
-        ultra=ultra,
-    )
-
-
 def _stateless_prompt_with_budget(
     packet: SupervisorWakePacket,
     *,
@@ -1105,66 +1173,6 @@ def _slim_command(text: str | None, *, limit: int = 200) -> str:
     if not text:
         return text or ""
     return text if len(text) <= limit else text[:limit] + " …<truncated; run it yourself>"
-
-
-def _slim_completion_packet(packet: SupervisorWakePacket) -> SupervisorWakePacket:
-    """Strip everything the completion supervisor can re-derive by reading the repo.
-
-    The completion-review supervisor reads source and re-runs checks itself (it
-    already issues rg/sed/git exec_command calls during review), so we drop from the
-    prompt everything redundant or recoverable and keep only the evidence skeleton
-    useful to the completion reviewer and final report:
-
-    - drop inlined file diffs/contexts (changed_file_diffs/changed_file_contexts) — it runs `git diff`;
-    - drop validation_outputs/inspection_outputs entirely — after captured_output is
-      emptied they are near-duplicates of the validations/inspections ledgers;
-    - in each ledger item: empty captured_output, drop the duplicate raw/normalized
-      command, blank the constant cwd, and bound command + summary;
-    - in evidence_provenance_summary keep the risk flags but drop the third copy of the
-      full command it re-embeds per validation;
-    - drop patch_summary/diff_summary — the model reads the diff itself.
-    """
-    def slim_run(value: Any) -> Any:
-        had_output = bool((getattr(value, "captured_output", "") or "").strip())
-        return value.model_copy(
-            update={
-                "command": _slim_command(value.command, limit=120),
-                "raw_command": "",
-                "normalized_command": "",
-                "cwd": "",
-                "captured_output": "",
-                "captured_output_truncated": value.captured_output_truncated or had_output,
-                "summary": _bounded_text(value.summary, limit=200),
-            }
-        )
-
-    provenance = packet.evidence_provenance_summary
-    if provenance is not None:
-        provenance = provenance.model_copy(
-            update={
-                "validations": [
-                    entry.model_copy(update={"command": _slim_command(entry.command, limit=120)})
-                    for entry in provenance.validations
-                ]
-            }
-        )
-
-    return packet.model_copy(
-        update={
-            "validations": [slim_run(v) for v in packet.validations],
-            "inspections": [slim_run(v) for v in packet.inspections],
-            "validation_outputs": [],
-            "inspection_outputs": [],
-            # Child-agent orchestration is runtime evidence. Completion reviews use
-            # the resulting workspace and shared validation ledger instead.
-            "subagents": [],
-            "changed_file_diffs": [],
-            "changed_file_contexts": [],
-            "evidence_provenance_summary": provenance,
-            "patch_summary": None,
-            "diff_summary": None,
-        }
-    )
 
 
 def _prepare_runtime_packet(packet: SupervisorWakePacket) -> SupervisorWakePacket:

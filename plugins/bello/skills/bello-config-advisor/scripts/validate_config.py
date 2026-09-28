@@ -45,6 +45,9 @@ REQUIRED_KEYS = {
     "completion_multi_agent",
     "adversary_multi_agent",
 }
+# Older complete recommendations omit these opt-ins. Match ProjectConfig's
+# false defaults without accepting arbitrary new keys or coercing strings.
+OPTIONAL_BOOLEAN_KEYS = {"async_tools", "windows_native_root_read"}
 
 
 def _is_int(value: Any, *, minimum: int = 0) -> bool:
@@ -232,11 +235,14 @@ def validate(
     except ValueError as exc:
         return [f"catalog: {exc}; supply a current catalog from inspect_models.py"]
     missing = REQUIRED_KEYS - config.keys()
-    extra = config.keys() - REQUIRED_KEYS
+    extra = config.keys() - REQUIRED_KEYS - OPTIONAL_BOOLEAN_KEYS
     if missing:
         errors.append(f"root: missing keys {sorted(missing)}")
     if extra:
         errors.append(f"root: unknown keys {sorted(extra)}")
+    for field in sorted(OPTIONAL_BOOLEAN_KEYS):
+        if type(config.get(field, False)) is not bool:
+            errors.append(f"{field}: expected boolean")
 
     if config.get("review_limit_format") != "explicit":
         errors.append("review_limit_format: must be 'explicit'")

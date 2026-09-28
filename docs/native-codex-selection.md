@@ -129,10 +129,13 @@ the original native output; it never counts as successful compression.
 ## Build from source
 
 The source patch is [native-codex-selection.patch](../scripts/native-codex-selection.patch).
-It targets the official `rust-v0.153.4` source, not an arbitrary current checkout.
-It changes only the optional command/poll focus field, local selection hook and
-related tests. Execution, native permissions, policy hooks, model routing and
-the existing output metadata stay native. It does not disable sandboxing.
+It targets official `rust-v0.155.1`, revision
+`be2951ea34f0d295ed0becf97079f92fa5f6950e`, not an arbitrary current checkout.
+It includes the optional command/poll focus field and local selection hook,
+opt-in Smart Execution scheduling, and related tests. Native permissions,
+policy hooks, model routing and existing output metadata are preserved; neither
+feature disables sandboxing. These source-build instructions describe the new
+candidate, not the older published selection-only downloads listed above.
 
 Use a separate build directory, with no user account credentials mounted. Install
 the upstream Rust/Cargo build prerequisites first. The validated build used
@@ -140,22 +143,20 @@ Rust 1.95.0 and Linux x86-64 with glibc 2.35, Clang, lld, libclang, libcap,
 OpenSSL development headers, `just`, and `cargo-nextest`.
 
 ```sh
-git clone --branch rust-v0.153.4 --depth 1 https://github.com/openai/codex.git codex-bello-selection
-cd codex-bello-selection
-git apply --check /absolute/path/to/Bello/scripts/native-codex-selection.patch
-git apply /absolute/path/to/Bello/scripts/native-codex-selection.patch
-cd codex-rs
+git clone --branch rust-v0.155.1 --depth 1 https://github.com/openai/codex.git codex-bello-selection
+python /absolute/path/to/Bello/scripts/prepare_native_codex_linux.py prepare \
+  --source codex-bello-selection \
+  --patch /absolute/path/to/Bello/scripts/native-codex-selection.patch
+cd codex-bello-selection/codex-rs
 ```
 
-The upstream tag's workspace package versions may need alignment: in the tested
-source, `Cargo.toml` used 0.153.4 while workspace-only `Cargo.lock` entries used
-0.0.0. If Cargo reports that mismatch, run `cargo update --workspace` and inspect
-the lock diff. Only source-less workspace package versions may change from
-0.0.0 to 0.153.4; do not accept registry/git dependency changes. Use `--locked`
-for the builds and tests after this alignment.
+The preparation helper requires the exact clean source revision, applies the
+patch, and aligns only source-less `Cargo.lock` workspace packages from `0.0.0`
+to `0.155.1`. It does not resolve or update registry/git dependencies. Inspect
+the resulting diff and use `--locked` for subsequent builds and tests.
 
-V8 is also needed by Codex code mode. For this tag, the lockfile uses V8 150.4.0.
-To avoid compiling it, obtain the official `rusty-v8-v150.4.0` release's
+V8 is also needed by Codex code mode. The pinned preparation helpers and build
+workflows use `rusty-v8-v150.4.0`. To avoid compiling it, obtain that release's
 `ptrcomp_sandbox_release_x86_64-unknown-linux-gnu` archive and Rust binding,
 verify them against the release's corresponding `.sha256` file, and set
 `RUSTY_V8_ARCHIVE` and `RUSTY_V8_SRC_BINDING_PATH` to those local files.
@@ -210,6 +211,20 @@ transport checks are separate from the learned selector's quality evaluation.
 The [official app-server protocol](https://learn.chatgpt.com/docs/app-server#protocol)
 remains the external native transport. The private selection channel is a Bello
 extension, not an official OpenAI protocol capability.
+
+## Explicit Windows read-root permission
+
+Native Codex's Windows sandbox requires read access to the workspace's drive or
+share root. In Bello's configuration editor, **Windows native root read** is an
+explicit opt-in, off by default (`windows_native_root_read: false`). Enable it
+before starting a Windows native run only when broad disk reads are acceptable.
+
+Writes remain scoped to the assigned workspace; repository-control directories
+remain readonly. Existing private Bello controller/runtime directories and the
+source and isolated Codex homes are denied. Writable tool scratch stays inside
+the assigned workspace. This does not enable full-access mode, relax network
+policy, or change other platforms or engines. Saved threads cannot be resumed
+with a different setting; start a fresh run when changing it.
 
 ## License
 

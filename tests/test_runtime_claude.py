@@ -96,6 +96,8 @@ class FakeClient:
         return {"mcpServers": list(self.factory.mcp_servers)}
 
     async def query(self, prompt: str):
+        if not isinstance(prompt, str):
+            prompt = [message async for message in prompt]
         self.queries.append(prompt)
         if self.factory.complete_after_queries == len(self.queries):
             for message in self.factory.messages:
@@ -161,7 +163,7 @@ def backend(tmp_path: Path, factory: FakeFactory, events: list[dict], tool_handl
     )
 
 
-async def start_thread(instance: ClaudeBackend, tmp_path: Path, *, effort="high") -> None:
+async def start_thread(instance: ClaudeBackend, tmp_path: Path, *, effort="high", async_tools=False) -> None:
     await instance.request("initialize", {})
     response = await instance.request(
         "thread/start",
@@ -172,6 +174,7 @@ async def start_thread(instance: ClaudeBackend, tmp_path: Path, *, effort="high"
             "cwd": str(tmp_path),
             "tools": TOOLS,
             "effort": effort,
+            "asyncTools": async_tools,
             "developerInstructions": "Keep responses concise.",
         },
     )
@@ -191,6 +194,84 @@ async def wait_disconnected(client: FakeClient) -> None:
     async with asyncio.timeout(2):
         while client.disconnect_task is None:
             await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+async def test_async_sdk_keeps_subscription_session_and_waits_for_real_late_output(tmp_path, interrupt):
+    from types import SimpleNamespace
+    from supervisor.runtime.claude import _MCP_REQUEST_CONTEXT
+    from supervisor.runtime.claude_async import BATCH_TOOL_NAME
+
+    events = []
+    gate = asyncio.Event()
+    stopped = asyncio.Event()
+    routed = []
+
+    async def host(request):
+        routed.append(request)
+        if request["arguments"]["path"] == "slow":
+            try:
+                await gate.wait()
+            finally:
+                stopped.set()
+            return {"content": [{"type": "text", "text": "late evidence"}, {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"}], "isError": False}
+        return {"content": [{"type": "text", "text": "ready evidence"}], "isError": False}
+
+    factory = FakeFactory(messages=[result_message(result="final checked result")], complete_after_queries=3)
+    instance = backend(tmp_path, factory, events, tool_handler=host)
+    try:
+        await start_thread(instance, tmp_path, async_tools=True)
+        response = await instance.request("turn/start", {"threadId": "thread-1", "turnId": "async-turn", "input": [{"type": "text", "text": "Check the solution"}]})
+        turn_id = response["turn"]["id"]
+        async with asyncio.timeout(2):
+            while not factory.clients or not factory.clients[-1].queries:
+                await asyncio.sleep(0)
+        client = factory.clients[-1]
+        assert f"mcp__bello__{BATCH_TOOL_NAME}" in client.options.allowed_tools
+        coordinator = instance._async_batches[("thread-1", turn_id)]
+        coordinator.grace_seconds = 0
+        record = instance._record("thread-1")
+        tool = next(tool for tool in instance._sdk_tools(record, {}) if tool.name == BATCH_TOOL_NAME)
+        context_token = _MCP_REQUEST_CONTEXT.set(SimpleNamespace(request_id="batch", meta=None))
+        try:
+            result = await tool.handler({"calls": [{"name": "read_file", "arguments": {"path": "fast"}}, {"name": "read_file", "arguments": {"path": "slow"}}]})
+        finally:
+            _MCP_REQUEST_CONTEXT.reset(context_token)
+        assert "still running" in result["content"][-1]["text"]
+        await client.messages.put(result_message(result="waiting"))
+        async with asyncio.timeout(2):
+            while ("thread-1", turn_id) not in instance._async_usage:
+                await asyncio.sleep(0)
+        assert not any(event["method"] == "turn/completed" for event in events)
+        assert len(client.queries) == 1
+        if interrupt:
+            await instance.request("turn/interrupt", {"threadId": "thread-1", "turnId": turn_id})
+        else:
+            await instance.request("turn/steer", {"threadId": "thread-1", "expectedTurnId": turn_id, "input": [{"type": "text", "text": "Also verify the late image"}]})
+            assert len(client.queries) == 2, "genuine user/runtime input must wake an idle model immediately"
+            assert client.queries[1] == "Also verify the late image"
+            await client.messages.put(result_message(result="waiting after correction"))
+            async with asyncio.timeout(2):
+                while instance._async_usage[("thread-1", turn_id)]["input_tokens"] != 14:
+                    await asyncio.sleep(0)
+            gate.set()
+        completed = await wait_completed(events)
+        assert completed["params"]["turn"]["status"] == ("interrupted" if interrupt else "completed")
+        await wait_disconnected(client)
+        assert stopped.is_set()
+        assert len(factory.clients) == 1
+        assert len(routed) == 2
+        if interrupt:
+            assert len(client.queries) == 1
+        else:
+            assert len(client.queries) == 3
+            content = client.queries[2][0]["message"]["content"]
+            assert any(block.get("text") == "late evidence" for block in content)
+            assert any(block.get("source", {}).get("media_type") == "image/png" for block in content)
+            assert completed["params"]["turn"]["usage"]["input_tokens"] == 21
+        assert record["asyncTools"] is True
+    finally:
+        await instance.stop()
 
 
 async def test_subscription_auth_rejects_environment_provider_routes_without_leaking_values(

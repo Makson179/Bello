@@ -132,6 +132,11 @@ class BelloClickGroup(click.Group):
     help="Enable or disable runtime supervision for this run.",
 )
 @click.option(
+    "--async-tools/--no-async-tools",
+    default=None,
+    help="Enable event-driven tool execution for this run (default: off).",
+)
+@click.option(
     "--log-distiller/--no-log-distiller",
     "log_distiller_enabled",
     default=None,
@@ -196,6 +201,7 @@ def cli(
     protected_paths: tuple[Path, ...],
     clean: bool | None,
     runtime_enabled: bool | None,
+    async_tools: bool | None,
     log_distiller_enabled: bool | None,
     distiller_model_path: Path | None,
     completion_review: bool | None,
@@ -226,6 +232,7 @@ def cli(
             protected_paths=protected_paths,
             clean=clean,
             runtime_enabled=runtime_enabled,
+            async_tools=async_tools,
             log_distiller_enabled=log_distiller_enabled,
             distiller_model_path=distiller_model_path,
             completion_review=completion_review,
@@ -538,6 +545,7 @@ def config_command() -> None:
         click.echo(f"revision-coder-mod: {config.revision_coder_mod}")
         click.echo(f"revision-coder-intelligence: {config.revision_coder_intelligence}")
     click.echo(f"runtime: {str(config.runtime_enabled).lower()}")
+    click.echo(f"async-tools: {str(config.async_tools).lower()}")
     if config.runtime_enabled:
         click.echo(f"runtime-mod: {config.runtime_mod}")
         click.echo(f"cheap-runtime: {str(config.effective_cheap_runtime).lower()}")
@@ -678,6 +686,7 @@ async def _run_bello(settings: RunSettings) -> int:
         declared_grading_roots=settings.protected_paths,
         clean_workspace=settings.clean,
         runtime_enabled=settings.runtime_enabled,
+        async_tools=settings.async_tools,
         log_distiller=settings.log_distiller,
         adversary_enabled=settings.adversary,
         adversary_runs=settings.adversary_runs,
@@ -711,6 +720,7 @@ class RunSettings:
     adversary: bool
     adversary_runs: int
     runtime_enabled: bool = True
+    async_tools: bool = False
     log_distiller: LogDistillerConfig = field(default_factory=LogDistillerConfig)
 
 
@@ -734,6 +744,7 @@ def _resolve_run_settings(
     protected_paths: tuple[Path, ...] = (),
     clean: bool | None = None,
     runtime_enabled: bool | None = None,
+    async_tools: bool | None = None,
     log_distiller_enabled: bool | None = None,
     distiller_model_path: Path | None = None,
     completion_review: bool | None = None,
@@ -803,6 +814,7 @@ def _resolve_run_settings(
         protected_paths=selected_protected_paths,
         clean=project_config.clean if clean is None else clean,
         runtime_enabled=selected_runtime_enabled,
+        async_tools=project_config.async_tools if async_tools is None else async_tools,
         log_distiller=selected_distiller,
         completion_review=selected_completion_review,
         # An explicit --adversary wins; otherwise an explicit --adversary-runs implies on/off (0 = off).

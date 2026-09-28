@@ -1,6 +1,6 @@
 # Current Bello configuration schema
 
-This reference targets Bello 0.6.0's user-facing `ProjectConfig`. The persistent file is `.supervisor/config.json`, but it also contains runtime state after a run starts. Never replace that file directly or feed it directly to the advisor validator; first extract the project settings with `scripts/inspect_config.py`.
+This reference targets Bello 0.7.0's user-facing `ProjectConfig`. The persistent file is `.supervisor/config.json`, but it also contains runtime state after a run starts. Never replace that file directly or feed it directly to the advisor validator; first extract the project settings with `scripts/inspect_config.py`.
 
 The inspector deliberately preserves valid dormant values such as saved review budgets, cheap-runtime preference, and a distiller path while their feature is off. Its `current_project_config` is for safe application after selection, not evidence for choosing the setup, and is not necessarily valid under the advisor's stricter canonical output policy. Overlay the selected switches and review fields, zero inactive budgets, and set cheap runtime false when runtime is off before running `validate_config.py`. The inspector checks source syntax, not model capabilities or bundle availability.
 
@@ -23,6 +23,8 @@ The inspector deliberately preserves valid dormant values such as saved review b
   "adversary_intelligence": "xhigh",
   "speed": "usual",
   "runtime_enabled": true,
+  "async_tools": false,
+  "windows_native_root_read": false,
   "cheap_runtime": true,
   "log_distiller": {
     "enabled": false,
@@ -77,7 +79,7 @@ The inspector deliberately preserves valid dormant values such as saved review b
 
 Always include `"review_limit_format": "explicit"`. Without it, older zero-budget semantics are migrated to `"unlimited"`.
 
-Complete recommendations require every shown root field and both `log_distiller` fields. Sparse saved configs remain supported: missing `runtime_enabled` defaults to true; missing `log_distiller` or its fields defaults to `{"enabled": false, "model_path": null}`. Completion and adversary retain their own switches; neither is inferred from runtime or distiller.
+Complete recommendations include the shown root fields and both `log_distiller` fields. For compatibility, the validator also accepts older recommendations without `async_tools` and `windows_native_root_read`; both default to false and, when present, must be Booleans. Sparse saved configs remain supported: missing `runtime_enabled` defaults to true; missing `log_distiller` or its fields defaults to `{"enabled": false, "model_path": null}`. Completion and adversary retain their own switches; neither is inferred from runtime or distiller.
 
 ## Providers, models, and effort
 
@@ -111,6 +113,10 @@ When a separate plan is recommended, use the host's supported planning workflow 
 The plan must be a regular `.md` file inside the project root, distinct from the task, not named `AGENTS.md`, not a link or hardlink, and outside Bello runtime, cache, and dependency directories. In a Git repository it must be untracked and absent from reachable Git history. Bello stages a guarded copy for the initial coder, excludes it from the resulting patch, removes it before switching to a revision coder, and keeps completion review, adversary, and adversary-report normalization plan-blind.
 
 ## Runtime and log-distiller switches
+
+`async_tools` (Smart Execution) defaults off and is independent of runtime, reviews, and distillation. It enables event-driven execution of independent tools for coder/reviewer threads and their children; it does not change models, billing routes, sandbox authority, or runtime's bounded wakeups. Choose it before starting a fresh run. Native Codex requires an explicitly compatible `bello_async_tools` build; do not treat an older selection-only helper as sufficient or silently substitute an engine.
+
+`windows_native_root_read` defaults off. It is an explicit Windows native-Codex opt-in to read the workspace's drive/share root while writes stay scoped and known private controller/Codex homes remain denied. Enable it only with the user's explicit consent to that broader read scope; never infer consent from a request to make Windows work. Other platforms and engines ignore it. Changing saved-thread consent requires a fresh run. Preserve an existing setting during application unless changing it was authorized.
 
 `runtime_enabled`, `completion_review`, `adversary`, and `log_distiller.enabled` are four independent Booleans. Any combination is supported, subject to each feature's own model, budget, or backend requirements.
 
@@ -213,8 +219,8 @@ The validator uses that default triage route. If an existing `BELLO_RUNTIME_TRIA
 
 ## Current application limitation
 
-The current run CLI exposes initial-coder, runtime, completion, and adversary models and efforts; `--runtime/--no-runtime`; review/adversary toggles; `--log-distiller/--no-log-distiller` and `--distiller-model PATH`; adversary count; speed; task; an optional private `--plan PATH`; start-over; clean; and protected paths. These one-run flags override the corresponding saved values without rewriting the project config. `--plan` has no persistent config counterpart and applies only to that run.
+The current run CLI exposes initial-coder, runtime, completion, and adversary models and efforts; `--runtime/--no-runtime`; `--async-tools/--no-async-tools`; review/adversary toggles; `--log-distiller/--no-log-distiller` and `--distiller-model PATH`; adversary count; speed; task; an optional private `--plan PATH`; start-over; clean; and protected paths. These one-run flags override the corresponding saved values without rewriting the project config. `--plan` has no persistent config counterpart and applies only to that run.
 
-It does not expose revision-coder enablement/model/effort, cheap runtime, completion-return budgets, or any of the three multi-agent policy objects as one-run flags. Those fields require the saved `bello config` interface. A one-run initial-coder override does not implicitly rewrite the persisted revision-coder profile.
+It does not expose Windows native root-read, revision-coder enablement/model/effort, cheap runtime, completion-return budgets, or any of the three multi-agent policy objects as one-run flags. Those fields require the saved `bello config` interface. A one-run initial-coder override does not implicitly rewrite the persisted revision-coder profile.
 
-The 0.6.0 `bello-delegate` helper starts the installed Bello with the already selected saved configuration and explicitly approved task/plan paths. It does not select models or apply configuration itself. Finish the authorized configuration step before delegating the launch; do not silently drop settings to fit an older plugin.
+The 0.7.0 `bello-delegate` helper starts the installed Bello with the already selected saved configuration and explicitly approved task/plan paths. It does not select models or apply configuration itself. Finish the authorized configuration step before delegating the launch; do not silently drop settings to fit an older plugin.

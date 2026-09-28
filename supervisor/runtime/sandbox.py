@@ -35,6 +35,7 @@ import errno
 import math
 import os
 from pathlib import Path
+import shlex
 import shutil
 import signal
 import stat
@@ -329,6 +330,7 @@ def _tool_runtime_root(path: Path) -> Path:
         ((".asdf", "installs"), 2),
         (("mise", "installs"), 2),
         ((".rustup", "toolchains"), 1),
+        (("/", "usr", "local", "rustup", "toolchains"), 1),
         (("Cellar",), 2),
     )
     for pattern, trailing in patterns:
@@ -536,7 +538,17 @@ def _stage_tool_shims(scratch: Path, toolchain: _Toolchain) -> Path:
     for name, target in toolchain.shims:
         link = directory / name
         try:
-            link.symlink_to(target)
+            if sys.platform == "linux" and name in {"python", "python3"}:
+                # A relocated standalone CPython can use argv[0] before
+                # resolving a PATH shim, missing pyvenv.cfg and its stdlib.
+                # exec the same absolute, discovered interpreter; retain all
+                # arguments, stdio, exit status and the existing mount scope.
+                script = "#!/bin/sh\nexec " + shlex.quote(str(target)) + ' "$@"\n'
+                with link.open("x", encoding="utf-8") as stream:
+                    stream.write(script)
+                link.chmod(0o700)
+            else:
+                link.symlink_to(target)
         except FileExistsError:
             continue
     return directory
@@ -796,6 +808,7 @@ def _mac_invocation(
 def _linux_system_mounts() -> tuple[tuple[Path, Path], ...]:
     candidates = [
         "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64", "/usr/libexec", "/usr/share",
+        "/usr/include",
         "/lib", "/lib64", "/bin", "/sbin", "/etc/ld.so.cache", "/etc/group",
         "/etc/localtime", "/etc/nsswitch.conf", "/etc/passwd", "/nix/store", "/gnu/store",
     ]
@@ -808,6 +821,10 @@ def _linux_system_mounts() -> tuple[tuple[Path, Path], ...]:
         if destination.is_symlink() or not destination.exists():
             continue
         source = destination.resolve()
+        # Public system headers belong to the selected Linux environment,
+        # never to a caller-supplied host tree or a symlinked private location.
+        if value == "/usr/include" and (not destination.is_dir() or source != destination):
+            continue
         if any(_contains(existing_source, source) and _contains(existing_dest, destination)
                for existing_source, existing_dest in mounts):
             continue

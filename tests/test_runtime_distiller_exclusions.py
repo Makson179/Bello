@@ -306,7 +306,9 @@ async def test_yielded_protected_command_stays_protected_when_polled_or_stopped(
 
 
 @pytest.mark.asyncio
-async def test_configured_task_scope_survives_coder_repair_resume_and_child(tmp_path):
+@pytest.mark.parametrize("windows", [False, True])
+async def test_configured_task_scope_survives_coder_repair_resume_and_child(tmp_path, monkeypatch, windows):
+    monkeypatch.setattr("supervisor.runtime.client._IS_WINDOWS", windows)
     class FakeBackend:
         async def request(self, method, params, timeout=30):
             if method == "thread/start":
@@ -330,6 +332,7 @@ async def test_configured_task_scope_survives_coder_repair_resume_and_child(tmp_
     workspace.mkdir()
     task = workspace / "custom-job.txt"
     client = RuntimeClient(cwd=root, backends={"codex": FakeBackend(), "claude-code": FakeBackend()})
+    client.configure_run(windows_native_root_read=True)
     client._distiller = FakeDistiller()
     await client.start()
     try:

@@ -33,11 +33,14 @@ async def make_client(tmp_path, *, approval_handler=None):
     workspace.mkdir()
     codex, claude = FakeBackend(), FakeBackend()
     client = RuntimeClient(cwd=root, backends={"codex": codex, "claude-code": claude}, server_request_handler=approval_handler)
+    client.configure_run(windows_native_root_read=True)
     await client.start()
     return client, workspace, codex, claude
 
 
 async def start(client, workspace, model="gpt-5.6-sol", **extra):
+    # Native consent belongs to configure_run, not shared host-tool dependencies.
+    # A drive root here would invalidate the separate Pi/Claude sandbox policy.
     response = await client.thread_start({"cwd": str(workspace), "runtimeWorkspaceRoots": [str(workspace)],
         "model": model, "sandbox": "workspace-write", "approvalPolicy": "on-request", **extra})
     return response["thread"]["id"]

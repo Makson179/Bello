@@ -14,16 +14,19 @@ import inspect
 import os
 from pathlib import Path
 import shutil
+import stat
+import tempfile
 from typing import Any
 from uuid import uuid4
 
 from jsonschema import ValidationError
 
 from supervisor.appserver import (AppServerClient, AppServerError, AppServerMessage,
-    AppServerTimeoutError, _private_owned_directory)
+    AppServerTimeoutError, _private_owned_directory, _codex_home_from_environment)
 from supervisor.runtime.journal import RuntimeJournal
-from supervisor.runtime.codex_permissions import native_permission_params
+from supervisor.runtime.codex_permissions import native_permission_params, validate_windows_native_scope
 from supervisor.runtime.codex_toolchains import native_toolchain_read_paths
+from supervisor.filesystem_safety import is_link_or_reparse, remove_path_tree
 
 
 _DELEGATION = frozenset({"spawn_agent", "send_message", "wait_agent", "close_agent"})
@@ -35,6 +38,14 @@ _APPROVALS = frozenset({"item/commandExecution/requestApproval", "item/fileChang
     "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval"})
 _IDENTITY_FIELDS = {"threadId", "parentThreadId", "senderThreadId", "receiverThreadId"}
 _IS_WINDOWS = os.name == "nt"
+
+
+def _scratch_directory_identity(path: Path) -> tuple[int, int]:
+    metadata = path.lstat()
+    if (is_link_or_reparse(path, stat_result=metadata) or not stat.S_ISDIR(metadata.st_mode)
+            or not metadata.st_ino or path.resolve(strict=True) != path):
+        raise AppServerError("native scratch requires stable ordinary directories")
+    return metadata.st_dev, metadata.st_ino
 
 
 def _delegation_tools(params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -70,7 +81,7 @@ def _tier(value: Any) -> str:
 class CodexBackend:
     def __init__(self, *, state_dir: Path, emit, tool_handler=None, client_factory=None,
                  on_error=None, command: list[str] | None = None, distiller=None,
-                 selection_manifest: Path | None = None):
+                 selection_manifest: Path | None = None, private_read_roots: tuple[Path, ...] = ()):
         self.state_dir = Path(state_dir).absolute()
         self.emit, self.tool_handler, self.on_error = emit, tool_handler, on_error
         self._factory = client_factory or AppServerClient
@@ -80,8 +91,14 @@ class CodexBackend:
         self._selection_verified = False
         self._selection_manifest = selection_manifest
         self._selection_lock = asyncio.Lock()
+        self._async_tools_verified = False
+        self._async_tools_checked = False
         self._native_command = None
         self._runtime_read_paths: tuple[Path, ...] = ()
+        self._private_read_roots = tuple(Path(path).absolute() for path in private_read_roots)
+        self._source_codex_home: Path | None = None
+        self._windows_scratch: dict[str, Path] = {}
+        self._windows_scratch_owned: dict[Path, tuple[tuple[Path, tuple[int, int]], ...]] = {}
         self._toolchain_read_paths: dict[str, tuple[Path, ...]] = {}
         self._client = None
         self._journal = RuntimeJournal(self.state_dir)
@@ -122,6 +139,22 @@ class CodexBackend:
             raise AppServerTimeoutError("native Codex request deadline expired before dispatch")
         try:
             async with asyncio.timeout(timeout):
+                if _IS_WINDOWS:
+                    scope = params or {}
+                    if method == "thread/start":
+                        validate_windows_native_scope(scope)
+                    elif method in {"thread/resume", "turn/start"}:
+                        record = self._threads.get(scope.get("threadId"))
+                        if record is not None:
+                            if ("windowsNativeRootRead" in scope and
+                                    (type(scope["windowsNativeRootRead"]) is not bool or
+                                     scope["windowsNativeRootRead"] != record["params"].get("windowsNativeRootRead", False))):
+                                raise AppServerError("native resume/turn cannot change Windows root-read consent")
+                            # A turn inherits its thread's permissions; only
+                            # cwd is a native turn-level filesystem override.
+                            overrides = scope if method == "thread/resume" else {
+                                "cwd": scope.get("cwd", record["params"]["cwd"])}
+                            validate_windows_native_scope({**record["params"], **overrides})
                 await self._ensure_initialized(timeout)
                 return await self._request(method, deepcopy(params or {}), timeout)
         except TimeoutError as exc:
@@ -154,6 +187,9 @@ class CodexBackend:
             manifest = os.environ.get("BELLO_CODEX_SELECTION_MANIFEST", "").strip()
             if self._selection_manifest is None and manifest:
                 self._selection_manifest = Path(manifest).expanduser().absolute()
+            if self._selection_manifest is not None:
+                from supervisor.runtime.native_codex_layout import validate_native_package
+                await validate_native_package(command, self._selection_manifest)
             executable = shutil.which(command[0])
             if executable is not None:
                 launcher = Path(executable).absolute()
@@ -167,6 +203,11 @@ class CodexBackend:
             command = [*command, "-c", 'forced_login_method="chatgpt"', "-c", 'model_provider="openai"',
                        "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false",
                        "-c", "agents.enabled=false"]
+            if _IS_WINDOWS:
+                # Bind the exact source home used by AppServerClient, without
+                # enumerating it or changing the user's environment.
+                self._source_codex_home = _codex_home_from_environment(os.environ)
+                environment["CODEX_HOME"] = str(self._source_codex_home)
             self._client = self._factory(command=command, cwd=self.state_dir,
                 notification_handler=self._receive, server_request_handler=self._receive,
                 transport_error_handler=self._transport_error, environment_overrides=environment,
@@ -228,9 +269,46 @@ class CodexBackend:
             raise AppServerError("unsupported native Codex service tier")
         if params.get("distillerEnabled"):
             await self._validate_selection()
+        if params.get("asyncTools"):
+            await self._validate_async_tools(timeout)
+        elif not self._async_tools_checked:
+            # Read-only capability discovery lets OFF mask a global experimental
+            # override without sending unknown flags to stock binaries.
+            try:
+                await self._validate_async_tools(timeout)
+            except AppServerError:
+                self._async_tools_checked = True
         return {"valid": True, "model": descriptor,
                 "requested": {"effort": effort, "serviceTier": params.get("serviceTier")},
                 "execution": {"engine": "codex", "effort": effort}}
+
+    async def _validate_async_tools(self, timeout: float) -> None:
+        """Stock app-server silently ignores unknown flags: require capability."""
+        if self._async_tools_verified:
+            return
+        if self._async_tools_checked:
+            raise AppServerError("Async tools requires a native Codex build with bello_async_tools support")
+        cursor, seen = None, set()
+        while True:
+            params = {"limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            response = await self._client.request("experimentalFeature/list", params, timeout=timeout)
+            if any(feature.get("name") == "bello_async_tools" for feature in response.get("data", [])
+                   if isinstance(feature, dict)):
+                self._async_tools_verified = True
+                self._async_tools_checked = True
+                return
+            cursor = response.get("nextCursor")
+            if not cursor or cursor in seen:
+                break
+            seen.add(cursor)
+        self._async_tools_checked = True
+        raise AppServerError(
+            "Async tools requires a native Codex build with bello_async_tools support. "
+            "This binary cannot run the requested mode; no engine or API fallback was used. "
+            "Set BELLO_CODEX_BINARY to a compatible build or turn async_tools off."
+        )
 
     async def _validate_selection(self) -> None:
         if self._bridge is None:
@@ -307,10 +385,63 @@ class CodexBackend:
         return self._thread_locks.setdefault(host, asyncio.Lock())
 
     def _thread_params(self, params: dict[str, Any]) -> dict[str, Any]:
+        # Automatic scratch is backend-owned transient state, not a persisted
+        # caller grant. A resumed backend allocates its own fresh directory.
+        params = deepcopy(params)
+        if _IS_WINDOWS:
+            validate_windows_native_scope(params)
+        root_read = _IS_WINDOWS and params.get("windowsNativeRootRead", False)
+        private_read_roots: tuple[Path, ...] = ()
+        if root_read:
+            # Host-derived directories only. Never create a missing deny path:
+            # the native deny resolver would turn it into a directory.
+            source_home = self._source_codex_home or _codex_home_from_environment(os.environ)
+            private_read_roots = tuple(dict.fromkeys((
+                *self._private_read_roots, self.state_dir, self.state_dir / "codex-home",
+                *((source_home,) if source_home.exists() else ()),
+            )))
+            for path in private_read_roots:
+                _private_owned_directory(path)
+            # Validate overlap before creating scratch or dispatching a thread.
+            native_permission_params(params, windows_root_read=True, private_read_roots=private_read_roots)
+        if root_read and params.get("sandbox", "workspace-write") == "workspace-write" and params.get("runtimeScratchRoot") is None:
+            # Native tool TMP must not live inside the now-denied controller
+            # state. Assign one exact scratch within the existing write scope.
+            workspace = Path(params["cwd"]).resolve(strict=True)
+            if not workspace.is_dir() or workspace == Path(workspace.anchor):
+                raise AppServerError("native Windows requires an existing non-root workspace")
+            key = str(workspace)
+            if key not in self._windows_scratch:
+                workspace_identity = _scratch_directory_identity(workspace)
+                # Reuse the existing generated-artifact exclusion namespace.
+                # Do not alter existing parent contents, modes, or user files.
+                cache = workspace / "__pycache__"
+                cache.mkdir(mode=0o700, exist_ok=True)
+                cache_identity = _scratch_directory_identity(cache)
+                scratch = Path(tempfile.mkdtemp(prefix="bello-native-", dir=cache))
+                identities = ((workspace, workspace_identity), (cache, cache_identity),
+                              (scratch, _scratch_directory_identity(scratch)))
+                if any(_scratch_directory_identity(path) != identity for path, identity in identities):
+                    raise AppServerError("native scratch directory changed during allocation")
+                self._windows_scratch[key] = scratch
+                self._windows_scratch_owned[scratch] = identities
+            scratch = self._windows_scratch[key]
+            if any(_scratch_directory_identity(path) != identity
+                   for path, identity in self._windows_scratch_owned[scratch]):
+                raise AppServerError("native scratch directory identity changed")
+            _private_owned_directory(scratch)
+            params["runtimeScratchRoot"] = str(scratch)
         model = _model(params.get("model"))
         if params.get("provider", "openai-codex") != "openai-codex" or params.get("baseInstructions") is not None:
             raise AppServerError("native Codex retains its native provider and base instructions")
         config = deepcopy(params.get("config") or {})
+        if params.get("asyncTools") and not self._async_tools_verified:
+            raise AppServerError("native Async tools requested without verified capability")
+        if isinstance(config.get("features"), dict):
+            config["features"].pop("bello_async_tools", None)
+        config.pop("features.bello_async_tools", None)
+        if self._async_tools_verified:
+            config["features.bello_async_tools"] = bool(params.get("asyncTools", False))
         config.pop("agents", None)  # Bello's profile schema is not Codex's agent config.
         for key in list(config):
             if key == "model_providers" or key.startswith("model_providers."):
@@ -380,6 +511,14 @@ class CodexBackend:
         if dynamic:
             mapping = "Use Bello's configured delegation tools: " + ", ".join(t["name"] for t in dynamic) + "."
             native["developerInstructions"] = ((native.get("developerInstructions") or "") + "\n" + mapping).strip()
+        if params.get("asyncTools"):
+            interactive = (
+                "Finite non-TTY commands deliver their results automatically when they finish. "
+                "For a server or command deliberately kept running, use exec_command with tty=true. "
+                "That explicit interactive session retains write_stdin for necessary input or reading ongoing output; "
+                "the no-poll rule does not prohibit those interactions. Do not repeatedly check unchanged interactive output."
+            )
+            native["developerInstructions"] = ((native.get("developerInstructions") or "") + "\n" + interactive).strip()
         native.update(model=model, modelProvider="openai", config=config, dynamicTools=dynamic)
         toolchain_paths: tuple[Path, ...] = ()
         if params.get("sandbox", "workspace-write") != "danger-full-access":
@@ -388,8 +527,12 @@ class CodexBackend:
                 if cwd not in self._toolchain_read_paths:
                     self._toolchain_read_paths[cwd] = native_toolchain_read_paths(Path(cwd))
                 toolchain_paths = self._toolchain_read_paths[cwd]
-        permissions = native_permission_params(params, temp_dir=tool_tmp,
-            runtime_read_paths=(*self._runtime_read_paths, *toolchain_paths))
+        # Read-only tools receive no writable TMP; the native host itself
+        # may still use its private per-backend temporary directory.
+        permissions = native_permission_params(params,
+            temp_dir=tool_tmp if params.get("sandbox", "workspace-write") == "workspace-write" else None,
+            runtime_read_paths=(*self._runtime_read_paths, *toolchain_paths),
+            windows_root_read=root_read, private_read_roots=private_read_roots)
         if "permissions" in permissions:
             native.pop("sandbox", None)
             config.pop("sandbox_workspace_write.network_access", None)
@@ -470,6 +613,8 @@ class CodexBackend:
 
     async def _resume(self, record: dict[str, Any], params: dict[str, Any], timeout: float) -> dict[str, Any]:
         combined = {**record["params"], **params}
+        if bool(combined.get("asyncTools", False)) != bool(record["params"].get("asyncTools", False)):
+            raise AppServerError("native resume cannot change Async tools mode; start a new run")
         if _model(combined["model"]) != record["model"] or str(Path(combined["cwd"]).resolve()) != str(Path(record["cwd"]).resolve()):
             raise AppServerError("native resume cannot change the assigned model or workspace")
         await self._subscription(timeout)
@@ -495,10 +640,12 @@ class CodexBackend:
             if record["id"] not in self._loaded:
                 await self._resume(record, {}, timeout)
             await self._subscription(timeout)
+            if "asyncTools" in params and bool(params["asyncTools"]) != bool(record["params"].get("asyncTools", False)):
+                raise AppServerError("native turn cannot change Async tools mode; start a new run")
             model = _model(params.get("model", record["model"]))
             if model != record["model"]:
                 raise AppServerError("native Codex model changes require a new thread")
-            await self._validate({**params, "model": model}, timeout)
+            await self._validate({**record["params"], **params, "model": model}, timeout)
             forwarded = {key: deepcopy(params[key]) for key in _TURN_FIELDS if key in params}
             if record["params"].get("sandbox", "workspace-write") != "danger-full-access":
                 # Preserve the thread's scoped filesystem/network permission profile.
@@ -743,6 +890,25 @@ class CodexBackend:
         try:
             if self._client:
                 await self._client.stop()
+            # Never delete tool scratch until the exact native process has
+            # stopped successfully. Do not follow or delete replaced paths.
+            for scratch, identities in tuple(self._windows_scratch_owned.items()):
+                try:
+                    scratch.lstat()
+                except FileNotFoundError:
+                    # Snapshot disposal or the tool itself may already have
+                    # removed this exact leaf. Nothing is adopted or deleted.
+                    del self._windows_scratch_owned[scratch]
+                    continue
+                for path, identity in identities:
+                    if _scratch_directory_identity(path) != identity:
+                        raise AppServerError("refusing cleanup of replaced native scratch")
+                metadata = scratch.lstat()
+                if (metadata.st_dev, metadata.st_ino) != identities[-1][1]:
+                    raise AppServerError("refusing cleanup of replaced native scratch")
+                remove_path_tree(scratch, stat_result=metadata)
+                del self._windows_scratch_owned[scratch]
+            self._windows_scratch.clear()
         finally:
             if self._bridge:
                 await self._bridge.close()

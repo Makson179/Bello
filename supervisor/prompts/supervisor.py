@@ -89,8 +89,12 @@ def build_stateless_supervisor_prompt(packet: SupervisorWakePacket) -> str:
     return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
 
 
-def build_completion_review_prompt(packet: SupervisorWakePacket) -> str:
-    payload = packet.model_dump(
+def build_completion_review_prompt(
+    packet: SupervisorWakePacket,
+    *,
+    selective_context: dict[str, Any] | None = None,
+) -> str:
+    payload = dict(selective_context) if selective_context is not None else packet.model_dump(
         mode="json",
         exclude={
             "progress_path",
@@ -103,9 +107,16 @@ def build_completion_review_prompt(packet: SupervisorWakePacket) -> str:
         },
     )
     section_names = _completion_review_section_names(packet)
-    payload["prompt_sections"] = section_names
-    payload["instructions"] = [_stateless_supervisor_section_text(name) for name in section_names]
-    return json.dumps(payload, indent=2, sort_keys=True)
+    # Stable authored instructions and objective precede the changing evidence index.
+    # The native engine's own system instructions remain untouched.
+    result = {
+        "instructions": [_stateless_supervisor_section_text(name) for name in section_names],
+        "prompt_sections": section_names,
+    }
+    if "task_contents" in payload:
+        result["task_contents"] = payload.pop("task_contents")
+    result.update(payload)
+    return json.dumps(result, indent=2)
 
 
 def build_adv_report_controller_prompt(

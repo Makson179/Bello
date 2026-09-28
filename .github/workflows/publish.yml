@@ -7,8 +7,8 @@ on:
 jobs:
   build:
     name: Build distributions
-    # Native helper releases are downloadable components, not Bello/PyPI releases.
-    if: startsWith(github.event.release.tag_name, 'v')
+    # Native assets and explicitly GitHub-only releases must not publish to PyPI.
+    if: startsWith(github.event.release.tag_name, 'v') && !contains(github.event.release.body, '<!-- bello:github-only -->')
     runs-on: ubuntu-latest
     permissions:
       contents: read

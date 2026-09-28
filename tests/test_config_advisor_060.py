@@ -53,6 +53,7 @@ def policy():
 def config():
     result = dict(review_limit_format="explicit", task="TASK.md", speed="usual",
                   revision_coder_enabled=False, runtime_enabled=True, cheap_runtime=False,
+                  async_tools=False, windows_native_root_read=False,
                   log_distiller={"enabled": False, "model_path": None}, start_over=False,
                   completion_review=True, adversary=True, max_adversary_runs=1,
                   max_completion_returns_before_adversary=1,
@@ -120,6 +121,47 @@ class CatalogTests(unittest.TestCase):
 
 
 class AdvisorValidationTests(unittest.TestCase):
+    def test_old_complete_recommendations_keep_false_opt_in_defaults(self):
+        candidate = config()
+        candidate.pop("async_tools")
+        candidate.pop("windows_native_root_read")
+        self.assertEqual(validate(candidate), [])
+        current = INSPECTOR._normalize(candidate, config_exists=True)
+        self.assertIs(current["async_tools"], False)
+        self.assertIs(current["windows_native_root_read"], False)
+
+    def test_new_opt_ins_are_strict_independent_booleans(self):
+        for async_tools, root_read in itertools.product((False, True), repeat=2):
+            candidate = config()
+            candidate.update(async_tools=async_tools, windows_native_root_read=root_read)
+            self.assertEqual(validate(candidate), [])
+        for field, value in itertools.product(("async_tools", "windows_native_root_read"),
+                                               (0, 1, "false", "true", None, [], {})):
+            candidate = config()
+            candidate[field] = value
+            self.assertIn(f"{field}: expected boolean", validate(candidate))
+            current = INSPECTOR._normalize(candidate, config_exists=True)
+            self.assertIn(f"{field} must be boolean", INSPECTOR._source_config_errors(
+                candidate, current, config_exists=True))
+
+    def test_actual_project_config_inspector_validator_roundtrip(self):
+        from supervisor.project_config import _config_from_payload
+        for async_tools, root_read in itertools.product((False, True), repeat=2):
+            candidate = config()
+            candidate.update(async_tools=async_tools, windows_native_root_read=root_read)
+            actual = _config_from_payload(candidate, path=Path("synthetic.json")).to_json_data()
+            with tempfile.TemporaryDirectory() as name:
+                root = Path(name)
+                path = root / ".supervisor/config.json"
+                path.parent.mkdir()
+                path.write_text(json.dumps(actual))
+                before = path.read_bytes()
+                inspected = INSPECTOR.inspect(root, include_bello_version=False, timeout_seconds=1)
+                self.assertEqual(path.read_bytes(), before)
+            self.assertTrue(inspected["source_config_valid"])
+            self.assertEqual(inspected["current_project_config"], actual)
+            self.assertEqual(validate(inspected["current_project_config"]), [])
+
     def test_mixed_c_a_and_children_pass(self):
         candidate = config()
         for field in ("multi_agent", "completion_multi_agent", "adversary_multi_agent"):
@@ -504,8 +546,8 @@ class ConfigInspectionTests(unittest.TestCase):
             "max_completion_returns_before_adversary": 0, "max_completion_returns_after_adversary": 0}),
             ("unlimited", "unlimited"))
 
-    def test_version_target_recognizes_060_development(self):
-        for value in ("0.6.0", "0.6.0.dev0", "0.6.0.dev12"):
+    def test_version_target_recognizes_070_development(self):
+        for value in ("0.7.0", "0.7.0.dev0", "0.7.0.dev12"):
             self.assertEqual(INSPECTOR._version_compatibility(value), "verified")
         self.assertEqual(INSPECTOR._version_compatibility("0.5.2"), "update_required")
         self.assertEqual(INSPECTOR._version_compatibility("garbage"), "unverified")

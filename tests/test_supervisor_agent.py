@@ -165,7 +165,10 @@ async def test_completion_review_uses_disposable_workspace_write_snapshot(
     review_root = Path(client.thread_params["cwd"])
     assert client.thread_params["effort"] == "high"
     assert client.thread_params["sandbox"] == "workspace-write"
-    assert client.thread_params["runtimeWorkspaceRoots"] == [str(review_root), str(task)]
+    context_store = agent.completion_context_store
+    assert context_store is not None
+    assert client.thread_params["runtimeWorkspaceRoots"] == [str(review_root), str(task), str(context_store.root)]
+    assert not context_store.root.is_relative_to(review_root)
     assert client.thread_params["config"]["agents"] == {
         "enabled": True,
         "max_concurrent_threads_per_session": 3,
@@ -201,6 +204,8 @@ async def test_completion_review_uses_disposable_workspace_write_snapshot(
     assert cleanup_calls == [("completion-thread", review_root)]
     assert not review_root.exists()
     assert agent.completion_workspace_snapshot is None
+    assert not context_store.root.exists()
+    assert agent.completion_context_store is None
 
 
 async def test_completion_review_rejects_submitted_file_mutation(tmp_path: Path) -> None:
@@ -427,7 +432,7 @@ def test_supervisor_packet_uses_canonical_task_contents_override(tmp_path: Path)
     assert packet.task_contents == "strict original task"
 
 
-def test_supervisor_packet_plumbs_subagents_and_completion_slims_them(tmp_path: Path) -> None:
+def test_supervisor_packet_plumbs_subagents(tmp_path: Path) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
     store = StateStore(tmp_path)
@@ -449,7 +454,6 @@ def test_supervisor_packet_plumbs_subagents_and_completion_slims_them(tmp_path: 
     )
 
     assert packet.subagents == [child]
-    assert supervisor_agent_module._slim_completion_packet(packet).subagents == []
 
 
 async def test_runtime_prompt_uses_recent_state_and_relevant_ledgers(tmp_path: Path) -> None:
@@ -886,22 +890,27 @@ async def test_completion_review_compacts_large_packet_under_budget(tmp_path: Pa
     decision = await agent.decide_completion(packet)
 
     assert decision.decision == "accept"
-    # The completion packet is slimmed: the evidence skeleton (ids, outcomes, short
-    # command/summary) remains available to the reviewer and final report, but full
-    # captured output and inlined file diffs are dropped — the supervisor reads the
-    # workspace itself. So evidence ids survive; raw captured output and diffs do not.
-    assert "inspection-49" in client.prompt  # evidence id (skeleton) kept
-    assert "validation-11" in client.prompt
-    assert "INSPECTION-49" not in client.prompt  # raw captured output not inlined
-    assert "D" * 200 not in client.prompt  # changed_file_diffs dropped
-    assert len(client.prompt) < 500_000  # comfortably under the 1 MiB app-server cap
+    # Neither the growing evidence skeleton nor its detailed output is pushed into
+    # the model. Indexes select individual records, including their full output.
+    payload = json.loads(client.prompt)
+    assert payload["review_context_mode"] == "selective_files"
+    assert "inspection-49" not in client.prompt
+    assert "validation-11" not in client.prompt
+    assert "INSPECTION-49" not in client.prompt
+    assert "D" * 200 not in client.prompt
+    assert len(client.prompt) < 40_000
+    inspection_index = Path(payload["available_evidence"]["inspections"]["index_path"])
+    records = [json.loads(line) for line in inspection_index.read_text().splitlines()]
+    assert records[-1]["inspection_id"] == "inspection-49"
+    detail = json.loads(Path(records[-1]["path"]).read_text())
+    assert detail["captured_output"] == inspections[-1].captured_output
     audit = json.loads(store.path(SUPERVISOR_WAKES).read_text(encoding="utf-8").splitlines()[-1])
-    assert audit["packet"]["inspections"][0]["captured_output"] == ""
-    # validation_outputs / inspection_outputs are dropped entirely because they are
-    # near-duplicates of the ledgers once captured_output is emptied.
-    assert audit["packet"]["validation_outputs"] == []
-    assert audit["packet"]["inspection_outputs"] == []
-    assert audit["packet"]["changed_file_diffs"] == []
+    assert audit["packet"]["inspections"][0]["captured_output"] == inspections[0].captured_output
+    assert len(audit["packet"]["validation_outputs"]) == len(validation_outputs)
+    assert len(audit["packet"]["inspection_outputs"]) == len(inspection_outputs)
+    assert len(audit["packet"]["changed_file_diffs"]) == 2
+    await agent.close_completion_review()
+    assert not inspection_index.exists()
 
 
 async def test_completion_review_uses_dedicated_long_timeout(tmp_path: Path) -> None:
