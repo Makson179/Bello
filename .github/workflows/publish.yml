@@ -3,19 +3,34 @@ name: Publish
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing published release to publish from the selected main commit (for example v0.7.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name || inputs.release_tag }}
+  cancel-in-progress: false
 
 jobs:
   build:
     name: Build distributions
     # Native assets and explicitly GitHub-only releases must not publish to PyPI.
-    if: startsWith(github.event.release.tag_name, 'v') && !contains(github.event.release.body, '<!-- bello:github-only -->')
+    if: >-
+      (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v') && !contains(github.event.release.body, '<!-- bello:github-only -->')) ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
       prerelease: ${{ steps.version.outputs.prerelease }}
+      source_sha: ${{ steps.version.outputs.source_sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -23,20 +38,43 @@ jobs:
         run: python -m pip install --upgrade build twine packaging
       - name: Verify tag matches package version
         id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           python - <<'PY'
+          import json
           import os
+          import subprocess
           import tomllib
           from packaging.version import Version
 
-          tag = os.environ["GITHUB_REF_NAME"]
+          tag = os.environ["RELEASE_TAG"]
           with open("pyproject.toml", "rb") as handle:
               version = tomllib.load(handle)["project"]["version"]
           expected = f"v{version}"
           if tag != expected:
               raise SystemExit(f"release tag {tag!r} does not match package version {version!r}; expected {expected!r}")
+          prerelease = Version(version).is_prerelease
+          if os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch":
+              if os.environ["GITHUB_REF"] != "refs/heads/main":
+                  raise SystemExit("manual publication is allowed only from main")
+              release = json.loads(subprocess.check_output([
+                  "gh", "release", "view", tag, "--repo", os.environ["GITHUB_REPOSITORY"],
+                  "--json", "isDraft,isPrerelease,body",
+              ], text=True))
+              if release["isDraft"] or release["isPrerelease"] != prerelease:
+                  raise SystemExit("published release state does not match package version")
+              if "<!-- bello:github-only -->" in release["body"]:
+                  raise SystemExit("GitHub-only release is not authorized for package publication")
+              tagged_commit = subprocess.check_output([
+                  "git", "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}",
+              ], text=True).strip()
+              subprocess.run(["git", "merge-base", "--is-ancestor", tagged_commit, "HEAD"], check=True)
+          source_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"prerelease={str(Version(version).is_prerelease).lower()}\n")
+              output.write(f"prerelease={str(prerelease).lower()}\nsource_sha={source_sha}\n")
+          print(f"Building {tag} from commit {source_sha}")
           PY
       - name: Build
         run: python -m build
@@ -71,6 +109,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build.outputs.source_sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
