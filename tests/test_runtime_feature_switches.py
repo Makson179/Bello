@@ -122,14 +122,20 @@ async def test_cross_provider_children_inherit_distiller_only_for_coder(tmp_path
 
 
 @pytest.mark.parametrize("role", ["coder", "completion_review", "adversary"])
+@pytest.mark.parametrize("windows", [False, True])
 async def test_native_child_resume_and_revision_preserve_selection_at_appserver_boundary(
-    tmp_path, selector, monkeypatch, role,
+    tmp_path, selector, monkeypatch, role, windows,
 ):
     """Cross-engine delegation traverses the real native adapter, not FakeBackend."""
     from supervisor.runtime import codex_distiller
     from supervisor.runtime.codex import CodexBackend
     from tests.test_runtime_codex_backend import FakeNative, drain
 
+    monkeypatch.setattr("supervisor.runtime.client._IS_WINDOWS", windows)
+    monkeypatch.setattr("supervisor.runtime.codex._IS_WINDOWS", windows)
+    source_home = tmp_path / "fake-source-home"
+    source_home.mkdir(mode=0o700)
+    monkeypatch.setattr("supervisor.runtime.codex._codex_home_from_environment", lambda env: source_home)
     scopes, native_clients = [], []
     bridge = SimpleNamespace(environment={"BELLO_SELECTOR_SOCKET": "/synthetic/selector.sock"},
         thread_config={codex_distiller.FEATURE_KEY: True}, start=AsyncMock(), close=AsyncMock(),
@@ -140,6 +146,7 @@ async def test_native_child_resume_and_revision_preserve_selection_at_appserver_
     await client.start()
 
     def native_factory(**kwargs):
+        kwargs["persistent_isolated_home"].mkdir(mode=0o700, exist_ok=True)
         native = FakeNative(**kwargs)
         native_clients.append(native)
         return native
