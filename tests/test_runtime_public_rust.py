@@ -1,24 +1,33 @@
 """Public Rust runtimes stay scoped to one discovered version."""
 
-from pathlib import Path
+from pathlib import PurePosixPath
+from types import SimpleNamespace
 
 import pytest
 
 from supervisor.runtime import sandbox
 
 
-RUST = Path("/usr/local/rustup/toolchains/1.92.0-x86_64-unknown-linux-gnu")
+class VirtualPosixPath(PurePosixPath):
+    """Model the Linux runtime inventory independently of the test host."""
+
+    def exists(self):
+        return self == RUST
+
+    def resolve(self):
+        return self
+
+    def is_file(self):
+        return False
+
+
+RUST = VirtualPosixPath("/usr/local/rustup/toolchains/1.92.0-x86_64-unknown-linux-gnu")
 
 
 @pytest.fixture
 def public_rust(monkeypatch):
-    exists = Path.exists
-    resolve = Path.resolve
-    monkeypatch.setattr(Path, "exists", lambda path: path == RUST or exists(path))
-    monkeypatch.setattr(
-        Path, "resolve", lambda path, *args, **kwargs:
-        path if path == RUST else resolve(path, *args, **kwargs)
-    )
+    monkeypatch.setattr(sandbox, "Path", VirtualPosixPath)
+    monkeypatch.setattr(sandbox, "sys", SimpleNamespace(platform="linux"))
 
 
 @pytest.mark.parametrize("tool", ["rustc", "cargo"])
@@ -35,5 +44,5 @@ def test_public_rust_exposes_only_selected_version(public_rust, tool):
     "/usr/local/rustup-other/toolchains/other/bin/rustc",
 ])
 def test_public_rust_does_not_grant_parent_or_unrelated_roots(public_rust, value):
-    path = Path(value)
+    path = VirtualPosixPath(value)
     assert sandbox._tool_runtime_root(path) == path

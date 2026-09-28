@@ -73,6 +73,11 @@ def test_private_namespace_symlink_into_new_header_authority_still_fails_closed(
     root.mkdir()
     (root / ".supervisor").symlink_to(HEADERS, target_is_directory=True)
     virtual_headers(monkeypatch)
+    # Resolve the alias to the same virtual authority as the mount inventory;
+    # Windows otherwise prepends a drive to this synthetic POSIX target.
+    resolve = Path.resolve
+    monkeypatch.setattr(Path, "resolve", lambda p, *a, **kw:
+        HEADERS if p == root / ".supervisor" else resolve(p, *a, **kw))
     monkeypatch.setattr(sandbox, "_linux_launcher", lambda: Path("/usr/bin/bwrap"))
     with pytest.raises(sandbox.SandboxPolicyError, match="private sandbox namespaces cannot be symbolic links"):
         sandbox._linux_invocation(sandbox.SandboxPolicy(root), root, ("/usr/bin/true",))

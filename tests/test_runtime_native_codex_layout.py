@@ -12,6 +12,8 @@ from supervisor.runtime.codex import CodexBackend
 
 def bundle(tmp_path, monkeypatch, system="Linux"):
     monkeypatch.setattr(layout.platform, "system", lambda: system)
+    # These synthetic bundles model another host's layout, not executable discovery.
+    monkeypatch.setattr(layout.shutil, "which", lambda command: str(Path(command)) if Path(command).is_file() else None)
     root = tmp_path / "bundle"
     names = ["bin/codex", "bin/codex-code-mode-host"]
     if system == "Windows":
@@ -77,6 +79,9 @@ async def test_declared_helper_invalidity_is_rejected(tmp_path, monkeypatch, mut
         path.mkdir()
     elif mutation == "not-executable":
         path.chmod(0o644)
+        original_access = layout.os.access
+        monkeypatch.setattr(layout.os, "access", lambda candidate, mode:
+            False if Path(candidate) == path and mode == layout.os.X_OK else original_access(candidate, mode))
     elif mutation == "symlink":
         target = tmp_path / "unchanged-target"
         path.rename(target)
@@ -109,7 +114,8 @@ async def test_custom_host_without_packaged_contract_retains_compatibility(tmp_p
     await layout.validate_native_package(["custom-wrapper", "arg"], manifest)
 
 
-@pytest.mark.parametrize("payload", [None, b"not-json", b"[]", b" " * (65536 + 1)])
+@pytest.mark.parametrize("payload", [None, b"not-json", b"[]", b" " * (65536 + 1)],
+                         ids=["missing", "not-json", "non-object", "oversized"])
 async def test_no_new_requirement_for_unreadable_selection_off_capability(tmp_path, monkeypatch, payload):
     manifest = tmp_path / "ignored-by-selection-off.json"
     if payload is not None:
