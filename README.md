@@ -103,6 +103,8 @@ You can also ask a stronger model to prepare an advisory `PLAN.md`, then have a
 less expensive Bello configuration execute it. The coder receives the plan as
 guidance, while completion review and adversarial testing remain independent.
 
+https://github.com/user-attachments/assets/1a61ba61-444f-4347-b12b-e411d12c55c6
+
 ## How Bello runs a task
 
 The coder implements the task in a disposable workspace and runs its own
