@@ -3,53 +3,48 @@
 ## Four models, with and without Bello
 
 <picture>
-  <source media="(max-width: 600px)" srcset="./readme-model-comparison-mobile.svg">
-  <img src="./readme-model-comparison.svg" alt="Four-model comparison: mean score rises from 43.29% to 52.17%." width="100%">
+  <img src="./readme-model-comparison.png" alt="Four-model comparison: mean score rises from 43.29% to 52.17%." width="100%">
 </picture>
 
 ## Log distiller
 
 <picture>
-  <source media="(max-width: 600px)" srcset="./readme-distiller-mobile.svg">
-  <img src="./readme-distiller.svg" alt="Distiller API-equivalent cost versus quality: Astra cost 100 to 77.98, score 62.22% to 60.57%; Luna cost 100 to 85.22, score 56.75% to 55.45%, including runtime. Costs are normalized independently for each model." width="100%">
+  <img src="./readme-distiller.png" alt="Distiller API-equivalent cost versus quality: Astra cost 100 to 77.98, score 62.22% to 60.57%; Luna cost 100 to 85.22, score 56.75% to 55.45%, including runtime. Costs are normalized independently for each model." width="100%">
 </picture>
 
 ## Smart Execution
 
 <picture>
-  <source media="(max-width: 600px)" srcset="./readme-smart-execution-mobile.svg">
-  <img src="./readme-smart-execution.svg" alt="Smart Execution: API-equivalent cost falls 30.19% on Sonnet 5 and 31.61% on Astra; solution time falls 50.00% and 15.06%; mean scores decrease by 3.68% and 0.74%." width="100%">
+  <img src="./readme-smart-execution.png" alt="Smart Execution: API-equivalent cost falls 30.19% on Sonnet 5 and 31.61% on Astra; solution time falls 50.00% and 15.06%; mean scores decrease by 3.68% and 0.74%." width="100%">
 </picture>
 
 ## Budget C+A
 
 <picture>
-  <source media="(max-width: 600px)" srcset="./programbench-efficient-budget-quality-cost-mobile.svg">
-  <img src="./programbench-efficient-budget-quality-cost.svg" alt="Budget C+A versus Raw Sol XHigh: 66.3% lower weekly-limit usage with average quality preserved." width="100%">
+  <img src="./programbench-efficient-budget-quality-cost.png" alt="Budget C+A versus Raw Sol XHigh: 66.3% lower weekly-limit usage with average quality preserved." width="100%">
 </picture>
 
 ## Sol Ultra C+A
 
 <picture>
-  <source media="(max-width: 600px)" srcset="./programbench-ca-performance-mobile.svg">
-  <img src="./programbench-ca-performance.svg" alt="Sol Ultra C+A: 26.41% higher relative mean score; per-task scores and solution times." width="100%">
+  <img src="./programbench-ca-performance.png" alt="Sol Ultra C+A: 26.41% higher relative mean score; per-task scores and solution times." width="100%">
 </picture>
 
 ## Runtime-only
 
 <picture>
-  <source media="(max-width: 600px)" srcset="./runtime-only-custom-task-results-mobile.svg">
-  <img src="./runtime-only-custom-task-results.svg" alt="Runtime-only improves all three task-specific scores: Marl, Slab, and Pinch." width="100%">
+  <img src="./runtime-only-custom-task-results.png" alt="Runtime-only improves all three task-specific scores: Marl, Slab, and Pinch." width="100%">
 </picture>
 
 <details>
 <summary>Sources, design references, and regeneration</summary>
 
-Six figures; each has a wide layout and a narrow-screen layout. The README
-selects the narrow layout below 600 px. Each SVG has its own light/dark palette,
-text alternatives, and no scripts, external fonts, or external images.
+The README uses six supplied PNG redesigns, unchanged, on all screen sizes.
+Their mapping is: eee1 → model comparison, eee2 → Smart Execution, eee3 →
+Efficient Budget, eee4 → Sol Ultra C+A, eee5 → Runtime-only, eee6 → distiller.
 
-Regenerate with Python 3, without installing dependencies:
+The original SVG figures and their generator are retained as source references.
+The regeneration command below rebuilds those SVGs, not the supplied PNGs:
 
 ```sh
 python3 scripts/plot_readme_graphs.py

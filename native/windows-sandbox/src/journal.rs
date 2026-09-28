@@ -13,7 +13,8 @@ use std::io::{Read, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
+    GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_SHARING_VIOLATION,
 };
 use windows_sys::Win32::Security::{
     AddAccessAllowedAce, GetLengthSid, GetTokenInformation, InitializeAcl,
@@ -32,6 +33,29 @@ use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath}
 
 const JOURNAL_VERSION: u32 = 5;
 const MAX_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
+
+const JOURNAL_REPLACE_ATTEMPTS: usize = 21;
+
+fn retry_journal_replace(
+    mut replace: impl FnMut() -> std::result::Result<(), u32>,
+) -> std::result::Result<(), u32> {
+    for attempt in 1..=JOURNAL_REPLACE_ATTEMPTS {
+        match replace() {
+            Ok(()) => return Ok(()),
+            Err(code)
+                if matches!(code, ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
+                    && attempt < JOURNAL_REPLACE_ATTEMPTS =>
+            {
+                // A reader or filesystem filter may briefly deny replacement.
+                // Retry only the same atomic rename, never ACLs or a delete-first
+                // fallback. Persistent denials still fail closed after 20 waits.
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(code) => return Err(code),
+        }
+    }
+    unreachable!("the final replacement attempt always returns")
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -214,18 +238,29 @@ impl Journal {
         file.write_all(&bytes)?;
         file.sync_all()?;
         drop(file);
-        let replaced = unsafe {
-            MoveFileExW(
-                wide(&temporary).as_ptr(),
-                wide(&self.path).as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
-        if replaced == 0 {
+        let source = wide(&temporary);
+        let destination = wide(&self.path);
+        let replaced = retry_journal_replace(|| {
+            if unsafe {
+                MoveFileExW(
+                    source.as_ptr(),
+                    destination.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            } != 0
+            {
+                Ok(())
+            } else {
+                Err(unsafe { GetLastError() })
+            }
+        });
+        if let Err(code) = replaced {
             // Cleanup can overwrite the thread's last-error value. Capture the
             // failed replacement before doing any further filesystem work.
-            let error =
-                crate::winutil::last_error(&format!("MoveFileExW({})", self.path.display()));
+            let error = anyhow!(
+                "MoveFileExW({}) failed with Win32 error {code}",
+                self.path.display()
+            );
             let _ = fs::remove_file(&temporary);
             return Err(error);
         }
@@ -847,6 +882,78 @@ mod tests {
         )
         .unwrap();
         (base, journal)
+    }
+
+    #[test]
+    fn journal_replace_retries_only_transient_access_conflicts() {
+        let mut calls = 0;
+        let result = retry_journal_replace(|| {
+            calls += 1;
+            match calls {
+                1 => Err(ERROR_ACCESS_DENIED),
+                2 => Err(ERROR_SHARING_VIOLATION),
+                _ => Ok(()),
+            }
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls, 3);
+
+        let mut calls = 0;
+        let result = retry_journal_replace(|| {
+            calls += 1;
+            Err(ERROR_FILE_NOT_FOUND)
+        });
+        assert_eq!(result, Err(ERROR_FILE_NOT_FOUND));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn journal_replace_persistent_denial_is_bounded_and_preserves_the_error() {
+        for code in [ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION] {
+            let mut calls = 0;
+            let result = retry_journal_replace(|| {
+                calls += 1;
+                Err(code)
+            });
+            assert_eq!(result, Err(code));
+            assert_eq!(calls, JOURNAL_REPLACE_ATTEMPTS);
+        }
+    }
+
+    #[test]
+    fn journal_replace_recovers_after_a_real_reader_releases_the_destination() {
+        let (base, mut journal) = liveness_fixture();
+        let before = fs::read(&journal.path).unwrap();
+        journal.data.broker_required = true;
+        let after = serde_json::to_vec(&journal.data).unwrap();
+        let temporary = journal.path.with_extension("json.probe");
+        fs::write(&temporary, &after).unwrap();
+        let mut held = Some(open_regular_file_read(&journal.path).unwrap());
+        let source = wide(&temporary);
+        let destination = wide(&journal.path);
+        let mut calls = 0;
+        retry_journal_replace(|| {
+            calls += 1;
+            let replaced = unsafe {
+                MoveFileExW(
+                    source.as_ptr(),
+                    destination.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            if replaced != 0 {
+                assert!(calls > 1, "the held reader must deny the first rename");
+                return Ok(());
+            }
+            let code = unsafe { GetLastError() };
+            assert_eq!(fs::read(&journal.path).unwrap(), before);
+            drop(held.take());
+            Err(code)
+        })
+        .unwrap();
+        assert_eq!(fs::read(&journal.path).unwrap(), after);
+        assert!(!temporary.exists());
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

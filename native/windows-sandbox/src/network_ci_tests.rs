@@ -580,6 +580,52 @@ struct EchoPeers {
     stop: Arc<AtomicBool>,
     threads: Vec<std::thread::JoinHandle<()>>,
 }
+
+fn echo_tcp_nonce(mut stream: TcpStream) -> std::io::Result<()> {
+    // Winsock accept inherits the listener's nonblocking mode. Reading before
+    // the client sends its nonce would otherwise close a healthy connection.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let mut nonce = [0_u8; 32];
+    stream.read_exact(&mut nonce)?;
+    stream.write_all(&nonce)
+}
+
+#[test]
+fn echo_peer_waits_for_a_delayed_nonce_on_an_accepted_nonblocking_socket() -> Result<()> {
+    for address in ["127.0.0.1:0", "[::1]:0"] {
+        let listener = TcpListener::bind(address)?;
+        listener.set_nonblocking(true)?;
+        let mut client = TcpStream::connect(listener.local_addr()?)?;
+        client.set_read_timeout(Some(Duration::from_secs(3)))?;
+        client.set_write_timeout(Some(Duration::from_secs(3)))?;
+        let (server, _) = listener.accept()?;
+        // Explicitly reproduce the Winsock inheritance contract, even if this
+        // fixture is later reused on a platform whose accept resets the mode.
+        server.set_nonblocking(true)?;
+        let (started, waiting) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            echo_tcp_nonce(server)
+        });
+        waiting.recv_timeout(Duration::from_secs(3))?;
+        std::thread::sleep(Duration::from_millis(50));
+        let nonce = [42_u8; 32];
+        let exchange = (|| -> std::io::Result<()> {
+            client.write_all(&nonce)?;
+            let mut reply = [0_u8; 32];
+            client.read_exact(&mut reply)?;
+            assert_eq!(reply, nonce);
+            Ok(())
+        })();
+        let served = worker.join().map_err(|_| anyhow!("echo worker panicked"))?;
+        exchange?;
+        served?;
+    }
+    Ok(())
+}
+
 impl EchoPeers {
     fn start() -> Result<Self> {
         let mut peers = Self {
@@ -597,11 +643,9 @@ impl EchoPeers {
             let stop = peers.stop.clone();
             peers.threads.push(std::thread::spawn(move || {
                 while !stop.load(Ordering::Acquire) {
-                    if let Ok((mut stream, _)) = tcp.accept() {
-                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                        let mut nonce = [0_u8; 32];
-                        if stream.read_exact(&mut nonce).is_ok() {
-                            let _ = stream.write_all(&nonce);
+                    if let Ok((stream, _)) = tcp.accept() {
+                        if let Err(error) = echo_tcp_nonce(stream) {
+                            eprintln!("CI TCP echo peer: {error}");
                         }
                     } else {
                         std::thread::sleep(Duration::from_millis(10));

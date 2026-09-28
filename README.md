@@ -156,8 +156,7 @@ Three ProgramBench tasks (Solar, Samtools, and Rumdl), four models, each run
 raw and through Bello: 24 runs in total. Sol ran at `xhigh` here.
 
 <picture>
-  <source media="(max-width: 600px)" srcset="./docs/assets/readme-model-comparison-mobile.svg">
-  <img src="./docs/assets/readme-model-comparison.svg" alt="Mean ProgramBench score per model: Luna raw 32.75%, Bello 46.32%; Terra 31.75%, 41.24%; Sol 48.98%, 55.44%; Astra 59.70%, 65.68%" width="100%">
+  <img src="./docs/assets/readme-model-comparison.png" alt="Mean ProgramBench score per model: Luna raw 32.75%, Bello 46.32%; Terra 31.75%, 41.24%; Sol 48.98%, 55.44%; Astra 59.70%, 65.68%" width="100%">
 </picture>
 
 Bello scored higher with every model. The gap is 13.6 points on Luna, 9.5 on
@@ -176,8 +175,7 @@ We compared RAW with Smart Execution on Sonnet 5 and Astra, with three runs per
 model and setup, twelve in total. The table shows means; times cover the solver.
 
 <picture>
-  <source media="(max-width: 600px)" srcset="./docs/assets/readme-smart-execution-mobile.svg">
-  <img src="./docs/assets/readme-smart-execution.svg" alt="Smart Execution versus RAW: API-equivalent cost falls 30.19% on Sonnet 5 and 31.61% on Astra; solution time falls 50.00% and 15.06%. Mean scores change from 43.98% to 42.37% and from 58.88% to 58.44%. Three runs per model and setup." width="100%">
+  <img src="./docs/assets/readme-smart-execution.png" alt="Smart Execution versus RAW: API-equivalent cost falls 30.19% on Sonnet 5 and 31.61% on Astra; solution time falls 50.00% and 15.06%. Mean scores change from 43.98% to 42.37% and from 58.88% to 58.44%. Three runs per model and setup." width="100%">
 </picture>
 
 | Model | API-equivalent cost, RAW → SE | Solution time, RAW → SE | Score, RAW → SE |
@@ -212,8 +210,7 @@ against 28:27.
 *Scores and times are means over three runs; weekly limit is the sum.*
 
 <picture>
-  <source media="(max-width: 600px)" srcset="./docs/assets/programbench-efficient-budget-quality-cost-mobile.svg">
-  <img src="./docs/assets/programbench-efficient-budget-quality-cost.svg" alt="Efficient Budget quality and weekly limit use compared with Raw GPT-5.6 Sol XHigh" width="100%">
+  <img src="./docs/assets/programbench-efficient-budget-quality-cost.png" alt="Efficient Budget quality and weekly limit use compared with Raw GPT-5.6 Sol XHigh" width="100%">
 </picture>
 
 [Solutions and checksums.](https://drive.google.com/drive/folders/1W1Lm0U7gcb5rTa3DyXQH_6n6XbFXwB9c?usp=share_link)
@@ -234,8 +231,7 @@ tasks rose from 2:48:55 to 7:08:06.
 | Mean / total time | 53.53% | 67.67% | +26.41% | 02:48:55 | 07:08:06 |
 
 <picture>
-  <source media="(max-width: 600px)" srcset="./docs/assets/programbench-ca-performance-mobile.svg">
-  <img src="./docs/assets/programbench-ca-performance.svg" alt="C+A completion and runtime compared with Raw Codex" width="100%">
+  <img src="./docs/assets/programbench-ca-performance.png" alt="C+A completion and runtime compared with Raw Codex" width="100%">
 </picture>
 
 [Run-level scores and times.](./programbench_ca_run_info.csv)
@@ -256,8 +252,7 @@ average gain was about 2%.
 | Pinch | 89.25% | 98.00% | +9.80% | 00:40:09 | 00:43:34 |
 
 <picture>
-  <source media="(max-width: 600px)" srcset="./docs/assets/runtime-only-custom-task-results-mobile.svg">
-  <img src="./docs/assets/runtime-only-custom-task-results.svg" alt="Runtime-only results on large tasks with contradictory specifications" width="100%">
+  <img src="./docs/assets/runtime-only-custom-task-results.png" alt="Runtime-only results on large tasks with contradictory specifications" width="100%">
 </picture>
 
 [Task briefs, tests, and evaluator outputs.](https://drive.google.com/drive/folders/1eLut349Wu_uxw59H6u87cuWNRqYb3x7x)
@@ -279,8 +274,7 @@ without distillation, on a weaker model (GPT-5.6 Luna) and on a frontier model
 coders alike.
 
 <picture>
-  <source media="(max-width: 600px)" srcset="./docs/assets/readme-distiller-mobile.svg">
-  <img src="./docs/assets/readme-distiller.svg" alt="API-equivalent cost versus quality: each model's Raw cost is normalized to 100. Astra XHigh changes from cost 100 and score 62.22% to cost 77.98 and score 60.57%. Luna Max changes from cost 100 and score 56.75% to cost 85.22 and score 55.45%, including runtime." width="100%">
+  <img src="./docs/assets/readme-distiller.png" alt="API-equivalent cost versus quality: each model's Raw cost is normalized to 100. Astra XHigh changes from cost 100 and score 62.22% to cost 77.98 and score 60.57%. Luna Max changes from cost 100 and score 56.75% to cost 85.22 and score 55.45%, including runtime." width="100%">
 </picture>
 
 | Coder | Runs per arm | API-equivalent cost | Score, off to on | Mean solution time, off to on |
