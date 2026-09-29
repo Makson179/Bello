@@ -1,6 +1,6 @@
 {
   "name": "@bello/pi-worker",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "private": true,
   "description": "Pinned Pi SDK execution worker for Bello",
   "type": "module",

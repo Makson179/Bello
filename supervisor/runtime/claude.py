@@ -857,7 +857,7 @@ class ClaudeBackend:
             ),
             "env": {
                 "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
-                "CLAUDE_AGENT_SDK_CLIENT_APP": "bello/0.7.0",
+                "CLAUDE_AGENT_SDK_CLIENT_APP": "bello/0.7.1",
             },
             "extra_args": {"disable-slash-commands": None, "no-chrome": None},
             "effort": params.get("effort"),
@@ -897,7 +897,7 @@ class ClaudeBackend:
             ),
             env={
                 "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
-                "CLAUDE_AGENT_SDK_CLIENT_APP": "bello/0.7.0",
+                "CLAUDE_AGENT_SDK_CLIENT_APP": "bello/0.7.1",
             },
             extra_args={"disable-slash-commands": None, "no-chrome": None},
         )
@@ -1015,7 +1015,7 @@ class ClaudeBackend:
         server_ref: dict[str, Any] = {}
         config = create_sdk_mcp_server(
             _MCP_SERVER,
-            version="0.7.0",
+            version="0.7.1",
             tools=self._sdk_tools(record, server_ref),
         )
         server = config["instance"]

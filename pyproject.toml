@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "Bello"
-version = "0.7.0"
+version = "0.7.1"
 description = "Multi-provider supervisor for autonomous coding agents"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -44,14 +44,17 @@ log-distiller = [
   "huggingface-hub>=0.28,<1",
 ]
 claude = [
-  "claude-agent-sdk==0.2.159",
+  "claude-agent-sdk==0.2.161; sys_platform != 'win32'",
+  # 0.2.161 has no Windows wheel with the required bundled Claude CLI.
+  "claude-agent-sdk==0.2.159; sys_platform == 'win32'",
 ]
 test = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
   "setuptools>=77",
   "wheel>=0.45,<1",
-  "claude-agent-sdk==0.2.159",
+  "claude-agent-sdk==0.2.161; sys_platform != 'win32'",
+  "claude-agent-sdk==0.2.159; sys_platform == 'win32'",
 ]
 
 [project.scripts]

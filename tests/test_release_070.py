@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_release_versions_are_consistent():
     version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
-    assert version == "0.7.0"
+    assert version == "0.7.1"
     for name in ("plugins/bello/.codex-plugin/plugin.json",
                  "plugins/bello/.claude-plugin/plugin.json",
                  "supervisor/pi_worker/package.json",
@@ -49,7 +49,7 @@ def test_manual_release_publication_guards(case, monkeypatch, tmp_path):
     monkeypatch.chdir(ROOT)
     output = tmp_path / "outputs"
     for key, value in {
-        "RELEASE_TAG": "v0.7.0" if case != "wrong_tag" else "v0.6.0",
+        "RELEASE_TAG": "v0.7.1" if case != "wrong_tag" else "v0.6.0",
         "GITHUB_EVENT_NAME": "release" if case == "automatic" else "workflow_dispatch",
         "GITHUB_REF": "refs/heads/other" if case == "wrong_branch" else "refs/heads/main",
         "GITHUB_REPOSITORY": "Makson179/Bello",
