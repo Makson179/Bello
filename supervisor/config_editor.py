@@ -16,6 +16,21 @@ from typing import Any, Literal, cast
 from wcwidth import wcwidth
 
 from supervisor.runtime.client import RuntimeClient
+from supervisor.config_validation import (
+    CLAUDE_CODE_EFFORTS,
+    FAST_HELP,
+    CatalogModel,
+    ConfigReport,
+    ModelCatalog,
+    catalog_from_model_list,
+    choose_effort,
+    fast_support,
+    model_detail,
+    model_label,
+    project_profiles,
+    validate_project_config,
+)
+from supervisor.runtime.models import NO_EFFORT, ModelSelectionError, parse_model_selection
 from supervisor.project_config import (
     GPT_5_6_MODELS,
     MODEL_GPT_5_5,
@@ -44,11 +59,44 @@ FormattedRender = list[StyledFragment]
 
 # Refreshed from the authenticated engines when opening the editor. This only
 # describes selectable values; execution still validates the exact profile.
+# An empty tuple means the model advertises no effort (known-empty), which is
+# different from a model missing from this map (unknown).
 _model_effort_catalog: dict[str, tuple[str, ...]] = {}
+# Raw result of the latest discovery; consumed by available_model_choices().
+_discovery: dict[str, Any] = {}
+
+
+class ModelChoices(tuple):
+    """Discovered model ids, plus the sanitized catalog they came from.
+
+    It behaves as the plain tuple of ids other code expects; `catalog` adds
+    names, alias resolution, capabilities and engine failures for display and
+    offline validation. Plain tuples (previews and tests) carry no catalog.
+    """
+
+    catalog: ModelCatalog | None
+
+    def __new__(cls, models: Any = (), catalog: ModelCatalog | None = None) -> "ModelChoices":
+        instance = super().__new__(cls, models)
+        instance.catalog = catalog
+        return instance
 
 
 def intelligence_choices_for_model(model: str) -> tuple[str, ...]:
-    return _model_effort_catalog.get(model, _fallback_intelligence_choices(model))
+    advertised = _model_effort_catalog.get(model)
+    if advertised is not None:
+        # A model with no advertised effort is used without sending one.
+        return advertised or (NO_EFFORT,)
+    try:
+        engine = parse_model_selection(model).engine if "/" in model else None
+    except ModelSelectionError:
+        engine = None
+    if engine == "claude-code":
+        # Unknown catalog: offer the Claude Code engine's own effort contract
+        # rather than Bello's generic list, which it would reject.
+        return CLAUDE_CODE_EFFORTS
+    # Unknown is not "advertises none": do not offer the no-effort choice here.
+    return tuple(value for value in _fallback_intelligence_choices(model) if value != NO_EFFORT)
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 ELLIPSIS = "..."
@@ -181,6 +229,10 @@ class EditorParameter:
     options: tuple[EditorOption, ...]
     edit_kind: InlineEditKind | None = None
     help_text: str = ""
+    # Result of the offline checks shared with run preflight, shown at the row.
+    issue: str | None = None
+    issue_title: str | None = None
+    issue_level: Literal["error", "warning"] | None = None
 
 
 @dataclass(frozen=True)
@@ -192,6 +244,9 @@ class EditorState:
     edit_kind: InlineEditKind | None = None
     edit_value: str = ""
     edit_error: str | None = None
+    # One-shot message for a change Bello made visibly (for example an effort
+    # adjusted after a model change); cleared by the next navigation.
+    notice: str | None = None
 
 
 @dataclass(frozen=True)
@@ -447,6 +502,69 @@ class WidthUtils:
 
 def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None = None) -> tuple[EditorParameter, ...]:
     models = _model_choices_for_config(config, model_choices)
+    catalog = _editor_catalog(model_choices, models)
+    parameters = _parameter_defs(config, models, catalog)
+    return _annotate_issues(config, parameters, validate_project_config(config, catalog))
+
+
+def editor_report(config: ProjectConfig, model_choices: tuple[str, ...] | None = None) -> ConfigReport:
+    """The same offline checks the rows show, for the STATUS panel."""
+    models = _model_choices_for_config(config, model_choices)
+    return validate_project_config(config, _editor_catalog(model_choices, models))
+
+
+def _editor_catalog(model_choices: tuple[str, ...] | None, models: tuple[str, ...]) -> ModelCatalog:
+    discovered = getattr(model_choices, "catalog", None)
+    if discovered is not None:
+        return discovered
+    if model_choices is None:
+        # An offline preview has no discovery, so nothing is verified.
+        return ModelCatalog(discovered=False)
+    entries: dict[str, CatalogModel] = {}
+    for model in models:
+        try:
+            selection = parse_model_selection(model)
+        except ModelSelectionError:
+            continue
+        entries.setdefault(selection.qualified, CatalogModel(
+            selection.qualified, selection.engine, _model_effort_catalog.get(model)))
+    return ModelCatalog(models=entries, discovered=True)
+
+
+def _annotate_issues(
+    config: ProjectConfig, parameters: tuple[EditorParameter, ...], report: ConfigReport,
+) -> tuple[EditorParameter, ...]:
+    if not report.issues:
+        return parameters
+    annotated = []
+    present = {parameter.key for parameter in parameters}
+    for parameter in parameters:
+        keys = [parameter.key]
+        parts = _multi_agent_editor_field_parts(parameter.key)
+        if parts is not None and parts[1] in {"default_model", "default_intelligence"}:
+            # The default subagent is one of the allowed profiles.
+            keys.append(f"{parts[0]}_allowed:{getattr(config, parts[0]).default.model}")
+        if parts is not None and parts[1] == "unavailable_profiles":
+            # Unavailable allowed models have no row of their own.
+            keys.extend(key for key in (f"{parts[0]}_allowed:{model}" for model in getattr(config, parts[0]).allowed)
+                        if key not in present)
+        issues = [issue for key in keys for issue in report.for_setting(key)]
+        issues.sort(key=lambda issue: issue.level != "error")
+        if not issues:
+            annotated.append(parameter)
+            continue
+        annotated.append(replace(
+            parameter,
+            issue=" ".join(dict.fromkeys(issue.message for issue in issues)),
+            issue_title=issues[0].title,
+            issue_level=issues[0].level,
+        ))
+    return tuple(annotated)
+
+
+def _parameter_defs(
+    config: ProjectConfig, models: tuple[str, ...], catalog: ModelCatalog,
+) -> tuple[EditorParameter, ...]:
     coder_parameters = _role_parameters(
         "coder",
         "coder_mod",
@@ -454,6 +572,7 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
         config.coder_mod,
         config.coder_intelligence,
         models,
+        catalog,
     )
     revision_coder_toggle = EditorParameter(
         "revision_coder_enabled",
@@ -476,6 +595,7 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
             config.revision_coder_mod,
             config.revision_coder_intelligence,
             models,
+            catalog,
         )
         if config.revision_coder_enabled
         else ()
@@ -486,6 +606,7 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
         config_field="multi_agent",
         owner="coder",
         label_prefix="",
+        catalog=catalog,
     )
     runtime_parameters = _role_parameters(
         "runtime",
@@ -494,6 +615,7 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
         config.runtime_mod,
         config.runtime_intelligence,
         models,
+        catalog,
     ) if config.runtime_enabled else ()
     completion_parameters = (
         _role_parameters(
@@ -503,6 +625,7 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
             config.completion_mod,
             config.completion_intelligence,
             models,
+            catalog,
         )
         if config.completion_review
         else ()
@@ -514,6 +637,7 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
             config_field="completion_multi_agent",
             owner="completion reviewer",
             label_prefix="completion-",
+            catalog=catalog,
         )
         if config.completion_review
         else ()
@@ -528,6 +652,7 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
             config.adversary_mod,
             config.adversary_intelligence,
             models,
+            catalog,
         )
         if adversary_active
         else ()
@@ -539,6 +664,7 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
             config_field="adversary_multi_agent",
             owner="adversarial tester",
             label_prefix="adversary-",
+            catalog=catalog,
         )
         if adversary_active
         else ()
@@ -659,11 +785,9 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
             "speed",
             "speed",
             config.speed,
-            tuple(EditorOption(value, "speed", value) for value in SPEED_CHOICES),
-            help_text=(
-                "fast uses the priority service tier for coder, revision-coder, runtime, and completion-review turns. "
-                "usual leaves the service tier unset."
-            ),
+            tuple(EditorOption(_speed_option_label(value, config, catalog), "speed", value)
+                  for value in SPEED_CHOICES),
+            help_text=FAST_HELP,
         ),
         *((EditorParameter(
             "cheap_runtime",
@@ -674,8 +798,10 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
                 EditorOption("false", "cheap_runtime", False),
             ),
             help_text=(
-                "true lets cheap triage (Luna by default) dismiss routine runtime checks. Human messages, "
-                "approvals, and mandatory checks bypass it. false uses the full runtime supervisor for every check."
+                "true lets cheap triage (gpt-5.6-luna through your Codex login by default; "
+                "BELLO_RUNTIME_TRIAGE_MODEL overrides it) dismiss routine runtime checks. Human messages, "
+                "approvals, and mandatory checks bypass it. If that route is unavailable, the run uses the full "
+                "runtime supervisor for every check. false always uses the full runtime supervisor."
             ),
         ),) if config.runtime_enabled else ()),
         EditorParameter(
@@ -740,6 +866,19 @@ def parameter_defs(config: ProjectConfig, model_choices: tuple[str, ...] | None 
     )
 
 
+def _speed_option_label(value: str, config: ProjectConfig, catalog: ModelCatalog) -> str:
+    if value != "fast":
+        return value
+    blocked = list(dict.fromkeys(
+        use.model for use in project_profiles(config)
+        if fast_support(use.model, catalog.get(use.model)) == "unsupported"
+    ))
+    if not blocked:
+        return value
+    more = f" +{len(blocked) - 1}" if len(blocked) > 1 else ""
+    return f"fast - not offered by {blocked[0]}{more}"
+
+
 def _multi_agent_parameters(
     config: ProjectConfig,
     models: tuple[str, ...],
@@ -747,6 +886,7 @@ def _multi_agent_parameters(
     config_field: str,
     owner: str,
     label_prefix: str,
+    catalog: ModelCatalog | None = None,
 ) -> tuple[EditorParameter, ...]:
     settings = getattr(config, config_field)
     field_prefix = config_field
@@ -790,6 +930,7 @@ def _multi_agent_parameters(
         f"{field_prefix}_default_model",
         settings.default.model,
         allowed_models,
+        catalog,
     )
     default_intelligence = EditorParameter(
         f"{field_prefix}_default_intelligence",
@@ -800,7 +941,8 @@ def _multi_agent_parameters(
             for value in settings.allowed[settings.default.model]
         ),
         help_text=(
-            f"Reasoning effort used when the {owner} does not explicitly choose another allowed subagent profile."
+            f"Reasoning effort used when the {owner} does not explicitly choose another allowed subagent profile. "
+            "A model change keeps a still-allowed effort, otherwise the nearest allowed lower level."
         ),
     )
     allowed_parameters = tuple(
@@ -818,8 +960,8 @@ def _multi_agent_parameters(
             ),
             help_text=(
                 f"Toggle reasoning efforts the {owner} may use with {model}. The active default and the final "
-                "remaining profile cannot be removed."
-            ),
+                "remaining profile cannot be removed. " + model_detail(model, catalog)
+            ).strip(),
         )
         for model in models
     )
@@ -847,21 +989,30 @@ def _role_parameters(
     selected_model: str,
     selected_intelligence: str,
     available_models: tuple[str, ...],
+    catalog: ModelCatalog | None = None,
 ) -> tuple[EditorParameter, ...]:
+    choices = intelligence_choices_for_model(selected_model)
+    if choices == (NO_EFFORT,):
+        effort_help = (
+            f"{selected_model} advertises no reasoning effort, so '{NO_EFFORT}' sends none to the "
+            f"{ROLE_PURPOSES[role]}."
+        )
+    else:
+        effort_help = (
+            f"Reasoning effort (intelligence) sent to the {ROLE_PURPOSES[role]}. Choices are the levels the "
+            "connected engine advertises for this exact model; higher levels allow more reasoning per turn. "
+            "Changing the model keeps a supported effort, otherwise the nearest lower supported level."
+        )
+        if selected_model not in available_models:
+            effort_help += " The model is unavailable, so its levels cannot be verified yet."
     return (
-        *_model_parameters(role, model_field, selected_model, available_models),
+        *_model_parameters(role, model_field, selected_model, available_models, catalog),
         EditorParameter(
             intelligence_field,
             f"{role}-intelligence",
             selected_intelligence,
-            tuple(
-                EditorOption(value, intelligence_field, value)
-                for value in intelligence_choices_for_model(selected_model)
-            ),
-            help_text=(
-                f"Reasoning effort sent to the {ROLE_PURPOSES[role]}. "
-                "Higher levels allow more reasoning per turn."
-            ),
+            tuple(EditorOption(value, intelligence_field, value) for value in choices),
+            help_text=effort_help,
         ),
     )
 
@@ -871,6 +1022,7 @@ def _model_parameters(
     field: str,
     selected_model: str,
     available_models: tuple[str, ...],
+    catalog: ModelCatalog | None = None,
 ) -> tuple[EditorParameter, ...]:
     available = set(available_models)
     available_56 = [model for model in GPT_5_6_MODELS if model in available]
@@ -883,20 +1035,31 @@ def _model_parameters(
     if MODEL_GPT_5_5 in available:
         family_options.append(EditorOption(MODEL_FAMILY_5_5_LABEL, field, MODEL_GPT_5_5))
     for model in sorted(available - set(SUPPORTED_MODEL_CHOICES)):
-        family_options.append(EditorOption(model, field, model))
+        family_options.append(EditorOption(model_label(model, catalog), field, model))
 
+    if selected_model in available:
+        value = (_model_family_label(selected_model) if selected_model in SUPPORTED_MODEL_CHOICES
+                 else model_label(selected_model, catalog))
+    else:
+        value = _model_family_label(selected_model) + " (unavailable)"
+    help_text = (
+        f"Models from connected providers for the {ROLE_PURPOSES[role]}. "
+        "Saved selections are not changed automatically."
+    )
+    detail = model_detail(selected_model, catalog) if selected_model in available else ""
+    if detail:
+        help_text += " " + detail
+    if catalog is not None and catalog.failures:
+        help_text += " Not connected: " + " ".join(failure.text() for failure in catalog.failures.values())
+    elif not available:
+        help_text += " Connect a provider with bello runtime login <provider>, then reopen this editor."
     parameters = [
         EditorParameter(
             field,
             f"{role}-mod",
-            _model_family_label(selected_model) + (" (unavailable)" if selected_model not in available else ""),
+            value,
             tuple(family_options),
-            help_text=(
-                f"Models from connected providers for the {ROLE_PURPOSES[role]}. "
-                "Saved selections are not changed automatically."
-                + (" Connect a provider with bello runtime login <provider>, then reopen this editor."
-                   if not available else "")
-            ),
+            help_text=help_text,
         )
     ]
     if selected_model in GPT_5_6_MODELS and available_56:
@@ -979,8 +1142,11 @@ def select_current(
     if _is_multi_agent_allowed_field(option.field):
         updated = _toggle_multi_agent_allowed(config, option.field, str(option.value))
         return updated, _keep_parameter_expanded(state, parameter.key, updated, model_choices), None
-    updated = _replace_config_field(config, option.field, option.value)
-    return updated, _advance_after_parameter_change(state, parameters, updated, model_choices), None
+    catalog = getattr(model_choices, "catalog", None)
+    updated = _replace_config_field(config, option.field, option.value, catalog=catalog)
+    next_state = _advance_after_parameter_change(state, parameters, updated, model_choices)
+    notice = _effort_change_notice(config, updated)
+    return updated, replace(next_state, notice=notice) if notice else next_state, None
 
 
 def advance_after_selection(state: EditorState, parameter_count: int) -> EditorState:
@@ -1131,7 +1297,36 @@ def _commit_inline_edit(
     return config, cancel_inline_edit(state)
 
 
-def _replace_config_field(config: ProjectConfig, field: str, value: Any) -> ProjectConfig:
+_EFFORT_FIELDS = {
+    "coder_intelligence": ("coder", "coder_mod"),
+    "revision_coder_intelligence": ("revision-coder", "revision_coder_mod"),
+    "runtime_intelligence": ("runtime", "runtime_mod"),
+    "completion_intelligence": ("completion", "completion_mod"),
+    "adversary_intelligence": ("adversary", "adversary_mod"),
+}
+
+
+def _effort_change_notice(before: ProjectConfig, after: ProjectConfig) -> str | None:
+    """Describe any effort Bello had to change because the new model lacks it."""
+    changes = []
+    for effort_field, (role, model_field) in _EFFORT_FIELDS.items():
+        old, new = getattr(before, effort_field), getattr(after, effort_field)
+        model = getattr(after, model_field)
+        if old != new and getattr(before, model_field) != model:
+            changes.append(f"{role} effort {old} -> {new} ({old} is not offered by {model})")
+    for field_name in MULTI_AGENT_CONFIG_FIELDS:
+        old_default, new_default = getattr(before, field_name).default, getattr(after, field_name).default
+        if old_default.model != new_default.model and old_default.intelligence != new_default.intelligence:
+            changes.append(
+                f"{field_name.replace('_', '-')} default effort {old_default.intelligence} -> "
+                f"{new_default.intelligence} ({old_default.intelligence} is not allowed for {new_default.model})"
+            )
+    return "Saved; " + "; ".join(changes) if changes else None
+
+
+def _replace_config_field(
+    config: ProjectConfig, field: str, value: Any, *, catalog: ModelCatalog | None = None,
+) -> ProjectConfig:
     if field == "log_distiller_enabled":
         return replace(config, log_distiller=replace(config.log_distiller, enabled=bool(value)))
     if field == "distiller_model_path":
@@ -1149,10 +1344,9 @@ def _replace_config_field(config: ProjectConfig, field: str, value: Any) -> Proj
         return replace(config, **{config_field: replace(settings, max_concurrent=int(value))})
     if setting_field == "default_model":
         model = str(value)
-        allowed_efforts = settings.allowed[model]
-        intelligence = settings.default.intelligence
-        if intelligence not in allowed_efforts:
-            intelligence = "high" if "high" in allowed_efforts else allowed_efforts[0]
+        # The same rule as a role's model change, within this policy's allowed efforts.
+        intelligence = choose_effort(settings.default.intelligence, tuple(settings.allowed[model]),
+                                     advertised_default=_advertised_default(model, catalog))
         default = SubagentDefaultConfig(model=model, intelligence=intelligence)
         return replace(config, **{config_field: replace(settings, default=default)})
     if setting_field == "default_intelligence":
@@ -1181,9 +1375,19 @@ def _replace_config_field(config: ProjectConfig, field: str, value: Any) -> Proj
         current_intelligence = getattr(updated, intelligence_field)
         supported = intelligence_choices_for_model(str(value))
         if current_intelligence not in supported:
-            updated = replace(updated, **{intelligence_field: supported[-1]})
+            # Never jump to the most expensive level: keep the nearest supported
+            # level at or below the previous one (see choose_effort). The editor
+            # reports the change instead of making it silently.
+            chosen = choose_effort(current_intelligence, tuple(v for v in supported if v != NO_EFFORT),
+                                   advertised_default=_advertised_default(str(value), catalog))
+            updated = replace(updated, **{intelligence_field: chosen})
         return updated
     return replace(config, **{field: value})
+
+
+def _advertised_default(model: str, catalog: ModelCatalog | None) -> str | None:
+    entry = catalog.get(model) if catalog is not None else None
+    return entry.default_effort if entry is not None else None
 
 
 def _toggle_multi_agent_allowed(config: ProjectConfig, field: str, effort: str) -> ProjectConfig:
@@ -1201,7 +1405,11 @@ def _toggle_multi_agent_allowed(config: ProjectConfig, field: str, effort: str) 
         updated_efforts = tuple(value for value in current if value != effort)
     else:
         selected = {*current, effort}
-        updated_efforts = tuple(value for value in intelligence_choices_for_model(model) if value in selected)
+        order = intelligence_choices_for_model(model)
+        # Keep saved values the current catalog does not list (they are flagged,
+        # not silently dropped) after the advertised ones.
+        updated_efforts = (*(value for value in order if value in selected),
+                           *(value for value in current if value not in order))
 
     allowed = dict(settings.allowed)
     if updated_efforts:
@@ -1273,14 +1481,17 @@ class PathBar:
 class HelpLine:
     @staticmethod
     def render(layout: LayoutSpec, theme: Theme, state: EditorState) -> FragmentLine:
-        text = (
-            "    Type value. Enter saves. Esc cancels. Backspace edits."
-            if state.editing
-            else "    Arrows move. Enter expands or saves. Esc/q exits."
-        )
+        style_key = "muted"
+        if state.editing:
+            text = "    Type value. Enter saves. Esc cancels. Backspace edits."
+        elif state.notice:
+            text = f"    {state.notice}"
+            style_key = "yellow"
+        else:
+            text = "    Arrows move. Enter expands or saves (each change is saved at once). Esc/q exits."
         return _frame_line(
             _fit_fragments(
-                [(_merge_styles(theme.style("surface"), theme.style("muted")), text)],
+                [(_merge_styles(theme.style("surface"), theme.style(style_key)), text)],
                 layout.content_width,
                 theme,
                 fill_style=theme.style("surface"),
@@ -1530,6 +1741,7 @@ class SidePanel:
         width: int,
         height: int,
         theme: Theme,
+        report: ConfigReport | None = None,
     ) -> list[FragmentLine]:
         if width <= 0 or height <= 0:
             return []
@@ -1538,6 +1750,13 @@ class SidePanel:
         parameter = parameters[parameter_index]
         tip_style = "red" if parameter.key == "clean" else "muted"
         tip_lines = _wrapped_side_tip(parameter.help_text, width, theme, style_key=tip_style)
+        if parameter.issue:
+            # The actionable explanation comes first, at the relevant setting.
+            tip_lines = [
+                *_wrapped_side_tip(parameter.issue, width, theme,
+                                   style_key="red" if parameter.issue_level == "error" else "yellow"),
+                *tip_lines,
+            ]
         navigation: list[FragmentLine] = [
             _side_text("NAVIGATION", theme, style_key="panel_title"),
             _side_text("^ up", theme, style_key="name"),
@@ -1553,13 +1772,9 @@ class SidePanel:
             _side_text("TIPS", theme, style_key="panel_title"),
             *tip_lines,
         ]
-        unavailable = any(parameter.value.endswith(" (unavailable)")
-                          or parameter.key.endswith("_unavailable_profiles") for parameter in parameters)
         status: list[FragmentLine] = [
             _side_text("STATUS", theme, style_key="panel_title"),
-            _side_text("  Check model access" if unavailable else f"{symbols.selected} Ready", theme,
-                       style_key="red" if unavailable else "green"),
-            _side_text("  Saved model unavailable" if unavailable else "  Config valid", theme, style_key="muted"),
+            *_status_lines(parameters, report, width, theme),
         ]
         if height < 12:
             content = tips
@@ -1570,12 +1785,13 @@ class SidePanel:
                 *tips,
             ]
         else:
+            # STATUS precedes TIPS so a long explanation cannot hide it.
             content = [
                 *navigation,
                 _side_divider(width, theme),
-                *tips,
-                _side_divider(width, theme),
                 *status,
+                _side_divider(width, theme),
+                *tips,
             ]
         if height == 1:
             return [_fit_fragments(content[0], width, theme, fill_style=theme.style("panel"))]
@@ -1612,6 +1828,7 @@ def render_editor(
         layout,
         theme,
         animation_frame=animation_frame,
+        report=editor_report(config, model_choices),
     )
     if formatted:
         return _join_fragment_lines(lines)
@@ -1627,6 +1844,7 @@ def _render_editor_lines(
     theme: Theme,
     *,
     animation_frame: int | None,
+    report: ConfigReport | None = None,
 ) -> list[FragmentLine]:
     lines = [
         _horizontal_line(layout, theme, top=True),
@@ -1646,7 +1864,8 @@ def _render_editor_lines(
         animation_frame,
     )
     if layout.side_panel:
-        side_lines = SidePanel.render(config, parameters, state, layout.side_width, layout.list_height, theme)
+        side_lines = SidePanel.render(config, parameters, state, layout.side_width, layout.list_height, theme,
+                                      report)
         body_lines = [
             _frame_line(_combine_body_line(left, right, layout, theme), layout, theme, fill_style=theme.style("surface"))
             for left, right in zip(config_lines, side_lines, strict=True)
@@ -1870,6 +2089,52 @@ def _side_text(text: str, theme: Theme, *, style_key: str) -> FragmentLine:
         (theme.style("panel"), "  "),
         (_merge_styles(theme.style("panel"), theme.style(style_key)), text),
     ]
+
+
+def _status_lines(
+    parameters: tuple[EditorParameter, ...], report: ConfigReport | None, width: int, theme: Theme,
+) -> list[FragmentLine]:
+    """Summarize the offline checks; never claim more than they establish."""
+    selected = theme.symbols.selected
+    errors = list(report.errors) if report is not None else []
+    if report is None:
+        titles = [parameter.issue_title for parameter in parameters
+                  if parameter.issue_level == "error" and parameter.issue_title]
+        if titles:
+            headline, detail = "  Fix before running", titles[0]
+        else:
+            headline, detail = "  Checks not run", "Model access not verified"
+        lines = [(headline, "red" if titles else "yellow"), (f"  {detail}", "muted")]
+    elif errors:
+        availability = next((issue for issue in errors if issue.category == "availability"), None)
+        headline = "  Check model access" if availability else "  Fix before running"
+        detail = (availability or errors[0]).title
+        count = len(errors) + len(report.warnings)
+        lines = [(headline, "red"), (f"  {detail}", "muted"),
+                 (f"  {count} issue{'s' if count != 1 else ''} marked with !", "muted")]
+    elif not report.verified:
+        detail = (f"  Model discovery failed ({report.discovery_error})" if report.discovery_error
+                  else "  Model discovery did not run")
+        lines = [("  Not verified", "yellow"), (detail, "muted")]
+    elif report.warnings:
+        lines = [(f"{selected} Offline checks passed", "green"), (f"  Note: {report.warnings[0].title}", "yellow")]
+    else:
+        lines = [(f"{selected} Ready", "green"), ("  Offline checks passed", "muted")]
+    line_width = max(8, width - 6)
+
+    def wrapped(text: str, style: str, *, limit: int = 3) -> list[FragmentLine]:
+        indent = "  " if text.startswith("  ") else ""
+        parts = textwrap.wrap(text.strip(), width=line_width, break_long_words=True,
+                              break_on_hyphens=False) or [""]
+        if len(parts) > limit:
+            parts = [*parts[: limit - 1], WidthUtils.truncate_right(" ".join(parts[limit - 1:]), line_width)]
+        return [_side_text(f"{indent if index == 0 else '  '}{part}", theme, style_key=style)
+                for index, part in enumerate(parts)]
+
+    rendered = [line for text, style in lines for line in wrapped(text, style)]
+    for failure in (report.failures if report is not None else ())[:3]:
+        rendered.extend(wrapped(f"  {failure.label}: {failure.summary}", "yellow", limit=2))
+    return rendered
 
 
 def _wrapped_side_tip(text: str, width: int, theme: Theme, *, style_key: str) -> list[FragmentLine]:
@@ -2280,7 +2545,15 @@ def _parameter_value_fragments(
                 ]
             )
         return fragments
-    return [(value_style, parameter.value)]
+    fragments = [(value_style, parameter.value)]
+    if parameter.issue_title:
+        # The row names the problem; the focused TIPS panel explains it.
+        fragments.extend([
+            (active_style, "  "),
+            (_merge_styles(active_style, theme.style("red" if parameter.issue_level == "error" else "yellow")),
+             f"! {parameter.issue_title}"),
+        ])
+    return fragments
 
 
 def _option_matches_current(config: ProjectConfig, parameter: EditorParameter, option: EditorOption) -> bool:
@@ -2396,6 +2669,8 @@ def run_config_editor(project_root: Path) -> ProjectConfig:
         previous_config = config
         config, state, _action = select_current(config, state, model_choices)
         _save_config_change(project_root, previous_config, config)
+        if config != previous_config and state.notice is None:
+            state = replace(state, notice="Saved to .supervisor/config.json.")
         event.app.invalidate()
 
     @kb.add("backspace")
@@ -2460,12 +2735,21 @@ def _save_config_change(project_root: Path, previous_config: ProjectConfig, conf
         sync_runtime_config_fields(project_root, config, changed_fields)
 
 
-def available_model_choices(project_root: Path) -> tuple[str, ...]:
+def available_model_choices(project_root: Path) -> ModelChoices:
     _model_effort_catalog.clear()
-    models = _available_models_from_app_server(project_root)
-    # A disk cache or an old saved choice does not establish that its provider
-    # is still connected. Only offer the current execution engines' catalog.
-    return _normalize_model_choices(models)
+    _discovery.clear()
+    try:
+        models = _available_models_from_app_server(project_root)
+        # A disk cache or an old saved choice does not establish that its provider
+        # is still connected. Only offer the current execution engines' catalog.
+        choices = _normalize_model_choices(models)
+        response, error = _discovery.get("response"), _discovery.get("error")
+        # Without a captured response (a substituted discovery function) the
+        # ids are all that is known; they are then treated like a plain tuple.
+        catalog = catalog_from_model_list(response, error=error) if response is not None or error else None
+    finally:
+        _discovery.clear()
+    return ModelChoices(choices, catalog)
 
 
 def _model_choices_for_config(config: ProjectConfig, model_choices: tuple[str, ...] | None) -> tuple[str, ...]:
@@ -2543,11 +2827,14 @@ def _available_models_from_app_server(project_root: Path) -> tuple[str, ...]:
             response = await client.request("model/list", {
                 "engines": ["codex", "pi", "claude-code"], "optionalEngines": True,
             })
+            _discovery["response"] = response if isinstance(response, dict) else {}
             for descriptor in response.get("data", []):
                 if not isinstance(descriptor, dict):
                     continue
                 efforts = descriptor.get("supportedEfforts")
-                if isinstance(efforts, list) and efforts and all(isinstance(item, str) for item in efforts):
+                # An empty list is recorded too: "advertises no effort" is not
+                # the same as a model whose capabilities are unknown.
+                if isinstance(efforts, list) and all(isinstance(item, str) for item in efforts):
                     for model in _extract_model_ids(descriptor):
                         _model_effort_catalog[model] = tuple(dict.fromkeys(efforts))
             return tuple(_extract_model_ids(response))
@@ -2556,7 +2843,9 @@ def _available_models_from_app_server(project_root: Path) -> tuple[str, ...]:
 
     try:
         return asyncio.run(read_models())
-    except Exception:
+    except Exception as exc:
+        # Keep only the error class: the text may carry provider payloads.
+        _discovery["error"] = exc.__class__.__name__
         return ()
 
 

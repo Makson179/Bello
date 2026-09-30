@@ -33,7 +33,7 @@ CATALOG_FIELDS = {
     "name", "displayName", "description", "resolvedModel", "api", "reasoning",
     "inputModalities", "defaultEffort", "supportedEfforts", "supportedServiceTiers",
     "supportsServiceTier", "effortCapabilitySources", "effortRoutes", "available",
-    "configured", "billingRoute", "contextWindow", "maxTokens", "cost", "pricing",
+    "configured", "billingRoute", "contextWindow", "maxTokens", "cost", "pricing", "alias",
 }
 
 
@@ -60,7 +60,7 @@ def summarize_catalog(payload: Any) -> list[dict[str, Any]]:
         tiers = entry.get("supportedServiceTiers")
         if "supportedServiceTiers" in entry and (not isinstance(tiers, list) or any(not isinstance(value, str) for value in tiers)):
             raise ValueError(f"{identity} has an invalid supportedServiceTiers array")
-        for field in ("available", "configured", "supportsServiceTier"):
+        for field in ("available", "configured", "supportsServiceTier", "alias"):
             if field in entry and not isinstance(entry[field], bool):
                 raise ValueError(f"{identity} has an invalid {field} flag")
         if identity in result and result[identity] != entry:

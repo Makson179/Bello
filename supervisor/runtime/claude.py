@@ -7,9 +7,12 @@ scope, cancellation and at-most-once dispatch.
 
 Authentication is deliberately narrower than the Agent SDK supports.  This
 backend accepts only an existing first-party ``claude.ai`` subscription login
-from the unmodified CLI bundled with ``claude-agent-sdk``.  It never reads,
-copies, refreshes or persists credentials, and it refuses API-key and hosted
-cloud-provider routes instead of silently changing the caller's environment.
+from the unmodified official CLI: the one bundled with ``claude-agent-sdk`` or,
+where the pinned SDK release has no wheel with a bundled CLI, the identical
+official build Bello downloads and verifies (see ``claude_cli``).  It never
+reads, copies, refreshes or persists credentials, and it refuses API-key and
+hosted cloud-provider routes instead of silently changing the caller's
+environment.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ from jsonschema.exceptions import SchemaError, ValidationError
 from supervisor.appserver import AppServerError, AppServerTimeoutError
 from supervisor.runtime.models import validate_effort
 from supervisor.runtime.claude_async import BATCH_GUIDANCE, BATCH_TOOL_NAME, ClaudeAsyncBatches
+from supervisor.runtime.claude_cli import OfficialCli, resolve_official_cli, sdk_bundled_cli
 
 
 SUPPORTED_EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -164,7 +168,8 @@ class ClaudeBackend:
             )
         if cli_path is not None and client_factory is None:
             raise AppServerError(
-                "Claude Code production mode always uses the official CLI bundled with claude-agent-sdk"
+                "Claude Code production mode always uses the official CLI bundled with claude-agent-sdk "
+                "or Bello's verified pinned download of the same build; it does not accept another path"
             )
         self._prepare_state_directory()
         self._load_state()
@@ -249,7 +254,7 @@ class ClaudeBackend:
 
     async def _initialize(self) -> dict[str, Any]:
         self._assert_subscription_environment()
-        self._cli_path = self._cli_path_override or self._bundled_cli_path()
+        self._cli_path = self._cli_path_override or self._official_cli_path()
         raw = await self._run_auth_probe()
         if raw.get("loggedIn") is not True:
             raise AppServerError(
@@ -843,7 +848,7 @@ class ClaudeBackend:
             "strict_mcp_config": True,
             "permission_mode": "dontAsk",
             "cwd": record["cwd"],
-            "cli_path": str(self._cli_path or self._bundled_cli_path()),
+            "cli_path": str(self._cli_path or self._official_cli_path()),
             "model": record["model"],
             "fallback_model": None,
             "setting_sources": [],
@@ -857,7 +862,7 @@ class ClaudeBackend:
             ),
             "env": {
                 "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
-                "CLAUDE_AGENT_SDK_CLIENT_APP": "bello/0.7.0",
+                "CLAUDE_AGENT_SDK_CLIENT_APP": "bello/0.7.1",
             },
             "extra_args": {"disable-slash-commands": None, "no-chrome": None},
             "effort": params.get("effort"),
@@ -885,7 +890,7 @@ class ClaudeBackend:
             strict_mcp_config=True,
             permission_mode="dontAsk",
             cwd=self.state_dir,
-            cli_path=str(self._cli_path or self._bundled_cli_path()),
+            cli_path=str(self._cli_path or self._official_cli_path()),
             setting_sources=[],
             skills=[],
             plugins=[],
@@ -897,7 +902,7 @@ class ClaudeBackend:
             ),
             env={
                 "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
-                "CLAUDE_AGENT_SDK_CLIENT_APP": "bello/0.7.0",
+                "CLAUDE_AGENT_SDK_CLIENT_APP": "bello/0.7.1",
             },
             extra_args={"disable-slash-commands": None, "no-chrome": None},
         )
@@ -1015,7 +1020,7 @@ class ClaudeBackend:
         server_ref: dict[str, Any] = {}
         config = create_sdk_mcp_server(
             _MCP_SERVER,
-            version="0.7.0",
+            version="0.7.1",
             tools=self._sdk_tools(record, server_ref),
         )
         server = config["instance"]
@@ -1177,9 +1182,8 @@ class ClaudeBackend:
             )
 
     def _validate_model_effort(self, model: str, effort: Any, info: Any) -> None:
-        if effort is None:
-            return
-        self._validate_effort(effort, SUPPORTED_EFFORTS)
+        if effort is not None:
+            self._validate_effort(effort, SUPPORTED_EFFORTS)
         models = info.get("models", []) if isinstance(info, dict) else []
         match = next(
             (
@@ -1191,10 +1195,14 @@ class ClaudeBackend:
             None,
         )
         if match is None:
+            # Checked even when no effort is sent (a `default` profile), before
+            # any prompt: the model itself is not offered by this CLI/account.
             raise AppServerError(
-                f"Claude Code did not advertise effort capabilities for model {model!r}; "
-                "Bello will not substitute an effort"
+                f"Claude Code did not advertise model {model!r} for this subscription and CLI version; "
+                "no model request was sent. Bello will not substitute another model or effort"
             )
+        if effort is None:
+            return
         supported = match.get("supportedEffortLevels")
         if not isinstance(supported, list) or effort not in supported:
             choices = ", ".join(str(value) for value in supported or []) or "none"
@@ -1206,11 +1214,25 @@ class ClaudeBackend:
     @staticmethod
     def _catalog_entries(info: Any) -> list[dict[str, Any]]:
         models = info.get("models", []) if isinstance(info, dict) else []
+        rows = [item for item in models if isinstance(item, dict)]
+
+        # Describe an exact model by the row about that model: its own row, else
+        # a family alias; never by the "default" recommendation row alone.
+        def specificity(item: dict[str, Any]) -> int:
+            if item.get("value") == item.get("resolvedModel"):
+                return 0
+            return 2 if item.get("value") == "default" else 1
+
+        describing: dict[str, dict[str, Any]] = {}
+        for item in rows:
+            resolved = item.get("resolvedModel")
+            if isinstance(resolved, str) and resolved and (
+                resolved not in describing or specificity(item) < specificity(describing[resolved])
+            ):
+                describing[resolved] = item
         entries: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for item in models:
-            if not isinstance(item, dict):
-                continue
+        for item in rows:
             for identifier, resolved in (
                 (item.get("value"), item.get("resolvedModel")),
                 (item.get("resolvedModel"), item.get("resolvedModel")),
@@ -1218,30 +1240,49 @@ class ClaudeBackend:
                 if not isinstance(identifier, str) or not identifier or identifier in seen:
                     continue
                 seen.add(identifier)
+                resolved_id = resolved if isinstance(resolved, str) and resolved else identifier
+                alias = identifier != resolved_id
+                source = item if alias else describing.get(identifier, item)
+                # Efforts come from the first row that names the model, exactly
+                # as turn-time validation matches it.
                 supported = item.get("supportedEffortLevels")
-                entries.append(
-                    {
-                        "id": identifier,
-                        "model": identifier,
-                        "qualifiedId": f"claude-code/{identifier}",
-                        "provider": "claude-code",
-                        "name": item.get("displayName") or identifier,
-                        "displayName": item.get("displayName") or identifier,
-                        "resolvedModel": resolved if isinstance(resolved, str) else identifier,
-                        "available": True,
-                        "configured": True,
-                        "reasoning": True,
-                        "supportedEfforts": [
-                            value for value in (supported or []) if value in SUPPORTED_EFFORTS
-                        ],
-                        "supportedReasoningEfforts": [
-                            value for value in (supported or []) if value in SUPPORTED_EFFORTS
-                        ],
-                        "supportsServiceTier": False,
-                        "billingRoute": "subscription",
-                    }
-                )
+                display = source.get("displayName") or identifier
+                entry = {
+                    "id": identifier,
+                    "model": identifier,
+                    "qualifiedId": f"claude-code/{identifier}",
+                    "provider": "claude-code",
+                    "name": display,
+                    "displayName": display,
+                    "resolvedModel": resolved_id,
+                    # A floating alias ("sonnet", "default") may resolve to a
+                    # different model after a CLI update; an exact id does not.
+                    "alias": alias,
+                    "available": True,
+                    "configured": True,
+                    "reasoning": True,
+                    "supportedEfforts": [
+                        value for value in (supported or []) if value in SUPPORTED_EFFORTS
+                    ],
+                    "supportedReasoningEfforts": [
+                        value for value in (supported or []) if value in SUPPORTED_EFFORTS
+                    ],
+                    "supportsServiceTier": False,
+                    "billingRoute": "subscription",
+                }
+                description = ClaudeBackend._catalog_text(source.get("description"))
+                if description is not None:
+                    entry["description"] = description
+                entries.append(entry)
         return entries
+
+    @staticmethod
+    def _catalog_text(value: Any) -> str | None:
+        """CLI catalog descriptions are display metadata; keep them short and inert."""
+        if not isinstance(value, str):
+            return None
+        text = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", value).split())
+        return text[:200] or None
 
     async def _run_auth_probe(self) -> dict[str, Any]:
         probe = self._auth_probe or self._official_auth_status
@@ -1257,7 +1298,7 @@ class ClaudeBackend:
         }
 
     async def _official_auth_status(self) -> dict[str, Any]:
-        cli = self._cli_path or self._bundled_cli_path()
+        cli = self._cli_path or self._official_cli_path()
         process = await asyncio.create_subprocess_exec(
             str(cli),
             "auth",
@@ -1285,17 +1326,21 @@ class ClaudeBackend:
 
     @staticmethod
     def _bundled_cli_path() -> Path:
-        try:
-            import claude_agent_sdk
-        except ImportError as exc:
-            raise AppServerError(
-                "Claude Code support requires the pinned claude-agent-sdk package"
-            ) from exc
-        name = "claude.exe" if os.name == "nt" else "claude"
-        path = Path(claude_agent_sdk.__file__).resolve().parent / "_bundled" / name
-        if not path.is_file():
-            raise AppServerError("the official CLI bundled with claude-agent-sdk is missing")
-        return path
+        """The CLI inside the installed SDK wheel; raises if the wheel has none."""
+        return sdk_bundled_cli()
+
+    @staticmethod
+    def _official_cli(*, prepare: bool = False) -> OfficialCli:
+        """The only CLI production mode may execute (shared readiness contract).
+
+        ``prepare=True`` may download Bello's pinned official build where the
+        SDK wheel has no bundled CLI; otherwise local files are only verified.
+        """
+        return resolve_official_cli(prepare=prepare, bundled=lambda: ClaudeBackend._bundled_cli_path())
+
+    @staticmethod
+    def _official_cli_path() -> Path:
+        return ClaudeBackend._official_cli().path
 
     def _assert_subscription_environment(self) -> None:
         blocked = {

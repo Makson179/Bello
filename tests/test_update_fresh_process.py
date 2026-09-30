@@ -100,7 +100,10 @@ def test_update_prepares_replacement_release_in_isolated_same_interpreter(
 
         class ClaudeBackend:
             @staticmethod
-            def _bundled_cli_path():
+            def _official_cli(*, prepare=False):
+                # The replacement release prepares its official CLI through the
+                # shared readiness contract after its SDK pin is installed.
+                assert prepare is True
                 assert metadata.version("claude-agent-sdk") == "0.2.152"
                 Path({str(claude_checked)!r}).write_text("checked", encoding="utf-8")
                 return Path("fixture-claude")

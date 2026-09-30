@@ -118,9 +118,19 @@ def _windows_parent_readonly_rights(rights: str) -> bool:
     return bool(re.fullmatch(r"(?:FR|FX|GR|GX|RC|SY|CC|SW|WP|LO)+", rights))
 
 
+def _sddl_excerpt(text: str) -> str:
+    """Quote an OS-produced owner or ACE only in SDDL's plain alphabet.
+
+    Conditional and resource-attribute ACEs can carry free text, so they are
+    summarized rather than echoed into errors.
+    """
+    return text if re.fullmatch(r"[A-Za-z0-9;:()\-]{1,160}", text) else "an unsupported entry"
+
+
 def _validate_windows_security_descriptor(descriptor: str, user_sid: str, *, parent: bool = False,
                                           user_alias: str | None = None,
-                                          verified_public_executable: bool = False) -> None:
+                                          verified_public_executable: bool = False,
+                                          path: Path | None = None) -> None:
     """Fail closed on any grant outside the user, SYSTEM and administrators.
 
     These are private executable caches, not shared installation directories.
@@ -131,7 +141,9 @@ def _validate_windows_security_descriptor(descriptor: str, user_sid: str, *, par
     ACEs do not apply to that directory, and the new cache has a protected DACL.
     Only a checksum-verified public launcher may retain simple read/execute ACEs
     added by native sandbox setup. No write, delete or ACL-changing grant is allowed.
+    Errors name the rejected path, owner or ACE (sanitized), never the whole ACL.
     """
+    where = "" if path is None else f" on {'containing directory ' if parent else ''}{path}"
     owner, separator, dacl = descriptor.partition("D:")
     trusted = {user_sid, "SY", "BA", "S-1-5-18", "S-1-5-32-544"}
     if user_alias is not None:
@@ -141,28 +153,34 @@ def _validate_windows_security_descriptor(descriptor: str, user_sid: str, *, par
             raise ValueError("Invalid Windows current-user owner alias")
         trusted.add(user_alias)
     if not separator or owner.removeprefix("O:") not in trusted or not owner.startswith("O:"):
-        raise ValueError("Native Codex cache must have a trusted Windows owner and private DACL")
+        raise ValueError("Bello private runtime cache must have a trusted Windows owner and private DACL: "
+                         f"owner {_sddl_excerpt(owner.removeprefix('O:'))}{where}")
     # Windows/Python may express the trusted owner's grant as OWNER RIGHTS.
     # This trustee is safe only after validating the actual owner above; OW is
     # not itself an acceptable owner identity.
     trusted_grants = trusted | {"OW", "S-1-3-4"}
     flags, _, entries = dacl.partition("(")
     if not re.fullmatch(r"(?:P|AI|AR)*", flags) or not entries:
-        raise ValueError("Native Codex cache must have a private Windows DACL")
+        raise ValueError(f"Bello private runtime cache must have a private Windows DACL{where}")
     aces = re.findall(r"\([^()]*\)", "(" + entries)
     if "".join(aces) != "(" + entries:
-        raise ValueError("Native Codex cache has an unsupported Windows DACL")
+        raise ValueError(f"Bello private runtime cache has an unsupported Windows DACL{where}")
+
+    def other_accounts(ace: str) -> ValueError:
+        return ValueError("Bello private runtime cache must not grant access to other Windows accounts: "
+                          f"ACE {_sddl_excerpt(ace)}{where}")
+
     for ace in aces:
         fields = ace[1:-1].split(";")
         if (len(fields) != 6 or fields[0] != "A" or fields[3] or fields[4] or not fields[2]
                 or not re.fullmatch(r"(?:OI|CI|NP|IO|ID)*", fields[1])):
-            raise ValueError("Native Codex cache must not grant access to other Windows accounts")
+            raise other_accounts(ace)
         ace_flags = {fields[1][index:index + 2] for index in range(0, len(fields[1]), 2)}
         if fields[5] in trusted_grants or parent and "IO" in ace_flags:
             continue
         if (parent or verified_public_executable) and _windows_parent_readonly_rights(fields[2]):
             continue
-        raise ValueError("Native Codex cache must not grant access to other Windows accounts")
+        raise other_accounts(ace)
 
 
 def _windows_private_acl(path: Path, *, create: bool = False, parent: bool = False,
@@ -246,7 +264,7 @@ def _windows_private_acl(path: Path, *, create: bool = False, parent: bool = Fal
                     raise ctypes.WinError(error)
         metadata = path.lstat()
         if is_link_or_reparse(path, stat_result=metadata):
-            raise ValueError("Native Codex cache must not use Windows reparse points")
+            raise ValueError("Bello private runtime cache must not use Windows reparse points")
         if verified_public_executable and not stat.S_ISREG(metadata.st_mode):
             raise ValueError("Public read/execute ACL allowance is only for the verified codex.exe file")
         descriptor = pointer()
@@ -262,7 +280,8 @@ def _windows_private_acl(path: Path, *, create: bool = False, parent: bool = Fal
         allocated.append(sddl)
         _validate_windows_security_descriptor(ctypes.wstring_at(sddl), user_sid,
                                                parent=parent, user_alias=user_alias,
-                                               verified_public_executable=verified_public_executable)
+                                               verified_public_executable=verified_public_executable,
+                                               path=path)
     finally:
         for allocation in reversed(allocated):
             kernel.LocalFree(allocation)
@@ -274,7 +293,7 @@ def _reject_windows_reparse_ancestors(path: Path) -> None:
     if _IS_WINDOWS:
         for ancestor in (path, *path.parents):
             if is_link_or_reparse(ancestor):
-                raise ValueError("Native Codex cache must not traverse Windows reparse points")
+                raise ValueError("Bello private runtime cache must not traverse Windows reparse points")
 
 
 def _private_directory(path: Path, *, parents: bool = False) -> None:
@@ -285,7 +304,7 @@ def _private_directory(path: Path, *, parents: bool = False) -> None:
                 path.parent.lstat()
             except FileNotFoundError:
                 if path.parent == path:
-                    raise ValueError("Native Codex cache requires an existing filesystem anchor")
+                    raise ValueError("Bello private runtime cache requires an existing filesystem anchor")
                 # Never create intermediate cache directories with inherited
                 # public ACLs. Stop at the first existing ancestor, validate it
                 # as a parent, and atomically create each missing private child.
@@ -313,7 +332,7 @@ def _owned(path: Path, *, directory: bool = False, private: bool = False,
     metadata = path.lstat()
     valid_type = stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(metadata.st_mode)
     if is_link_or_reparse(path, stat_result=metadata) or not valid_type:
-        raise ValueError(f"Native Codex cache path must be a real {'directory' if directory else 'file'}: {path}")
+        raise ValueError(f"Bello private runtime cache path must be a real {'directory' if directory else 'file'}: {path}")
     if _IS_WINDOWS:
         if verified_public_executable:
             _windows_private_acl(path, verified_public_executable=True)
@@ -321,7 +340,7 @@ def _owned(path: Path, *, directory: bool = False, private: bool = False,
             _windows_private_acl(path)
     elif (metadata.st_uid != os.getuid()
           or stat.S_IMODE(metadata.st_mode) & (0o077 if private else 0o022)):
-        raise ValueError(f"Native Codex cache path must be owned by this user and not writable by others: {path}")
+        raise ValueError(f"Bello private runtime cache path must be owned by this user and not writable by others: {path}")
 
 
 def _verify(directory: Path, bundle: NativeBundle, *, system: str = "Darwin") -> None:

@@ -225,13 +225,14 @@ def default_project_config() -> ProjectConfig:
 
 def intelligence_choices_for_model(model: str) -> tuple[str, ...]:
     if "/" in model:
-        from supervisor.runtime.models import parse_model_selection
+        from supervisor.runtime.models import NO_EFFORT, parse_model_selection
         parse_model_selection(model)
         # Exact model/provider support is checked against the runtime catalog
         # before execution. API catalogs also contain non-reasoning models;
         # applying the old Codex-only list would reject their valid `off` setting.
-        # The editor must not silently clamp the saved effort.
-        return ("off", "minimal", *INTELLIGENCE_CHOICES)
+        # `default` (send no effort) keeps models that advertise no effort, such
+        # as Claude Haiku, loadable. The editor must not silently clamp the saved effort.
+        return ("off", "minimal", *INTELLIGENCE_CHOICES, NO_EFFORT)
     if model == MODEL_GPT_6_ASTRA:
         # Preserve existing unqualified Codex profile validation.
         return INTELLIGENCE_CHOICES

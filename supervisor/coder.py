@@ -14,6 +14,7 @@ from supervisor.appserver import (
 )
 from supervisor.prompts import build_coder_prompt, build_restart_prompt, build_revision_prompt
 from supervisor.project_config import MultiAgentConfig
+from supervisor.runtime.models import NO_EFFORT, engine_effort
 from supervisor.state import StateStore
 
 
@@ -92,8 +93,11 @@ def task_runtime_workspace_roots(
 
 
 def apply_intelligence(params: dict[str, Any], intelligence: str | None) -> dict[str, Any]:
-    if intelligence:
-        params["effort"] = intelligence
+    # `default` means the saved profile deliberately sends no effort (a model
+    # that advertises none, such as Claude Haiku); never send the placeholder.
+    effort = engine_effort(intelligence)
+    if effort:
+        params["effort"] = effort
     return params
 
 
@@ -111,6 +115,11 @@ def build_multi_agent_developer_instructions(
         f"- {model}: {', '.join(efforts)}"
         for model, efforts in config.allowed.items()
     )
+    if any(NO_EFFORT in efforts for efforts in config.allowed.values()):
+        allowed += (
+            f"\n(`{NO_EFFORT}` means the model has no effort setting; pass effort `{NO_EFFORT}` "
+            "and Bello sends none.)"
+        )
     shared = (
         "Use subagents when independent delegation would materially improve speed or quality.\n"
         "Before spawning each subagent, choose the fastest and least expensive allowed profile that can "

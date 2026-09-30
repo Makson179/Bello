@@ -1,6 +1,6 @@
 # Current Bello configuration schema
 
-This reference targets Bello 0.7.0's user-facing `ProjectConfig`. The persistent file is `.supervisor/config.json`, but it also contains runtime state after a run starts. Never replace that file directly or feed it directly to the advisor validator; first extract the project settings with `scripts/inspect_config.py`.
+This reference targets Bello 0.7.1's user-facing `ProjectConfig`. The persistent file is `.supervisor/config.json`, but it also contains runtime state after a run starts. Never replace that file directly or feed it directly to the advisor validator; first extract the project settings with `scripts/inspect_config.py`.
 
 The inspector deliberately preserves valid dormant values such as saved review budgets, cheap-runtime preference, and a distiller path while their feature is off. Its `current_project_config` is for safe application after selection, not evidence for choosing the setup, and is not necessarily valid under the advisor's stricter canonical output policy. Overlay the selected switches and review fields, zero inactive budgets, and set cheap runtime false when runtime is off before running `validate_config.py`. The inspector checks source syntax, not model capabilities or bundle availability.
 
@@ -98,7 +98,7 @@ Use exact qualified identifiers:
 
 The first slash separates the provider; the remaining model ID may contain more slashes. Preserve case and the exact catalog identifier. Legacy bare `gpt-...` IDs map to `openai-codex` for compatibility, but new advice uses qualified IDs. Do not infer a billing route from the model's author.
 
-Models, supported efforts, and service tiers are dynamic. Never use a fixed three-family whitelist or assign every provider the same effort values. Validate active settings against the supplied catalog; `off`, `minimal`, or `ultra` are legitimate only when that exact profile exposes them. Catalogue compatibility does not establish relative capability or remaining quota.
+Models, supported efforts, and service tiers are dynamic. Never use a fixed three-family whitelist or assign every provider the same effort values. Validate active settings against the supplied catalog; `off`, `minimal`, or `ultra` are legitimate only when that exact profile exposes them. A model whose catalog entry advertises no efforts (an empty `supportedEfforts`, for example Claude Haiku in Claude Code) uses the effort value `default`, which sends no effort; do not assign it an invented level, and do not use `default` for a model that advertises efforts. A missing catalog entry is unknown, not "no effort". Claude Code floating aliases (`claude-code/sonnet`, `claude-code/default`, ...) report `alias: true` and their current `resolvedModel`; prefer the exact id when the user wants a pinned model. Catalogue compatibility does not establish relative capability or remaining quota.
 
 Dormant fields are still structurally required. Canonicalize disabled role profiles to a valid active profile, and disabled child policies to a valid one-profile pool, without displaying them. Their providers do not need separate authentication while unused. Every enabled child pool must contain its default profile and use available, supported models and efforts. Parents and children need not share a provider.
 
@@ -223,4 +223,4 @@ The current run CLI exposes initial-coder, runtime, completion, and adversary mo
 
 It does not expose Windows native root-read, revision-coder enablement/model/effort, cheap runtime, completion-return budgets, or any of the three multi-agent policy objects as one-run flags. Those fields require the saved `bello config` interface. A one-run initial-coder override does not implicitly rewrite the persisted revision-coder profile.
 
-The 0.7.0 `bello-delegate` helper starts the installed Bello with the already selected saved configuration and explicitly approved task/plan paths. It does not select models or apply configuration itself. Finish the authorized configuration step before delegating the launch; do not silently drop settings to fit an older plugin.
+The 0.7.1 `bello-delegate` helper starts the installed Bello with the already selected saved configuration and explicitly approved task/plan paths. It does not select models or apply configuration itself. Finish the authorized configuration step before delegating the launch; do not silently drop settings to fit an older plugin.

@@ -20,7 +20,7 @@ from supervisor.appserver import AppServerClient, AppServerError, AppServerMessa
 from supervisor.approvals import ApprovalManager, normalize_approval_request
 from supervisor.runtime.cleanup import finish_cleanup
 from supervisor.runtime.journal import RuntimeJournal
-from supervisor.runtime.models import parse_model_selection
+from supervisor.runtime.models import engine_effort, parse_model_selection
 from supervisor.runtime.codex_permissions import validate_windows_native_scope
 from supervisor.runtime.sandbox import SandboxPolicy
 from supervisor.runtime.tools import ToolHost, ToolScope, tool_result, tool_definitions
@@ -139,6 +139,24 @@ class RuntimeClient(AppServerClient):
         if not self._started:
             await self.start()
         return {"runtime": "bello", "protocolVersion": 1, "engines": ["codex", "pi", "claude-code"]}
+
+    async def prepare_engines(self, models: tuple[str, ...] | list[str]) -> None:
+        """Prepare pinned engine executables before a run, outside RPC deadlines.
+
+        Only a run does this. Model discovery (`bello config`, `bello runtime
+        models`) merely verifies local files and reports what is missing.
+        """
+        engines = set()
+        for model in models:
+            try:
+                engines.add(parse_model_selection(model).engine)
+            except ValueError:
+                continue
+        if "claude-code" in engines and "claude-code" not in self._engines:
+            from supervisor.runtime.claude import ClaudeBackend
+            # The official CLI may need a one-time verified download (native
+            # Windows). Never a PATH executable or another version.
+            await asyncio.to_thread(ClaudeBackend._official_cli, prepare=True)
 
     async def _engine(self, name: str):
         async with self._engine_lock:
@@ -304,13 +322,20 @@ class RuntimeClient(AppServerClient):
                     if not optional:
                         raise
                     unavailable[name] = str(exc)
+            # Optional discovery reports why an engine is missing, but never an
+            # external error body: only Bello-authored, classified text.
+            reported: dict[str, Any] = {}
+            if unavailable:
+                from supervisor.runtime.engine_status import sanitized_unavailable_engines
+                texts, reasons = sanitized_unavailable_engines(unavailable)
+                reported = {"unavailableEngines": texts, "unavailableReasons": reasons}
             if method == "model/list":
                 data = [item for response in responses for item in response.get("data", [])]
                 for item in list(data):
                     if isinstance(item, dict) and item.get("qualifiedId"):
                         data.append({**item, "id": item["qualifiedId"]})
-                return {"data": data, **({"unavailableEngines": unavailable} if unavailable else {})}
-            return {"accounts": responses, **({"unavailableEngines": unavailable} if unavailable else {})}
+                return {"data": data, **reported}
+            return {"accounts": responses, **reported}
         if method == "account/rateLimits/read":
             if "codex" in self._engines or any(parse_model_selection(model).engine == "codex" for model in self.required_models):
                 return await (await self._engine("codex")).request(method, params, timeout=timeout)
@@ -692,7 +717,9 @@ class RuntimeClient(AppServerClient):
                 child_params = {key: deepcopy(record[key]) for key in (
                     "cwd", "sandbox", "approvalPolicy", "runtimeWorkspaceRoots", "runtimeTaskPath", "runtimeScratchRoot", "serviceTier", "belloRole"
                 ) if key in record}
-                child_params.update(model=selected.qualified, effort=args["effort"], parentThreadId=parent,
+                # An allowed `default` profile deliberately sends no effort.
+                child_effort = engine_effort(args["effort"])
+                child_params.update(model=selected.qualified, effort=child_effort, parentThreadId=parent,
                                     rootThreadId=family, depth=depth + 1,
                                     developerInstructions=record.get("developerInstructions", ""),
                                     config={"agents": deepcopy(agents) if role == "coder" else {"enabled": False}})
@@ -700,7 +727,7 @@ class RuntimeClient(AppServerClient):
                 child = response["thread"]["id"]
                 try:
                     self._scope_for(parent, turn_id)
-                    await self.request("turn/start", {"threadId": child, "input": [{"type": "text", "text": args["message"]}], "effort": args["effort"]})
+                    await self.request("turn/start", {"threadId": child, "input": [{"type": "text", "text": args["message"]}], "effort": child_effort})
                 except BaseException as exc:
                     try:
                         await self.request("thread/archive", {"threadId": child}, timeout=5)

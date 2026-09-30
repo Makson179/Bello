@@ -524,6 +524,25 @@ def test_windows_parent_still_requires_trusted_owner():
         install._validate_windows_security_descriptor("O:BUD:AI(A;OICI;FRFX;;;BU)", _USER_SID, parent=True)
 
 
+@pytest.mark.parametrize("descriptor,detail", [
+    (f"O:{_USER_SID}D:AI(A;OICI;FA;;;{_USER_SID})(A;CIID;LC;;;BU)", "ACE (A;CIID;LC;;;BU)"),
+    (f"O:{_USER_SID}D:AI(A;OICIID;0x1301bf;;;AU)", "ACE (A;OICIID;0x1301bf;;;AU)"),
+    ("O:BUD:AI(A;OICI;FRFX;;;BU)", "owner BU"),
+    (f"O:{_USER_SID}D:AI(A;;FA;;;WD \"secret text\")", "ACE an unsupported entry"),
+    ("O:S-1-5-21-1-2-3-1002 \"secret\"D:AI(A;;FA;;;SY)", "owner an unsupported entry"),
+    (f"O:{_USER_SID}D:AI(A;;FA;;;{'S-1-5-21-' + '9' * 200})", "ACE an unsupported entry"),
+])
+def test_windows_acl_errors_name_the_path_and_only_a_sanitized_entry(tmp_path, descriptor, detail):
+    for parent, role in ((True, "containing directory "), (False, "")):
+        with pytest.raises(ValueError, match="Windows") as caught:
+            install._validate_windows_security_descriptor(descriptor, _USER_SID, parent=parent, path=tmp_path)
+        assert str(caught.value).endswith(f": {detail} on {role}{tmp_path}")
+        assert "secret" not in str(caught.value) and "9" * 161 not in str(caught.value)
+    with pytest.raises(ValueError) as unnamed:  # Callers without a path keep the plain reason.
+        install._validate_windows_security_descriptor(descriptor, _USER_SID, parent=True)
+    assert str(unnamed.value).endswith(detail)
+
+
 def test_windows_parent_does_not_confuse_ci_oi_with_inherit_only():
     descriptor = f"O:{_USER_SID}D:AI(A;CIOI;GA;;;BU)"
     with pytest.raises(ValueError, match="other Windows accounts"):

@@ -52,6 +52,18 @@ def parse_model_selection(value: str) -> ModelSelection:
     return ModelSelection(provider, model)
 
 
+# Configuration value meaning "send no effort parameter". It is offered for a
+# model whose catalog advertises no effort levels (for example Claude Haiku in
+# Claude Code), so such a model is selectable without inventing an effort. It is
+# never sent to an engine; see engine_effort().
+NO_EFFORT = "default"
+
+
+def engine_effort(value: str | None) -> str | None:
+    """Translate a saved Bello effort into the value sent to an engine."""
+    return None if value in (None, "", NO_EFFORT) else value
+
+
 def validate_effort(effort: str | None, supported: list[str] | tuple[str, ...]) -> None:
     if effort is not None and effort not in supported:
         raise ModelSelectionError(

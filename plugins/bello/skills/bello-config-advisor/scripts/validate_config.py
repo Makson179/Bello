@@ -13,7 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from inspect_models import qualified_model, summarize_catalog
 
 # This is project-file syntax, not a promise that each model supports every value.
-CONFIG_EFFORTS = {"off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+# `default` sends no effort; it is valid only for a model that advertises none.
+NO_EFFORT = "default"
+CONFIG_EFFORTS = {"off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", NO_EFFORT}
 
 REQUIRED_KEYS = {
     "review_limit_format",
@@ -82,7 +84,11 @@ def _validate_profile(
     if entry is None or entry.get("available") is False or entry.get("configured") is False:
         errors.append(f"{field}: {identity} is not available in the supplied catalog")
         return
-    if effort not in entry["supportedEfforts"]:
+    if effort == NO_EFFORT:
+        if entry["supportedEfforts"]:
+            errors.append(f"{field}: {NO_EFFORT!r} is only for models that advertise no effort; "
+                          f"{identity} advertises {', '.join(entry['supportedEfforts'])}")
+    elif effort not in entry["supportedEfforts"]:
         errors.append(f"{field}: {effort!r} is not advertised for {identity}")
     if fast and (entry.get("supportsServiceTier") is not True or "priority" not in entry.get("supportedServiceTiers", [])):
         errors.append(f"{field}: speed=fast requires advertised priority service tier support")

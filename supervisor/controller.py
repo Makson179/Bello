@@ -32,7 +32,8 @@ from supervisor.appserver import (
 )
 from supervisor.runtime.client import RuntimeClient
 from supervisor.runtime_errors import bounded_provider_error, sanitize_error_text
-from supervisor.runtime.models import parse_model_selection
+from supervisor.runtime.models import engine_effort, parse_model_selection
+from supervisor.config_validation import preflight_profiles
 from supervisor.approvals import ApprovalManager, normalize_approval_request
 from supervisor.coder import (
     CODER_SANDBOX_DANGER_FULL_ACCESS,
@@ -1617,6 +1618,11 @@ class BelloController:
             selected.append(self._adversary_model())
         selected.extend(self._enabled_subagent_models_for_preflight())
         self.client.required_models = tuple(dict.fromkeys(selected))
+        prepare_engines = getattr(self.client, "prepare_engines", None)
+        if callable(prepare_engines):
+            if any(model.startswith("claude-code/") for model in self.client.required_models):
+                self.tui.status("checking the official Claude Code CLI (one-time verified download if needed)")
+            await prepare_engines(self.client.required_models)
         models = await self.client.model_list()
         self.store.update_bello_config(lambda cfg: cfg.model_copy(update={
             "runtime_name": "bello-codex/pi/claude-code", "runtime_protocol_version": 1,
@@ -1625,22 +1631,26 @@ class BelloController:
         await self._ensure_selected_models_available(models)
         if self.store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE:
             return
-        profiles = [(self._coder_model(), self._coder_intelligence())]
-        policies = [self._multi_agent_config()]
-        if self._effective_completion_review():
-            profiles.append((self._completion_model(), self._completion_intelligence()))
-            policies.append(self._completion_multi_agent_config())
-        if self._post_coder_review_enabled() and self._revision_coder_enabled():
-            profiles.append((self._revision_coder_model(), self._revision_coder_intelligence()))
-        if self._adversary_model_required_for_preflight():
-            profiles.append((self._adversary_model(), self._adversary_intelligence()))
-            policies.append(self._adversary_multi_agent_config())
-        for policy in policies:
-            if policy.enabled:
-                profiles.extend((model, effort) for model, efforts in policy.allowed.items() for effort in efforts)
-        async_profiles = set(profiles)
-        if self._runtime_enabled():
-            profiles.append((self._runtime_model(), self._runtime_intelligence()))
+        self._report_alias_resolution(models)
+        # The same enumeration `bello config` uses for its offline checks.
+        completion = self._effective_completion_review()
+        adversary = self._adversary_model_required_for_preflight()
+        policies = [("multi_agent", self._multi_agent_config())]
+        if completion:
+            policies.append(("completion_multi_agent", self._completion_multi_agent_config()))
+        if adversary:
+            policies.append(("adversary_multi_agent", self._adversary_multi_agent_config()))
+        uses = preflight_profiles(
+            coder=(self._coder_model(), self._coder_intelligence()),
+            completion=(self._completion_model(), self._completion_intelligence()) if completion else None,
+            revision_coder=((self._revision_coder_model(), self._revision_coder_intelligence())
+                            if self._post_coder_review_enabled() and self._revision_coder_enabled() else None),
+            adversary=(self._adversary_model(), self._adversary_intelligence()) if adversary else None,
+            runtime=(self._runtime_model(), self._runtime_intelligence()) if self._runtime_enabled() else None,
+            policies=policies,
+        )
+        profiles = [(use.model, use.effort) for use in uses]
+        async_profiles = {(use.model, use.effort) for use in uses if use.role != "runtime"}
         distilled_models = set()
         if self._log_distiller_config().enabled:
             distilled_models.add(parse_model_selection(self._coder_model()).qualified)
@@ -1652,7 +1662,8 @@ class BelloController:
         for model, effort in dict.fromkeys(profiles):
             selection = parse_model_selection(model)
             request = {
-                "model": model, "effort": effort,
+                # A `default` profile (a model advertising no effort) sends none.
+                "model": model, "effort": engine_effort(effort),
                 "serviceTier": "priority" if self._fast_mode() else None,
             }
             if (model, effort) not in async_profiles:
@@ -1680,6 +1691,22 @@ class BelloController:
             await self._structured_output_self_test()
             await self._configure_runtime_triage()
 
+    def _report_alias_resolution(self, models_response: dict[str, Any]) -> None:
+        """Make floating-alias resolution visible; the saved alias is not changed."""
+        render = getattr(self.tui, "render", None)
+        selected = set(getattr(self.client, "required_models", ()) or ())
+        data = models_response.get("data") if isinstance(models_response, dict) else None
+        if not callable(render) or not isinstance(data, list):
+            return
+        for item in data:
+            if not isinstance(item, dict) or item.get("alias") is not True:
+                continue
+            qualified, resolved = item.get("qualifiedId"), item.get("resolvedModel")
+            if qualified in selected and isinstance(resolved, str) and resolved:
+                selected.discard(qualified)  # RuntimeClient lists each entry twice
+                render("SYSTEM", f"{qualified} is a floating Claude Code alias; this run uses "
+                                 f"{resolved}, as the CLI resolves it now")
+
     async def _ensure_selected_models_available(self, models_response: dict[str, Any]) -> None:
         result = _selected_model_availability(
             models_response,
@@ -1696,12 +1723,15 @@ class BelloController:
         )
         if result.ok:
             return
-        available = ", ".join(result.available_models) if result.available_models else "none reported"
+        readable = _readable_available_models(models_response)
+        available = ", ".join(readable) if readable else "none reported"
         missing = ", ".join(result.missing_roles)
+        hint = (" Choose one with `bello config` or a --<role>-mod provider/model flag; "
+                "Bello does not substitute a model." if readable != result.available_models else "")
         message = (
             "model availability preflight failed before coder start: "
             f"selected model(s) are not available from the execution engine: {missing}. "
-            f"Available models: {available}. "
+            f"Available models: {available}.{hint} "
             "The interruption is recorded in .supervisor/FINAL_REPORT.md."
         )
         self.store.append_text_locked(PROGRESS, f"- {message}\n")
@@ -10419,6 +10449,31 @@ def _selected_model_availability(
         if subagent_model not in available:
             missing.append(f"subagent={subagent_model}")
     return ModelAvailabilityResult(missing_roles=tuple(missing), available_models=available_models)
+
+
+def _readable_available_models(models_response: Any) -> tuple[str, ...]:
+    """Selectable provider/model ids only, never display names or bare aliases.
+
+    A floating Claude Code alias also shows what it currently resolves to.
+    Legacy catalogs without qualified ids keep the previous extracted list.
+    """
+    data = models_response.get("data") if isinstance(models_response, dict) else None
+    labels: dict[str, str] = {}
+    for item in data if isinstance(data, list) else ():
+        if (not isinstance(item, dict) or item.get("hidden") is True or item.get("visibility") == "hidden"
+                or item.get("configured") is False or item.get("available") is False):
+            continue
+        qualified = item.get("qualifiedId")
+        if not isinstance(qualified, str) or not qualified:
+            continue
+        resolved = item.get("resolvedModel")
+        if item.get("alias") is True and isinstance(resolved, str) and resolved:
+            labels[qualified] = f"{qualified} (alias, now {resolved})"
+        else:
+            labels.setdefault(qualified, qualified)
+    if not labels:
+        return tuple(sorted(_extract_model_ids(models_response)))
+    return tuple(labels[key] for key in sorted(labels))
 
 
 def _extract_model_ids(value: Any) -> set[str]:

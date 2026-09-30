@@ -22,11 +22,17 @@ from supervisor.project_config import (
     load_project_config,
     project_config_path,
 )
+from supervisor.runtime.models import NO_EFFORT
 from supervisor.schemas import BelloStatus
 from supervisor.task_select import TaskSelectionError
 
 
 OPTIONAL_BOOL_FLAGS = {"--fast", "--start-over", "--clean", "--adversary", "--completion-review"}
+# `default` sends no effort: for a model that advertises none (e.g. Claude Haiku).
+EFFORT_FLAG_CHOICES = ("off", "minimal", *INTELLIGENCE_CHOICES, NO_EFFORT)
+EFFORT_FLAG_NOTE = (
+    f"Must be advertised for that exact model; '{NO_EFFORT}' sends no effort (models with none, such as Claude Haiku)."
+)
 
 
 class BelloClickGroup(click.Group):
@@ -67,34 +73,34 @@ class BelloClickGroup(click.Group):
 @click.option(
     "--coder-intelligence",
     default=None,
-    type=click.Choice(("off", "minimal", *INTELLIGENCE_CHOICES)),
-    help="Reasoning effort for coder turns.",
+    type=click.Choice(EFFORT_FLAG_CHOICES),
+    help=f"Reasoning effort for coder turns. {EFFORT_FLAG_NOTE}",
 )
 @click.option(
     "--runtime-intelligence",
     "runtime_intelligence",
     default=None,
-    type=click.Choice(("off", "minimal", *INTELLIGENCE_CHOICES)),
-    help="Reasoning effort for runtime supervisor turns.",
+    type=click.Choice(EFFORT_FLAG_CHOICES),
+    help=f"Reasoning effort for runtime supervisor turns. {EFFORT_FLAG_NOTE}",
 )
 @click.option(
     "--completion-intelligence",
     default=None,
-    type=click.Choice(("off", "minimal", *INTELLIGENCE_CHOICES)),
-    help="Reasoning effort for completion review turns.",
+    type=click.Choice(EFFORT_FLAG_CHOICES),
+    help=f"Reasoning effort for completion review turns. {EFFORT_FLAG_NOTE}",
 )
 @click.option(
     "--adversary-intelligence",
     default=None,
-    type=click.Choice(("off", "minimal", *INTELLIGENCE_CHOICES)),
-    help="Reasoning effort for adversarial tester turns.",
+    type=click.Choice(EFFORT_FLAG_CHOICES),
+    help=f"Reasoning effort for adversarial tester turns. {EFFORT_FLAG_NOTE}",
 )
 @click.option(
     "--super-intelligence",
     "legacy_supervisor_intelligence",
     default=None,
     hidden=True,
-    type=click.Choice(("off", "minimal", *INTELLIGENCE_CHOICES)),
+    type=click.Choice(EFFORT_FLAG_CHOICES),
     help="Legacy alias that sets both runtime and completion reasoning effort.",
 )
 @click.option(
@@ -102,7 +108,11 @@ class BelloClickGroup(click.Group):
     default=None,
     type=click.BOOL,
     metavar="[true|false]",
-    help="Use Codex Fast service tier for both coder and supervisor turns. Bare --fast means true.",
+    help=(
+        "Bello Fast: request the OpenAI/Codex priority service tier for coder, revision-coder, runtime and "
+        "completion-review turns and their subagents. Not Smart Execution (--async-tools) and not Claude Code's "
+        "fast mode; profiles without the tier, such as claude-code models, fail preflight. Bare --fast means true."
+    ),
 )
 @click.option(
     "--start-over",
@@ -328,14 +338,57 @@ def runtime_group() -> None:
 
 
 @runtime_group.command("install")
-def runtime_install_command() -> None:
-    """Install the exact Pi dependencies pinned by this Bello version."""
-    from supervisor.runtime.install import install_worker
-    try:
-        destination = install_worker()
-    except Exception as exc:
-        raise click.ClickException(str(exc)) from exc
-    click.echo(f"Pi runtime installed: {destination}")
+@click.argument("component", required=False, default="all",
+                type=click.Choice(["all", "pi", "claude-code"]))
+def runtime_install_command(component: str) -> None:
+    """Install the exact execution dependencies pinned by this Bello version.
+
+    `pi` installs the pinned Pi worker (needs Node.js). `claude-code` prepares the
+    official Claude Code CLI: the SDK bundle, or on native Windows Bello's verified
+    download of the same official build. `all` (default) does both, preparing
+    Claude Code only when the optional `claude` extra is installed.
+    """
+    failures: list[str] = []
+    if component in {"all", "claude-code"}:
+        from supervisor.update_check import _claude_is_installed
+        if component == "claude-code" or _claude_is_installed():
+            try:
+                click.echo(_prepare_claude_cli_message(), nl=False)
+                cli = _prepare_claude_cli()
+            except Exception as exc:
+                click.echo("")
+                if component == "claude-code":
+                    raise click.ClickException(str(exc)) from exc
+                failures.append(f"Claude Code: {exc}")
+            else:
+                click.echo(f" ready.\nClaude Code: {cli.describe()}: {cli.path}")
+    if component in {"all", "pi"}:
+        from supervisor.runtime.install import install_worker
+        try:
+            destination = install_worker()
+        except Exception as exc:
+            if component == "pi":
+                raise click.ClickException(str(exc)) from exc
+            failures.append(f"Pi: {exc}")
+        else:
+            click.echo(f"Pi runtime installed: {destination}")
+    if failures:
+        raise click.ClickException("\n".join(failures))
+
+
+def _prepare_claude_cli_message() -> str:
+    from supervisor.runtime.claude_cli import managed_release
+    release = managed_release()
+    if release is None:
+        return "Checking the official Claude Code CLI bundled with claude-agent-sdk..."
+    return (f"Preparing the official Claude Code CLI {release.cli_version} "
+            f"(downloaded once from downloads.claude.ai if needed, ~{release.size // 1_000_000} MB)...")
+
+
+def _prepare_claude_cli():
+    """Download only through the shared official-CLI readiness contract."""
+    from supervisor.runtime.claude import ClaudeBackend
+    return ClaudeBackend._official_cli(prepare=True)
 
 
 @runtime_group.group("windows-sandbox")
@@ -517,8 +570,11 @@ def runtime_login_command(provider: str) -> None:
         if provider == "openai-codex":
             command = [os.environ.get("BELLO_CODEX_BINARY", "codex"), "login"]
         elif provider == "claude-code":
-            from supervisor.runtime.claude import ClaudeBackend
-            command = [str(ClaudeBackend._bundled_cli_path()), "auth", "login"]
+            # Login uses the same verified official CLI as every Bello run.
+            from supervisor.runtime.claude_cli import managed_release
+            if managed_release() is not None:
+                click.echo(_prepare_claude_cli_message())
+            command = [str(_prepare_claude_cli().path), "auth", "login"]
         else:
             command = worker_command()
             auth = Path(command[1]).with_name("auth.mjs")
@@ -535,11 +591,15 @@ def runtime_login_command(provider: str) -> None:
 @cli.command("config")
 def config_command() -> None:
     try:
+        before = load_project_config(Path.cwd(), create=True)
         config = run_config_editor(Path.cwd())
     except (ProjectConfigError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"Saved Bello config: {project_config_path(Path.cwd())}")
+    # Each change was saved when it was made; say whether anything changed.
+    heading = "Saved Bello config" if config != before else "Bello config unchanged"
+    click.echo(f"{heading}: {project_config_path(Path.cwd())}")
     click.echo(f"coder-mod: {config.coder_mod}")
+    click.echo(f"coder-intelligence: {config.coder_intelligence}")
     click.echo(f"revision-coder: {'on' if config.revision_coder_enabled else 'off'}")
     if config.revision_coder_enabled:
         click.echo(f"revision-coder-mod: {config.revision_coder_mod}")
@@ -548,13 +608,17 @@ def config_command() -> None:
     click.echo(f"async-tools: {str(config.async_tools).lower()}")
     if config.runtime_enabled:
         click.echo(f"runtime-mod: {config.runtime_mod}")
+        click.echo(f"runtime-intelligence: {config.runtime_intelligence}")
         click.echo(f"cheap-runtime: {str(config.effective_cheap_runtime).lower()}")
     click.echo(f"completion-review: {str(config.completion_review).lower()}")
     if config.completion_review:
         click.echo(f"completion-mod: {config.completion_mod}")
+        click.echo(f"completion-intelligence: {config.completion_intelligence}")
     click.echo(f"adversary: {str(config.adversary).lower()}")
     if config.adversary:
         click.echo(f"adversary-mod: {config.adversary_mod}")
+        click.echo(f"adversary-intelligence: {config.adversary_intelligence}")
+    click.echo(f"speed: {config.speed}" + (" (Bello Fast: OpenAI/Codex priority service tier)" if config.fast else ""))
     click.echo(f"log-distiller: {str(config.log_distiller.enabled).lower()}")
     if config.log_distiller.enabled:
         click.echo(f"distiller-model: {config.log_distiller.model_path or 'published model (automatic cache)'}")
