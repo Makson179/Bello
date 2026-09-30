@@ -56,6 +56,32 @@ For a project or toolchain on another local drive, prepare only that drive's
 root with `bello runtime windows-sandbox prepare --drive D:`. Offline commands
 refuse to start if their network blocking rules cannot be established.
 
+### Claude Code subscription on native Windows
+
+Bello 0.7.1 pins `claude-agent-sdk==0.2.161` on every platform. That SDK
+release has no Windows wheel with a bundled Claude Code CLI, so on Windows pip
+installs its pure-Python source distribution, and Bello supplies the identical
+official Claude Code 2.1.284 build that the SDK's macOS and Linux wheels bundle:
+
+```powershell
+pipx install 'bello[claude]' --force
+bello runtime install claude-code
+bello runtime login claude-code
+bello doctor
+```
+
+`bello runtime install claude-code` downloads `claude.exe` once from
+`https://downloads.claude.ai/claude-code-releases/2.1.284/win32-x64/`, checks the
+exact size and SHA-256 pinned in Bello, and keeps it in a private,
+ACL-checked cache under `%USERPROFILE%\.bello\runtime\claude-code` (or
+`BELLO_RUNTIME_DIR`). `bello update` and the start of a run whose roles use
+`claude-code/...` prepare it the same way; `bello doctor`, `bello config` and
+backend startup only verify the local file. Bello never uses a `claude` from
+PATH or the project, a different CLI version, or an API route instead. A failed
+or tampered download stops with an actionable message; nothing is replaced
+automatically. The download needs network access to `downloads.claude.ai`
+(unavailable in some regions); no login or model request is involved.
+
 ## Native use
 
 Open PowerShell or Command Prompt in a project on local NTFS, then run:
@@ -124,6 +150,15 @@ found for the runtime and Git, so a stale or mixed WSL/native PATH is visible.
 
 Run `node --version`, `bello runtime install`, and the login command for the
 selected provider in the same terminal. Then rerun `bello doctor`.
+`bello runtime install pi` and `bello runtime install claude-code` prepare one
+component at a time; the Claude Code CLI does not need Node.js.
+
+### `bello config` shows a provider as not connected
+
+The STATUS panel lists each engine that could not report models, with a short
+reason and the next command (for example, Claude Code not signed in, the
+official CLI not prepared, or an API-key variable that would switch Claude
+Code away from the subscription route). Details from providers are not shown.
 
 ### Offline network service is missing or outdated
 

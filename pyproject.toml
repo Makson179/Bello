@@ -44,17 +44,17 @@ log-distiller = [
   "huggingface-hub>=0.28,<1",
 ]
 claude = [
-  "claude-agent-sdk==0.2.161; sys_platform != 'win32'",
-  # 0.2.161 has no Windows wheel with the required bundled Claude CLI.
-  "claude-agent-sdk==0.2.159; sys_platform == 'win32'",
+  # One pin everywhere. PyPI has no win_amd64 wheel for 0.2.161, so Windows
+  # installs its pure-Python sdist and Bello supplies the identical official
+  # Claude Code 2.1.284 build (supervisor/runtime/claude_cli.py).
+  "claude-agent-sdk==0.2.161",
 ]
 test = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
   "setuptools>=77",
   "wheel>=0.45,<1",
-  "claude-agent-sdk==0.2.161; sys_platform != 'win32'",
-  "claude-agent-sdk==0.2.159; sys_platform == 'win32'",
+  "claude-agent-sdk==0.2.161",
 ]
 
 [project.scripts]

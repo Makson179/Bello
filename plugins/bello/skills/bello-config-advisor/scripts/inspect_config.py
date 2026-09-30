@@ -23,7 +23,8 @@ TARGET_VERSION = "0.7.1"
 ACTIVE_STATUSES = {"starting", "running", "paused", "restarting"}
 TERMINAL_STATUSES = {"complete", "escalated", "stuck", "provider_failure", "exited"}
 LEGACY_MODELS = {"gpt-6-astra", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.5"}
-ALL_EFFORTS = {"off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+# `default` sends no effort (qualified models that advertise none, e.g. Claude Haiku).
+ALL_EFFORTS = {"off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "default"}
 
 DEFAULT_MULTI_AGENT = {
     "enabled": False,
@@ -235,7 +236,7 @@ def _valid_effort(model: Any, effort: Any, *, subagent: bool = False) -> bool:
         return False
     if "/" in model:
         return True  # Exact capabilities are checked later against the current catalog.
-    if model not in LEGACY_MODELS or effort in {"off", "minimal"}:
+    if model not in LEGACY_MODELS or effort in {"off", "minimal", "default"}:
         return False
     if model == "gpt-5.5" and effort in {"max", "ultra"}:
         return False

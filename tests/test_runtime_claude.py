@@ -160,6 +160,9 @@ def backend(tmp_path: Path, factory: FakeFactory, events: list[dict], tool_handl
         client_factory=factory,
         auth_probe=lambda: dict(auth),
         environment={},
+        # Test mode never executes a CLI; do not depend on the host's SDK
+        # bundle or Windows download (production rejects this argument).
+        cli_path=tmp_path / "official-claude-cli-fixture",
     )
 
 
@@ -714,6 +717,7 @@ async def test_model_validate_checks_exact_subscription_profile_without_query(tm
             "name": "Sonnet",
             "displayName": "Sonnet",
             "resolvedModel": "claude-sonnet-5",
+            "alias": True,
             "available": True,
             "configured": True,
             "reasoning": True,

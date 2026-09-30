@@ -88,7 +88,12 @@ bello doctor
 ```
 
 The Claude extra includes the pinned official Agent SDK and its official CLI.
-It can be omitted when no role uses `claude-code`. Pi's exact dependency versions
+It can be omitted when no role uses `claude-code`. On native Windows the pinned
+`claude-agent-sdk==0.2.161` has no wheel with a bundled CLI; `bello runtime install
+claude-code` (also run by `bello update` and before a Claude run) downloads the
+identical official Claude Code 2.1.284 build from `downloads.claude.ai`, checks
+its pinned SHA-256 and keeps it in Bello's private runtime cache. See
+[Windows](windows.md#claude-code-subscription-on-native-windows). Pi's exact dependency versions
 are installed from the bundled npm lockfile; the Node dependency tree is not
 copied into the Python wheel. `BELLO_NODE` can select an existing compatible
 Node executable. `BELLO_RUNTIME_DIR` can select the private Pi installation
@@ -194,6 +199,32 @@ The editor shows models and reasoning efforts reported by the authenticated
 engines. Preflight validates every active role and allowed child profile before
 starting model work. Unsupported efforts or Fast mode are errors, not silent
 substitutions. In particular, `ultra` is not treated as a synonym for `max`.
+
+`bello config` runs the same offline checks as that preflight step (model
+availability, advertised effort and the Fast service tier for exactly the active
+profiles) and marks the affected row. STATUS says "Ready / Offline checks
+passed" only when they pass; login, sandbox and structured-output checks still
+run when a task starts. Engines that could not list models are shown with a
+short, sanitized reason and the next command. Claude Code models are shown by
+exact identity (`Sonnet 5.5 - claude-code/claude-sonnet-5-5`); a floating alias
+such as `claude-code/sonnet` also shows what the installed CLI resolves it to now,
+and a run reports that resolution. Saved ids missing from the current catalog,
+such as an older `...[1m]` Opus id, are kept and flagged, never replaced; their
+absence from the catalog is not treated as evidence of a smaller context window.
+
+Changing a role's model keeps a supported effort. Otherwise Bello uses the
+nearest supported level at or below the previous one (the lowest level if none
+is lower), never the most expensive by default, and shows the change. A model
+whose catalog advertises no effort (for example Claude Haiku through Claude
+Code) uses the effort value `default`, which sends no effort parameter; an
+unknown catalog is not treated that way.
+
+`speed=fast` (`--fast`) is Bello Fast: it requests the OpenAI/Codex `priority`
+service tier for coder, revision-coder, runtime and completion-review turns and
+the subagents they start. It is not Smart Execution (`async_tools`) and not
+Claude Code's differently named fast mode. Every active profile must offer the
+tier; Claude Code subscription models do not, so the editor flags that
+combination and preflight rejects it.
 
 For supported OpenAI Codex models, the pinned Pi integration has an explicit
 `ultra` provider-payload mapping. The provider receives literal `ultra`, even

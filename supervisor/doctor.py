@@ -120,20 +120,49 @@ def _runtime_dependency_results() -> list[DoctorResult]:
         results.append(DoctorResult("warn", "Pi runtime dependency check failed",
                                     f"{exc}. Required only for Pi providers; native Codex does not need Pi."))
     results.append(_sandbox_dependency_result())
+    results.append(_claude_dependency_result(ClaudeBackend, AppServerError))
+    return results
+
+
+def _claude_dependency_result(backend: type, error_type: type[Exception]) -> DoctorResult:
+    """File-level readiness only: the same official-CLI contract as backend startup.
+
+    Doctor never downloads, executes the CLI, logs in, or sends a model request.
+    """
+    from supervisor.runtime.claude_cli import ClaudeCliError, INSTALL_COMMAND
+
     try:
-        claude = ClaudeBackend._bundled_cli_path()
-    except (AppServerError, OSError) as exc:
-        results.append(DoctorResult(
+        cli = backend._official_cli()
+    except ClaudeCliError as exc:
+        if exc.kind in {"not-prepared", "invalid-cache", "sdk-mismatch"}:
+            return DoctorResult(
+                "warn", "Claude Code subscription backend is installed but its official CLI is not ready",
+                f"{exc}. A standalone claude on PATH does not replace Bello's verified CLI. "
+                "Not required for Pi/API providers.",
+            )
+        return DoctorResult(
+            "warn", "Claude Code subscription backend is not installed or is incomplete",
+            f"{exc}. Install Bello with the optional `claude` extra to use this backend, then run "
+            f"`{INSTALL_COMMAND}`. A standalone claude on PATH does not replace the SDK bundle. "
+            "Not required for Pi/API providers.",
+        )
+    except (error_type, OSError) as exc:
+        return DoctorResult(
             "warn", "Claude Code subscription backend is not installed or is incomplete",
             f"{exc}. Install Bello with the optional `claude` extra to use this backend. "
             "A standalone claude on PATH does not replace the SDK bundle. Not required for Pi/API providers.",
-        ))
-    else:
-        results.append(DoctorResult(
-            "ok", f"Official Claude Code SDK bundle found: {claude}",
+        )
+    if cli.source == "sdk-bundle":
+        return DoctorResult(
+            "ok", f"Official Claude Code SDK bundle found: {cli.path}",
             "Optional subscription backend; authenticate with `bello runtime login claude-code`.",
-        ))
-    return results
+        )
+    return DoctorResult(
+        "ok", f"Official Claude Code CLI {cli.cli_version} found (Bello-verified download): {cli.path}",
+        "The pinned claude-agent-sdk wheel for this platform has no bundled CLI, so Bello uses the same "
+        "official build from downloads.claude.ai, checked against its pinned SHA-256. Optional "
+        "subscription backend; authenticate with `bello runtime login claude-code`.",
+    )
 
 
 def _sandbox_dependency_result() -> DoctorResult:
