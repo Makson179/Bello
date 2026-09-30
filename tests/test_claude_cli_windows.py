@@ -14,6 +14,7 @@ import hashlib
 import io
 import os
 from pathlib import Path
+import re
 import sys
 from types import ModuleType, SimpleNamespace
 import urllib.error
@@ -54,7 +55,6 @@ def windows(tmp_path, monkeypatch):
     monkeypatch.setattr(native_codex_install.platform, "machine", lambda: "AMD64")
     release = _release()
     monkeypatch.setattr(claude_cli, "MANAGED_RELEASES", {("Windows", "x86_64"): release})
-    monkeypatch.setattr(claude_cli, "_VERIFIED", set())
     package = tmp_path / "site-packages" / "claude_agent_sdk"
     (package / "_bundled").mkdir(parents=True)
     (package / "_bundled" / ".gitignore").write_text("*\n")  # all an sdist-built wheel contains
@@ -194,6 +194,56 @@ def test_tampered_cache_fails_closed_and_is_never_repaired_or_replaced(windows):
     assert len(windows.downloads) == 1
 
 
+def _identity(path: Path) -> tuple[int, int, int, int]:
+    metadata = path.stat()
+    return metadata.st_size, metadata.st_mtime_ns, metadata.st_ino, metadata.st_dev
+
+
+def _rewrite_keeping_metadata(path: Path, data: bytes, *, offset: int = 0) -> None:
+    """Change bytes in place, then restore the timestamps.
+
+    Size, mtime, inode and device all stay identical, deterministically: this
+    covers coarse filesystem clocks (NTFS updates at timer-tick granularity)
+    and deliberately restored timestamps without sleeping or timing races.
+    """
+    before = path.stat()
+    with path.open("r+b") as stream:
+        stream.seek(offset)
+        stream.write(data)
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert _identity(path) == (before.st_size, before.st_mtime_ns, before.st_ino, before.st_dev)
+
+
+@pytest.mark.parametrize("offset,data", [(0, PAYLOAD.replace(b"official", b"tampered")),
+                                         (len(PAYLOAD) - 1, b"?")], ids=["rewrite", "last-byte"])
+def test_tampering_with_unchanged_size_and_restored_mtime_fails_closed(windows, offset, data):
+    installed = claude_cli.resolve_official_cli(prepare=True).path
+    assert claude_cli.resolve_official_cli().path == installed  # verified more than once beforehand
+    _rewrite_keeping_metadata(installed, data, offset=offset)
+    tampered = installed.read_bytes()
+    assert tampered != PAYLOAD and len(tampered) == len(PAYLOAD)
+    for prepare in (False, True, False):
+        with pytest.raises(claude_cli.ClaudeCliError) as caught:
+            claude_cli.resolve_official_cli(prepare=prepare)
+        assert caught.value.kind == "invalid-cache"
+        assert "checksum does not match the pinned official build" in str(caught.value)
+        assert str(installed.parent) in str(caught.value) and "never repaired or replaced" in str(caught.value)
+    assert installed.read_bytes() == tampered  # never repaired, replaced or re-downloaded
+    assert len(windows.downloads) == 1
+
+
+def test_every_readiness_check_hashes_the_cached_bytes(windows, monkeypatch):
+    installed = claude_cli.resolve_official_cli(prepare=True).path
+    hashed = []
+    real_sha256 = native_codex_install._sha256
+    monkeypatch.setattr(native_codex_install, "_sha256", lambda path: hashed.append(path) or real_sha256(path))
+    for prepare in (False, False, True):
+        assert claude_cli.resolve_official_cli(prepare=prepare).path == installed
+    # No metadata-only shortcut: size, mtime, inode and device do not prove the bytes.
+    assert hashed == [installed] * 3
+    assert len(windows.downloads) == 1
+
+
 @pytest.mark.parametrize("change", ["extra-file", "wrong-size"])
 def test_unexpected_cache_contents_are_rejected(windows, change):
     installed = claude_cli.resolve_official_cli(prepare=True).path
@@ -215,6 +265,146 @@ def test_cache_writable_by_others_is_rejected(windows):
             claude_cli.resolve_official_cli()
     finally:
         installed.parent.chmod(0o700)
+
+
+# --- Where the private cache may live -------------------------------------------------
+
+_USER_SID = "S-1-5-21-123-456-789-1001"
+_PRIVATE_SDDL = f"O:{_USER_SID}D:P(A;OICI;FA;;;{_USER_SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+# Plausible (not captured) runner work/temp directories that inherit a volume
+# root's grants: Users may create folders/files, or Authenticated Users modify.
+_SHARED_PARENTS = {
+    "users-create": ("O:BAD:AI(A;OICIID;FA;;;BA)(A;OICIID;FA;;;SY)(A;OICIIOID;GA;;;CO)"
+                     "(A;OICIID;0x1200a9;;;BU)(A;CIID;LC;;;BU)(A;CIID;DC;;;BU)", "(A;CIID;LC;;;BU)"),
+    "authenticated-modify": ("O:BAD:AI(A;OICIID;FA;;;BA)(A;OICIID;FA;;;SY)(A;OICIID;0x1200a9;;;BU)"
+                             "(A;OICIID;0x1301bf;;;AU)", "(A;OICIID;0x1301bf;;;AU)"),
+}
+
+
+def _default_home(tmp_path, monkeypatch) -> Path:
+    """Unset BELLO_RUNTIME_DIR so Bello resolves ~/.bello/runtime in a fixture profile."""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    monkeypatch.delenv("BELLO_RUNTIME_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(profile))
+    monkeypatch.setenv("USERPROFILE", str(profile))  # Path.home() on Windows
+    assert claude_cli._runtime_base() == profile / ".bello" / "runtime"
+    return profile
+
+
+@pytest.fixture
+def windows_acls(windows, monkeypatch):
+    """The installer's Windows branch with SDDL fixtures instead of OS ACL calls.
+
+    The real validator judges every descriptor. Native Windows CI additionally
+    runs the ``real_windows`` tests below and prepares the real default cache.
+    """
+    descriptors: dict[Path, str] = {}
+    calls: list[tuple[Path, bool, bool]] = []
+
+    def acl(path, *, create=False, parent=False, verified_public_executable=False):
+        calls.append((path, create, parent))
+        if create and not path.exists():  # CreateDirectoryW; an existing entry is only inspected
+            path.mkdir(mode=0o700)
+        native_codex_install._validate_windows_security_descriptor(
+            descriptors.get(path, _PRIVATE_SDDL), _USER_SID, parent=parent, path=path)
+
+    monkeypatch.setattr(native_codex_install, "_IS_WINDOWS", True)
+    monkeypatch.setattr(native_codex_install, "_windows_private_acl", acl)
+    return SimpleNamespace(descriptors=descriptors, calls=calls)
+
+
+def test_default_per_user_runtime_directory_is_created_private(windows, windows_acls, tmp_path, monkeypatch):
+    profile = _default_home(tmp_path, monkeypatch)
+    prepared = claude_cli.resolve_official_cli(prepare=True)
+    runtime = profile / ".bello" / "runtime"
+    assert prepared.path == runtime / "claude-code" / windows.release.sha256 / "claude.exe"
+    assert prepared.path.read_bytes() == PAYLOAD and len(windows.downloads) == 1
+    # Missing ancestors are created privately, outermost first; the profile is
+    # only inspected as a containing directory and never created or changed.
+    created = [path for path, create, _ in windows_acls.calls if create]
+    assert created == [runtime.parent, runtime, runtime / "claude-code"]
+    assert {parent for path, _, parent in windows_acls.calls if path == profile} == {True}
+    assert claude_cli.resolve_official_cli() == prepared
+
+
+@pytest.mark.parametrize("shape", sorted(_SHARED_PARENTS))
+def test_shared_containing_directory_is_refused_with_its_path_and_ace(windows, windows_acls, tmp_path,
+                                                                      monkeypatch, shape):
+    descriptor, rejected_ace = _SHARED_PARENTS[shape]
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    windows_acls.descriptors[runner_temp] = descriptor
+    base = runner_temp / "bello-runtime"
+    monkeypatch.setenv("BELLO_RUNTIME_DIR", str(base))
+    with pytest.raises(claude_cli.ClaudeCliError) as caught:
+        claude_cli.resolve_official_cli(prepare=True)
+    message = str(caught.value)
+    assert caught.value.kind == "invalid-cache"
+    assert f"private runtime directory {base} failed verification" in message
+    assert f"other Windows accounts: ACE {rejected_ace} on containing directory {runner_temp}" in message
+    assert "was not installed" in message and "~/.bello/runtime" in message
+    assert str(base / "claude-code") not in message  # no advice to delete a cache that never existed
+    assert list(runner_temp.iterdir()) == [] and windows.downloads == []
+    assert windows_acls.descriptors[runner_temp] == descriptor  # never repaired
+    with pytest.raises(claude_cli.ClaudeCliError) as readiness:
+        claude_cli.resolve_official_cli()
+    assert readiness.value.kind == "not-prepared"
+
+
+def _set_real_dacl(path: Path, sddl: str) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    pointer = ctypes.c_void_p
+    advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(pointer), pointer]
+    advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    advapi.SetFileSecurityW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, pointer]
+    advapi.SetFileSecurityW.restype = wintypes.BOOL
+    kernel.LocalFree.argtypes, kernel.LocalFree.restype = [pointer], pointer
+    descriptor = pointer()
+    assert advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(descriptor), None)
+    try:  # DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+        assert advapi.SetFileSecurityW(str(path), 0x80000004, descriptor)
+    finally:
+        kernel.LocalFree(descriptor)
+
+
+real_windows = pytest.mark.skipif(os.name != "nt", reason="real Windows ACL APIs")
+
+
+@real_windows
+def test_real_windows_default_runtime_directory_has_private_acls(windows, tmp_path, monkeypatch):
+    profile = _default_home(tmp_path, monkeypatch)
+    prepared = claude_cli.resolve_official_cli(prepare=True).path
+    runtime = profile / ".bello" / "runtime"
+    assert prepared == runtime / "claude-code" / windows.release.sha256 / "claude.exe"
+    native_codex_install._windows_private_acl(profile, parent=True)
+    for path in (runtime.parent, runtime, runtime / "claude-code", prepared.parent, prepared):
+        native_codex_install._windows_private_acl(path)
+    assert claude_cli.resolve_official_cli(prepare=True).path == prepared
+    assert len(windows.downloads) == 1
+
+
+@real_windows
+def test_real_windows_shared_containing_directory_is_refused_unchanged(windows, tmp_path, monkeypatch):
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    # Volume-root style grants: Users read, create folders here, create files below.
+    _set_real_dacl(runner_temp, "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+                                "(A;OICI;0x1200a9;;;BU)(A;CI;LC;;;BU)(A;CIIO;DC;;;BU)")
+    monkeypatch.setenv("BELLO_RUNTIME_DIR", str(runner_temp / "bello-runtime"))
+    with pytest.raises(claude_cli.ClaudeCliError) as caught:
+        claude_cli.resolve_official_cli(prepare=True)
+    assert caught.value.kind == "invalid-cache"
+    assert re.search(rf"ACE \(A;CI;(?:LC|0x4);;;BU\) on containing directory {re.escape(str(runner_temp))}",
+                     str(caught.value))
+    assert list(runner_temp.iterdir()) == [] and windows.downloads == []
+    with pytest.raises(ValueError, match="other Windows accounts"):
+        native_codex_install._windows_private_acl(runner_temp, parent=True)  # left unchanged
 
 
 def test_failed_download_installs_nothing_and_leaves_no_staging(windows, monkeypatch):
@@ -422,19 +612,61 @@ def test_windows_ci_proves_each_readiness_phase_without_credentials():
     assert phases == sorted(phases)
     install = workflow.index("bello runtime install claude-code")
     assert phases[1] < install < phases[2]
+    # The real default per-user cache is prepared: no runtime-directory override.
+    assert "BELLO_RUNTIME_DIR=" not in workflow and "BELLO_RUNTIME_DIR:" not in workflow
+    informational = workflow.index("scripts/verify_claude_cli_windows.py runner-temp")
+    assert phases[1] < informational < install
+    assert workflow[informational:].splitlines()[1].strip() == "continue-on-error: true"
     assert 'python -m pip install ".[test,claude]"' in workflow
     for forbidden in ("secrets.", "ANTHROPIC_", "OAUTH", "api_key"):
         assert forbidden not in workflow
     assert "tests/test_claude_cli_windows.py" in workflow and "windows-2022" in workflow and "windows-2025" in workflow
 
 
-def test_windows_verifier_refuses_other_platforms(monkeypatch, capsys):
+def _verifier():
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("verify_claude_cli_windows",
                                                   ROOT / "scripts" / "verify_claude_cli_windows.py")
     verifier = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(verifier)
+    return verifier
+
+
+def test_windows_verifier_proves_only_the_default_runtime_directory(tmp_path, monkeypatch, capsys):
+    verifier = _verifier()
+    profile = _default_home(tmp_path, monkeypatch)
+    assert verifier.default_runtime() == profile / ".bello" / "runtime"
+    monkeypatch.setenv("BELLO_RUNTIME_DIR", str(tmp_path / "runner-temp" / "bello-runtime"))
+    monkeypatch.setattr(verifier.sys, "argv", ["verify", "before"])
+    monkeypatch.setattr(verifier.sys, "platform", "win32")
+    with pytest.raises(SystemExit) as caught:
+        verifier.main()
+    assert caught.value.code == 1
+    assert "unset BELLO_RUNTIME_DIR" in capsys.readouterr().out
+
+
+def test_runner_temp_phase_reports_the_refusal_without_failing_or_writing(tmp_path, monkeypatch, capsys):
+    verifier = _verifier()
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    descriptor, rejected_ace = _SHARED_PARENTS["users-create"]
+    checked = []
+
+    def acl(path, *, parent=False, **_kwargs):
+        checked.append((path, parent))
+        native_codex_install._validate_windows_security_descriptor(descriptor, _USER_SID, parent=parent, path=path)
+
+    monkeypatch.setattr(native_codex_install, "_windows_private_acl", acl)
+    monkeypatch.setenv("RUNNER_TEMP", str(runner_temp))
+    verifier.check_runner_temp()
+    assert checked == [(runner_temp, True)]
+    assert f"ACE {rejected_ace} on containing directory {runner_temp}" in capsys.readouterr().out
+    assert list(runner_temp.iterdir()) == []
+
+
+def test_windows_verifier_refuses_other_platforms(monkeypatch, capsys):
+    verifier = _verifier()
     monkeypatch.setattr(verifier.sys, "platform", "linux")
     monkeypatch.setattr(verifier.sys, "argv", ["verify", "sdk"])
     with pytest.raises(SystemExit) as caught:

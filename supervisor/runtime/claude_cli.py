@@ -97,8 +97,6 @@ MANAGED_RELEASES: dict[tuple[str, str], OfficialCliRelease] = {
     ),
 }
 _MAX_REDIRECTED_URL = 4096
-# Full hashing of a ~250 MB file is only repeated when its identity changes.
-_VERIFIED: set[tuple[str, int, int, int, int]] = set()  # (pinned sha256, size, mtime_ns, inode, device)
 
 
 @dataclass(frozen=True)
@@ -237,6 +235,17 @@ def _invalid_cache(directory: Path, error: BaseException) -> ClaudeCliError:
     )
 
 
+def _unusable_runtime_directory(base: Path, error: BaseException) -> ClaudeCliError:
+    # Before any cache exists: the location itself (or its containing
+    # directory) failed the shared private-cache checks. Name it; change nothing.
+    return ClaudeCliError(
+        f"Bello's private runtime directory {base} failed verification ({error}). The Claude Code CLI was "
+        "not installed and existing permissions were not changed; use the per-user default ~/.bello/runtime "
+        f"or a BELLO_RUNTIME_DIR that other accounts cannot modify, then run `{INSTALL_COMMAND}`",
+        kind="invalid-cache",
+    )
+
+
 def _verify_directory(directory: Path, release: OfficialCliRelease) -> None:
     cache = _cache()
     cache._owned(directory, directory=True, private=True)
@@ -247,15 +256,13 @@ def _verify_directory(directory: Path, release: OfficialCliRelease) -> None:
     metadata_ = path.lstat()
     if not stat.S_ISREG(metadata_.st_mode) or metadata_.st_size != release.size:
         raise ValueError("the cached Claude Code CLI does not have the pinned size")
-    # A rename into place keeps the file identity, so it is not hashed twice.
-    identity = (release.sha256, metadata_.st_size, metadata_.st_mtime_ns, metadata_.st_ino, metadata_.st_dev)
-    if identity in _VERIFIED:
-        return
+    # Always hash the bytes. Size, mtime, inode and device can all stay the
+    # same after an in-place rewrite (coarse NTFS timestamps, restored mtime),
+    # so no metadata-keyed memo may stand in for the pinned SHA-256.
     if cache._sha256(path) != release.sha256:
         raise ValueError("the cached Claude Code CLI checksum does not match the pinned official build")
     if os.name != "nt" and not os.access(path, os.X_OK):
         raise ValueError("the cached Claude Code CLI is not executable")
-    _VERIFIED.add(identity)
 
 
 def _install(release: OfficialCliRelease, download: Callable[[OfficialCliRelease, Path], None]) -> Path:
@@ -277,7 +284,7 @@ def _install(release: OfficialCliRelease, download: Callable[[OfficialCliRelease
         if lock_path.exists():
             cache._owned(lock_path)
     except (OSError, ValueError) as exc:
-        raise _invalid_cache(destination, exc) from exc
+        raise _unusable_runtime_directory(base, exc) from exc
     with FileLock(lock_path):
         try:
             cache._owned(lock_path)

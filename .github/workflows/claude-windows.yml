@@ -3,6 +3,8 @@ name: Claude Code on native Windows
 # Proves the 0.7.1 Windows path: claude-agent-sdk 0.2.161 has no win_amd64 wheel,
 # so it installs from its sdist and Bello supplies the identical official Claude
 # Code 2.1.284 build (downloads.claude.ai, pinned size and SHA-256, private cache).
+# BELLO_RUNTIME_DIR stays unset: the proof uses the real default per-user cache,
+# %USERPROFILE%\.bello\runtime, not a shared runner directory.
 # No login, prompt or model request is made; no credentials are configured.
 
 on:
@@ -32,9 +34,6 @@ jobs:
     env:
       BELLO_SKIP_UPDATE_CHECK: "1"
     steps:
-      - name: Use a runner-private Bello runtime directory
-        shell: pwsh
-        run: Add-Content -LiteralPath $env:GITHUB_ENV -Value "BELLO_RUNTIME_DIR=$env:RUNNER_TEMP\bello-runtime"
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
@@ -57,6 +56,9 @@ jobs:
           tests/test_update_fresh_process.py tests/test_native_codex_install.py
       - name: Unprepared readiness fails closed without downloading
         run: python scripts/verify_claude_cli_windows.py before
+      - name: Record whether RUNNER_TEMP could contain the private cache (informational, read-only)
+        run: python scripts/verify_claude_cli_windows.py runner-temp
+        continue-on-error: true
       - name: Prepare the official CLI through Bello (one verified download)
         run: bello runtime install claude-code
       - name: Reuse the verified cache without another download

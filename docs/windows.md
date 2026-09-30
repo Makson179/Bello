@@ -74,7 +74,11 @@ bello doctor
 `https://downloads.claude.ai/claude-code-releases/2.1.284/win32-x64/`, checks the
 exact size and SHA-256 pinned in Bello, and keeps it in a private,
 ACL-checked cache under `%USERPROFILE%\.bello\runtime\claude-code` (or
-`BELLO_RUNTIME_DIR`). `bello update` and the start of a run whose roles use
+`BELLO_RUNTIME_DIR`, which must be private to you, SYSTEM and Administrators
+inside a directory that gives other accounts at most read access; a shared
+folder such as a CI runner's temp directory is refused with the rejected path
+and ACL entry, and its permissions are never changed).
+`bello update` and the start of a run whose roles use
 `claude-code/...` prepare it the same way; `bello doctor`, `bello config` and
 backend startup only verify the local file. Bello never uses a `claude` from
 PATH or the project, a different CLI version, or an API route instead. A failed

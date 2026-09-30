@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """Verify Bello's official Claude Code CLI on a real native Windows runner.
 
-Phases (run in order on a fresh runner with BELLO_RUNTIME_DIR set):
+Phases (run in order on a fresh runner with BELLO_RUNTIME_DIR unset, so the
+proof covers the default per-user runtime directory %USERPROFILE%\\.bello\\runtime):
 
 * ``sdk``     - claude-agent-sdk is the pinned release built from its sdist:
                 importable, bundled-CLI version 2.1.284, and no bundled claude.exe.
 * ``before``  - readiness fails closed with the setup command; doctor warns.
                 Nothing is downloaded.
+* ``runner-temp`` - informational and read-only: whether Bello's containing-
+                directory policy accepts RUNNER_TEMP, with the sanitized reason
+                if not. Nothing is created or downloaded; it never fails the job.
 * ``after``   - after ``bello runtime install claude-code``: the verified cache
-                is used, its SHA-256 matches the pin, the Windows ACL checks
-                pass, Windows reports a valid Authenticode signature by
-                Anthropic, and ``claude.exe --version`` reports 2.1.284.
+                in the default directory is used, its SHA-256 matches the pin,
+                real Windows ACLs are private from ``.bello`` down to claude.exe,
+                Windows reports a valid Authenticode signature by Anthropic, and
+                ``claude.exe --version`` reports 2.1.284.
 * ``metadata``- a signed-out metadata handshake through Bello's own backend
                 (SDK initialize/get_server_info in an isolated CLAUDE_CONFIG_DIR)
                 lists claude-sonnet-5-5 with the pinned CLI. No login, no prompt,
@@ -63,6 +68,16 @@ def check_sdk() -> None:
     ok(f"claude-agent-sdk {version} (sdist build, declares CLI {__cli_version__}) without a bundled CLI")
 
 
+def default_runtime() -> Path:
+    """Bello's own default per-user runtime directory, as the product resolves it."""
+    from supervisor.runtime import claude_cli
+
+    runtime = claude_cli._runtime_base()
+    if runtime != (Path.home() / ".bello" / "runtime").absolute():
+        fail("Bello did not resolve its default per-user runtime directory")
+    return runtime
+
+
 def check_before() -> None:
     from supervisor import doctor
     from supervisor.appserver import AppServerError
@@ -72,6 +87,7 @@ def check_before() -> None:
     def forbidden(*_args, **_kwargs):
         fail("readiness verification attempted a download")
 
+    runtime = default_runtime()
     claude_cli._download = forbidden
     try:
         ClaudeBackend._official_cli()
@@ -83,7 +99,23 @@ def check_before() -> None:
     result = doctor._claude_dependency_result(ClaudeBackend, AppServerError)
     if result.level != "warn" or "bello runtime install claude-code" not in (result.detail or ""):
         fail("doctor did not report the missing preparation")
-    ok("unprepared state fails closed with the setup command; nothing was downloaded")
+    ok(f"unprepared state fails closed with the setup command; nothing was downloaded ({runtime})")
+
+
+def check_runner_temp() -> None:
+    """Record why RUNNER_TEMP cannot contain Bello's private cache (read-only)."""
+    from supervisor.runtime import native_codex_install
+
+    temp = os.environ.get("RUNNER_TEMP")
+    if not temp:
+        print("INFO: RUNNER_TEMP is not set; nothing to inspect")
+        return
+    try:
+        native_codex_install._windows_private_acl(Path(temp), parent=True)
+    except (OSError, ValueError) as exc:
+        print(f"INFO: Bello's private-cache policy refuses RUNNER_TEMP as a containing directory: {exc}")
+    else:
+        print("INFO: Bello's private-cache policy accepts RUNNER_TEMP as a containing directory")
 
 
 def _authenticode(path: Path) -> dict:
@@ -107,18 +139,26 @@ def _authenticode(path: Path) -> dict:
 def check_after() -> None:
     from supervisor import doctor
     from supervisor.appserver import AppServerError
-    from supervisor.runtime import claude_cli
+    from supervisor.runtime import claude_cli, native_codex_install
     from supervisor.runtime.claude import ClaudeBackend
 
     cli = ClaudeBackend._official_cli()
     release = claude_cli.managed_release()
-    runtime = Path(os.environ["BELLO_RUNTIME_DIR"]).resolve()
-    if cli.source != "managed-download" or not cli.path.resolve().is_relative_to(runtime):
-        fail("Bello did not use its verified private cache")
+    runtime = default_runtime()
+    if cli.source != "managed-download" or cli.path != runtime / "claude-code" / release.sha256 / release.binary:
+        fail("Bello did not use its verified private cache in the default per-user runtime directory")
     digest = hashlib.sha256(cli.path.read_bytes()).hexdigest()
     if digest != release.sha256 or cli.path.stat().st_size != release.size:
         fail("the cached CLI does not match the pinned official build")
     ok(f"verified {cli.path} (SHA-256 {digest})")
+    # Real OS ACLs for everything Bello created: owner and grants limited to
+    # this user, SYSTEM and Administrators (the same validator the cache uses).
+    try:
+        for path in (runtime.parent, runtime, runtime / "claude-code", cli.path.parent, cli.path):
+            native_codex_install._windows_private_acl(path)
+    except (OSError, ValueError) as exc:
+        fail(f"private Windows ACL check failed: {exc}")
+    ok(f"private Windows ACLs from {runtime.parent} down to {release.binary}")
     signature = _authenticode(cli.path)
     if signature.get("Status") != "Valid" or "Anthropic" not in (signature.get("Subject") or ""):
         fail(f"Authenticode status {signature.get('Status')!r}, signer {signature.get('Subject')!r}")
@@ -174,13 +214,15 @@ def check_metadata() -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("phase", choices=["sdk", "before", "after", "metadata"])
+    phases = {"sdk": check_sdk, "before": check_before, "runner-temp": check_runner_temp,
+              "after": check_after, "metadata": check_metadata}
+    parser.add_argument("phase", choices=list(phases))
     arguments = parser.parse_args()
     if sys.platform != "win32":
         fail("run this verifier on native Windows")
-    if not os.environ.get("BELLO_RUNTIME_DIR"):
-        fail("set BELLO_RUNTIME_DIR to a runner-private directory")
-    {"sdk": check_sdk, "before": check_before, "after": check_after, "metadata": check_metadata}[arguments.phase]()
+    if "BELLO_RUNTIME_DIR" in os.environ:
+        fail("unset BELLO_RUNTIME_DIR: this proof covers Bello's default per-user runtime directory")
+    phases[arguments.phase]()
     return 0
 
 
