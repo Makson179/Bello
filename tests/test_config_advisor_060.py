@@ -591,11 +591,12 @@ class ConfigInspectionTests(unittest.TestCase):
             "max_completion_returns_before_adversary": 0, "max_completion_returns_after_adversary": 0}),
             ("unlimited", "unlimited"))
 
-    def test_version_target_recognizes_071_development(self):
-        for value in ("0.7.1", "0.7.1.dev0", "0.7.1.dev12"):
+    def test_version_target_recognizes_072_development(self):
+        for value in ("0.7.2", "0.7.2.dev0", "0.7.2.dev12"):
             self.assertEqual(INSPECTOR._version_compatibility(value), "verified")
         self.assertEqual(INSPECTOR._version_compatibility("0.5.2"), "update_required")
         self.assertEqual(INSPECTOR._version_compatibility("0.7.0"), "update_required")
+        self.assertEqual(INSPECTOR._version_compatibility("0.7.1"), "update_required")
         self.assertEqual(INSPECTOR._version_compatibility("garbage"), "unverified")
 
     def test_live_process_guard_and_state_are_preserved_read_only(self):

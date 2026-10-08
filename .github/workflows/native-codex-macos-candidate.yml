@@ -1,0 +1,205 @@
+name: Native Codex 0.161 macOS arm64 candidate
+
+on:
+  push:
+    branches: ['codex/072-recovery-validation']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-codex-macos-candidate-0161-${{ github.ref }}
+  cancel-in-progress: false
+
+# Separate recipe: the already-qualified Linux/Windows cache identity is untouched.
+# No publishing or credentials; Mac cleanup proves normal completion/groups only.
+jobs:
+  macos-build:
+    if: github.ref == 'refs/heads/codex/072-recovery-validation'
+    runs-on: macos-15
+    timeout-minutes: 240
+    outputs:
+      artifact-name: ${{ steps.identity.outputs.artifact-name }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: '3'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      CARGO_PROFILE_RELEASE_LTO: 'false'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require native ARM64 Darwin
+        run: test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Identify the separate exact macOS build recipe
+        id: identity
+        run: |
+          key=$(python scripts/build_native_codex_macos_candidate.py build-key --target darwin-arm64)
+          [[ "$key" =~ ^[0-9a-f]{64}$ ]]
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          echo "artifact-name=native-codex-candidate-0161-darwin-arm64-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        id: candidate
+        with:
+          path: native-candidate
+          key: native-codex-candidate-0161-darwin-arm64-ready-v1-${{ steps.identity.outputs.key }}
+      - name: Verify exact cached inventory hashes Mach-O and signatures before reuse
+        if: steps.candidate.outputs.cache-hit == 'true'
+        run: python scripts/build_native_codex_macos_candidate.py verify-build --target darwin-arm64 --candidate native-candidate --restore-executable-modes
+      - name: Configure isolated build paths
+        if: steps.candidate.outputs.cache-hit != 'true'
+        run: |
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/bello-macos-candidate-0161-target" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$RUNNER_TEMP/bello-macos-candidate-0161-cargo" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        if: steps.candidate.outputs.cache-hit != 'true'
+        with:
+          repository: openai/codex
+          ref: 979011409de0a60b52f179721948e65531d26144
+          path: native-source
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        if: steps.candidate.outputs.cache-hit != 'true'
+        with:
+          toolchain: '1.95.0'
+          targets: aarch64-apple-darwin
+      - uses: actions/cache/restore@v4
+        if: steps.candidate.outputs.cache-hit != 'true'
+        id: cargo_cache
+        with:
+          path: |
+            ${{ runner.temp }}/bello-macos-candidate-0161-cargo/registry
+            ${{ runner.temp }}/bello-macos-candidate-0161-cargo/git
+            ${{ runner.temp }}/bello-macos-candidate-0161-target
+          key: native-codex-candidate-0161-darwin-arm64-cargo-v1-${{ steps.identity.outputs.key }}
+          # Only Cargo may reuse recompilable state; never use a ready-binary fallback.
+          restore-keys: native-codex-candidate-0161-darwin-arm64-cargo-v1-
+      - name: Apply the exact current 0.161 candidate patch
+        if: steps.candidate.outputs.cache-hit != 'true'
+        run: python scripts/prepare_native_codex_candidate.py prepare --source native-source
+      - name: Download and verify pinned arm64 V8 v150.4 artifacts
+        if: steps.candidate.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/bello-macos-candidate-0161-v8"
+          base=https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0
+          archive=librusty_v8_ptrcomp_sandbox_release_aarch64-apple-darwin.a.gz
+          binding=src_binding_ptrcomp_sandbox_release_aarch64-apple-darwin.rs
+          for name in "$archive" "$binding"; do
+            curl --fail --location --retry 3 "$base/$name" -o "$RUNNER_TEMP/bello-macos-candidate-0161-v8/$name"
+          done
+          python scripts/build_native_codex_macos_candidate.py verify-v8 --directory "$RUNNER_TEMP/bello-macos-candidate-0161-v8"
+          echo "RUSTY_V8_ARCHIVE=$RUNNER_TEMP/bello-macos-candidate-0161-v8/$archive" >> "$GITHUB_ENV"
+          echo "RUSTY_V8_SRC_BINDING_PATH=$RUNNER_TEMP/bello-macos-candidate-0161-v8/$binding" >> "$GITHUB_ENV"
+      - name: Compile native Codex and code-mode host without post-link mutation
+        if: steps.candidate.outputs.cache-hit != 'true'
+        working-directory: native-source/codex-rs
+        run: cargo build --locked --release --timings --target aarch64-apple-darwin --bin codex --bin codex-code-mode-host
+      - name: Test actual native path URI conversions
+        if: steps.candidate.outputs.cache-hit != 'true'
+        working-directory: native-source/codex-rs
+        run: cargo test --locked --release --target aarch64-apple-darwin -p codex-utils-path-uri --lib
+      - name: Test actual lossless permission path serialization
+        if: steps.candidate.outputs.cache-hit != 'true'
+        working-directory: native-source/codex-rs
+        run: cargo test --locked --release --target aarch64-apple-darwin -p codex-protocol --lib bello_permission_path_roundtrip
+      - name: Preserve successful recompilable Cargo state
+        if: steps.candidate.outputs.cache-hit != 'true' && steps.cargo_cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ runner.temp }}/bello-macos-candidate-0161-cargo/registry
+            ${{ runner.temp }}/bello-macos-candidate-0161-cargo/git
+            ${{ runner.temp }}/bello-macos-candidate-0161-target
+          key: ${{ steps.cargo_cache.outputs.cache-primary-key }}
+      - name: Capture signed Mach-O binaries licenses exact source and build receipt
+        if: steps.candidate.outputs.cache-hit != 'true'
+        run: python scripts/build_native_codex_macos_candidate.py snapshot-build --target darwin-arm64 --source native-source --release "$CARGO_TARGET_DIR/aarch64-apple-darwin/release" --cargo-home "$CARGO_HOME" --output native-candidate
+      - name: Verify every file exact identity and native signature
+        run: python scripts/build_native_codex_macos_candidate.py verify-build --target darwin-arm64 --candidate native-candidate
+      - name: Preserve exact verified candidate cache
+        if: steps.candidate.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: native-candidate
+          key: ${{ steps.candidate.outputs.cache-primary-key }}
+      - name: Preserve binaries independently of qualification
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.identity.outputs.artifact-name }}
+          path: native-candidate/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  macos-proof:
+    if: github.ref == 'refs/heads/codex/072-recovery-validation'
+    needs: macos-build
+    runs-on: macos-15
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require native ARM64 Darwin
+        run: test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.macos-build.outputs.artifact-name }}
+          path: native-candidate
+      - name: Verify every byte and native signature before executing candidate
+        run: python scripts/build_native_codex_macos_candidate.py verify-build --target darwin-arm64 --candidate native-candidate --restore-executable-modes
+      - name: Install CPU inference and local proof dependencies
+        run: python -m pip install -e '.[log-distiller,test]'
+      - name: Validate separate macOS build and qualifier contracts
+        run: python -m pytest -q tests/test_build_native_codex_macos_candidate.py tests/test_verify_native_codex_macos_candidate.py tests/test_native_codex_macos_candidate_workflow.py --junitxml=native-candidate-tests.xml
+      - name: Prove selection9 async14 history1 and CPU inference4 plus bypass2
+        run: python scripts/verify_native_codex_macos_candidate.py --candidate native-candidate --target darwin-arm64 --output-dir candidate-proof --modernbert
+      - name: Package only the qualified exact candidate with all installable hashes
+        run: python scripts/release_native_codex_candidate.py package --target darwin-arm64 --candidate native-candidate --qualification candidate-proof --output "$RUNNER_TEMP/bello-0161-macos-release"
+      - name: Prove the real fresh-cache installer and installed native CPU pipeline
+        run: python scripts/release_native_codex_candidate.py install-local --target darwin-arm64 --artifact "$RUNNER_TEMP/bello-0161-macos-release" --runtime-root "$RUNNER_TEMP/bello-0161-installed-runtime" --output "$RUNNER_TEMP/bello-0161-macos-installed-proof" --modernbert
+      - name: Preserve qualified archive and its checksums without publishing
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-codex-release-0161-darwin-arm64-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/bello-0161-macos-release/bello-native-codex-0.161.0-aarch64-apple-darwin.tar.gz
+            ${{ runner.temp }}/bello-0161-macos-release/checksums.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Preserve bounded synthetic proof receipts even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-codex-candidate-0161-darwin-arm64-proof-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            native-candidate/native-build-receipt.json
+            native-candidate/BUILD-INFO
+            native-candidate-tests.xml
+            candidate-proof/qualification.json
+            candidate-proof/worker/qualification.json
+            candidate-proof/worker/*/report.json
+            candidate-proof/worker/*/*/result.json
+            ${{ runner.temp }}/bello-0161-macos-installed-proof/installed-proof.json
+            ${{ runner.temp }}/bello-0161-macos-installed-proof/worker/report.json
+            ${{ runner.temp }}/bello-0161-macos-installed-proof/worker/*/report.json
+            ${{ runner.temp }}/bello-0161-macos-installed-proof/worker/*/*/result.json
+          if-no-files-found: warn
+          retention-days: 14

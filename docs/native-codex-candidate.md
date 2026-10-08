@@ -93,3 +93,35 @@ reports live under `candidate-proof/worker/`; a passing worker report alone is
 not sufficient. Do not upload the guardian control directory or model/home
 caches. Local mocked wrapper tests prove validation behavior, not native-platform
 execution, learned-model performance, or release readiness.
+
+## Release archive and installed-cache gates
+
+The release preparation path is separate from candidate compilation.
+`native-codex-release-qualification.yml` binds Linux and Windows artifact IDs to
+the exact successful source run before downloading them. The versioned release
+packager verifies the complete build, aggregate guardian receipt, worker receipt,
+proof-source hashes and individual case results before creating the installer's
+strict file inventory. It does not modify the compiled executable bytes or reuse
+the older packaging helpers under a different version constant.
+
+`native-codex-macos-candidate.yml` builds the same pinned upstream and patch on an
+actual Apple Silicon runner. Its separate build and qualification receipts do not
+replace the Linux or Windows evidence. macOS proves normal process-group cleanup;
+it does **not** prove cleanup of arbitrary detached descendants. Automatic crash
+continuation on macOS therefore remains fail-closed.
+
+All release targets must then cold-install their archive through Bello's real
+private-cache installer and repeat selection, async/cancellation, persistent
+history and six CPU ModernBERT cases (four inference runs and two protected-input
+bypass controls), plus the bundled sandbox on Linux. Local
+archive transfer is substituted only during this prepublication gate; no mock
+native executable or provider credential is used. A separate postpublication
+gate must download the pinned archive through the normal HTTPS downloader and
+verify unchanged cache reuse. Passing source or candidate tests alone does not
+mean these archive and HTTPS gates have passed.
+
+Archive checksums must exist before setting public download pins. Native helper
+assets are published separately from the Bello package release. The managed
+helper is selected for native Smart Execution or log distillation; ordinary
+Codex execution without those features continues to use the user's host Codex.
+No global Codex installation is replaced by this release path.

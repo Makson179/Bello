@@ -1,0 +1,173 @@
+name: Native Codex 0.161 release archive qualification
+
+on:
+  push:
+    branches: ['codex/072-recovery-validation']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: native-codex-release-0161-${{ github.ref }}
+  cancel-in-progress: false
+
+# Repackage the exact successful candidate; never build from a moving upstream,
+# execute an unverified download, upload a release, or consume provider secrets.
+jobs:
+  package-install:
+    if: github.ref == 'refs/heads/codex/072-recovery-validation'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            python: '3.11'
+            target: linux-x64
+            binary-id: '11549045823'
+            binary-size: '530814955'
+            binary-digest: sha256:b564931c0da300a2db054c449f15e6f6fcd48f683edf6257353f31b685339340
+            proof-id: '11550105744'
+            proof-size: '39201'
+            proof-digest: sha256:bab6b6c698d85889c8b354fdf982e04c84fd76482bf2198681af524331ac7773
+            proof-label: linux
+          - os: windows-2022
+            python: '3.11'
+            target: windows-x64
+            binary-id: '11552345407'
+            binary-size: '492480932'
+            binary-digest: sha256:c52178f0e07674c2155ab2ea40df1a75ec47ddd9dd67a87099d4bbba67f24296
+            proof-id: '11552567973'
+            proof-size: '57652'
+            proof-digest: sha256:a64b1d47be62f58b548ae2b25b2fe38d9a8f66c03efa3219c28bca5a2a9b9af2
+            proof-label: windows-2022-py3.11
+          - os: windows-2025
+            python: '3.14'
+            target: windows-x64
+            binary-id: '11552345407'
+            binary-size: '492480932'
+            binary-digest: sha256:c52178f0e07674c2155ab2ea40df1a75ec47ddd9dd67a87099d4bbba67f24296
+            # Same proof input produces one identical release archive on both
+            # hosts; installed runtime proofs below still execute on each OS.
+            proof-id: '11552567973'
+            proof-size: '57652'
+            proof-digest: sha256:a64b1d47be62f58b548ae2b25b2fe38d9a8f66c03efa3219c28bca5a2a9b9af2
+            proof-label: windows-2022-py3.11
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Bind immutable artifact IDs to the successful exact source run
+        uses: actions/github-script@v7
+        env:
+          BINARY_ID: ${{ matrix.binary-id }}
+          BINARY_SIZE: ${{ matrix.binary-size }}
+          BINARY_DIGEST: ${{ matrix.binary-digest }}
+          PROOF_ID: ${{ matrix.proof-id }}
+          PROOF_SIZE: ${{ matrix.proof-size }}
+          PROOF_DIGEST: ${{ matrix.proof-digest }}
+          TARGET: ${{ matrix.target }}
+          PROOF_LABEL: ${{ matrix.proof-label }}
+        with:
+          script: |
+            const owner = 'Makson179', repo = 'Bello';
+            const run_id = 37769628940;
+            const head = '0bbe6e35b7bdc0224f039999c6a2e32c49b855f6';
+            if (context.repo.owner !== owner || context.repo.repo !== repo) throw Error('Wrong repository');
+            const {data: run} = await github.rest.actions.getWorkflowRun({owner, repo, run_id});
+            if (run.id !== run_id || run.head_sha !== head || run.run_attempt !== 1 ||
+                run.status !== 'completed' || run.conclusion !== 'success' || run.event !== 'push' ||
+                run.head_branch !== 'codex/072-recovery-validation' ||
+                run.path !== '.github/workflows/native-codex-candidate.yml' ||
+                run.repository.full_name !== `${owner}/${repo}` ||
+                run.head_repository.full_name !== `${owner}/${repo}`) throw Error('Source run identity rejected');
+            const definitions = [
+              [process.env.BINARY_ID, process.env.BINARY_SIZE, process.env.BINARY_DIGEST, `native-codex-candidate-0161-${process.env.TARGET}-${head}-${run_id}-1`],
+              [process.env.PROOF_ID, process.env.PROOF_SIZE, process.env.PROOF_DIGEST, `native-codex-candidate-0161-${process.env.PROOF_LABEL}-proof-${head}-${run_id}-1`],
+            ];
+            const artifacts = [];
+            for (const [id, size, digest, name] of definitions) {
+              const {data: a} = await github.rest.actions.getArtifact({owner, repo, artifact_id: Number(id)});
+              if (a.id !== Number(id) || a.name !== name || a.size_in_bytes !== Number(size) || a.digest !== digest || a.expired ||
+                  a.workflow_run?.id !== run_id || a.workflow_run?.head_sha !== head)
+                throw Error('Artifact provenance rejected');
+              artifacts.push({id: a.id, name: a.name, size_in_bytes: a.size_in_bytes, digest: a.digest ?? null});
+            }
+            const receipts = require('path').join(process.env.RUNNER_TEMP, 'release-receipts');
+            require('fs').mkdirSync(receipts, {recursive: false});
+            require('fs').writeFileSync(require('path').join(receipts, 'source-artifact-binding.json'), JSON.stringify({
+              schema: 'bello.native-release-source-artifacts.v1', source_run_id: run_id,
+              source_head: head, source_attempt: 1, packaging_head: context.sha, artifacts,
+            }, null, 2) + '\n');
+      - uses: actions/download-artifact@v4
+        with:
+          repository: Makson179/Bello
+          run-id: '37769628940'
+          artifact-ids: ${{ matrix.binary-id }}
+          github-token: ${{ github.token }}
+          merge-multiple: true
+          path: native-candidate
+      - uses: actions/download-artifact@v4
+        with:
+          repository: Makson179/Bello
+          run-id: '37769628940'
+          artifact-ids: ${{ matrix.proof-id }}
+          github-token: ${{ github.token }}
+          merge-multiple: true
+          path: source-proof
+      - name: Verify candidate bytes before restoring transport-lost executable modes
+        run: python scripts/build_native_codex_candidate.py verify-build --target ${{ matrix.target }} --candidate native-candidate --restore-executable-modes
+      - name: Install CPU inference and credential-free proof dependencies
+        run: |
+          python -m pip install 'torch>=2.6,<3' --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e '.[log-distiller,test]'
+      - name: Test release packaging and fail-closed artifact contracts
+        run: python -m pytest -q tests/test_release_native_codex_candidate.py tests/test_native_codex_release_workflow.py --junitxml="$RUNNER_TEMP/release-receipts/release-contracts.xml"
+      - name: Package only the verified candidate and complete qualification
+        run: python scripts/release_native_codex_candidate.py package --target ${{ matrix.target }} --candidate native-candidate --qualification source-proof/candidate-proof --output "$RUNNER_TEMP/native-release"
+      - name: Cold install through production cache and repeat all actual native proofs
+        run: |
+          if [[ "$RUNNER_OS" == 'Windows' ]]; then
+            runtime_parent="$LOCALAPPDATA"
+          else
+            runtime_parent="$RUNNER_TEMP"
+          fi
+          python scripts/release_native_codex_candidate.py install-local \
+            --target ${{ matrix.target }} --artifact "$RUNNER_TEMP/native-release" \
+            --runtime-root "$runtime_parent/bello-0161-release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --output "$RUNNER_TEMP/release-receipts/installed-release-proof" --modernbert
+      - name: Preserve qualified archive without publishing it
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-codex-0161-release-${{ matrix.os }}-py${{ matrix.python }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/native-release/*.tar.gz
+            ${{ runner.temp }}/native-release/checksums.json
+            ${{ runner.temp }}/native-release/bundle/selection-manifest.json
+            ${{ runner.temp }}/native-release/bundle/BUILD-INFO
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+      - name: Preserve bounded public receipts even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-codex-0161-installed-proof-${{ matrix.os }}-py${{ matrix.python }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/release-receipts/source-artifact-binding.json
+            ${{ runner.temp }}/release-receipts/release-contracts.xml
+            ${{ runner.temp }}/release-receipts/installed-release-proof/installed-proof.json
+            ${{ runner.temp }}/release-receipts/installed-release-proof/worker/report.json
+            ${{ runner.temp }}/release-receipts/installed-release-proof/worker/*/report.json
+            ${{ runner.temp }}/release-receipts/installed-release-proof/worker/*/*/result.json
+          if-no-files-found: warn
+          retention-days: 14

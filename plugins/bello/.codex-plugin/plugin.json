@@ -1,6 +1,6 @@
 {
   "name": "bello",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Choose a Bello configuration, then launch and monitor a supervised coding task from Codex.",
   "author": {
     "name": "Maxim Bocharov",

@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Existing published release to publish from the selected main commit (for example v0.7.0)"
+        description: "Existing published release whose tag exactly matches the selected main commit (for example v0.7.2)"
         required: true
         type: string
 
@@ -36,7 +36,7 @@ jobs:
           python-version: "3.11"
       - name: Install build tooling
         run: python -m pip install --upgrade build twine packaging
-      - name: Verify tag matches package version
+      - name: Verify release version and exact main-integrated source
         id: version
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
@@ -67,11 +67,18 @@ jobs:
                   raise SystemExit("published release state does not match package version")
               if "<!-- bello:github-only -->" in release["body"]:
                   raise SystemExit("GitHub-only release is not authorized for package publication")
-              tagged_commit = subprocess.check_output([
-                  "git", "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}",
-              ], text=True).strip()
-              subprocess.run(["git", "merge-base", "--is-ancestor", tagged_commit, "HEAD"], check=True)
-          source_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          tagged_commit = subprocess.check_output([
+              "git", "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}",
+          ], text=True).strip()
+          source_sha = subprocess.check_output([
+              "git", "rev-parse", "--verify", "HEAD^{commit}",
+          ], text=True).strip()
+          if tagged_commit != source_sha:
+              raise SystemExit("checked-out source must exactly match the release tag commit")
+          main_commit = subprocess.check_output([
+              "git", "rev-parse", "--verify", "refs/remotes/origin/main^{commit}",
+          ], text=True).strip()
+          subprocess.run(["git", "merge-base", "--is-ancestor", tagged_commit, main_commit], check=True)
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"prerelease={str(prerelease).lower()}\nsource_sha={source_sha}\n")
           print(f"Building {tag} from commit {source_sha}")

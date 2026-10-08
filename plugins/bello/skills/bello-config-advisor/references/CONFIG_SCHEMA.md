@@ -1,6 +1,6 @@
 # Current Bello configuration schema
 
-This reference targets Bello 0.7.1's user-facing `ProjectConfig`. The persistent file is `.supervisor/config.json`, but it also contains runtime state after a run starts. Never replace that file directly or feed it directly to the advisor validator; first extract the project settings with `scripts/inspect_config.py`.
+This reference targets Bello 0.7.2's user-facing `ProjectConfig`. The persistent file is `.supervisor/config.json`, but it also contains runtime state after a run starts. Never replace that file directly or feed it directly to the advisor validator; first extract the project settings with `scripts/inspect_config.py`.
 
 New configurations default the five parent roles to `openai-codex/gpt-6-astra` at `xhigh` (stored using the compatible bare `gpt-6-astra` alias). Existing partial configuration files retain their previous `gpt-5.6-sol` fallback, and explicit selections are preserved. Default children and cheap runtime triage retain `gpt-5.6-luna`; do not infer availability of newer Sol/Luna ids from their announcement. Recommendations use the current catalog and the role-fit guidance in `MODEL_ECONOMICS.md`. The complete shape below illustrates independently selectable fields, not a universal recommendation or the new-project defaults.
 
@@ -225,4 +225,4 @@ The current run CLI exposes initial-coder, runtime, completion, and adversary mo
 
 It does not expose Windows native root-read, revision-coder enablement/model/effort, cheap runtime, completion-return budgets, or any of the three multi-agent policy objects as one-run flags. Those fields require the saved `bello config` interface. A one-run initial-coder override does not implicitly rewrite the persisted revision-coder profile.
 
-The 0.7.1 `bello-delegate` helper starts the installed Bello with the already selected saved configuration and explicitly approved task/plan paths. It does not select models or apply configuration itself. Finish the authorized configuration step before delegating the launch; do not silently drop settings to fit an older plugin.
+The 0.7.2 `bello-delegate` helper starts the installed Bello with the already selected saved configuration and explicitly approved task/plan paths. It does not select models or apply configuration itself. Finish the authorized configuration step before delegating the launch; do not silently drop settings to fit an older plugin.

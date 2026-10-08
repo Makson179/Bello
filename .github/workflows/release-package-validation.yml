@@ -1,0 +1,142 @@
+name: Release package validation
+
+on:
+  push:
+    branches: [codex/072-recovery-validation]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-package-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  portable:
+    name: Build portable wheel and sdist
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build and check portable distributions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade build twine 2>&1 | tee portable-tooling.log
+          python -m build --sdist --wheel --outdir dist 2>&1 | tee portable-build.log
+          python -m twine check dist/* 2>&1 | tee portable-metadata.log
+          python -m pip wheel --no-deps --wheel-dir rebuilt dist/*.tar.gz 2>&1 | tee portable-sdist-rebuild.log
+          python scripts/verify_release_install.py build-check \
+            --source-root "$GITHUB_WORKSPACE" --source-sha "${{ github.sha }}" \
+            --dist-dir dist --rebuilt-dir rebuilt --report build-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bello-release-portable-${{ github.sha }}
+          path: |
+            dist/*
+            rebuilt/*.whl
+            build-report.json
+            portable-*.log
+          if-no-files-found: error
+
+  windows:
+    name: Build Windows wheel with restricted sandbox
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build and check Windows distribution
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade build twine *> windows-tooling.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m build --wheel --outdir dist *> windows-build.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m twine check dist/* *> windows-metadata.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify_release_install.py build-check `
+            --source-root "$env:GITHUB_WORKSPACE" --source-sha "${{ github.sha }}" `
+            --dist-dir dist --windows --report build-report.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bello-release-windows-${{ github.sha }}
+          path: |
+            dist/*
+            build-report.json
+            windows-*.log
+          if-no-files-found: error
+
+  clean-install:
+    name: Installed package / ${{ matrix.os }} / Python ${{ matrix.python }}
+    needs: [portable, windows]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.11"
+            distribution: portable
+          - os: ubuntu-latest
+            python: "3.14"
+            distribution: portable
+          - os: macos-15
+            python: "3.13"
+            distribution: portable
+          - os: windows-2022
+            python: "3.11"
+            distribution: windows
+          - os: windows-2025
+            python: "3.14"
+            distribution: windows
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install Linux doctor prerequisite
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes bubblewrap
+      - uses: actions/download-artifact@v4
+        with:
+          name: bello-release-${{ matrix.distribution }}-${{ github.sha }}
+          path: incoming
+      - name: Verify isolated installed artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/verify_release_install.py clean-install \
+            --source-root "$GITHUB_WORKSPACE" --source-sha "${{ github.sha }}" \
+            --wheel-dir incoming/dist --build-report incoming/build-report.json \
+            --work-dir "$RUNNER_TEMP/bello-release-install" \
+            --report "$RUNNER_TEMP/bello-release-install/RESULT.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bello-release-install-${{ matrix.os }}-py${{ matrix.python }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/bello-release-install/*.json
+            ${{ runner.temp }}/bello-release-install/*.log
+          if-no-files-found: error
