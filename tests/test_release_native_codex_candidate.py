@@ -342,15 +342,38 @@ def test_archive_entry_inventory_and_metadata_fail_closed_even_with_rebound_oute
 def test_installer_code_identity_excludes_only_pin_values(tmp_path, monkeypatch):
     path = tmp_path / "supervisor/runtime/native_codex_install.py"
     path.parent.mkdir(parents=True)
-    original = (release.ROOT / "supervisor/runtime/native_codex_install.py").read_text()
+    original = (release.ROOT / "supervisor/runtime/native_codex_install.py").read_bytes()
     monkeypatch.setattr(release, "ROOT", tmp_path)
-    path.write_text(original)
+    path.write_bytes(original)
     before = release.installer_implementation()
-    path.write_text(original.replace("0.155.1", "0.161.0").replace("0.153.4", "0.161.0"))
+    starts = [0]
+    for line in original.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    replacements = []
+    for node in release.ast.parse(original.decode("utf-8")).body:
+        if (isinstance(node, release.ast.AnnAssign)
+                and isinstance(node.target, release.ast.Name)
+                and node.target.id in {"BUNDLES", "ASYNC_BUNDLES"}):
+            for call in node.value.values:
+                literals = call.args or [keyword.value for keyword in call.keywords]
+                for literal in literals:
+                    start = starts[literal.lineno - 1] + literal.col_offset
+                    end = starts[literal.end_lineno - 1] + literal.end_col_offset
+                    # Deliberately synthetic strings, never an executable/download fixture.
+                    replacement = repr(literal.value + "-pin-mask-regression").encode("utf-8")
+                    assert replacement != original[start:end]
+                    replacements.append((start, end, replacement))
+    assert len(replacements) == 18
+    changed = original
+    for start, end, replacement in sorted(replacements, reverse=True):
+        changed = changed[:start] + replacement + changed[end:]
+    assert changed != original
+    assert hashlib.sha256(changed).digest() != hashlib.sha256(original).digest()
+    path.write_bytes(changed)
     assert release.installer_implementation() == before
-    path.write_text(original.replace("_MAX_DOWNLOAD = 1024 * 1024 * 1024", "_MAX_DOWNLOAD = 1"))
+    path.write_bytes(original.replace(b"_MAX_DOWNLOAD = 1024 * 1024 * 1024", b"_MAX_DOWNLOAD = 1"))
     assert release.installer_implementation() != before
-    path.write_text(original.replace("ASYNC_BUNDLES:", "RENAMED_BUNDLES:"))
+    path.write_bytes(original.replace(b"ASYNC_BUNDLES:", b"RENAMED_BUNDLES:"))
     with pytest.raises(ValueError): release.installer_implementation()
 
 

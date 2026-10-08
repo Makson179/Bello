@@ -1,10 +1,13 @@
-# Local Codex 0.161.0 source candidate
+# Managed Codex 0.161.0 runtime and qualification
 
 The separate [`native-codex-0.161.0.patch`](../scripts/native-codex-0.161.0.patch)
 targets upstream commit `979011409de0a60b52f179721948e65531d26144`
-(`rust-v0.161.0`). It is a source candidate, not a published, installable Bello
-runtime. The existing `native-codex-selection.patch`, 0.155.1 build workflows,
-and automatic-download pins remain separate and unchanged.
+(`rust-v0.161.0`). The managed selection and Smart Execution pins now select the
+same published 0.161.0 archive for each supported platform: Linux x64, Windows
+x64 and macOS Apple Silicon. The native assets use the GitHub-only release
+`native-codex-0.161.0-smart-execution-v1`, separate from Bello package publication.
+The existing `native-codex-selection.patch` and 0.155.1 build workflows are retained
+as historical recipes, not relabelled as 0.161.0 builds.
 
 Use a fresh, isolated checkout of that exact official Git commit, with no account
 credentials. The source preparation helper is stdlib-only and makes no network
@@ -78,7 +81,8 @@ Use `--target windows-x64` on Windows. The supplied executable must report exact
 change download pins. It checks the full build receipt before and after each
 proof, binds proof-script hashes, and requires nine selection cases, fourteen
 async cases including three cold concurrency attempts, persistent history, the
-bundled Linux sandbox where applicable, and six actual CPU ModernBERT cases.
+bundled Linux sandbox where applicable, and six CPU ModernBERT cases (four
+inference runs and two protected-input bypass controls).
 ModernBERT uses the public pinned bundle with authentication disabled; only that
 download may contact an external model repository. Provider proofs use synthetic
 loopback requests, empty homes, no account credentials, and rejecting proxies.
@@ -125,3 +129,10 @@ assets are published separately from the Bello package release. The managed
 helper is selected for native Smart Execution or log distillation; ordinary
 Codex execution without those features continues to use the user's host Codex.
 No global Codex installation is replaced by this release path.
+
+The pin-promotion commit starts the separate production-HTTPS qualification on
+Linux, macOS Apple Silicon and both Windows/Python variants. Published URLs and
+pins are not evidence that this gate passed: release approval requires successful
+receipts on the exact final source. Both Windows variants must select the same
+archive and manifest hashes. No stable Bello release or HTTPS success is claimed
+by this documentation update alone.

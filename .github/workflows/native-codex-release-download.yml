@@ -1,8 +1,19 @@
 name: Published Native Codex 0.161 release qualification
 
-# Dispatch only after real native assets exist and both installer pin tables
-# contain their verified hashes. This never builds or publishes an artifact.
+# Push qualification starts only after the separately published native assets
+# and their verified immutable hashes have been promoted into the installer.
+# This workflow never builds or publishes an artifact.
 on:
+  push:
+    branches: ['codex/072-recovery-validation']
+    paths:
+      - 'supervisor/runtime/native_codex_install.py'
+      - '.github/workflows/native-codex-release-download.yml'
+      - 'scripts/release_native_codex_candidate.py'
+      - 'tests/test_native_codex_install.py'
+      - 'tests/test_release_native_codex_candidate.py'
+      - 'tests/test_native_codex_release_workflow.py'
+      - 'tests/test_native_codex_download_transport.py'
   workflow_dispatch:
 
 permissions:

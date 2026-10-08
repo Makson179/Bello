@@ -34,24 +34,24 @@ class NativeBundle:
 BUNDLES: dict[tuple[str, str], NativeBundle] = {
     ("Linux", "x86_64"): NativeBundle(
         url=("https://github.com/Makson179/Bello/releases/download/"
-             "native-codex-0.153.4-selection-v1/"
-             "bello-native-codex-0.153.4-x86_64-unknown-linux-gnu.tar.gz"),
-        archive_sha256="887bb0ca1b4f04598e899fef184b40faa4b4361f7a9ff914ddce9fd5972beb0e",
-        manifest_sha256="cc3be17f14331159297e99cabb63d84fb0de09af7f24d53879a0904453a90f5a",
+             "native-codex-0.161.0-smart-execution-v1/"
+             "bello-native-codex-0.161.0-x86_64-unknown-linux-gnu.tar.gz"),
+        archive_sha256="1a7bceded0ba7e8134f55a5af048dae387b82e14946d0b87faefda2ce1c41865",
+        manifest_sha256="f6f0c751e01493869f87a5330b3e5818f342491691e3d1d166d338f652e1bf6a",
     ),
     ("Darwin", "arm64"): NativeBundle(
         url=("https://github.com/Makson179/Bello/releases/download/"
-             "native-codex-0.153.4-selection-v1/"
-             "bello-native-codex-0.153.4-aarch64-apple-darwin.tar.gz"),
-        archive_sha256="587bdeb27a9d6896252238805b2057e15b6d196cbec1411f76d5e2563e81ced2",
-        manifest_sha256="cc16402a699eba247b6fe34fd7f71328d318f8d5a83ef836498d8dbadd0e136e",
+             "native-codex-0.161.0-smart-execution-v1/"
+             "bello-native-codex-0.161.0-aarch64-apple-darwin.tar.gz"),
+        archive_sha256="f68975458df96607eb26935d0703e5b788d2b59b70434ea65b4b1180170f1ea8",
+        manifest_sha256="fb8f3f30eedbc5789d7f308ca1dbc8e4dec0503b74f531bf200339024f9ad345",
     ),
     ("Windows", "x86_64"): NativeBundle(
         url=("https://github.com/Makson179/Bello/releases/download/"
-             "native-codex-0.153.4-selection-v1/"
-             "bello-native-codex-0.153.4-x86_64-pc-windows-msvc.tar.gz"),
-        archive_sha256="dc9628bda906e259b2838e801ebd12a061b3f6949362102c3d556eded4768d4e",
-        manifest_sha256="533450f5c62f89bda3fa228089184e08709f0172b324d44543a14a0c73036723",
+             "native-codex-0.161.0-smart-execution-v1/"
+             "bello-native-codex-0.161.0-x86_64-pc-windows-msvc.tar.gz"),
+        archive_sha256="57042f61b748ee5c8623692d75d216c63758fbc57143c5a49f9e910537bdce14",
+        manifest_sha256="a606bec1ac967a81b1b614acb9cea0db7a7a0458ff4168c6b9f210e2b193bf4e",
     ),
 }
 # Keep capability-specific pins separate: the published selection-v1 binaries do
@@ -62,24 +62,24 @@ BUNDLES: dict[tuple[str, str], NativeBundle] = {
 ASYNC_BUNDLES: dict[tuple[str, str], NativeBundle] = {
     ("Linux", "x86_64"): NativeBundle(
         url=("https://github.com/Makson179/Bello/releases/download/"
-             "native-codex-0.155.1-smart-execution-v1/"
-             "bello-native-codex-0.155.1-x86_64-unknown-linux-gnu.tar.gz"),
-        archive_sha256="ba27107574789187a147e3a3caa159e0f5d435bd071759be623fe5745c5bdc07",
-        manifest_sha256="e48fdaddd736198010c8ae1cfd073fa8f511cb27ab6534e89d8405b2f8673407",
+             "native-codex-0.161.0-smart-execution-v1/"
+             "bello-native-codex-0.161.0-x86_64-unknown-linux-gnu.tar.gz"),
+        archive_sha256="1a7bceded0ba7e8134f55a5af048dae387b82e14946d0b87faefda2ce1c41865",
+        manifest_sha256="f6f0c751e01493869f87a5330b3e5818f342491691e3d1d166d338f652e1bf6a",
     ),
     ("Darwin", "arm64"): NativeBundle(
         url=("https://github.com/Makson179/Bello/releases/download/"
-             "native-codex-0.155.1-smart-execution-v1/"
-             "bello-native-codex-0.155.1-aarch64-apple-darwin.tar.gz"),
-        archive_sha256="8614648cf79bf5582879b2c899cdb515e6da01687f4b65ee9d529cca25023029",
-        manifest_sha256="792dbcd8df2672df020a63115dddd1af86e31ff5e1ca6c2008ff627be1057a1c",
+             "native-codex-0.161.0-smart-execution-v1/"
+             "bello-native-codex-0.161.0-aarch64-apple-darwin.tar.gz"),
+        archive_sha256="f68975458df96607eb26935d0703e5b788d2b59b70434ea65b4b1180170f1ea8",
+        manifest_sha256="fb8f3f30eedbc5789d7f308ca1dbc8e4dec0503b74f531bf200339024f9ad345",
     ),
     ("Windows", "x86_64"): NativeBundle(
         url=("https://github.com/Makson179/Bello/releases/download/"
-             "native-codex-0.155.1-smart-execution-v1/"
-             "bello-native-codex-0.155.1-x86_64-pc-windows-msvc.tar.gz"),
-        archive_sha256="8993eea58f8d4f3466f72713eba62bd4842e702d92d8552ab79c3a2d4b7308b8",
-        manifest_sha256="d6b859995d238de668cd9bb533d23d3c2a7c96b1940808295a197e2360830ccd",
+             "native-codex-0.161.0-smart-execution-v1/"
+             "bello-native-codex-0.161.0-x86_64-pc-windows-msvc.tar.gz"),
+        archive_sha256="57042f61b748ee5c8623692d75d216c63758fbc57143c5a49f9e910537bdce14",
+        manifest_sha256="a606bec1ac967a81b1b614acb9cea0db7a7a0458ff4168c6b9f210e2b193bf4e",
     ),
 }
 _MAX_DOWNLOAD = 1024 * 1024 * 1024

@@ -191,18 +191,50 @@ def test_both_windows_python_extremes_and_linux_are_real_install_gates():
 
 def test_published_download_gate_has_no_local_archive_substitution_or_publication():
     text = (ROOT / '.github/workflows/native-codex-release-download.yml').read_text()
-    assert set(re.findall(r'^  ([a-z_]+):', _block(text, 'on'), re.M)) == {'workflow_dispatch'}
+    triggers = _block(text, 'on')
+    assert set(re.findall(r'^  ([a-z_]+):', triggers, re.M)) == {'push', 'workflow_dispatch'}
+    push = _block(triggers, 'push')
+    assert _field(push, 'branches') == "['codex/072-recovery-validation']"
+    assert re.findall(r"^\s*- '([^']+)'$", _block(push, 'paths'), re.M) == [
+        'supervisor/runtime/native_codex_install.py',
+        '.github/workflows/native-codex-release-download.yml',
+        'scripts/release_native_codex_candidate.py',
+        'tests/test_native_codex_install.py',
+        'tests/test_release_native_codex_candidate.py',
+        'tests/test_native_codex_release_workflow.py',
+        'tests/test_native_codex_download_transport.py',
+    ]
     assert _field(_block(text, 'permissions'), 'contents') == 'read'
     assert _field(_block(text, 'concurrency'), 'cancel-in-progress') == 'false'
     job = _block(_block(text, 'jobs'), 'published-install')
     matrix = _block(_block(job, 'strategy'), 'matrix')
     assert re.findall(r'os: ([\w.-]+)', matrix) == ['ubuntu-22.04', 'macos-15', 'windows-2022', 'windows-2025']
+    assert re.findall(r"python: '([\d.]+)'", matrix) == ['3.11', '3.13', '3.11', '3.14']
+    assert re.findall(r'target: ([\w-]+)', matrix) == ['linux-x64', 'darwin-arm64', 'windows-x64', 'windows-x64']
+    assert set(re.findall(r'^\s{8}([a-z_]+):', matrix, re.M)) == {'include'}
     steps = _steps(job)
     assert not any(_action(step) == 'actions/download-artifact' for step in steps)
     proof = next(step for step in steps if 'install-published' in (_field(step, 'run') or ''))
     command = _field(proof, 'run')
     assert '--modernbert' in command and '--artifact' not in command
     assert '--output "$RUNNER_TEMP/published-release-proof"' in command
+    outputs = re.findall(r'--output "([^"]+)"', command)
+    assert outputs == ['$RUNNER_TEMP/published-release-proof']
+    for temporary, size, maximum in [('/home/runner/work/_temp', 91, 107),
+                                     ('/Users/runner/work/_temp', 92, 103)]:
+        selector = outputs[0].replace('$RUNNER_TEMP', temporary) + '/worker/tmp/bello-sel-12345678/selector.sock'
+        assert len(selector.encode('utf-8')) == size <= maximum
+    uploads = [step for step in steps if _action(step) == 'actions/upload-artifact']
+    assert len(uploads) == 1 and _field(uploads[0], 'if') == 'always()'
+    prefix = '${{ runner.temp }}/published-release-proof/'
+    paths = _field(_block(uploads[0], 'with'), 'path').splitlines()
+    assert {path.strip() for path in paths if path.strip()} == {
+        prefix + 'installed-proof.json', prefix + 'worker/report.json',
+        prefix + 'worker/*/report.json', prefix + 'worker/*/*/result.json',
+    }
+    for step in steps:
+        if _action(step) == 'actions/checkout':
+            assert _field(_block(step, 'with'), 'persist-credentials') == 'false'
     assert 'LOCALAPPDATA' in command and 'runtime_parent="$RUNNER_TEMP"' in command
     assert _field(proof, 'continue-on-error') is None
     assert not re.search(r'\$\{\{\s*secrets\.', text)
