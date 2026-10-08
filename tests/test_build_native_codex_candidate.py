@@ -70,6 +70,10 @@ def prepared_source(tmp_path, recipe, monkeypatch):
     # This synthetic Git repository explicitly disables autocrlf below, so
     # create its canonical LF source bytes on Windows as well as POSIX.
     (source / "changed.txt").write_bytes(b"before\n")
+    for name, markers in prepare.ROOT_ROUNDTRIP_SOURCE_MARKERS.items():
+        target = source / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join(markers) + "\n", encoding="utf-8", newline="\n")
 
     def git(*args):
         return subprocess.check_output(["git", "-C", str(source), *args])

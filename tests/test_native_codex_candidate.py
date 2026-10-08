@@ -132,6 +132,10 @@ def test_candidate_preparation_with_real_git_preserves_patch_and_external_depend
                     '\n[[package]]\nname = "external"\nversion = "0.0.0"\nsource = "registry+pinned"\n',
                     encoding="utf-8", newline="\n")
     (source / "file.txt").write_bytes(b"before\n\ncontext\n")
+    for name, markers in candidate.ROOT_ROUNDTRIP_SOURCE_MARKERS.items():
+        target = source / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join(markers) + "\n", encoding="utf-8", newline="\n")
     git("add", ".")
     git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "fixture")
     monkeypatch.setattr(candidate, "UPSTREAM_REVISION", git("rev-parse", "HEAD").strip())
@@ -165,3 +169,20 @@ def test_candidate_reports_inputs_changing_during_application(input_root, tmp_pa
     monkeypatch.setattr(legacy, "prepare", apply)
     with pytest.raises(ValueError, match="inputs changed"):
         candidate.prepare(tmp_path / "source", root=input_root)
+
+
+@pytest.mark.parametrize("missing", [
+    (name, marker) for name, markers in candidate.ROOT_ROUNDTRIP_SOURCE_MARKERS.items()
+    for marker in markers
+])
+def test_candidate_source_requires_root_normalizer_strict_guard_and_rust_tests(tmp_path, missing):
+    for name, markers in candidate.ROOT_ROUNDTRIP_SOURCE_MARKERS.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(markers) + "\n", encoding="utf-8", newline="\n")
+    candidate.verify_root_roundtrip_source(tmp_path)
+    name, marker = missing
+    path = tmp_path / name
+    path.write_text(path.read_text().replace(marker, "removed"), encoding="utf-8", newline="\n")
+    with pytest.raises(ValueError, match="source contract is incomplete"):
+        candidate.verify_root_roundtrip_source(tmp_path)

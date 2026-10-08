@@ -4501,8 +4501,127 @@ index 00000000..54d56a98
 +    }
 +    assert!(request_lock_sid(&serde_json::json!({"mode": "provision-only"})).is_err());
 +}
+diff --git a/codex-rs/protocol/src/permissions.rs b/codex-rs/protocol/src/permissions.rs
+index 140090f5..bb3c0e87 100644
+--- a/codex-rs/protocol/src/permissions.rs
++++ b/codex-rs/protocol/src/permissions.rs
+@@ -2638,6 +2638,101 @@ mod tests {
+     use std::path::Path;
+     use tempfile::TempDir;
+ 
++    #[test]
++    fn bello_permission_path_roundtrip_config_drive_roots() {
++        for input in [r"D:\", "D:/", r"D:\\", "D://", r"D:\.", "D:/child/.."] {
++            let path = PathUri::resolve_config_path_uri(input, PathConvention::Windows, None, None)
++                .expect("absolute configured root");
++            let raw = raw_path_from_uri(path.clone()).expect("lossless configured root");
++            assert_eq!(path_uri_from_raw(raw).expect("read raw root"), path);
++        }
++        for input in ["file:///D:", "file:///D:/", "file:///d%3a", "file:///D%3A/"] {
++            let path = PathUri::parse(input).expect("root URI");
++            let raw = raw_path_from_uri(path.clone()).expect("lossless root URI");
++            assert_eq!(path_uri_from_raw(raw).expect("read raw root"), path);
++        }
++    }
++
++    #[test]
++    fn bello_permission_path_roundtrip_profile_preserves_read_write_and_deny() {
++        use crate::models::PermissionProfile;
++        let entries = [
++            (r"D:\", FileSystemAccessMode::Read),
++            (r"D:\workspace", FileSystemAccessMode::Write),
++            (r"D:\workspace\.git", FileSystemAccessMode::Read),
++            (r"D:\private", FileSystemAccessMode::Deny),
++        ]
++        .into_iter()
++        .map(|(input, access)| {
++            let path = PathUri::resolve_config_path_uri(input, PathConvention::Windows, None, None)
++                .expect("configured permission path");
++            FileSystemSandboxEntry::new(path.into(), access)
++        })
++        .collect();
++        let profile = PermissionProfile::from_runtime_permissions(
++            &FileSystemSandboxPolicy::restricted(entries),
++            NetworkSandboxPolicy::Restricted,
++        );
++        let bytes = serde_json::to_vec(&profile).expect("serialize runner permission profile");
++        let restored: PermissionProfile =
++            serde_json::from_slice(&bytes).expect("read runner profile");
++        assert_eq!(restored, profile);
++    }
++
++    #[test]
++    fn bello_permission_path_roundtrip_keeps_lossy_inputs_rejected() {
++        for input in [
++            "file:///D:/child%2Fother",
++            "file:///D:/child%5Cother",
++            "file:///D:/%FF",
++        ] {
++            let path = PathUri::parse(input).expect("URI retains encoded bytes");
++            assert!(
++                raw_path_from_uri(path).is_err(),
++                "lossy permission path must fail"
++            );
++        }
++        for input in ["D:", "D:relative", r"\rooted", "/foreign"] {
++            assert!(
++                PathUri::resolve_config_path_uri(input, PathConvention::Windows, None, None)
++                    .is_err()
++            );
++        }
++    }
++
++    #[cfg(windows)]
++    #[test]
++    fn bello_permission_path_roundtrip_native_windows_root() {
++        use crate::models::PermissionProfile;
++        let expected = AbsolutePathBuf::from_absolute_path_checked(r"D:\").expect("native root");
++        for input in [r"D:\", "D:/", "D:/child/.."] {
++            let path = PathUri::resolve_config_path_uri(input, PathConvention::Windows, None, None)
++                .expect("configured root");
++            assert_eq!(
++                path.to_abs_path().expect("native configured root"),
++                expected
++            );
++            let raw = raw_path_from_uri(path.clone()).expect("strict serialization");
++            let restored = path_uri_from_raw(raw).expect("native raw parser");
++            assert_eq!(restored, path);
++            assert_eq!(
++                restored.to_abs_path().expect("native restored root"),
++                expected
++            );
++            let profile = PermissionProfile::from_runtime_permissions(
++                &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry::new(
++                    restored.into(),
++                    FileSystemAccessMode::Read,
++                )]),
++                NetworkSandboxPolicy::Restricted,
++            );
++            let bytes = serde_json::to_vec(&profile).expect("serialize native runner profile");
++            let decoded: PermissionProfile =
++                serde_json::from_slice(&bytes).expect("read native runner profile");
++            assert_eq!(decoded, profile);
++        }
++    }
++
+     #[cfg(unix)]
+     const SYMLINKED_TMPDIR_TEST_ENV: &str = "CODEX_PROTOCOL_TEST_SYMLINKED_TMPDIR";
+ 
+diff --git a/codex-rs/utils/path-uri/src/api_path_string_tests.rs b/codex-rs/utils/path-uri/src/api_path_string_tests.rs
+index b115a900..4906b154 100644
+--- a/codex-rs/utils/path-uri/src/api_path_string_tests.rs
++++ b/codex-rs/utils/path-uri/src/api_path_string_tests.rs
+@@ -129,7 +129,7 @@ const RENDER_CASES: &[RenderCase] = &[
+         r"C:\Users\Alice Smith\src\main.rs",
+     ),
+     RenderCase::round_trips("file:///C:/", PathConvention::Windows, "C:\\"),
+-    RenderCase::renders_lossily("file:///C:", PathConvention::Windows, "C:\\"),
++    RenderCase::round_trips("file:///C:", PathConvention::Windows, "C:\\"),
+     RenderCase::round_trips("file:///C:/Users", PathConvention::Windows, r"C:\Users"),
+     RenderCase::round_trips("file:///C:/Windows", PathConvention::Windows, r"C:\Windows"),
+     RenderCase::round_trips(
 diff --git a/codex-rs/utils/path-uri/src/lib.rs b/codex-rs/utils/path-uri/src/lib.rs
-index 7a42363d..f7caa6f5 100644
+index 7a42363d..cd84f540 100644
 --- a/codex-rs/utils/path-uri/src/lib.rs
 +++ b/codex-rs/utils/path-uri/src/lib.rs
 @@ -608,14 +608,16 @@ impl PathUri {
@@ -4530,7 +4649,40 @@ index 7a42363d..f7caa6f5 100644
          AbsolutePathBuf::from_absolute_path_checked(path).map_err(|_| {
              io::Error::new(
                  io::ErrorKind::InvalidInput,
-@@ -766,6 +768,28 @@ fn decode_bad_path_uri(url: &Url) -> Option<Vec<u8>> {
+@@ -644,6 +646,7 @@ impl TryFrom<Url> for PathUri {
+         validate_file_url(&url)?;
+         let url = without_localhost_authority(url);
+         let url = with_normalized_windows_drive_letter(url);
++        let url = with_canonical_windows_drive_root(url);
+         Ok(Self(url))
+     }
+ }
+@@ -741,6 +744,24 @@ fn with_normalized_windows_drive_letter(mut url: Url) -> Url {
+     url
+ }
+ 
++/// A hostless drive root has one stored spelling, including after a native
++/// path roundtrip. Lexical parent/join operations already use the slashless
++/// form; native conversion restores its required separator separately.
++fn with_canonical_windows_drive_root(mut url: Url) -> Url {
++    if url.host_str().is_none()
++        && url
++            .path()
++            .strip_prefix('/')
++            .and_then(|path| path.strip_suffix('/'))
++            .is_some_and(is_windows_drive_uri_segment)
++    {
++        url.path_segments_mut()
++            .expect("validated file URI has path segments")
++            .pop_if_empty();
++    }
++    url
++}
++
+ /// Percent-decodes a URI path when it is valid UTF-8.
+ ///
+ /// `file:` URLs may contain encoded non-UTF-8 bytes. In that case the encoded
+@@ -766,6 +787,28 @@ fn decode_bad_path_uri(url: &Url) -> Option<Vec<u8>> {
          .then_some(path_bytes)
  }
  
@@ -4560,10 +4712,10 @@ index 7a42363d..f7caa6f5 100644
      matches!(
          segment.as_bytes(),
 diff --git a/codex-rs/utils/path-uri/src/tests.rs b/codex-rs/utils/path-uri/src/tests.rs
-index 49dbd278..38e6cae7 100644
+index 49dbd278..f79f2e7c 100644
 --- a/codex-rs/utils/path-uri/src/tests.rs
 +++ b/codex-rs/utils/path-uri/src/tests.rs
-@@ -532,6 +532,114 @@ fn file_uri_round_trips_literal_percent_characters() {
+@@ -532,6 +532,153 @@ fn file_uri_round_trips_literal_percent_characters() {
      assert_eq!(uri.basename(), Some("file".to_string()));
  }
  
@@ -4588,11 +4740,50 @@ index 49dbd278..38e6cae7 100644
 +        "file:///tmp/root",
 +        "file:///",
 +    ] {
-+        let uri = PathUri::parse(input).expect(input);
++        let uri = Url::parse(input).expect(input);
 +        assert!(
-+            matches!(file_url_for_native_conversion(&uri.0), Cow::Borrowed(_)),
++            matches!(file_url_for_native_conversion(&uri), Cow::Borrowed(_)),
 +            "{input}: {uri}"
 +        );
++    }
++}
++
++#[test]
++fn windows_drive_root_stored_spelling_roundtrips_without_relaxing_identity() {
++    use std::collections::hash_map::DefaultHasher;
++    let root = PathUri::parse("file:///D:").expect("root");
++    let hash = |uri: &PathUri| {
++        let mut hasher = DefaultHasher::new();
++        uri.hash(&mut hasher);
++        hasher.finish()
++    };
++    for input in [
++        "file:///D:",
++        "file:///D:/",
++        "file:///d:/",
++        "file:///D%3A",
++        "file:///D%3a/",
++    ] {
++        let uri = PathUri::parse(input).expect(input);
++        assert!(!uri.to_string().ends_with('/'));
++        assert_eq!(uri, root);
++        assert_eq!(hash(&uri), hash(&root));
++        let native = LegacyAppPathString::from(uri.clone());
++        assert_eq!(PathUri::try_from(native).expect("native roundtrip"), uri);
++        assert_eq!(uri.join(".").expect("config root"), root);
++    }
++    for input in [
++        "file:///D:/child",
++        "file:///D:/child/",
++        "file://server/share",
++        "file://server/share/",
++        "file:///tmp/root/",
++        "file:///",
++        "file:///%00/bad/path/YQ",
++        "file:///D:/child%2Fother",
++        "file:///D:/child%5Cother",
++    ] {
++        assert_eq!(PathUri::parse(input).expect(input).to_string(), input);
 +    }
 +}
 +
@@ -4678,3 +4869,21 @@ index 49dbd278..38e6cae7 100644
  #[cfg(windows)]
  #[test]
  fn host_windows_paths_round_trip_through_file_uris() {
+@@ -1114,7 +1261,7 @@ fn windows_namespace_normalization_preserves_opaque_paths() {
+ fn join_absolute_parent_segments_stop_at_native_path_roots() {
+     for (base, path, expected) in [
+         ("file:///workspace", "/a/..", "file:///"),
+-        ("file:///C:/workspace", r"D:\a\..", "file:///D:/"),
++        ("file:///C:/workspace", r"D:\a\..", "file:///D:"),
+         (
+             "file:///C:/workspace",
+             r"\\server\share\a\..",
+@@ -1150,7 +1297,7 @@ fn join_collapses_redundant_absolute_separators() {
+             "file:///server/share/",
+         ),
+         ("file:///C:/workspace", r"D:\tmp\\\", "file:///D:/tmp/"),
+-        ("file:///C:/workspace", r"D:\\\", "file:///D:/"),
++        ("file:///C:/workspace", r"D:\\\", "file:///D:"),
+         (
+             "file:///C:/workspace",
+             r"\\server\share\tmp\\\",

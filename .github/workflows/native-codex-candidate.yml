@@ -119,6 +119,10 @@ jobs:
         if: steps.candidate.outputs.cache-hit != 'true'
         working-directory: native-source/codex-rs
         run: cargo test --locked --release --target x86_64-unknown-linux-gnu -p codex-utils-path-uri --lib
+      - name: Test lossless permission path serialization before snapshotting the candidate
+        if: steps.candidate.outputs.cache-hit != 'true'
+        working-directory: native-source/codex-rs
+        run: cargo test --locked --release --target x86_64-unknown-linux-gnu -p codex-protocol --lib bello_permission_path_roundtrip
       - name: Preserve the exact successful Cargo build
         if: steps.candidate.outputs.cache-hit != 'true' && steps.cargo_cache.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -247,6 +251,10 @@ jobs:
         if: steps.candidate.outputs.cache-hit != 'true'
         working-directory: native-source/codex-rs
         run: cargo test --locked --release --target x86_64-pc-windows-msvc -p codex-utils-path-uri --lib
+      - name: Test lossless Windows permission path serialization before snapshotting the candidate
+        if: steps.candidate.outputs.cache-hit != 'true'
+        working-directory: native-source/codex-rs
+        run: cargo test --locked --release --target x86_64-pc-windows-msvc -p codex-protocol --lib bello_permission_path_roundtrip
       - name: Preserve the exact successful Cargo build
         if: steps.candidate.outputs.cache-hit != 'true' && steps.cargo_cache.outputs.cache-hit != 'true'
         continue-on-error: true

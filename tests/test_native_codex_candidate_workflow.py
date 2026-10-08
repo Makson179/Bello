@@ -147,21 +147,23 @@ def test_ready_cache_is_exact_cargo_fallback_is_target_scoped_and_candidates_ver
     ("linux", "x86_64-unknown-linux-gnu"),
     ("windows", "x86_64-pc-windows-msvc"),
 ])
-def test_real_path_uri_rust_tests_gate_every_new_candidate_snapshot(workflow, platform, target):
+def test_real_path_and_permission_uri_rust_tests_gate_every_new_candidate_snapshot(workflow, platform, target):
     steps = _steps(_jobs(workflow)[f"{platform}-build"])
     commands = [_field(step, "run") or "" for step in steps]
     indices = [i for i, command in enumerate(commands) if "cargo test" in command]
-    assert len(indices) == 1
-    test_index = indices[0]
-    test = steps[test_index]
-    assert commands[test_index] == f"cargo test --locked --release --target {target} -p codex-utils-path-uri --lib"
-    assert _miss_required(test)
-    assert _field(test, "working-directory") == "native-source/codex-rs"
-    assert _field(test, "continue-on-error") is None
+    assert len(indices) == 2
+    packages = ["codex-utils-path-uri --lib",
+                "codex-protocol --lib bello_permission_path_roundtrip"]
     snapshot = next(i for i, command in enumerate(commands) if " snapshot-build " in command)
     prepare = next(i for i, command in enumerate(commands) if " prepare " in command)
-    assert prepare < test_index < snapshot
-    assert all(test_index < i for i, step in enumerate(steps) if _action(step) == "actions/cache/save")
+    for test_index, package in zip(indices, packages, strict=True):
+        test = steps[test_index]
+        assert commands[test_index] == f"cargo test --locked --release --target {target} -p {package}"
+        assert _miss_required(test)
+        assert _field(test, "working-directory") == "native-source/codex-rs"
+        assert _field(test, "continue-on-error") is None
+        assert prepare < test_index < snapshot
+        assert all(test_index < i for i, step in enumerate(steps) if _action(step) == "actions/cache/save")
 
 
 def test_linux_bwrap_is_final_before_codex_compiles(workflow):

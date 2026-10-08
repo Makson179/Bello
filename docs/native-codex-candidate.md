@@ -52,9 +52,15 @@ The candidate also repairs native conversion of an already-absolute Windows
 drive-root URI such as `file:///D:` after lexical parent/config resolution. It
 restores only the missing root separator during conversion; native-convention
 and encoded-separator rejection still run first, and no filesystem permission
-grant changes. Both native builds run the `codex-utils-path-uri` library tests
-before saving a build. Windows-specific root/config/parent roundtrips therefore
-run on Windows, not merely as portable source-contract tests.
+grant changes. The stored hostless drive-root URI also uses one canonical form
+across config resolution and native-path reimport. This preserves the strict
+lossless permission-path serialization check instead of bypassing it; URI
+equality, hashing and sandbox permission grants remain unchanged.
+Both native builds run the `codex-utils-path-uri` library tests and the
+`codex-protocol` `bello_permission_path_roundtrip` regressions before saving a
+build. Windows-specific root/config/parent and permission-profile roundtrips
+therefore run on Windows, not merely as portable source-contract tests. A local
+portable pass is not a native Windows runtime qualification.
 
 Cargo intermediate caches may reuse an older recipe on the same target, with
 `cargo --locked` rebuilding affected inputs. Ready-candidate caches never use
