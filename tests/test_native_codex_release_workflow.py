@@ -1,9 +1,14 @@
 """The release archive gate consumes exact proven candidates without publishing."""
+import asyncio
 from pathlib import Path
 import json
+import os
 import re
 import shutil
+import socket
 import subprocess
+import sys
+import tempfile
 
 import pytest
 
@@ -11,6 +16,112 @@ from tests.test_native_codex_windows_workflow import _action, _block, _field, _s
 
 ROOT = Path(__file__).resolve().parents[1]
 TEXT = (ROOT / '.github/workflows/native-codex-release-qualification.yml').read_text()
+
+
+def _installed_proof_output():
+    steps = _steps(_block(_block(TEXT, 'jobs'), 'package-install'))
+    command = next(_field(step, 'run') for step in steps
+                   if '.py install-local ' in (_field(step, 'run') or ''))
+    outputs = re.findall(r'--output "([^"]+)"', command)
+    assert len(outputs) == 1
+    return outputs[0]
+
+
+def _installed_selector_path():
+    # Actual ubuntu-22.04 runner prefix, followed by the private worker TMPDIR
+    # and the production bridge's tempfile prefix, random suffix, and filename.
+    output = _installed_proof_output().replace('$RUNNER_TEMP', '/home/runner/work/_temp')
+    return output + '/worker/tmp/bello-sel-12345678/selector.sock'
+
+
+def test_installed_receipt_paths_leave_room_for_the_private_selector_socket():
+    pathname_bytes = len(os.fsencode(_installed_selector_path()))
+    assert pathname_bytes <= 103  # below both Darwin and Linux pathname limits
+    assert pathname_bytes == 94
+    assert _installed_proof_output() == '$RUNNER_TEMP/release-receipts/installed'
+    steps = _steps(_block(_block(TEXT, 'jobs'), 'package-install'))
+    receipts = next(step for step in steps if _action(step) == 'actions/upload-artifact'
+                    and _field(step, 'if') == 'always()')
+    paths = _field(_block(receipts, 'with'), 'path').splitlines()
+    prefix = '${{ runner.temp }}/release-receipts/installed/'
+    assert {path.strip() for path in paths if path.strip().startswith(prefix)} == {
+        prefix + 'installed-proof.json', prefix + 'worker/report.json',
+        prefix + 'worker/*/report.json', prefix + 'worker/*/*/result.json',
+    }
+    assert 'installed-release-proof' not in TEXT
+
+
+@pytest.mark.skipif(sys.platform not in {'darwin', 'linux'},
+                    reason='Windows production selector uses authenticated TCP, not AF_UNIX')
+@pytest.mark.parametrize('case', ('native_maximum', 'one_byte_over', 'old_workflow', 'current_workflow'))
+def test_installed_selector_real_posix_socket_boundary(case, monkeypatch):
+    from supervisor.runtime.codex_distiller import CodexDistillerBridge
+
+    maximum = 103 if sys.platform == 'darwin' else 107
+    length, expected = {
+        'native_maximum': (maximum, True),
+        'one_byte_over': (maximum + 1, False),
+        'old_workflow': (108, False),
+        'current_workflow': (len(os.fsencode(_installed_selector_path())), True),
+    }[case]
+    suffix = '/bello-sel-12345678/selector.sock'
+    # pytest's own temporary directory can already exceed AF_UNIX's limit.
+    # The only removed tree is this newly created, private tempfile fixture.
+    with tempfile.TemporaryDirectory(prefix='bello-sock-', dir='/tmp') as fixture:
+        base = Path(fixture)
+        assert base.stat().st_mode & 0o777 == 0o700
+        padding = length - len(suffix) - len(os.fsencode(fixture)) - 1
+        assert 0 < padding < 200
+        temporary = base / ('p' * padding)
+        temporary.mkdir(mode=0o700)
+        raw_path = temporary / 'bello-sel-12345678' / 'selector.sock'
+        raw_path.parent.mkdir(mode=0o700)
+        assert len(os.fsencode(str(raw_path))) == length
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as endpoint:
+            if expected:
+                endpoint.bind(str(raw_path))
+            else:
+                with pytest.raises(OSError, match=r'^AF_UNIX path too long$'):
+                    endpoint.bind(str(raw_path))
+        if expected:
+            raw_path.unlink()
+        raw_path.parent.rmdir()
+
+        for name in ('TMPDIR', 'TMP', 'TEMP'):
+            monkeypatch.setenv(name, str(temporary))
+        monkeypatch.setattr(tempfile, 'tempdir', None)
+        directory = tempfile.TemporaryDirectory
+        allocated = []
+
+        def observe_directory(*args, **kwargs):
+            result = directory(*args, **kwargs)
+            allocated.append(Path(result.name) / 'selector.sock')
+            return result
+
+        monkeypatch.setattr(tempfile, 'TemporaryDirectory', observe_directory)
+
+        class NoInference:
+            async def distill(self, *args, **kwargs):
+                raise AssertionError('Socket startup must not request inference')
+
+        async def exercise_bridge():
+            bridge = CodexDistillerBridge(NoInference(), base / 'state', transport='unix')
+            try:
+                if expected:
+                    await bridge.start()
+                    assert len(os.fsencode(bridge.environment['BELLO_SELECTOR_SOCKET'])) == length
+                else:
+                    with pytest.raises(OSError, match=r'^AF_UNIX path too long$'):
+                        await bridge.start()
+            finally:
+                await bridge.close()
+            assert len(allocated) == 1
+            assert len(os.fsencode(str(allocated[0]))) == length
+            assert not allocated[0].parent.exists()
+            assert bridge._server is None and bridge._directory is None and bridge._socket_path is None
+
+        asyncio.run(exercise_bridge())
+        assert not any(temporary.iterdir())
 
 
 def test_release_gate_is_readonly_and_serial_per_branch():

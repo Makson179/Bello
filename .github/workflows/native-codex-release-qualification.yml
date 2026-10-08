@@ -144,7 +144,7 @@ jobs:
           python scripts/release_native_codex_candidate.py install-local \
             --target ${{ matrix.target }} --artifact "$RUNNER_TEMP/native-release" \
             --runtime-root "$runtime_parent/bello-0161-release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
-            --output "$RUNNER_TEMP/release-receipts/installed-release-proof" --modernbert
+            --output "$RUNNER_TEMP/release-receipts/installed" --modernbert
       - name: Preserve qualified archive without publishing it
         uses: actions/upload-artifact@v4
         with:
@@ -165,9 +165,9 @@ jobs:
           path: |
             ${{ runner.temp }}/release-receipts/source-artifact-binding.json
             ${{ runner.temp }}/release-receipts/release-contracts.xml
-            ${{ runner.temp }}/release-receipts/installed-release-proof/installed-proof.json
-            ${{ runner.temp }}/release-receipts/installed-release-proof/worker/report.json
-            ${{ runner.temp }}/release-receipts/installed-release-proof/worker/*/report.json
-            ${{ runner.temp }}/release-receipts/installed-release-proof/worker/*/*/result.json
+            ${{ runner.temp }}/release-receipts/installed/installed-proof.json
+            ${{ runner.temp }}/release-receipts/installed/worker/report.json
+            ${{ runner.temp }}/release-receipts/installed/worker/*/report.json
+            ${{ runner.temp }}/release-receipts/installed/worker/*/*/result.json
           if-no-files-found: warn
           retention-days: 14
