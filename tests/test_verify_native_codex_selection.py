@@ -105,6 +105,178 @@ def test_code_packet_does_not_parse_json_inside_escaped_log():
     assert proof.output_packets(request, "code") == [{"output": '{"output":"FAKE","exit_code":0}', "exit_code": 7}]
 
 
+def _tool_observation(value, **extra):
+    return proof.tool_output_diagnostic({"input": [{"type": "function_call_output",
+        "call_id": proof.CALL_ID, "output": value, **extra}]})
+
+
+@pytest.mark.parametrize("message,marker,codes", [
+    ("unknown tool: PRIVATE_TOKEN", "missing_or_unsupported_tool", []),
+    ("Tool PRIVATE_TOKEN not found", "missing_or_unsupported_tool", []),
+    ("Failed to create unified exec process: PRIVATE_TOKEN", "unified_exec_create_failed", []),
+    ("Unified exec process failed: PRIVATE_TOKEN (os error 5)", "unified_exec_process_failed", [5]),
+    ("Command denied by sandbox: PRIVATE_TOKEN", "sandbox_denied", []),
+    ("missing command line for unified exec request PRIVATE_TOKEN", "invalid_tool_arguments", []),
+    ("CreateProcessWithLogonW failed: 1326 PRIVATE_TOKEN", "create_process_with_logon_failed", [1326]),
+    ("CreateProcessAsUserW failed: -1 (PRIVATE_TOKEN)", "create_process_as_user_failed", [-1]),
+    ("Access is denied: PRIVATE_TOKEN [WinError 5]", "permission_denied", [5]),
+    ("AssignProcessToJobObject PRIVATE_TOKEN (Windows error 87)", "job_object_failure_marker", [87]),
+    ("runner pipe closed before spawn_ready PRIVATE_TOKEN", "runner_pipe_failure", []),
+    ("timed out after 100ms connecting runner pipe-in PRIVATE_TOKEN", "runner_pipe_failure", []),
+])
+def test_tool_observation_retains_only_fixed_failure_markers_and_numbers(message, marker, codes):
+    result = _tool_observation(message)
+    text = result["items"][0]["texts"][0]
+    assert text["failure_markers"] == [marker]
+    assert text["error_codes"] == codes
+    assert text["bytes"] == len(message.encode())
+    assert text["sha256"] == hashlib.sha256(message.encode()).hexdigest()
+    assert "PRIVATE_TOKEN" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("stage", ["ReadSpawnRequest", "SpawnChild", "WriteSpawnReady"])
+def test_tool_observation_runner_stage_is_allowlisted(stage):
+    result = _tool_observation(f"runner failed during {stage}: PRIVATE_PATH (Windows error 5)")
+    text = result["items"][0]["texts"][0]
+    assert text["runner_stages"] == [stage] and text["error_codes"] == [5]
+    assert "PRIVATE_PATH" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("code", sorted(proof._DIAGNOSTIC_SETUP_CODES))
+def test_tool_observation_setup_code_ignores_sensitive_suffix(code):
+    result = _tool_observation(f"Failed to create unified exec process: {code}: PRIVATE_COMMAND_TOKEN")
+    assert result["items"][0]["texts"][0]["setup_error_codes"] == [code]
+    assert "PRIVATE_COMMAND_TOKEN" not in json.dumps(result)
+
+
+def test_tool_observation_ignores_unknown_text_identifiers_and_distractor_calls():
+    distractor = "CreateProcessWithLogonW failed: 1326 DISTRACTOR_SECRET"
+    unknown = "PRIVATE_UNKNOWN_CODE: PRIVATE_UNKNOWN_TEXT runner failed during PRIVATE_STAGE:"
+    request = {"input": [
+        {"type": "function_call_output", "call_id": proof.CALL_ID + "-other", "output": distractor},
+        {"type": "custom_tool_call_output", "call_id": proof.CALL_ID, "output": unknown,
+         "arguments": "PRIVATE_ARGUMENTS", "name": "PRIVATE_NAME"},
+    ], "instructions": "PRIVATE_PROMPT", "env": {"PRIVATE_ENV": "PRIVATE_TOKEN"}}
+    result = proof.tool_output_diagnostic(request)
+    assert len(result["items"]) == 1
+    text = result["items"][0]["texts"][0]
+    assert text["failure_markers"] == text["runner_stages"] == text["setup_error_codes"] == text["error_codes"] == []
+    serialized = json.dumps(result)
+    assert "PRIVATE_" not in serialized and "DISTRACTOR_SECRET" not in serialized
+    assert hashlib.sha256(distractor.encode()).hexdigest() not in serialized
+
+
+@pytest.mark.parametrize("provider_request,shape", [
+    (None, "null"), ([], "null"), ({}, "null"), ({"input": False}, "boolean"),
+    ({"input": 3}, "integer"), ({"input": 2.5}, "number"),
+    ({"input": "PRIVATE_INPUT"}, "string"), ({"input": {"PRIVATE": "TOKEN"}}, "object"),
+])
+def test_tool_observation_malformed_or_missing_inputs_are_bounded(provider_request, shape):
+    result = proof.tool_output_diagnostic(provider_request)
+    assert result["input_shape"] == shape and result["items"] == []
+    assert result["input_scanned"] == 0 and "PRIVATE" not in json.dumps(result)
+
+
+def test_tool_observation_structured_errors_only_accept_bounded_integer_fields():
+    result = _tool_observation({"exit_code": 7, "exitCode": True, "errno": -(2 ** 31),
+        "winerror": 2 ** 32 - 1, "code": 2 ** 32, "message": "PRIVATE_OUTPUT"},
+        type={"PRIVATE_TYPE": "TOKEN"}, error={"code": 5, "errno": "PRIVATE_CODE",
+        "winerror": -(2 ** 31) - 1, "exit_code": False, "message": "PRIVATE_ERROR"})
+    item = result["items"][0]
+    assert item["item_type"] == "other" and item["output_shape"] == item["error_shape"] == "object"
+    assert item["output_codes"] == {"exit_code": 7, "errno": -(2 ** 31), "winerror": 2 ** 32 - 1}
+    assert item["error_codes"] == {"code": 5} and item["texts"] == []
+    assert "PRIVATE" not in json.dumps(result)
+
+
+def test_tool_observation_caps_matches_input_parts_scan_and_diagnostic_size():
+    text = "x" * proof._DIAGNOSTIC_SCAN_LIMIT + " unknown tool PRIVATE_TAIL"
+    match = {"type": "function_call_output", "call_id": proof.CALL_ID,
+             "output": [{"text": text}] * (proof._DIAGNOSTIC_TEXT_LIMIT + 1)}
+    result = proof.tool_output_diagnostic({"input": [match] * (proof._DIAGNOSTIC_INPUT_LIMIT + 1)})
+    assert result["input_truncated"] and result["matches_truncated"]
+    assert result["input_scanned"] == proof._DIAGNOSTIC_INPUT_LIMIT
+    assert len(result["items"]) == proof._DIAGNOSTIC_ITEM_LIMIT
+    for item in result["items"]:
+        assert item["text_parts_truncated"] and len(item["texts"]) == proof._DIAGNOSTIC_TEXT_LIMIT
+        for observed in item["texts"]:
+            assert observed["scan_truncated"] and observed["scanned_characters"] == proof._DIAGNOSTIC_SCAN_LIMIT
+            assert observed["failure_markers"] == []
+            assert observed["bytes"] == len(text.encode())
+            assert observed["sha256"] == hashlib.sha256(text.encode()).hexdigest()
+    serialized = json.dumps(result)
+    assert len(serialized) < 16000 and "PRIVATE_TAIL" not in serialized
+    late = proof.tool_output_diagnostic({"input": [None] * proof._DIAGNOSTIC_INPUT_LIMIT + [match]})
+    assert late["input_truncated"] and late["items"] == []
+
+
+def test_tool_observation_text_parts_and_numeric_matches_reject_malformed_values():
+    result = _tool_observation([None, {"text": {"PRIVATE": "TOKEN"}}, {"text": False},
+        {"text": "os error 4294967296; errno -2147483649; error code 12345678901"}])
+    assert len(result["items"][0]["texts"]) == 1
+    assert result["items"][0]["texts"][0]["error_codes"] == []
+    assert "PRIVATE" not in json.dumps(result)
+    many = _tool_observation("; ".join(f"os error {n}" for n in range(20)))
+    assert many["items"][0]["texts"][0]["error_codes"] == list(range(8))
+
+
+@pytest.mark.parametrize("value", [None, True, 7, 2.5, [], {}, "\ud800PRIVATE\udfff"])
+def test_tool_observation_accepts_json_valid_malformed_outputs_and_surrogates(value):
+    result = _tool_observation(value, type=["PRIVATE_TYPE"], error="PRIVATE_ERROR")
+    assert len(result["items"]) == 1 and result["items"][0]["item_type"] == "other"
+    assert "PRIVATE" not in json.dumps(result)
+    if isinstance(value, str):
+        text = result["items"][0]["texts"][0]
+        assert text["bytes"] == len(value.encode("utf-8", errors="surrogatepass"))
+
+
+@pytest.mark.parametrize("mode", ["direct", "code", "poll"])
+def test_tool_observation_does_not_change_success_packets_or_parse_payload_errors(mode):
+    payload = "unknown tool PRIVATE_PAYLOAD (Windows error 5)"
+    text = ("Chunk ID: a\nProcess exited with code 7\nOutput:\n" + payload if mode == "direct" else
+            "Script completed\nOutput:\n" + json.dumps({"output": payload, "exit_code": 7}))
+    kind = "function_call_output" if mode == "direct" else "custom_tool_call_output"
+    request = {"input": [{"type": kind, "call_id": proof.CALL_ID, "output": text}]}
+    original = json.dumps(request)
+    packets = proof.output_packets(request, mode)
+    result = proof.tool_output_diagnostic(request)
+    assert proof.output_packets(request, mode) == packets == [{"output": payload, "exit_code": 7}]
+    assert json.dumps(request) == original and "PRIVATE_PAYLOAD" not in json.dumps(result)
+    observation = result["items"][0]["texts"][0]
+    assert observation["failure_markers"] == observation["error_codes"] == []
+    assert observation["exit_codes"] == ([7] if mode == "direct" else [])
+
+
+def test_tool_observation_error_without_packet_cannot_become_success():
+    request = {"input": [{"type": "function_call_output", "call_id": proof.CALL_ID,
+                           "output": "CreateProcessWithLogonW failed: 1326 PRIVATE"}]}
+    for mode in ("direct", "code", "poll"):
+        assert proof.output_packets(request, mode) == []
+        assert proof.tool_output_diagnostic(request)["items"][0]["texts"][0]["error_codes"] == [1326]
+        assert proof.output_packets(request, mode) == []
+
+
+def test_advertised_tools_observation_only_retains_known_names_with_bounded_traversal():
+    request = {"tools": [{"name": "PRIVATE_TOOL", "description": "PRIVATE_PROMPT"},
+        {"type": "namespace", "name": "PRIVATE_NAMESPACE", "tools": [
+            {"name": "exec_command", "parameters": {"PRIVATE_ARGUMENT": "TOKEN"}},
+            {"function": {"name": "write_stdin", "description": "PRIVATE_DESCRIPTION"}},
+            {"name": ["PRIVATE_MALFORMED"]}, None]}, {"name": "exec"}]}
+    original = json.dumps(request)
+    result = proof.advertised_tools_diagnostic(request)
+    assert result["known_names"] == ["exec", "exec_command", "write_stdin"]
+    assert not result["truncated"] and result["inspected"] == 7
+    assert "PRIVATE" not in json.dumps(result) and json.dumps(request) == original
+    nested = {"tools": [{"name": "apply_patch"}] * (proof._DIAGNOSTIC_INPUT_LIMIT + 1)}
+    bounded = proof.advertised_tools_diagnostic({"tools": [nested]})
+    assert bounded["truncated"] and bounded["inspected"] == proof._DIAGNOSTIC_INPUT_LIMIT
+    assert bounded["known_names"] == ["apply_patch"]
+    assert len(json.dumps(bounded)) < 200
+    for value in (None, {}, {"tools": "PRIVATE"}, {"tools": [False, [], {"function": "PRIVATE"}]}):
+        assert proof.advertised_tools_diagnostic(value)["known_names"] == []
+        assert "PRIVATE" not in json.dumps(proof.advertised_tools_diagnostic(value))
+
+
 def test_environment_does_not_inherit_credentials_or_parent_settings(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "synthetic-not-an-api-key")
     monkeypatch.setenv("CODEX_HOME", "/wrong")
