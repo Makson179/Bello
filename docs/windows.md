@@ -58,10 +58,11 @@ refuse to start if their network blocking rules cannot be established.
 
 ### Claude Code subscription on native Windows
 
-Bello 0.7.1 pins `claude-agent-sdk==0.2.161` on every platform. That SDK
-release has no Windows wheel with a bundled Claude Code CLI, so on Windows pip
-installs its pure-Python source distribution, and Bello supplies the identical
-official Claude Code 2.1.284 build that the SDK's macOS and Linux wheels bundle:
+This source tree pins `claude-agent-sdk==0.2.164` and pairs it with the official
+Claude Code **2.1.293** release, which adds Haiku 5.5 metadata. The SDK's wheel
+bundles CLI 2.1.292; Bello uses its verified 2.1.293 download instead, including
+when that older bundled executable exists. Both the SDK version and its
+declared bundled-CLI version are checked against the explicit pairing:
 
 ```powershell
 pipx install 'bello[claude]' --force
@@ -71,7 +72,7 @@ bello doctor
 ```
 
 `bello runtime install claude-code` downloads `claude.exe` once from
-`https://downloads.claude.ai/claude-code-releases/2.1.284/win32-x64/`, checks the
+`https://downloads.claude.ai/claude-code-releases/2.1.293/win32-x64/`, checks the
 exact size and SHA-256 pinned in Bello, and keeps it in a private,
 ACL-checked cache under `%USERPROFILE%\.bello\runtime\claude-code` (or
 `BELLO_RUNTIME_DIR`, which must be private to you, SYSTEM and Administrators

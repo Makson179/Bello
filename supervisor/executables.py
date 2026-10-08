@@ -159,14 +159,30 @@ def _windows_executable_names(command: str, environ: Mapping[str, str]) -> tuple
 def _path_is_blocked(path: Path, roots: Iterable[Path]) -> bool:
     try:
         candidate = os.path.normcase(str(path.resolve(strict=False)))
-    except OSError:
+    except (OSError, ValueError):
+        return True
+    if not os.path.isabs(candidate):
         return True
     for root in roots:
         try:
             boundary = os.path.normcase(str(root.resolve(strict=False)))
+        except (OSError, ValueError):
+            return True
+        if not os.path.isabs(boundary):
+            return True
+        try:
             if os.path.commonpath([candidate, boundary]) == boundary:
                 return True
-        except (OSError, ValueError):
+        except ValueError:
+            # Windows commonpath raises for distinct canonical drives/UNC
+            # shares. A trusted C: tool cannot be inside a D: workspace. Both
+            # paths must still be absolute; drive-relative ambiguity is denied.
+            candidate_drive = os.path.splitdrive(candidate)[0]
+            boundary_drive = os.path.splitdrive(boundary)[0]
+            if candidate_drive and boundary_drive and candidate_drive != boundary_drive:
+                continue
+            return True
+        except OSError:
             return True
     return False
 

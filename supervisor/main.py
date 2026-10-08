@@ -38,6 +38,12 @@ EFFORT_FLAG_NOTE = (
 class BelloClickGroup(click.Group):
     def main(self, args: list[str] | tuple[str, ...] | None = None, **extra: Any) -> Any:
         normalized_args = _normalize_optional_bool_args(list(args) if args is not None else sys.argv[1:])
+        # Console/module entrypoints use the process watchdog. Explicit Python
+        # callers (including Click's test runner) retain an in-process API.
+        context = extra.setdefault("obj", {})
+        if isinstance(context, dict):
+            context["bello_process_launch"] = args is None
+            context["bello_process_args"] = normalized_args
         return super().main(args=normalized_args, **extra)
 
 
@@ -184,6 +190,16 @@ class BelloClickGroup(click.Group):
     help="Maximum adversarial tester passes before final completion (default 1; 0 disables).",
 )
 @click.option(
+    "--auto-recover/--no-auto-recover",
+    default=True,
+    help="Automatically restore eligible controller crashes, with at most three restarts per run.",
+)
+@click.option(
+    "--recover",
+    is_flag=True,
+    help="Restore a previously fenced interrupted run; never starts a fresh task.",
+)
+@click.option(
     "--version",
     "-V",
     is_flag=True,
@@ -217,12 +233,40 @@ def cli(
     completion_review: bool | None,
     adversary: bool | None,
     adversary_runs: int | None,
+    auto_recover: bool,
+    recover: bool,
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
+    from supervisor.process_fence import configure_worker
+    from supervisor.watchdog import PERMIT_ENV, WORKER_ENV, watch_cli
+    configure_worker()
+    is_watchdog_worker = os.environ.pop(WORKER_ENV, None) == "1"
+    if recover and not auto_recover:
+        raise click.ClickException("--recover cannot be combined with --no-auto-recover")
+    if recover and (start_over or clean):
+        raise click.ClickException("--recover cannot be combined with --start-over or --clean")
+    if auto_recover and not is_watchdog_worker and isinstance(ctx.obj, dict) and ctx.obj.get("bello_process_launch"):
+        try:
+            raise SystemExit(watch_cli(ctx.obj["bello_process_args"], explicit_recovery=recover))
+        except RuntimeError as exc:
+            raise click.ClickException(str(exc)) from exc
     _startup_update_gate()
+    from supervisor.controller_recovery import RunOwner
+    owner = None
+    owned = False
     try:
-        project_config = load_project_config(Path.cwd(), create=True)
+        owner = RunOwner(Path.cwd())
+        owner.__enter__()
+        owned = True
+        if recover:
+            from supervisor.controller_recovery import recovery_disposition
+            if not os.environ.get(PERMIT_ENV) or not recovery_disposition(Path.cwd()).get("eligible"):
+                raise RuntimeError("--recover requires an eligible interrupted run with a trusted fencing receipt")
+        # Preserved recovery state must be validated before any missing config
+        # is synthesized. A new explicit run may create its initial config.
+        has_run = (owner.root / "run.json").exists()
+        project_config = load_project_config(Path.cwd(), create=bool(start_over) or not has_run)
         run_settings = _resolve_run_settings(
             project_config=project_config,
             task_path=task_path,
@@ -256,6 +300,9 @@ def cli(
         raise click.ClickException(str(exc)) from exc
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from exc
+    finally:
+        if owned and owner is not None:
+            owner.__exit__(None, None, None)
 
 
 @cli.command("update")
@@ -538,10 +585,13 @@ def runtime_windows_sandbox_remove(yes: bool, drive: str | None, null_device: bo
 
 @runtime_group.command("models")
 @click.option("--engine", type=click.Choice(["all", "codex", "pi", "claude-code"]), default="all", show_default=True)
-def runtime_models_command(engine: str) -> None:
+@click.option("--refresh", is_flag=True, help="Reload local Pi catalog/auth metadata (requires --engine pi; no network or login).")
+def runtime_models_command(engine: str, refresh: bool = False) -> None:
     """List the configured provider/model catalog without making a model request."""
     import tempfile
     from supervisor.runtime.client import RuntimeClient
+    if refresh and engine != "pi":
+        raise click.UsageError("--refresh requires --engine pi (local catalog refresh only)")
     async def read_models(directory: Path) -> dict[str, Any]:
         client = RuntimeClient(cwd=directory)
         try:
@@ -549,6 +599,7 @@ def runtime_models_command(engine: str) -> None:
             return await client.request("model/list", {
                 "engines": ["codex", "pi", "claude-code"] if engine == "all" else [engine],
                 "optionalEngines": engine == "all",
+                **({"refresh": True} if refresh else {}),
             })
         finally:
             await client.stop()
@@ -756,6 +807,7 @@ async def _run_bello(settings: RunSettings) -> int:
         adversary_runs=settings.adversary_runs,
         completion_review=settings.completion_review,
         project_config=load_project_config(Path.cwd(), create=False),
+        recovery_enabled=settings.recovery_enabled,
     )
     await controller.run()
     status = controller.store.get_bello_config().status
@@ -786,6 +838,7 @@ class RunSettings:
     runtime_enabled: bool = True
     async_tools: bool = False
     log_distiller: LogDistillerConfig = field(default_factory=LogDistillerConfig)
+    recovery_enabled: bool = True
 
 
 def _resolve_run_settings(

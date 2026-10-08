@@ -41,6 +41,26 @@ FAST_HELP = (
     "role and allowed subagent profile; Claude Code subscription models do not offer it. usual leaves the tier unset."
 )
 
+# Official Codex notice checked 2026-10-06. This is guidance, not an API
+# deprecation or permission to replace the user's saved subscription profile.
+GPT_55_CODEX_RETIREMENT_DATE = "2026-10-14"
+GPT_55_CODEX_RETIREMENT_URL = "https://developers.openai.com/codex/models#gpt-55-retirement"
+
+
+def model_retirement_notice(model: str) -> str | None:
+    try:
+        selection = parse_model_selection(model)
+    except ModelSelectionError:
+        return None
+    if selection.provider != "openai-codex" or selection.model != "gpt-5.5":
+        return None
+    return (
+        "GPT-5.5 retires from Codex with ChatGPT sign-in on October 14, 2026. "
+        "The OpenAI API is unaffected. Choose a replacement advertised for your account "
+        "and client; the saved model and subscription billing route are kept. "
+        + GPT_55_CODEX_RETIREMENT_URL
+    )
+
 
 # --- Active profiles ---------------------------------------------------------------------
 
@@ -319,7 +339,7 @@ def choose_effort(current: str, supported: tuple[str, ...], *, advertised_defaul
 
 
 IssueLevel = Literal["error", "warning"]
-IssueCategory = Literal["availability", "effort", "fast", "triage", "dependency"]
+IssueCategory = Literal["availability", "effort", "fast", "triage", "dependency", "retirement"]
 
 
 @dataclass(frozen=True)
@@ -398,6 +418,8 @@ def validate_project_config(
         except ModelSelectionError as exc:
             issues.append(ConfigIssue("error", "availability", "Invalid model id", f"{model}: {exc}", settings))
             continue
+        if notice := model_retirement_notice(model):
+            issues.append(ConfigIssue("warning", "retirement", "Codex model retirement", notice, settings))
         entry = catalog.get(model)
         if entry is None and catalog.discovered:
             failure = catalog.failures.get(selection.engine)

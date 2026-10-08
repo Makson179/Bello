@@ -6,6 +6,7 @@ import pytest
 
 from supervisor.schemas import BelloConfig
 from supervisor.state import StateStore
+from tests.support.controller import posix_command_semantics  # noqa: F401 (pytest fixture)
 
 
 @pytest.fixture

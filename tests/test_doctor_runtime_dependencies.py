@@ -1,35 +1,44 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from pathlib import Path
 import subprocess
-import sys
-from types import ModuleType
+from types import SimpleNamespace
 
 import pytest
 
 from supervisor import doctor
 from supervisor.appserver import AppServerError
-from supervisor.runtime import install, sandbox, windows_sandbox
+from supervisor.runtime import claude_cli, install, sandbox, windows_sandbox
 from supervisor.runtime.claude import ClaudeBackend
 
 
 @pytest.fixture(autouse=True)
-def isolated_dependencies(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Exercise doctor itself without launching tools, installers, or providers."""
+def isolated_dependencies(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace:
+    """Exercise doctor at the shared readiness boundary, without executing tools.
+
+    Pairing, cache verification and legacy bundle fallback have dedicated
+    resolver tests. Doctor consumes their OfficialCli result or typed failure;
+    it must never ask that boundary to prepare/download an executable.
+    """
     monkeypatch.setattr(install, "node_executable", lambda: "/trusted/node")
     monkeypatch.setattr(install, "worker_command", lambda: ["/trusted/node", "worker.mjs"])
     monkeypatch.setattr(doctor.platform, "system", lambda: "Linux")
     monkeypatch.setattr(sandbox, "_linux_launcher", lambda: Path("/usr/bin/bwrap"))
     monkeypatch.setattr(doctor.platform, "freedesktop_os_release", lambda: {"ID": "ubuntu"})
 
-    sdk = ModuleType("claude_agent_sdk")
-    sdk.__file__ = str(tmp_path / "claude_agent_sdk" / "__init__.py")
-    bundle = Path(sdk.__file__).parent / "_bundled"
-    bundle.mkdir(parents=True)
-    (bundle / ("claude.exe" if os.name == "nt" else "claude")).write_text("fixture")
-    monkeypatch.setitem(sys.modules, "claude_agent_sdk", sdk)
+    readiness = SimpleNamespace(
+        cli=claude_cli.OfficialCli(tmp_path / "verified-managed" / "claude", "managed-download", "2.1.293"),
+        error=None,
+    )
+
+    def official_cli(*, prepare=False):
+        assert prepare is False, "doctor must never prepare or download a CLI"
+        if readiness.error is not None:
+            raise readiness.error
+        return readiness.cli
+
+    monkeypatch.setattr(ClaudeBackend, "_official_cli", staticmethod(official_cli))
 
     def forbidden(*_args: object, **_kwargs: object) -> None:
         pytest.fail("Dependency diagnostics must not start subprocesses or query models")
@@ -38,6 +47,7 @@ def isolated_dependencies(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
     monkeypatch.setattr(subprocess, "run", forbidden)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden)
     monkeypatch.setattr(asyncio, "create_subprocess_shell", forbidden)
+    return readiness
 
 
 def sandbox_result() -> doctor.DoctorResult:
@@ -167,18 +177,29 @@ def test_windows_helper_symlink_is_rejected(monkeypatch: pytest.MonkeyPatch, tmp
     assert "non-reparse regular file" in result.detail
 
 
-def test_sdk_bundled_claude_is_detected_without_path(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("source", ["managed-download", "sdk-bundle"])
+def test_official_claude_is_detected_without_path(monkeypatch: pytest.MonkeyPatch, isolated_dependencies, source) -> None:
     monkeypatch.setenv("PATH", "")
+    if source == "sdk-bundle":
+        # Retain presentation coverage for legacy releases without an override.
+        isolated_dependencies.cli = claude_cli.OfficialCli(
+            Path("sdk/_bundled/claude"), "sdk-bundle", "2.1.284")
     result = claude_result()
     assert result.level == "ok"
-    assert "SDK bundle" in result.message
-    assert "_bundled" in result.message
+    if source == "sdk-bundle":
+        assert "SDK bundle" in result.message
+        assert "_bundled" in result.message
+    else:
+        assert "CLI 2.1.293" in result.message
+        assert "Bello-verified download" in result.message
+        assert str(isolated_dependencies.cli.path) in result.message
     assert "bello runtime login claude-code" in result.detail
 
 
-def test_standalone_claude_does_not_replace_missing_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_standalone_claude_does_not_replace_missing_sdk(monkeypatch: pytest.MonkeyPatch, isolated_dependencies) -> None:
     monkeypatch.setattr(doctor, "_doctor_executable", lambda _name: "/standalone/claude")
-    monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
+    isolated_dependencies.error = claude_cli.ClaudeCliError(
+        "Claude Code support requires the pinned claude-agent-sdk package", kind="missing-sdk")
     result = claude_result()
     assert result.level == "warn"
     assert "pinned claude-agent-sdk" in result.detail
@@ -186,21 +207,28 @@ def test_standalone_claude_does_not_replace_missing_sdk(monkeypatch: pytest.Monk
     assert "Not required for Pi/API providers" in result.detail
 
 
-def test_incomplete_sdk_bundle_is_optional_warning() -> None:
-    ClaudeBackend._bundled_cli_path().unlink()
+@pytest.mark.parametrize("kind", ["missing-bundle", "not-prepared", "sdk-mismatch", "invalid-cache"])
+def test_incomplete_official_cli_is_optional_warning(isolated_dependencies, kind) -> None:
+    message = {
+        "missing-bundle": "the official CLI bundled with claude-agent-sdk is missing",
+        "not-prepared": f"official Claude Code CLI 2.1.293 is not prepared; run {claude_cli.INSTALL_COMMAND}",
+        "sdk-mismatch": "installed SDK does not match the pinned SDK/CLI pair",
+        "invalid-cache": "cached Claude Code CLI checksum does not match the pinned official build",
+    }[kind]
+    isolated_dependencies.error = claude_cli.ClaudeCliError(message, kind=kind)
     result = claude_result()
     assert result.level == "warn"
-    assert "bundled with claude-agent-sdk is missing" in result.detail
+    assert message in result.detail
+    assert "standalone claude on PATH does not replace" in result.detail
+    assert "Not required for Pi/API providers" in result.detail
 
 
-def test_unreadable_sdk_bundle_is_optional_warning(monkeypatch: pytest.MonkeyPatch) -> None:
-    def denied() -> Path:
-        raise PermissionError("SDK bundle inaccessible")
-
-    monkeypatch.setattr(ClaudeBackend, "_bundled_cli_path", staticmethod(denied))
+def test_unreadable_official_cli_is_optional_warning(isolated_dependencies) -> None:
+    isolated_dependencies.error = PermissionError("official CLI inaccessible")
     result = claude_result()
     assert result.level == "warn"
-    assert "SDK bundle inaccessible" in result.detail
+    assert "official CLI inaccessible" in result.detail
+    assert "Not required for Pi/API providers" in result.detail
 
 
 @pytest.mark.parametrize("dependency", ["node_executable", "worker_command"])
@@ -214,7 +242,8 @@ def test_pi_failure_does_not_hide_sandbox_and_claude_results(
     results = doctor._runtime_dependency_results()
     assert any(result.level == "warn" and "Pi runtime" in result.message for result in results)
     assert any(result.level == "ok" and "OS sandbox" in result.message for result in results)
-    assert any(result.level == "ok" and "Claude Code SDK bundle" in result.message for result in results)
+    assert any(result.level == "ok" and "Claude Code CLI 2.1.293" in result.message
+               and "Bello-verified download" in result.message for result in results)
 
 
 def test_unsupported_platform_fails_without_linux_install_hint(monkeypatch: pytest.MonkeyPatch) -> None:

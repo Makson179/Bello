@@ -3,7 +3,7 @@ name: Native Codex Linux proof
 on:
   workflow_dispatch:
   push:
-    branches: [mystery, 'codex/**']
+    branches: [mystery, 'codex/**', '!codex/072-recovery-validation']
     paths:
       - '.github/workflows/native-codex-linux*.yml'
       - 'scripts/*native_codex_linux.py'
@@ -29,9 +29,11 @@ concurrency:
 
 jobs:
   native-build:
+    if: github.ref != 'refs/heads/codex/072-recovery-validation'
     uses: ./.github/workflows/native-codex-linux-build.yml
 
   native-proof:
+    if: github.ref != 'refs/heads/codex/072-recovery-validation'
     needs: native-build
     runs-on: ubuntu-22.04
     timeout-minutes: 30

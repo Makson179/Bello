@@ -41,7 +41,7 @@ jobs:
         run: python -B scripts/repackage_native_codex_windows_candidate.py download --historical ../provenance --output ../repackage-inputs
       - name: Verify and package using the original native build identity
         run: python -B scripts/repackage_native_codex_windows_candidate.py package --historical ../provenance --inputs ../repackage-inputs --output ../native-repackaged
-      - name: Fresh final-code install, nine selection cases and thirteen async cases
+      - name: Fresh final-code install, nine selection cases and fourteen async cases
         run: |
           $runtimeRoot = Join-Path $env:LOCALAPPDATA "bello-native-repackage-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           # Native provisioning intentionally rejects ParentDir, even in absolute paths.

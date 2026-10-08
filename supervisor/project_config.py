@@ -25,7 +25,12 @@ GPT_5_6_MODELS = (
     MODEL_GPT_5_6_LUNA,
 )
 SUPPORTED_MODEL_CHOICES = (MODEL_GPT_6_ASTRA, *GPT_5_6_MODELS, MODEL_GPT_5_5)
-DEFAULT_MODEL = MODEL_GPT_5_6_SOL
+# New configurations use the current GPT-6 model advertised by the pinned
+# native Codex catalog (verified 2026-10-06). Newer Sol/Luna identifiers remain
+# dynamically discovered profiles; their public announcement is not evidence
+# that this subscription client can execute them.
+DEFAULT_MODEL = MODEL_GPT_6_ASTRA
+LEGACY_DEFAULT_MODEL = MODEL_GPT_5_6_SOL
 DEFAULT_INTELLIGENCE = "xhigh"
 BASE_INTELLIGENCE_CHOICES = ("low", "medium", "high", "xhigh")
 INTELLIGENCE_CHOICES = (*BASE_INTELLIGENCE_CHOICES, "max", "ultra")
@@ -231,7 +236,7 @@ def intelligence_choices_for_model(model: str) -> tuple[str, ...]:
         # before execution. API catalogs also contain non-reasoning models;
         # applying the old Codex-only list would reject their valid `off` setting.
         # `default` (send no effort) keeps models that advertise no effort, such
-        # as Claude Haiku, loadable. The editor must not silently clamp the saved effort.
+        # as Claude Haiku 4.5, loadable. The editor must not silently clamp the saved effort.
         return ("off", "minimal", *INTELLIGENCE_CHOICES, NO_EFFORT)
     if model == MODEL_GPT_6_ASTRA:
         # Preserve existing unqualified Codex profile validation.
@@ -330,7 +335,15 @@ def changed_project_config_fields(before: ProjectConfig, after: ProjectConfig) -
 
 
 def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfig:
-    default = default_project_config()
+    # An existing partial/legacy file already had an effective model choice.
+    # Updating defaults for newly created files must not silently migrate it.
+    default = ProjectConfig(
+        coder_mod=LEGACY_DEFAULT_MODEL,
+        revision_coder_mod=LEGACY_DEFAULT_MODEL,
+        runtime_mod=LEGACY_DEFAULT_MODEL,
+        completion_mod=LEGACY_DEFAULT_MODEL,
+        adversary_mod=LEGACY_DEFAULT_MODEL,
+    )
     coder_mod = _required_string(
         _first_present(payload, ("coder_mod", "coder_model", "model"), default.coder_mod, skip_none=True),
         "coder_model",

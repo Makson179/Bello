@@ -1,8 +1,8 @@
 """The official Claude Code CLI on native Windows, entirely offline.
 
-claude-agent-sdk 0.2.161 has no win_amd64 wheel, so Windows installs its pure-
-Python sdist (no ``_bundled/claude.exe``). Bello then supplies the identical
-official Claude Code 2.1.284 build. These tests simulate that platform, use
+The historical SDK 0.2.161 / CLI 2.1.284 fixtures exercise the same-build
+fallback from a pure-Python sdist (no ``_bundled/claude.exe``). Current explicit
+SDK/CLI pairing is also covered by test_claude_haiku55_runtime. These tests use
 fixture bytes instead of the 246 MB binary, and never execute a CLI, log in,
 or contact the network (``urlopen`` is replaced wherever a download path runs).
 """
@@ -673,6 +673,53 @@ def test_windows_verifier_refuses_other_platforms(monkeypatch, capsys):
         verifier.main()
     assert caught.value.code == 1
     assert "native Windows" in capsys.readouterr().out
+
+
+def test_windows_verifier_accepts_explicit_pair_with_an_older_sdk_bundle(windows, monkeypatch, capsys):
+    from dataclasses import replace
+
+    verifier = _verifier()
+    # Historical fixture versions, with an explicit newer managed CLI.
+    release = replace(windows.release, cli_version="2.1.293", sdk_bundled_cli_version="2.1.284")
+    monkeypatch.setattr(claude_cli, "MANAGED_RELEASES", {("Windows", "x86_64"): release})
+    (windows.package / "_bundled" / "claude.exe").write_bytes(b"older SDK bundle")
+    verifier.check_sdk()
+    output = capsys.readouterr().out
+    assert "bundled executable present: True" in output
+    assert "explicitly paired managed CLI: 2.1.293" in output
+
+
+@pytest.mark.parametrize("defect", [None, "missing-haiku", "wrong-alias", "wrong-efforts"])
+def test_windows_metadata_proof_requires_haiku55_and_sonnet55(tmp_path, monkeypatch, capsys, defect):
+    verifier = _verifier()
+    for name in (*_DIRECT_CREDENTIAL_ENV, *_PROVIDER_SWITCH_ENV):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "signed-out"))
+    entries = []
+    for family in ("sonnet", "haiku"):
+        identifier = f"claude-{family}-5-5"
+        entries.extend([
+            {"id": identifier, "supportedEfforts": ["low", "medium", "high", "xhigh", "max"]},
+            {"id": family, "resolvedModel": identifier},
+        ])
+    if defect == "missing-haiku":
+        entries = entries[:2]
+    elif defect == "wrong-alias":
+        entries[-1]["resolvedModel"] = "claude-haiku-4-5-20251001"
+    elif defect == "wrong-efforts":
+        entries[-2]["supportedEfforts"] = []
+
+    async def catalog(self):
+        return entries
+
+    monkeypatch.setattr(ClaudeBackend, "_read_model_catalog", catalog)
+    if defect:
+        with pytest.raises(SystemExit) as caught:
+            verifier.check_metadata()
+        assert caught.value.code == 1
+    else:
+        verifier.check_metadata()
+        assert "alias haiku -> claude-haiku-5-5" in capsys.readouterr().out
 
 
 async def test_run_preparation_only_prepares_selected_claude_engine(windows, tmp_path):

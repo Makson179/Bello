@@ -4,15 +4,16 @@ Bello accepts exactly two sources for this executable and nothing else: no PATH
 lookup, checkout file, caller-supplied path, environment override, other CLI
 version, or API route.
 
-1. The CLI bundled in the installed ``claude-agent-sdk`` wheel.
-2. On a platform where the pinned SDK release publishes no wheel with a bundled
-   CLI (currently native Windows x64 for ``claude-agent-sdk==0.2.161``), the
-   same official Claude Code release that Anthropic bundles in that SDK's other
-   wheels. It is downloaded only from Anthropic's release host, checked against
-   the exact size and SHA-256 pinned below, and stored in Bello's private
-   runtime cache. It is paired with that SDK release only: a different SDK
-   version, or an SDK that declares another bundled-CLI version, is refused
-   instead of mixing versions.
+1. An explicitly pinned managed CLI/SDK pair on supported platforms. The
+   managed CLI takes precedence over the SDK's bundled CLI, but the SDK's exact
+   version and bundled-CLI metadata declaration must both match the pair.
+2. Otherwise, the CLI bundled in the installed ``claude-agent-sdk`` wheel, or
+   a same-build managed fallback where a release has no bundled executable.
+
+Managed builds are downloaded only from Anthropic's release host, checked
+against the exact size and SHA-256 pinned below, and stored in Bello's private
+runtime cache. A missing or mismatched explicit pair never falls back to an
+SDK bundle or a different executable.
 
 Preparation (download) happens only in explicit setup commands, ``bello
 update`` and before a run whose roles use ``claude-code``; ordinary readiness
@@ -69,31 +70,50 @@ class OfficialCliRelease:
     binary: str
     size: int
     sha256: str
+    # When present, this is the exact metadata declaration accepted from the
+    # pinned SDK, not the version of the managed executable selected at runtime.
+    # It also opts into managed-first resolution; None keeps legacy bundle-first
+    # resolution and same-build fallback for releases without a bundled CLI.
+    sdk_bundled_cli_version: str | None = None
 
     @property
     def url(self) -> str:
         return f"{OFFICIAL_RELEASE_BASE}{self.cli_version}/{self.platform}/{self.binary}"
 
 
-# Add an entry only when Bello's pinned SDK release has no wheel with a bundled
-# CLI for that platform, and only for the CLI version that SDK declares in
-# ``claude_agent_sdk._cli_version``. The values come from Anthropic's release
-# manifest for that version (``<version>/manifest.json`` on the host above,
-# published with a detached PGP signature that Bello does not check; the
-# SHA-256 pinned here is the trust anchor). For 2.1.284 the manifest's
-# darwin-arm64 entry is byte-identical to the CLI bundled in the official
-# claude-agent-sdk 0.2.161 macOS arm64 wheel, and the win32-x64 file below was
-# downloaded and matched to the manifest (its Authenticode block names
-# "Anthropic, PBC"; Windows CI checks that signature with the OS). Windows on
-# ARM is not a supported Bello platform.
+# The explicit SDK 0.2.164 / CLI 2.1.293 pair accepts only the SDK's 2.1.292
+# bundled-CLI metadata, while always executing the managed 2.1.293 build.
+# Sizes and SHA-256 values come from Anthropic's 2.1.293 release manifest
+# (<version>/manifest.json on the host above). Its detached PGP signature is
+# not checked here: these source-pinned hashes are the trust anchor. Windows
+# CI additionally checks the downloaded executable's Authenticode signature.
+# The Linux artifacts below target glibc, not musl/Alpine. Windows on ARM is
+# not a supported Bello platform.
 MANAGED_RELEASES: dict[tuple[str, str], OfficialCliRelease] = {
+    ("Darwin", "arm64"): OfficialCliRelease(
+        cli_version="2.1.293", sdk_version="0.2.164", sdk_bundled_cli_version="2.1.292",
+        platform="darwin-arm64", binary="claude", size=236_330_608,
+        sha256="4e21122a227857da1178aca3299700c1fd7f2b77c93f12e73c2c76db796a105e",
+    ),
+    ("Darwin", "x86_64"): OfficialCliRelease(
+        cli_version="2.1.293", sdk_version="0.2.164", sdk_bundled_cli_version="2.1.292",
+        platform="darwin-x64", binary="claude", size=244_819_072,
+        sha256="267af22d4eb187b8d65d1592e6fabf57b1df6c254913d5a6c5d8b956a02cd002",
+    ),
+    ("Linux", "arm64"): OfficialCliRelease(
+        cli_version="2.1.293", sdk_version="0.2.164", sdk_bundled_cli_version="2.1.292",
+        platform="linux-arm64", binary="claude", size=252_108_792,
+        sha256="a43629e888f0a7d96c5e8de62abf44852433a7ff2481574688db3e5b6399491f",
+    ),
+    ("Linux", "x86_64"): OfficialCliRelease(
+        cli_version="2.1.293", sdk_version="0.2.164", sdk_bundled_cli_version="2.1.292",
+        platform="linux-x64", binary="claude", size=252_755_128,
+        sha256="8968405e26db478af44eabc4635ab5ca557057b702a54460a59c13e1b253e978",
+    ),
     ("Windows", "x86_64"): OfficialCliRelease(
-        cli_version="2.1.284",
-        sdk_version="0.2.161",
-        platform="win32-x64",
-        binary="claude.exe",
-        size=246_480_032,
-        sha256="0416631e846f743110da5282409776fa1313e65f33a588aae066eaf8db0fda7d",
+        cli_version="2.1.293", sdk_version="0.2.164", sdk_bundled_cli_version="2.1.292",
+        platform="win32-x64", binary="claude.exe", size=256_155_808,
+        sha256="8693c4a02dde7441d0066ede68af8ddfc408bb982d77e12b506286268224e6fa",
     ),
 }
 _MAX_REDIRECTED_URL = 4096
@@ -148,12 +168,13 @@ def resolve_official_cli(
     startup and doctor. ``prepare=True`` may download the pinned build first;
     installation, ``bello update``, login and run preflight use it.
     """
-    try:
-        return OfficialCli(Path(bundled()), "sdk-bundle", sdk_declared_cli_version())
-    except BundledCliMissing:
-        release = managed_release()
-        if release is None:
-            raise
+    release = managed_release()
+    if release is None or release.sdk_bundled_cli_version is None:
+        try:
+            return OfficialCli(Path(bundled()), "sdk-bundle", sdk_declared_cli_version())
+        except BundledCliMissing:
+            if release is None:
+                raise
     check_sdk_pairing(release)
     path = _install(release, download or _download) if prepare else _verified(release)
     return OfficialCli(path, "managed-download", release.cli_version)
@@ -175,12 +196,18 @@ def check_sdk_pairing(release: OfficialCliRelease) -> None:
             "Claude Code support requires the pinned claude-agent-sdk package", kind="missing-sdk"
         ) from exc
     declared = sdk_declared_cli_version()
-    if installed != release.sdk_version or declared not in (None, release.cli_version):
+    expected_declaration = (release.cli_version if release.sdk_bundled_cli_version is None
+                            else release.sdk_bundled_cli_version)
+    accepted_declarations = ((release.sdk_bundled_cli_version,)
+                             if release.sdk_bundled_cli_version is not None
+                             else (None, release.cli_version))
+    if installed != release.sdk_version or declared not in accepted_declarations:
         raise ClaudeCliError(
             f"installed claude-agent-sdk {installed} (bundled-CLI version {declared or 'unknown'}) is not the "
             f"release Bello pairs with its verified Claude Code CLI {release.cli_version} "
-            f"(claude-agent-sdk {release.sdk_version}). Run `bello update` to restore this Bello "
-            "release's pinned SDK; Bello will not combine a different CLI version",
+            f"(claude-agent-sdk {release.sdk_version}, bundled-CLI declaration {expected_declaration}). "
+            "Run `bello update` to restore this Bello "
+            "release's pinned SDK; Bello will not use a different SDK/CLI pairing",
             kind="sdk-mismatch",
         )
 

@@ -95,7 +95,7 @@ def setup(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_cold_install_full_proof_cache_reuse_and_environment_restore(setup):
     result = await smoke.verify(setup.runtime, setup.output)
-    assert result["passed"] and result["cases_passed"] == 13
+    assert result["passed"] and result["cases_passed"] == 14
     assert result["cold_cache"] and result["cache_unchanged"]
     assert setup.calls == ["install", "install"]
     assert setup.env == setup.original

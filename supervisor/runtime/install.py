@@ -16,7 +16,7 @@ from supervisor.state import FileLock
 
 
 MIN_NODE_VERSION = Version("22.19.0")
-PINNED_PI_VERSION = "0.85.1"
+PINNED_PI_VERSION = "1.0.4"
 
 
 def _verify_installed_version(directory: Path) -> None:

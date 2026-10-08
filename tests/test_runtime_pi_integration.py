@@ -509,7 +509,8 @@ async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(
             lambda _policy: sandbox._Toolchain(readable_roots=(python.parent,)),
         )
     node = _supported_node()
-    worker_dir = Path(__file__).resolve().parents[1] / "supervisor" / "pi_worker"
+    worker_dir = Path(os.environ.get("BELLO_TEST_PI_WORKER_DIR",
+                                   Path(__file__).resolve().parents[1] / "supervisor" / "pi_worker"))
     worker = worker_dir / "worker.mjs"
     if not (worker_dir / "node_modules" / "@earendil-works" / "pi-coding-agent").is_dir():
         message = "the pinned Pi worker dependencies are not installed"
@@ -612,7 +613,7 @@ async def test_real_pi_sdk_runtime_client_toolhost_and_structured_output(
                     "agentDir": str(agent_dir),
                     "allowModelNetwork": False,
                 })
-                assert initialized["serverInfo"]["piSdkVersion"] == "0.85.1"
+                assert initialized["serverInfo"]["piSdkVersion"] == "1.0.4"
                 return backend
 
             transport = await start_worker()

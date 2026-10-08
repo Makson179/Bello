@@ -6,6 +6,7 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -56,6 +57,128 @@ def test_fixture_diagnostic_keeps_error_tail_without_exceeding_limit() -> None:
     assert rendered.endswith('FINAL-ERROR"}')
     assert "[diagnostic middle omitted]" in rendered
     assert _bounded_fixture_json({"output": "short"}) == '{"output": "short"}'
+
+
+_PIPELINE_ROLES = ("coder", "completion", "adversary", "adv_report_controller", "supervisor")
+_PIPELINE_FAILURE_MARKERS = (
+    "run infrastructure failed", "failed to create coder workspace snapshot",
+    "snapshot recovery rejected", "runtime exposure", "permission denied",
+    "another process has locked", "used by another process", "app-server rpc failed",
+    "run policy changes require stopping the runtime first",
+    "model availability preflight failed before coder start",
+    "required os sandbox", "structured-output supervisor self-test",
+)
+
+
+def _pipeline_diagnostic(controller, tui, provider, *, socket_diagnostic=None) -> str:
+    """Bounded structural failure evidence; never echo arbitrary controller text."""
+    try:
+        status = controller.store.get_bello_config().status
+        status = status.value if isinstance(status, BelloStatus) else "unknown"
+    except Exception:
+        status = "unavailable"
+    reason, reason_source = "", "unavailable"
+    try:
+        # Read only the bounded result header, not task text, validation output,
+        # diffs, prompts, provider exchanges, or the rest of the final report.
+        with (controller.store.state_dir / FINAL_REPORT).open(encoding="utf-8") as report:
+            for _ in range(8):
+                line = report.readline(4096)
+                if line.startswith("- Result: "):
+                    reason, reason_source = line[10:], "final_report_result"
+                    break
+    except (OSError, UnicodeError):
+        pass
+    if not reason:
+        for title, message in reversed(tui.messages):
+            if title not in {"SUPERVISOR", "ERROR"} or not isinstance(message, str):
+                continue
+            bounded = message[:4096]
+            if any(marker in bounded.lower() for marker in _PIPELINE_FAILURE_MARKERS):
+                reason, reason_source = bounded, "filtered_controller_error"
+                break
+    lowered = reason.lower()
+    markers = [marker for marker in _PIPELINE_FAILURE_MARKERS if marker in lowered]
+    # Paths and arbitrary exception suffixes may contain commands or secrets.
+    # Retain only known failure clauses, lock basenames, and numeric OS codes.
+    reason_summary = {
+        "source": reason_source,
+        "markers": markers,
+        "text_omitted": bool(reason),
+        "owner_lock_mentioned": "owner.lock" in lowered,
+        "watchdog_lock_mentioned": "watchdog.lock" in lowered,
+        "os_errors": sorted(set(re.findall(r"\[(?:Errno|WinError) [0-9]{1,6}\]", reason)))[:4],
+    }
+    summary = {
+        "status": status,
+        "reason": reason_summary,
+        "running": bool(controller.running),
+        "coder_started": bool(getattr(controller, "_coder_started", False)),
+        "snapshot_present": getattr(controller, "_coder_snapshot", None) is not None,
+        "finished_roles": [role for role in _PIPELINE_ROLES if role in provider.finished_roles],
+        "finished_role_count": len(provider.finished_roles),
+        "provider_request_count": len(provider.requests),
+        "provider_error_count": len(provider.errors),
+        "requests_by_role": {role: min(1000000, max(0, provider.roles[role])) for role in _PIPELINE_ROLES},
+    }
+    if socket_diagnostic is not None:
+        summary["socket_probe_exit_codes"] = {
+            name: value.get("exitCode") if type(value.get("exitCode")) is int else None
+            for name in ("host_control", "sandbox_network_access_false", "sandbox_network_access_true")
+            if isinstance(value := socket_diagnostic.get(name), dict)
+        }
+    return json.dumps(summary, ensure_ascii=True, sort_keys=True)
+
+
+def test_pipeline_diagnostic_reports_lock_failure_without_raw_private_content(tmp_path) -> None:
+    secret = "PRIVATE-PROMPT-ENV-COMMAND"
+    (tmp_path / FINAL_REPORT).write_text(
+        "# Final Report\n\n- Task: private-task\n- Status: provider_failure\n"
+        "- Result: run infrastructure failed: failed to create coder workspace snapshot: "
+        "[Errno 13] Permission denied: C:/private/controller/owner.lock " + secret + "\n"
+        "- Validations: " + secret * 10000, encoding="utf-8",
+    )
+    controller = SimpleNamespace(
+        store=SimpleNamespace(state_dir=tmp_path, get_bello_config=lambda: SimpleNamespace(status=BelloStatus.PROVIDER_FAILURE)),
+        running=False, _coder_started=False, _coder_snapshot=None,
+    )
+    tui = SimpleNamespace(messages=[("SYSTEM", secret), ("CODER", secret)])
+    provider = SimpleNamespace(finished_roles=set(), requests=[("private-role", {"messages": secret})],
+                               errors=[secret], roles=Counter({"private-role": 1}))
+    text = _pipeline_diagnostic(controller, tui, provider, socket_diagnostic={
+        "host_control": {"exitCode": 5, "stdout": secret},
+        "private-command": {"exitCode": 9, "output": secret},
+    })
+    result = json.loads(text)
+    assert len(text) < 2400 and secret not in text and "C:/private" not in text
+    assert "private-role" not in text and "private-command" not in text
+    assert result["status"] == "provider_failure" and result["provider_error_count"] == 1
+    assert result["provider_request_count"] == 1 and result["finished_role_count"] == 0
+    assert result["reason"]["owner_lock_mentioned"] is True
+    assert result["reason"]["os_errors"] == ["[Errno 13]"]
+    assert "failed to create coder workspace snapshot" in result["reason"]["markers"]
+    assert result["socket_probe_exit_codes"] == {"host_control": 5}
+
+
+def test_pipeline_diagnostic_fallback_filters_tui_and_keeps_only_known_roles(tmp_path) -> None:
+    controller = SimpleNamespace(
+        store=SimpleNamespace(state_dir=tmp_path, get_bello_config=lambda: SimpleNamespace(status=BelloStatus.STARTING)),
+        running=False, _coder_started=False, _coder_snapshot=object(),
+    )
+    tui = SimpleNamespace(messages=[
+        ("SYSTEM", "private system prompt"),
+        ("SUPERVISOR", "run infrastructure failed: [WinError 33] another process has locked owner.lock; private command"),
+        ("SUPERVISOR", "private model output"),
+    ])
+    provider = SimpleNamespace(finished_roles={"coder", "private-role"}, requests=[], errors=[],
+                               roles=Counter(coder=2))
+    text = _pipeline_diagnostic(controller, tui, provider)
+    result = json.loads(text)
+    assert "private" not in text and len(text) < 2400
+    assert result["reason"]["source"] == "filtered_controller_error"
+    assert result["reason"]["os_errors"] == ["[WinError 33]"]
+    assert result["finished_roles"] == ["coder"] and result["finished_role_count"] == 2
+    assert result["requests_by_role"]["coder"] == 2 and result["snapshot_present"]
 
 
 def test_afd_diagnostic_does_not_treat_endpoint_parameter_error_as_denial() -> None:
@@ -126,17 +249,18 @@ def _pytest_command(windows_python: Path | None = None) -> str:
     if windows_python is not None:
         return subprocess.list2cmdline([
             str(windows_python), "-I", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+            "-c", os.devnull, "--rootdir=.", "--confcutdir=.",
             "test_solution.py",
         ])
     executable = shutil.which("pytest")
     if executable is None:
         pytest.skip("the offline pipeline fixture requires pytest on the host")
     # The disposable coder workspace intentionally contains a denied
-    # .supervisor control link. Select the task test explicitly so pytest does
-    # not try to recurse into that private control surface during collection.
+    # .supervisor control link. Select the task test explicitly and suppress
+    # ancestor config discovery: the outer repository is outside its sandbox.
     return (
         f"{shlex_quote(str(Path(executable).resolve()))} "
-        "-q -p no:cacheprovider test_solution.py"
+        f"-q -p no:cacheprovider -c {shlex_quote(os.devnull)} --rootdir=. --confcutdir=. test_solution.py"
     )
 
 
@@ -805,7 +929,8 @@ async def test_real_pi_offline_coder_completion_adversary_pipeline(
             lambda _policy: sandbox._Toolchain(readable_roots=(windows_python.parent,)),
         )
     node = _supported_node()
-    worker_dir = Path(__file__).resolve().parents[1] / "supervisor" / "pi_worker"
+    worker_dir = Path(os.environ.get("BELLO_TEST_PI_WORKER_DIR",
+                                   Path(__file__).resolve().parents[1] / "supervisor" / "pi_worker"))
     worker = worker_dir / "worker.mjs"
     if not (worker_dir / "node_modules" / "@earendil-works" / "pi-coding-agent").is_dir():
         message = "the pinned Pi worker dependencies are not installed"
@@ -950,44 +1075,43 @@ async def test_real_pi_offline_coder_completion_adversary_pipeline(
                     "allowModelNetwork": False,
                 },
             )
-            assert initialized["serverInfo"]["piSdkVersion"] == "0.85.1"
+            assert initialized["serverInfo"]["piSdkVersion"] == "1.0.4"
             client._engines["pi"] = transport
             inserted = True
 
-            await asyncio.wait_for(controller.run(), timeout=240 if os.name == "nt" else 90)
+            try:
+                await asyncio.wait_for(controller.run(), timeout=240 if os.name == "nt" else 90)
+            except Exception as exc:
+                exc.add_note(_pipeline_diagnostic(controller, tui, provider))
+                raise
 
             socket_diagnostic = None
             if provider.errors and windows_python is not None:
                 socket_diagnostic = await _windows_socket_initialization_diagnostic(
                     windows_python, tmp_path / "socket-diagnostic",
                 )
-            assert not provider.errors, json.dumps({
-                "errors": provider.errors,
-                "windows_socket_initialization_diagnostic": socket_diagnostic,
-                "recent_exchanges_by_role": {
-                    role: _fixture_exchange_diagnostic(body)
-                    for role, body in provider.requests
-                },
-            }, ensure_ascii=False, indent=2)
+            diagnostic = _pipeline_diagnostic(controller, tui, provider, socket_diagnostic=socket_diagnostic)
+            provider_error_count = len(provider.errors)
+            assert provider_error_count == 0, diagnostic
             assert provider.finished_roles == {
                 "coder",
                 "completion",
                 "adversary",
                 "adv_report_controller",
-            }
-            assert provider.roles["supervisor"] >= 2  # startup self-test plus real runtime oversight
-            assert provider.schemas["supervisor"] == openai_strict_json_schema_for_supervisor_decision()
-            assert provider.schemas["completion"] == openai_strict_json_schema_for_completion_review_decision()
+            }, diagnostic
+            assert provider.roles["supervisor"] >= 2, diagnostic  # startup self-test plus real runtime oversight
+            assert provider.schemas["supervisor"] == openai_strict_json_schema_for_supervisor_decision(), diagnostic
+            assert provider.schemas["completion"] == openai_strict_json_schema_for_completion_review_decision(), diagnostic
             assert provider.schemas["adv_report_controller"] == (
                 openai_strict_json_schema_for_adv_report_controller_decision()
-            )
+            ), diagnostic
     finally:
         if not inserted and transport is not None:
             await transport.stop()
         if client._started:
             await client.stop()
 
-    assert controller.store.get_bello_config().status is BelloStatus.COMPLETE
+    assert controller.store.get_bello_config().status is BelloStatus.COMPLETE, _pipeline_diagnostic(controller, tui, provider)
     if os.name == "nt":
         assert file_tool_commands, "the actual file tools must launch the staged Python runtime"
     assert controller._snapshot_patch_applied is True

@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from inspect_models import qualified_model, summarize_catalog
 
 # This is project-file syntax, not a promise that each model supports every value.
-# `default` sends no effort; it is valid only for a model that advertises none.
+# `default` sends no effort override; the execution engine owns its default.
 NO_EFFORT = "default"
 CONFIG_EFFORTS = {"off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", NO_EFFORT}
 
@@ -85,9 +85,14 @@ def _validate_profile(
         errors.append(f"{field}: {identity} is not available in the supplied catalog")
         return
     if effort == NO_EFFORT:
-        if entry["supportedEfforts"]:
-            errors.append(f"{field}: {NO_EFFORT!r} is only for models that advertise no effort; "
-                          f"{identity} advertises {', '.join(entry['supportedEfforts'])}")
+        # Match core validation: native Codex and Claude Code accept an omitted
+        # effort, including saved aliases whose resolved model later changes.
+        # Pi must publish the effective default before an effort can be omitted.
+        provider = identity.split("/", 1)[0]
+        if (entry["supportedEfforts"] and provider not in {"openai-codex", "claude-code"}
+                and entry.get("defaultEffort") is None):
+            errors.append(f"{field}: {identity} has no default effort; "
+                          f"choose one of: {', '.join(entry['supportedEfforts'])}")
     elif effort not in entry["supportedEfforts"]:
         errors.append(f"{field}: {effort!r} is not advertised for {identity}")
     if fast and (entry.get("supportsServiceTier") is not True or "priority" not in entry.get("supportedServiceTiers", [])):

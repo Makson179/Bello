@@ -348,12 +348,15 @@ def _has_native_posix_backend() -> bool:
     reason="requires a native POSIX sandbox backend",
 )
 async def test_real_coder_runtime_executes_dependencies_without_writes_or_private_reads(
-    dependency_snapshot, tmp_path: Path,
+    dependency_snapshot, tmp_path: Path, request: pytest.FixtureRequest,
 ) -> None:
     if os.name != "posix" or os.geteuid() == 0:
         pytest.skip("execute-only file semantics require a non-root POSIX user")
     project, task, dependency, private, snapshot = dependency_snapshot
     oracle = dependency / "programbench-oracle"
+    # pytest retains basetemp after a run. Do not leave an unreadable fixture in
+    # a self-hosted candidate, even when setup, an assertion or client.stop fails.
+    request.addfinalizer(lambda: oracle.unlink(missing_ok=True))
     if sys.platform == "darwin":
         # Executing a copied Apple-signed binary can hang in the kernel. Use
         # a public script for execution and a never-executed permission fixture.

@@ -12,12 +12,14 @@ from supervisor.main import cli
 from supervisor.project_config import (
     DEFAULT_INTELLIGENCE,
     DEFAULT_MODEL,
+    LEGACY_DEFAULT_MODEL,
     INTELLIGENCE_CHOICES,
     LogDistillerConfig,
     MODEL_GPT_5_5,
     MODEL_GPT_5_6_LUNA,
     MODEL_GPT_5_6_SOL,
     MODEL_GPT_5_6_TERRA,
+    MODEL_GPT_6_ASTRA,
     MultiAgentConfig,
     ProjectConfig,
     ProjectConfigError,
@@ -84,8 +86,8 @@ def test_first_load_creates_default_project_config(tmp_path: Path) -> None:
     assert reloaded.adversary is False
 
 
-def test_gpt_56_sol_is_default_and_reasoning_choices_are_model_specific() -> None:
-    assert DEFAULT_MODEL == MODEL_GPT_5_6_SOL
+def test_astra_is_new_default_and_legacy_reasoning_choices_are_model_specific() -> None:
+    assert DEFAULT_MODEL == MODEL_GPT_6_ASTRA
     assert INTELLIGENCE_CHOICES == ("low", "medium", "high", "xhigh", "max", "ultra")
     assert intelligence_choices_for_model(MODEL_GPT_5_6_SOL) == INTELLIGENCE_CHOICES
     assert intelligence_choices_for_model(MODEL_GPT_5_6_TERRA) == INTELLIGENCE_CHOICES
@@ -104,9 +106,9 @@ def test_project_config_missing_fields_are_defaulted(tmp_path: Path) -> None:
     assert config.revision_coder_enabled is False
     assert config.revision_coder_mod == "gpt-coder"
     assert config.revision_coder_intelligence == DEFAULT_INTELLIGENCE
-    assert config.runtime_mod == DEFAULT_MODEL
-    assert config.completion_mod == DEFAULT_MODEL
-    assert config.adversary_mod == DEFAULT_MODEL
+    assert config.runtime_mod == LEGACY_DEFAULT_MODEL
+    assert config.completion_mod == LEGACY_DEFAULT_MODEL
+    assert config.adversary_mod == LEGACY_DEFAULT_MODEL
     assert config.start_over is False
     assert config.completion_returns_before_adversary == 4
     assert config.completion_returns_after_adversary == 2
@@ -341,7 +343,7 @@ def test_project_config_loads_runtime_config_shape(tmp_path: Path) -> None:
     assert config.coder_mod == "gpt-coder"
     assert config.runtime_mod == "gpt-supervisor"
     assert config.completion_mod == "gpt-supervisor"
-    assert config.adversary_mod == DEFAULT_MODEL
+    assert config.adversary_mod == LEGACY_DEFAULT_MODEL
     assert config.coder_intelligence == "low"
     assert config.revision_coder_enabled is False
     assert config.revision_coder_mod == "gpt-coder"
@@ -977,7 +979,11 @@ def test_config_editor_inline_number_rejects_invalid_input() -> None:
 
 
 def test_config_editor_groups_gpt_56_variants_and_filters_older_models() -> None:
-    config = ProjectConfig(completion_review=True, adversary=True)
+    config = ProjectConfig(
+        completion_review=True, adversary=True,
+        coder_mod=MODEL_GPT_5_6_SOL, runtime_mod=MODEL_GPT_5_6_SOL,
+        completion_mod=MODEL_GPT_5_6_SOL, adversary_mod=MODEL_GPT_5_6_SOL,
+    )
     params = parameter_defs(
         config,
         model_choices=(

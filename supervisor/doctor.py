@@ -159,8 +159,8 @@ def _claude_dependency_result(backend: type, error_type: type[Exception]) -> Doc
         )
     return DoctorResult(
         "ok", f"Official Claude Code CLI {cli.cli_version} found (Bello-verified download): {cli.path}",
-        "The pinned claude-agent-sdk wheel for this platform has no bundled CLI, so Bello uses the same "
-        "official build from downloads.claude.ai, checked against its pinned SHA-256. Optional "
+        "Bello uses the official build explicitly paired with its pinned claude-agent-sdk, from "
+        "downloads.claude.ai and checked against its pinned SHA-256. Optional "
         "subscription backend; authenticate with `bello runtime login claude-code`.",
     )
 

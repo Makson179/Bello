@@ -7,9 +7,9 @@ scope, cancellation and at-most-once dispatch.
 
 Authentication is deliberately narrower than the Agent SDK supports.  This
 backend accepts only an existing first-party ``claude.ai`` subscription login
-from the unmodified official CLI: the one bundled with ``claude-agent-sdk`` or,
-where the pinned SDK release has no wheel with a bundled CLI, the identical
-official build Bello downloads and verifies (see ``claude_cli``).  It never
+from the unmodified official CLI: the SDK bundle or the official build Bello
+explicitly pairs with that SDK release, downloads and verifies (see
+``claude_cli``). It never
 reads, copies, refreshes or persists credentials, and it refuses API-key and
 hosted cloud-provider routes instead of silently changing the caller's
 environment.
@@ -36,6 +36,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
 
 from supervisor.appserver import AppServerError, AppServerTimeoutError
+from supervisor.process_fence import create_subprocess_exec
 from supervisor.runtime.models import validate_effort
 from supervisor.runtime.claude_async import BATCH_GUIDANCE, BATCH_TOOL_NAME, ClaudeAsyncBatches
 from supervisor.runtime.claude_cli import OfficialCli, resolve_official_cli, sdk_bundled_cli
@@ -169,7 +170,7 @@ class ClaudeBackend:
         if cli_path is not None and client_factory is None:
             raise AppServerError(
                 "Claude Code production mode always uses the official CLI bundled with claude-agent-sdk "
-                "or Bello's verified pinned download of the same build; it does not accept another path"
+                "or Bello's verified build explicitly paired with that SDK; it does not accept another path"
             )
         self._prepare_state_directory()
         self._load_state()
@@ -862,7 +863,7 @@ class ClaudeBackend:
             ),
             "env": {
                 "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
-                "CLAUDE_AGENT_SDK_CLIENT_APP": "bello/0.7.1",
+                "CLAUDE_AGENT_SDK_CLIENT_APP": "bello/0.7.2",
             },
             "extra_args": {"disable-slash-commands": None, "no-chrome": None},
             "effort": params.get("effort"),
@@ -902,7 +903,7 @@ class ClaudeBackend:
             ),
             env={
                 "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
-                "CLAUDE_AGENT_SDK_CLIENT_APP": "bello/0.7.1",
+                "CLAUDE_AGENT_SDK_CLIENT_APP": "bello/0.7.2",
             },
             extra_args={"disable-slash-commands": None, "no-chrome": None},
         )
@@ -1020,7 +1021,7 @@ class ClaudeBackend:
         server_ref: dict[str, Any] = {}
         config = create_sdk_mcp_server(
             _MCP_SERVER,
-            version="0.7.1",
+            version="0.7.2",
             tools=self._sdk_tools(record, server_ref),
         )
         server = config["instance"]
@@ -1299,7 +1300,7 @@ class ClaudeBackend:
 
     async def _official_auth_status(self) -> dict[str, Any]:
         cli = self._cli_path or self._official_cli_path()
-        process = await asyncio.create_subprocess_exec(
+        process = await create_subprocess_exec(
             str(cli),
             "auth",
             "status",
@@ -1333,8 +1334,9 @@ class ClaudeBackend:
     def _official_cli(*, prepare: bool = False) -> OfficialCli:
         """The only CLI production mode may execute (shared readiness contract).
 
-        ``prepare=True`` may download Bello's pinned official build where the
-        SDK wheel has no bundled CLI; otherwise local files are only verified.
+        ``prepare=True`` may download Bello's explicitly paired official build;
+        otherwise local files are only verified, without falling back to an
+        older SDK bundle when the managed build is not ready.
         """
         return resolve_official_cli(prepare=prepare, bundled=lambda: ClaudeBackend._bundled_cli_path())
 

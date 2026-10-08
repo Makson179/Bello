@@ -16,6 +16,9 @@ from typing import Any
 
 from supervisor.appserver import AppServerError, AppServerProtocolError, AppServerTimeoutError
 from supervisor.runtime.cleanup import finish_cleanup
+from supervisor.process_fence import (
+    create_subprocess_exec, is_guarded_worker, process_group_id, signal_process_group,
+)
 
 
 class WorkerTransport:
@@ -47,7 +50,7 @@ class WorkerTransport:
             return
         self._closing = False
         self._stop_task = None
-        self.process = await asyncio.create_subprocess_exec(
+        self.process = await create_subprocess_exec(
             *self.command, cwd=self.cwd, env=self.env,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             limit=16 * 1024 * 1024, **({"start_new_session": True} if os.name != "nt" else {}),
@@ -170,20 +173,31 @@ class WorkerTransport:
 
     async def _terminate_process(self) -> None:
         process = self.process
-        if process and process.returncode is None:
-            try:
-                if os.name == "nt":
-                    process.terminate()
-                else:
-                    os.killpg(process.pid, signal.SIGTERM)
-                await asyncio.wait_for(process.wait(), 3)
-            except (asyncio.TimeoutError, ProcessLookupError):
-                if process.returncode is None:
+        if process is None:
+            return
+        try:
+            if process.returncode is None:
+                try:
                     if os.name == "nt":
-                        process.kill()
+                        process.terminate()
                     else:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    await process.wait()
+                        signal_process_group(process_group_id(process), signal.SIGTERM)
+                    await asyncio.wait_for(process.wait(), 3)
+                except (asyncio.TimeoutError, ProcessLookupError):
+                    if process.returncode is None:
+                        if os.name == "nt":
+                            process.kill()
+                        else:
+                            signal_process_group(process_group_id(process), signal.SIGKILL)
+                        await process.wait()
+        finally:
+            if os.name != "nt" and is_guarded_worker():
+                try:
+                    # Reap the owned guardian group even after an ordinary
+                    # worker exit. Bare reaped PIDs are not ownership leases.
+                    signal_process_group(process_group_id(process), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     async def stop(self) -> None:
         if self._stop_task is None:

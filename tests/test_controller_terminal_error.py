@@ -7,7 +7,7 @@ from supervisor.controller import _classify_supervisor_agent_error
 from supervisor.schemas import BelloStatus
 from supervisor.state import FINAL_REPORT, PROGRESS
 from supervisor.supervisor_agent import SupervisorAgentError, SupervisorTurnError
-from tests.test_bello_state import _runtime_controller
+from tests.support.controller import _runtime_controller
 from tests.test_supervisor_terminal_error import TerminalClient, terminal_turn
 from supervisor.supervisor_agent import StatelessSupervisorAgent
 

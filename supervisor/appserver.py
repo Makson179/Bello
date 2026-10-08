@@ -27,6 +27,7 @@ from supervisor.executables import (
     windows_system_executable,
 )
 from supervisor.runtime_errors import sanitize_error_text
+from supervisor.process_fence import create_subprocess_exec, process_group_id, signal_process_group
 
 CODEX_NO_WEB_SEARCH_CONFIG_FLAGS = ["-c", 'web_search="disabled"']
 
@@ -386,7 +387,7 @@ class AppServerClient:
             self._isolated_codex_home = _create_isolated_codex_home(source_codex_home)
             env["CODEX_HOME"] = str(self._isolated_codex_home)
         try:
-            self.process = await asyncio.create_subprocess_exec(
+            self.process = await create_subprocess_exec(
                 *resolved_command,
                 cwd=str(self.cwd) if self.cwd else None,
                 env=env,
@@ -400,10 +401,9 @@ class AppServerClient:
                 self._windows_job = _WindowsKillJob.create(self.process.pid)
                 _resume_windows_process(self.process.pid)
             else:
-                # start_new_session makes the app-server PID its process-group
-                # ID.  Save it now so descendants can still be killed after
-                # the direct child has already exited.
-                self._process_group_id = self.process.pid
+                # The crash guardian may supply a separately owned group.
+                # Save that identity before the direct child can exit.
+                self._process_group_id = process_group_id(self.process)
         except BaseException:
             await self._abort_failed_start()
             if not reuse_isolated_codex_home:
@@ -548,11 +548,11 @@ class AppServerClient:
             return
         group_id = self._process_group_id
         if group_id is None and process.returncode is None:
-            group_id = process.pid
+            group_id = process_group_id(process)
         try:
             if group_id is None:
                 return
-            os.killpg(group_id, sig)
+            signal_process_group(group_id, sig)
         except ProcessLookupError:
             return
         except OSError:

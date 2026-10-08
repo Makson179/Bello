@@ -26,6 +26,7 @@ from typing import Sequence
 
 from supervisor.runtime.distiller import LogDistiller, MAX_INPUT_BYTES, REQUEST_TIMEOUT_SECONDS
 from supervisor.runtime.distiller_policy import preserve_tool_output
+from supervisor.process_fence import create_subprocess_exec
 
 
 logger = logging.getLogger(__name__)
@@ -115,7 +116,7 @@ async def validate_native_selection(
             "the tcp-hmac-v1 transport; the selected build does not declare it. "
             "See docs/native-codex-selection.md."
         )
-    process = await asyncio.create_subprocess_exec(
+    process = await create_subprocess_exec(
         str(path), "features", "list", stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     )

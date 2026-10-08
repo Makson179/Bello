@@ -519,10 +519,23 @@ class NativeSession:
             cwd=self.home, env=self.env, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, limit=LIMIT)
         self.reader = asyncio.create_task(self.read())
-        self.stderr = asyncio.create_task(self.process.stderr.read(LIMIT))
+        self.stderr = asyncio.create_task(self.read_stderr())
         await self.request("initialize", {"clientInfo": {"name": "bello_selection_fixture", "version": "1.0"},
                                            "capabilities": {"experimentalApi": True}})
         await self.send({"method": "initialized", "params": {}})
+
+    async def read_stderr(self) -> bytes:
+        """Drain until EOF, retaining only a bounded diagnostic prefix.
+
+        A single read may return only the first available chunk. Keep consuming
+        even after the retention cap so a full stderr pipe cannot block Codex.
+        """
+        output = bytearray()
+        while chunk := await self.process.stderr.read(64 * 1024):
+            remaining = LIMIT - len(output)
+            if remaining > 0:
+                output.extend(chunk[:remaining])
+        return bytes(output)
 
     async def send(self, message):
         self.process.stdin.write((json.dumps(message) + "\n").encode())
@@ -626,6 +639,136 @@ def output_packets(request: dict[str, Any], mode: str) -> list[dict[str, Any]]:
                     if isinstance(value, dict) and "output" in value:
                         packets.append(value)
     return packets
+
+
+_DIAGNOSTIC_INPUT_LIMIT = 256
+_DIAGNOSTIC_ITEM_LIMIT = 8
+_DIAGNOSTIC_TEXT_LIMIT = 4
+_DIAGNOSTIC_SCAN_LIMIT = 8192
+_DIAGNOSTIC_TOOL_NAMES = {"exec_command", "write_stdin", "exec", "shell", "shell_command", "apply_patch"}
+# Pinned 0.161.0 windows-sandbox-rs/src/setup_error.rs, SetupErrorCode::as_str.
+# Never retain an arbitrary identifier or the potentially sensitive suffix.
+_DIAGNOSTIC_SETUP_CODES = {
+    "setup_transaction_lock_failed", "orchestrator_sandbox_dir_create_failed",
+    "orchestrator_elevation_check_failed", "orchestrator_elevation_required",
+    "orchestrator_payload_serialize_failed", "orchestrator_helper_launch_failed",
+    "orchestrator_helper_launch_canceled", "orchestrator_helper_exit_nonzero",
+    "orchestrator_helper_report_read_failed", "orchestrator_helper_incomplete",
+    "helper_request_args_failed", "helper_sandbox_dir_create_failed", "helper_log_failed",
+    "helper_user_provision_failed", "helper_users_group_create_failed",
+    "helper_user_create_or_update_failed", "helper_dpapi_protect_failed",
+    "helper_users_file_write_failed", "helper_setup_marker_write_failed",
+    "helper_sid_resolve_failed", "helper_capability_sid_failed", "helper_firewall_com_init_failed",
+    "helper_firewall_policy_access_failed", "helper_firewall_policy_ineffective",
+    "helper_firewall_rule_create_or_add_failed", "helper_firewall_rule_verify_failed",
+    "helper_read_acl_helper_spawn_failed", "helper_sandbox_lock_failed", "helper_unknown_error",
+}
+_DIAGNOSTIC_FAILURE_MARKERS = {
+    "missing_or_unsupported_tool": r"\b(?:unknown tool|unsupported tool|unrecognized tool|tool not found|no such tool)\b|\btool\b[^\r\n]{0,100}\b(?:not found|not available|not supported)\b",
+    "unified_exec_create_failed": r"failed to create unified exec process:",
+    "unified_exec_process_failed": r"unified exec process failed:",
+    "sandbox_denied": r"command denied by sandbox:",
+    "invalid_tool_arguments": r"missing command line for unified exec request|error parsing function call|invalid tool arguments",
+    "create_process_with_logon_failed": r"CreateProcessWithLogonW failed:",
+    "create_process_as_user_failed": r"CreateProcessAsUserW failed:",
+    "permission_denied": r"\b(?:PermissionDenied|AccessDenied|access is denied|access denied|permission denied)\b",
+    "job_object_failure_marker": r"AssignProcessToJobObject|PROC_THREAD_ATTRIBUTE_JOB_LIST|\bjob object\b",
+    "runner_pipe_failure": r"runner pipe closed before spawn_ready|wait for runner spawn_ready|timed out after [0-9]{1,10}ms connecting runner pipe-(?:in|out)",
+}
+
+
+def _diagnostic_shape(value: Any) -> str:
+    return {type(None): "null", bool: "boolean", int: "integer", float: "number",
+            str: "string", list: "array", dict: "object"}.get(type(value), "other")
+
+
+def _diagnostic_codes(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    return {key: value[key] for key in ("exit_code", "exitCode", "code", "errno", "winerror")
+            if type(value.get(key)) is int and -(2 ** 31) <= value[key] < 2 ** 32}
+
+
+def _diagnostic_text(text: str) -> dict[str, Any]:
+    data = text.encode("utf-8", errors="surrogatepass")
+    sample = text[:_DIAGNOSTIC_SCAN_LIMIT]
+    # Successful command payloads can contain arbitrary apparent error text.
+    # Classify only the wrapper when a canonical output separator is present.
+    header = re.split(r"\r?\nOutput:\r?\n", sample, maxsplit=1)[0]
+    codes = re.findall(r"\b(?:os error|Windows error|WinError|errno|error code)\s*[:=(\[]*\s*(-?[0-9]{1,10})\b", header, re.I)
+    codes += re.findall(r"\bCreateProcess(?:WithLogonW|AsUserW) failed:\s*(-?[0-9]{1,10})\b", header)
+    exits = re.findall(r"(?m)^Process exited with code (-?[0-9]{1,10})\r?$", header)
+    bounded = lambda values: sorted({int(v) for v in values if -(2 ** 31) <= int(v) < 2 ** 32})[:8]
+    return {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+            "scanned_characters": len(sample), "scan_truncated": len(text) > len(sample),
+            "failure_markers": sorted(name for name, pattern in _DIAGNOSTIC_FAILURE_MARKERS.items()
+                                      if re.search(pattern, header, re.I)),
+            "runner_stages": sorted(set(re.findall(r"runner failed during (ReadSpawnRequest|SpawnChild|WriteSpawnReady):", header))),
+            "setup_error_codes": sorted(code for code in _DIAGNOSTIC_SETUP_CODES
+                                        if re.search(r"\b" + code + ":", header)),
+            "error_codes": bounded(codes), "exit_codes": bounded(exits)}
+
+
+def tool_output_diagnostic(request: Any) -> dict[str, Any]:
+    """Observe only the fixture call; never retain text, arguments or unknown names.
+
+    Marker matches are diagnostic hints, not success or sandbox predicates.
+    Unknown/native error output remains a proof failure, with a hash for audit.
+    """
+    values = request.get("input") if isinstance(request, dict) else None
+    result = {"schema": "bello.synthetic-tool-observation.v1", "input_shape": _diagnostic_shape(values),
+              "input_scanned": 0, "input_truncated": False, "matches_truncated": False, "items": []}
+    if not isinstance(values, list):
+        return result
+    result["input_scanned"] = min(len(values), _DIAGNOSTIC_INPUT_LIMIT)
+    result["input_truncated"] = len(values) > _DIAGNOSTIC_INPUT_LIMIT
+    for item in values[:_DIAGNOSTIC_INPUT_LIMIT]:
+        if not isinstance(item, dict) or item.get("call_id") != CALL_ID:
+            continue
+        if len(result["items"]) == _DIAGNOSTIC_ITEM_LIMIT:
+            result["matches_truncated"] = True
+            break
+        value = item.get("output")
+        kind = item.get("type")
+        texts = [value] if isinstance(value, str) else []
+        if isinstance(value, list):
+            texts = [part.get("text") for part in value[:_DIAGNOSTIC_TEXT_LIMIT] if isinstance(part, dict)]
+        result["items"].append({
+            "item_type": kind if kind in ("function_call_output", "custom_tool_call_output") else "other",
+            "output_shape": _diagnostic_shape(value), "output_codes": _diagnostic_codes(value),
+            "error_shape": _diagnostic_shape(item.get("error")), "error_codes": _diagnostic_codes(item.get("error")),
+            "text_parts_truncated": isinstance(value, list) and len(value) > _DIAGNOSTIC_TEXT_LIMIT,
+            "texts": [_diagnostic_text(text) for text in texts if isinstance(text, str)],
+        })
+    return result
+
+
+def advertised_tools_diagnostic(request: Any) -> dict[str, Any]:
+    """Retain only known fixture tool names, never descriptions or arguments."""
+    tools = request.get("tools") if isinstance(request, dict) else None
+    result = {"shape": _diagnostic_shape(tools), "known_names": [], "inspected": 0, "truncated": False}
+    if not isinstance(tools, list):
+        return result
+    pending = list(tools[:_DIAGNOSTIC_INPUT_LIMIT])
+    result["truncated"] = len(tools) > _DIAGNOSTIC_INPUT_LIMIT
+    known = set()
+    while pending and result["inspected"] < _DIAGNOSTIC_INPUT_LIMIT:
+        item = pending.pop(0)
+        result["inspected"] += 1
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function")
+        name = item.get("name", function.get("name") if isinstance(function, dict) else None)
+        if isinstance(name, str) and name in _DIAGNOSTIC_TOOL_NAMES:
+            known.add(name)
+        nested = item.get("tools")
+        if isinstance(nested, list):
+            remaining = _DIAGNOSTIC_INPUT_LIMIT - result["inspected"] - len(pending)
+            pending.extend(nested[:remaining])
+            result["truncated"] |= len(nested) > remaining
+    result["known_names"] = sorted(known)
+    result["truncated"] |= bool(pending)
+    return result
 
 
 async def run_case(binary: Path, case: Case, output: Path, *, selector=None,
@@ -747,6 +890,8 @@ async def run_case(binary: Path, case: Case, output: Path, *, selector=None,
         "expected_output_bytes": len(expected.encode()) if isinstance(expected, str) else None,
         "actual_output_bytes": [len(str(p.get("output", "")).encode()) for p in packets]}
     result.update(windows_probe_result)
+    result["tool_output_diagnostic"] = tool_output_diagnostic(provider.requests[1] if len(provider.requests) >= 2 else None)
+    result["advertised_tools_diagnostic"] = advertised_tools_diagnostic(provider.requests[0] if provider.requests else None)
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
 

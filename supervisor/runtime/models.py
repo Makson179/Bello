@@ -52,10 +52,10 @@ def parse_model_selection(value: str) -> ModelSelection:
     return ModelSelection(provider, model)
 
 
-# Configuration value meaning "send no effort parameter". It is offered for a
-# model whose catalog advertises no effort levels (for example Claude Haiku in
-# Claude Code), so such a model is selectable without inventing an effort. It is
-# never sent to an engine; see engine_effort().
+# Configuration value meaning "send no effort override". Models without effort
+# levels (for example Claude Haiku 4.5 in Claude Code) need this choice. Native
+# engines also accept it for effort-enabled models; Pi requires an advertised
+# effective default. The literal is never sent to an engine; see engine_effort().
 NO_EFFORT = "default"
 
 

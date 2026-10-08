@@ -9,9 +9,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import { ProtocolError } from "./protocol.mjs";
 import { AsyncToolCoordinator, lateToolMessage } from "./async-tools.mjs";
+import { piAgentDirectory } from "./agent-directory.mjs";
+import { billingRouteError } from "./billing-route.mjs";
 
 const STATE_VERSION = 1;
 const ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/;
@@ -257,11 +260,18 @@ export class PiWorkerRuntime {
     this.threads = new Map();
     this.writeSequence = 0;
     this.closing = false;
+    this.catalogLoadedAt = undefined;
+    this.catalogRefreshing = false;
+    this.catalogRefreshError = null;
+    this.catalogUsers = 0;
   }
 
   async dispatch(method, params) {
     if (method === "initialize") return this.initialize(params);
     if (!this.initialized) throw new ProtocolError("initialize must be called first", "not_initialized");
+    if (this.catalogRefreshing && ["model/list", "model/validate", "account/read", "thread/start", "thread/resume", "turn/start"].includes(method)) {
+      throw new ProtocolError("Pi catalog refresh is in progress; retry after it completes", "catalog_busy");
+    }
     const methods = {
       "model/list": () => this.modelList(params),
       "model/validate": () => this.modelValidate(params),
@@ -279,13 +289,25 @@ export class PiWorkerRuntime {
     };
     const handler = methods[method];
     if (!handler) throw new ProtocolError(`unsupported worker method: ${method}`, "method_not_found");
-    return handler();
+    const usesCatalog = ["model/validate", "thread/start", "thread/resume", "turn/start"].includes(method);
+    if (usesCatalog && this.catalogRefreshError) {
+      throw new ProtocolError(this.catalogRefreshError, "catalog_refresh_failed");
+    }
+    if (usesCatalog) this.catalogUsers++;
+    try {
+      return await handler();
+    } finally {
+      if (usesCatalog) this.catalogUsers--;
+    }
   }
 
   async initialize(params) {
     if (this.initialized) {
       const requested = canonicalPath(params.stateDir, "stateDir", false);
       if (requested !== this.stateDir) throw new ProtocolError("worker is already initialized with a different stateDir");
+      if (params.agentDir !== undefined && canonicalPath(params.agentDir, "agentDir", false) !== this.agentDir) {
+        throw new ProtocolError("worker is already initialized with a different agentDir");
+      }
       return this.initializeResult();
     }
     const stateDir = canonicalPath(params.stateDir, "stateDir", false);
@@ -295,10 +317,18 @@ export class PiWorkerRuntime {
     this.sessionsDir = join(this.stateDir, "sessions");
     mkdirSync(this.threadsDir, { recursive: true, mode: 0o700 });
     mkdirSync(this.sessionsDir, { recursive: true, mode: 0o700 });
-    const defaultAgentDir = process.env.PI_CODING_AGENT_DIR || join(process.env.HOME || this.stateDir, ".pi", "agent");
-    this.agentDir = canonicalPath(params.agentDir ?? defaultAgentDir, "agentDir", false);
-    const allowModelNetwork = params.allowModelNetwork === true;
-    this.modelRuntime = await this.sdk.createModelRuntime({ agentDir: this.agentDir, allowModelNetwork });
+    this.agentDir = canonicalPath(params.agentDir ?? piAgentDirectory(), "agentDir", false);
+    // Discovery must never trigger a provider request or an OAuth refresh.
+    // Catalog refresh is an explicit local operation, independent of execution.
+    if (params.allowModelNetwork === true) {
+      throw new ProtocolError("Pi catalog discovery only supports local refresh", "invalid_params");
+    }
+    try {
+      this.modelRuntime = await this.catalogCandidate();
+    } catch {
+      throw new ProtocolError("Pi local catalog could not be loaded; check the agent directory configuration", "catalog_load_failed");
+    }
+    this.catalogLoadedAt = timestamp();
     this.loadMetadata();
     this.initialized = true;
     return this.initializeResult();
@@ -306,7 +336,7 @@ export class PiWorkerRuntime {
 
   initializeResult() {
     return {
-      serverInfo: { name: "bello-pi-worker", version: "0.7.1", piSdkVersion: this.sdk.version },
+      serverInfo: { name: "bello-pi-worker", version: "0.7.2", piSdkVersion: this.sdk.version },
       protocolVersion: 1,
       capabilities: {
         multiplex: true,
@@ -375,6 +405,7 @@ export class PiWorkerRuntime {
     return {
       meta,
       session: undefined,
+      executionModel: undefined,
       unsubscribe: undefined,
       loadPromise: undefined,
       requestOptions: { current: undefined },
@@ -413,6 +444,7 @@ export class PiWorkerRuntime {
   }
 
   isModelAvailable(model) {
+    if (billingRouteError(this.modelRuntime, model.provider)) return false;
     return this.modelRuntime.getAvailableSnapshot().some(
       (candidate) => candidate.provider === model.provider && candidate.id === model.id,
     );
@@ -445,19 +477,21 @@ export class PiWorkerRuntime {
     };
   }
 
-  providerDescriptors() {
-    if (typeof this.modelRuntime.getProviders !== "function") return [];
-    return this.modelRuntime.getProviders().map((provider) => {
-      const status = typeof this.modelRuntime.getProviderAuthStatus === "function"
-        ? this.modelRuntime.getProviderAuthStatus(provider.id)
-        : { configured: this.modelRuntime.hasConfiguredAuth(provider.id) };
+  providerDescriptors(modelRuntime = this.modelRuntime) {
+    if (typeof modelRuntime.getProviders !== "function") return [];
+    return modelRuntime.getProviders().map((provider) => {
+      const status = typeof modelRuntime.getProviderAuthStatus === "function"
+        ? modelRuntime.getProviderAuthStatus(provider.id)
+        : { configured: modelRuntime.hasConfiguredAuth(provider.id) };
       const loginMethods = [];
-      if (provider.auth?.oauth?.login) loginMethods.push("oauth");
+      if (provider.id !== "openai" && provider.auth?.oauth?.login) loginMethods.push("oauth");
       if (provider.auth?.apiKey?.login) loginMethods.push("api_key");
+      const routeError = billingRouteError(modelRuntime, provider.id);
       return {
         id: provider.id,
         name: provider.name,
-        configured: status.configured === true,
+        configured: status.configured === true && !routeError,
+        ...(routeError ? { configurationError: routeError } : {}),
         ...(typeof status.source === "string" ? { source: status.source } : {}),
         ...(typeof status.label === "string" ? { label: status.label } : {}),
         loginMethods,
@@ -465,13 +499,64 @@ export class PiWorkerRuntime {
     });
   }
 
+  async catalogCandidate() {
+    const createCatalog = this.sdk.createCatalogRuntime ?? this.sdk.createModelRuntime;
+    const candidate = await createCatalog.call(this.sdk, { agentDir: this.agentDir, allowModelNetwork: false });
+    if (candidate === this.modelRuntime || candidate.getError?.()) {
+      throw new Error("Pi catalog requires a valid independent snapshot");
+    }
+    // Check public projections before publishing, including unconfigured models.
+    for (const model of candidate.getModels()) this.modelDescriptor(model, false);
+    for (const model of candidate.getAvailableSnapshot()) this.modelDescriptor(model, true);
+    this.providerDescriptors(candidate);
+    return candidate;
+  }
+
   async modelList(params = {}) {
-    const available = this.modelRuntime.getAvailableSnapshot();
+    if (params.refresh !== undefined && typeof params.refresh !== "boolean") {
+      throw new ProtocolError("refresh must be a boolean", "invalid_params");
+    }
+    if (params.allowModelNetwork === true) {
+      throw new ProtocolError("Pi catalog discovery only supports local refresh", "invalid_params");
+    }
+    if (params.refresh === true) {
+      if (this.catalogUsers || [...this.threads.values()].some((record) => record.active || record.loadPromise)) {
+        throw new ProtocolError("Pi catalog cannot refresh while a turn or session is starting or running", "catalog_busy");
+      }
+      this.catalogRefreshing = true;
+      try {
+        const candidate = await this.catalogCandidate();
+        const loadedAt = timestamp();
+        // No await between publication and its freshness metadata. A failed
+        // candidate never changes the catalog or credentials used for discovery.
+        this.modelRuntime = candidate;
+        this.catalogLoadedAt = loadedAt;
+        this.catalogRefreshError = null;
+      } catch {
+        this.catalogRefreshError = "Pi local catalog refresh failed; check the agent directory configuration";
+        throw new ProtocolError(this.catalogRefreshError, "catalog_refresh_failed");
+      } finally {
+        this.catalogRefreshing = false;
+      }
+    }
+    const available = this.modelRuntime.getAvailableSnapshot().filter(
+      (model) => !billingRouteError(this.modelRuntime, model.provider),
+    );
     const availableIds = new Set(available.map((model) => `${model.provider}\0${model.id}`));
     const result = {
       data: available.map((model) => this.modelDescriptor(model, true)),
       providers: this.providerDescriptors(),
-      catalogError: this.modelRuntime.getError?.() ?? null,
+      catalogError: this.catalogRefreshError ?? (this.modelRuntime.getError?.()
+        ? "Pi local catalog contains configuration errors; check the agent directory configuration" : null),
+      catalogFreshness: {
+        source: "local",
+        loadedAt: this.catalogLoadedAt,
+        sdkVersion: this.sdk.version,
+        refreshPolicy: "explicit-local",
+        remoteFreshness: "unknown",
+        networkAllowed: false,
+        lastRefreshSucceeded: this.catalogRefreshError === null,
+      },
     };
     if (params.includeUnconfigured === true) {
       result.catalog = this.modelRuntime.getModels().map((model) => (
@@ -515,14 +600,16 @@ export class PiWorkerRuntime {
     return { provider, modelId, model };
   }
 
-  async ensureConfigured(model) {
-    if (this.modelRuntime.hasConfiguredAuth(model.provider)) return;
-    const auth = await this.modelRuntime.checkAuth(model.provider);
+  async ensureConfigured(model, modelRuntime = this.modelRuntime) {
+    const routeError = billingRouteError(modelRuntime, model.provider);
+    if (routeError) throw new ProtocolError(routeError, "billing_route_conflict");
+    if (modelRuntime.hasConfiguredAuth(model.provider)) return;
+    const auth = await modelRuntime.checkAuth(model.provider);
     if (!auth) throw new ProtocolError(`provider ${model.provider} is not authenticated`, "provider_not_configured");
   }
 
-  ensureAvailable(model) {
-    if (!this.isModelAvailable(model)) {
+  ensureAvailable(model, modelRuntime = this.modelRuntime) {
+    if (!modelRuntime.getAvailableSnapshot().some((candidate) => candidate.provider === model.provider && candidate.id === model.id)) {
       throw new ProtocolError(
         `model ${model.provider}/${model.id} is not available for the configured provider account`,
         "model_not_available",
@@ -651,15 +738,51 @@ export class PiWorkerRuntime {
     return { thread: publicThread(meta) };
   }
 
+  threadModel(record) {
+    const model = this.modelRuntime.getModel(record.meta.provider, record.meta.model);
+    if (!model) throw new ProtocolError(`thread model is unavailable: ${record.meta.provider}/${record.meta.model}`, "model_not_found");
+    if (record.session && !isDeepStrictEqual(record.executionModel, model)) {
+      throw new ProtocolError("Pi model configuration changed; start a fresh session after refreshing the local catalog", "catalog_drift");
+    }
+    return record.session ? record.executionModel : model;
+  }
+
   async loadSession(record, knownModel) {
-    if (record.session) return record.session;
+    if (record.session) {
+      this.threadModel(record);
+      return record.session;
+    }
     if (record.loadPromise) return record.loadPromise;
     record.loadPromise = (async () => {
       const meta = record.meta;
-      const model = knownModel ?? this.modelRuntime.getModel(meta.provider, meta.model);
-      if (!model) throw new ProtocolError(`persisted model is unavailable: ${meta.provider}/${meta.model}`, "model_not_found");
-      await this.ensureConfigured(model);
-      this.ensureAvailable(model);
+      const catalogModel = knownModel ?? this.threadModel(record);
+      await this.ensureConfigured(catalogModel);
+      this.ensureAvailable(catalogModel);
+      this.validateEffort(catalogModel, meta.effort);
+      this.validateServiceTier(catalogModel, meta.serviceTier);
+      // Use one execution runtime for both the model and its credentials. Never
+      // pair a cached endpoint with newly loaded API keys or request headers.
+      let sessionRuntime;
+      let model;
+      try {
+        sessionRuntime = this.sdk.createCatalogRuntime
+          ? await this.sdk.createModelRuntime({ agentDir: this.agentDir, allowModelNetwork: false })
+          : this.modelRuntime;
+        if (sessionRuntime.getError?.()) throw new Error("Invalid Pi execution configuration");
+        model = sessionRuntime.getModel(meta.provider, meta.model);
+      } catch {
+        throw new ProtocolError("Pi execution configuration could not be loaded; check the agent directory configuration", "catalog_load_failed");
+      }
+      if (!model || !isDeepStrictEqual(catalogModel, model)) {
+        throw new ProtocolError("Pi model configuration changed; refresh the local catalog before starting a session", "catalog_drift");
+      }
+      try {
+        await this.ensureConfigured(model, sessionRuntime);
+        this.ensureAvailable(model, sessionRuntime);
+      } catch (error) {
+        if (error.code === "billing_route_conflict") throw error;
+        throw new ProtocolError("Pi execution provider is not available; check the agent directory configuration", "provider_not_configured");
+      }
       this.validateEffort(model, meta.effort);
       this.validateServiceTier(model, meta.serviceTier);
       let sessionFile = meta.sessionFile;
@@ -680,7 +803,7 @@ export class PiWorkerRuntime {
       const session = await this.sdk.createSession({
         cwd: meta.cwd,
         agentDir: this.agentDir,
-        modelRuntime: this.modelRuntime,
+        modelRuntime: sessionRuntime,
         model,
         thinkingLevel: this.sdk.bootstrapEffort(model, meta.effort),
         sessionManager,
@@ -699,6 +822,7 @@ export class PiWorkerRuntime {
           }
         } : undefined,
       });
+      record.executionModel = model;
       record.session = session;
       record.unsubscribe = session.subscribe((event) => this.onAgentEvent(record, event));
       return session;
@@ -869,7 +993,7 @@ export class PiWorkerRuntime {
       if (!sameJson(tools, meta.tools)) throw new ProtocolError("thread/resume cannot change its tool contract", "scope_mismatch");
     }
     if (params.serviceTier !== undefined) {
-      const model = this.modelRuntime.getModel(meta.provider, meta.model);
+      const model = this.threadModel(record);
       meta.serviceTier = this.validateServiceTier(model, params.serviceTier) ?? null;
     }
     meta.archived = false;
@@ -912,6 +1036,7 @@ export class PiWorkerRuntime {
     record.unsubscribe = undefined;
     record.session.dispose();
     record.session = undefined;
+    record.executionModel = undefined;
   }
 
   async threadArchive(params) {
@@ -935,8 +1060,7 @@ export class PiWorkerRuntime {
     const turnId = requireId(params.turnId, "turnId");
     if (record.meta.turns.some((turn) => turn.id === turnId)) throw new ProtocolError(`duplicate turn id: ${turnId}`, "turn_exists");
     const input = normalizeInput(params.input);
-    const model = this.modelRuntime.getModel(record.meta.provider, record.meta.model);
-    if (!model) throw new ProtocolError(`thread model is unavailable: ${record.meta.provider}/${record.meta.model}`, "model_not_found");
+    const model = this.threadModel(record);
     const effort = this.validateEffort(model, params.effort ?? record.meta.effort);
     const tierInput = Object.hasOwn(params, "serviceTier") ? params.serviceTier : record.meta.serviceTier;
     const serviceTier = this.validateServiceTier(model, tierInput);
@@ -985,7 +1109,7 @@ export class PiWorkerRuntime {
     });
     try {
       const session = await this.loadSession(record);
-      const model = this.modelRuntime.getModel(record.meta.provider, record.meta.model);
+      const model = record.executionModel;
       const bootstrap = this.sdk.bootstrapEffort(model, active.effort);
       session.setThinkingLevel(bootstrap);
       if (session.thinkingLevel !== bootstrap) {

@@ -7,7 +7,9 @@ keeps known private controller/auth directories denied. No shared writable
 temporary directory is added.
 
 Apply the returned fields on thread/start and thread/resume, merging ``config``
-with the other native settings. A profile replaces the legacy ``sandbox`` field.
+with the other native settings. Keep the host-owned selector in that config:
+native retained-session rebuilding drops the top-level request override.
+A profile replaces the legacy ``sandbox`` field.
 Subsequent turns must inherit it: a legacy ``sandboxPolicy`` would replace it,
 while reselecting ``permissions`` would reload global rather than thread config.
 """
@@ -129,7 +131,7 @@ def native_permission_params(
     return {
         "permissions": PROFILE_ID,
         "runtimeWorkspaceRoots": readable_roots,
-        "config": {"permissions": {PROFILE_ID: {
+        "config": {"default_permissions": PROFILE_ID, "permissions": {PROFILE_ID: {
             "filesystem": filesystem,
             "network": {"enabled": network},
         }}},

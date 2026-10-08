@@ -53,31 +53,36 @@ def build_key(root: Path | None = None) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def normalize_workspace_versions(text: str) -> str:
+def normalize_workspace_versions(text: str, *, version: str = VERSION) -> str:
     """Repair upstream tag's source-less versions without resolving dependencies."""
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise ValueError("Native workspace version must be an exact release version")
     sections = text.split("[[package]]")
     for index, section in enumerate(sections[1:], 1):
         package = tomllib.loads("[[package]]" + section)["package"][0]
         if "source" not in package and package.get("version") == "0.0.0":
             sections[index] = re.sub(r'(?m)^version = "0\.0\.0"$',
-                                     f'version = "{VERSION}"', section, count=1)
+                                     f'version = "{version}"', section, count=1)
     return "[[package]]".join(sections)
 
 
-def prepare(source: Path, patch: Path, *, expected_revision: str = UPSTREAM_REVISION) -> None:
+def prepare(source: Path, patch: Path, *, expected_revision: str = UPSTREAM_REVISION,
+            version: str = VERSION) -> None:
     revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
     if revision != expected_revision:
         raise ValueError("Native Codex source is not the pinned upstream revision")
     dirty = subprocess.check_output(["git", "-C", str(source), "status", "--porcelain"], text=True)
     if dirty.strip():
         raise ValueError("Preparation requires a fresh upstream checkout")
+    lock = source / "codex-rs" / "Cargo.lock"
+    normalize_workspace_versions(lock.read_text(encoding="utf-8"), version=version)
     # Git for Windows can check the patch out with CRLF, which breaks bare
     # context blanks. Normalize transport bytes, not the distributed file.
     patch_bytes = patch.read_bytes().replace(b"\r\n", b"\n")
     subprocess.run(["git", "-C", str(source), "apply", "--check", "-"], input=patch_bytes, check=True)
     subprocess.run(["git", "-C", str(source), "apply", "-"], input=patch_bytes, check=True)
-    lock = source / "codex-rs" / "Cargo.lock"
-    lock.write_text(normalize_workspace_versions(lock.read_text(encoding="utf-8")), encoding="utf-8", newline="\n")
+    lock.write_text(normalize_workspace_versions(lock.read_text(encoding="utf-8"), version=version),
+                    encoding="utf-8", newline="\n")
 
 
 def verify_v8(directory: Path, *, expected_hashes: dict[str, str] | None = None) -> None:

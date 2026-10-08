@@ -18,7 +18,7 @@ from supervisor.workspace_snapshot import (
     apply_snapshot_patch,
     create_workspace_snapshot,
 )
-from tests.test_bello_state import _runtime_controller
+from tests.support.controller import _runtime_controller
 
 
 def _init_project(root: Path) -> Path:

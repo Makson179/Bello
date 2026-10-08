@@ -1,0 +1,88 @@
+name: Published Native Codex 0.161 release qualification
+
+# Push qualification starts only after the separately published native assets
+# and their verified immutable hashes have been promoted into the installer.
+# This workflow never builds or publishes an artifact.
+on:
+  push:
+    branches: ['codex/072-recovery-validation']
+    paths:
+      - 'supervisor/runtime/native_codex_install.py'
+      - '.github/workflows/native-codex-release-download.yml'
+      - 'scripts/release_native_codex_candidate.py'
+      - 'tests/test_native_codex_install.py'
+      - 'tests/test_release_native_codex_candidate.py'
+      - 'tests/test_native_codex_release_workflow.py'
+      - 'tests/test_native_codex_download_transport.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-codex-release-download-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  published-install:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            python: '3.11'
+            target: linux-x64
+          - os: macos-15
+            python: '3.13'
+            target: darwin-arm64
+          - os: windows-2022
+            python: '3.11'
+            target: windows-x64
+          - os: windows-2025
+            python: '3.14'
+            target: windows-x64
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install CPU inference and credential-free proof dependencies
+        run: |
+          if [[ "$RUNNER_OS" == 'macOS' ]]; then
+            python -m pip install 'torch>=2.6,<3'
+          else
+            python -m pip install 'torch>=2.6,<3' --index-url https://download.pytorch.org/whl/cpu
+          fi
+          python -m pip install -e '.[log-distiller,test]'
+      - name: Test published release verifier contracts
+        run: python -m pytest -q tests/test_release_native_codex_candidate.py tests/test_native_codex_release_workflow.py tests/test_native_codex_install.py tests/test_native_codex_download_transport.py
+      - name: Cold production HTTPS install and full actual installed native qualification
+        run: |
+          if [[ "$RUNNER_OS" == 'Windows' ]]; then
+            runtime_parent="$LOCALAPPDATA"
+          else
+            runtime_parent="$RUNNER_TEMP"
+          fi
+          python scripts/release_native_codex_candidate.py install-published \
+            --target ${{ matrix.target }} \
+            --runtime-root "$runtime_parent/bello-0161-published-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --output "$RUNNER_TEMP/published-release-proof" --modernbert
+      - name: Preserve bounded public receipts even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-codex-0161-https-proof-${{ matrix.os }}-py${{ matrix.python }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/published-release-proof/installed-proof.json
+            ${{ runner.temp }}/published-release-proof/worker/report.json
+            ${{ runner.temp }}/published-release-proof/worker/*/report.json
+            ${{ runner.temp }}/published-release-proof/worker/*/*/result.json
+          if-no-files-found: warn
+          retention-days: 14
