@@ -520,7 +520,7 @@ def test_subagent_default_model_change_uses_the_same_rule(discover):
     assert "multi-agent default effort max -> xhigh" in state.notice
 
 
-# --- Models with no advertised effort (Claude Haiku) --------------------------------------
+# --- Models with no advertised effort (Claude Haiku 4.5) ----------------------------------
 
 
 def test_haiku_is_selectable_with_no_effort_and_round_trips(discover, tmp_path):
@@ -606,7 +606,7 @@ async def test_unadvertised_model_fails_before_query_even_without_effort(tmp_pat
     await engine.stop()
 
 
-async def test_config_advisor_accepts_no_effort_only_where_none_is_advertised(tmp_path):
+async def test_config_advisor_preserves_an_omitted_claude_effort(tmp_path):
     from tests.test_claude_sonnet55_config import advisor_config, advisor_module
 
     models = advisor_module("inspect_models")
@@ -626,7 +626,17 @@ async def test_config_advisor_accepts_no_effort_only_where_none_is_advertised(tm
     assert any("'high' is not advertised for claude-code/haiku" in error for error in validate(haiku))
     sonnet = advisor_config()
     sonnet["coder_intelligence"] = NO_EFFORT
-    assert any("only for models that advertise no effort" in error for error in validate(sonnet))
+    assert validate(sonnet) == []
+    core_config = claude_only(coder_intelligence=NO_EFFORT)
+    assert validate_project_config(core_config, catalog_from_model_list(catalog)).errors == ()
+    engine, factory, _ = claude(tmp_path / "default-effort", AUTHENTICATED)
+    try:
+        assert (await engine.request("model/validate", {
+            "provider": "claude-code", "model": "claude-sonnet-5-5",
+        }))["valid"]
+        assert queries(factory) == []
+    finally:
+        await engine.stop()
 
 
 def test_cli_accepts_no_effort_for_qualified_models(monkeypatch, tmp_path):

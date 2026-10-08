@@ -1,8 +1,8 @@
 """Keep installation and `bello update` on the same official Claude Code CLI.
 
-0.7.1 pins one claude-agent-sdk release on every platform. Where that release
-has no wheel with a bundled CLI (native Windows), the readiness contract in
-``supervisor.runtime.claude_cli`` supplies the identical official build.
+Bello pins one claude-agent-sdk release on every platform. The readiness
+contract in ``supervisor.runtime.claude_cli`` selects the explicit managed
+CLI pair even when that SDK's wheel contains a bundled CLI.
 """
 
 from pathlib import Path
@@ -19,7 +19,7 @@ from supervisor.runtime.claude import ClaudeBackend
 
 
 PROJECT = Path(__file__).resolve().parents[1] / "pyproject.toml"
-PINNED_SDK = "0.2.161"
+PINNED_SDK = "0.2.164"
 
 
 def sdk_requirements(extra):
@@ -81,22 +81,29 @@ def test_updater_honors_platform_marker_and_ignores_test_extra(monkeypatch, plat
     monkeypatch.setattr(ClaudeBackend, "_official_cli", staticmethod(official_cli))
     update_check._ensure_claude_dependency()
     assert commands == ([] if already_matching else [["installer", f"claude-agent-sdk=={version}"]])
-    # The update prepares, not merely inspects, the official CLI (a Windows
-    # download when the wheel has no bundle) through the shared contract.
+    # The update prepares, not merely inspects, the explicitly paired official
+    # managed CLI through the shared contract on every supported platform.
     assert readiness == [True]
 
 
-def test_windows_managed_cli_is_paired_with_the_pinned_sdk_release():
-    release = claude_cli.MANAGED_RELEASES[("Windows", "x86_64")]
+@pytest.mark.parametrize("platform", [
+    ("Darwin", "arm64"), ("Darwin", "x86_64"),
+    ("Linux", "arm64"), ("Linux", "x86_64"), ("Windows", "x86_64"),
+])
+def test_managed_cli_is_paired_with_the_pinned_sdk_release(platform):
+    release = claude_cli.MANAGED_RELEASES[platform]
     for extra in ("claude", "test"):
         (requirement,) = sdk_requirements(extra)
         assert str(requirement.specifier) == f"=={release.sdk_version}"
-    assert release.cli_version == "2.1.284"
-    assert release.url == (
-        "https://downloads.claude.ai/claude-code-releases/2.1.284/win32-x64/claude.exe"
-    )
+    assert release.cli_version == "2.1.293"
+    assert release.sdk_bundled_cli_version == "2.1.292"
+    assert release.url == (f"https://downloads.claude.ai/claude-code-releases/2.1.293/"
+                           f"{release.platform}/{release.binary}")
     assert len(release.sha256) == 64 and int(release.sha256, 16) >= 0
-    assert set(claude_cli.MANAGED_RELEASES) == {("Windows", "x86_64")}
+    assert set(claude_cli.MANAGED_RELEASES) == {
+        ("Darwin", "arm64"), ("Darwin", "x86_64"),
+        ("Linux", "arm64"), ("Linux", "x86_64"), ("Windows", "x86_64"),
+    }
 
 
 def test_update_readiness_failure_is_an_actionable_update_error(monkeypatch):

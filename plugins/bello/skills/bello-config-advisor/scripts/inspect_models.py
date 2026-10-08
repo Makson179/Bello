@@ -89,7 +89,7 @@ def load_catalog(*, timeout_seconds: float, file: Path | None = None) -> dict[st
     return {
         "source": source,
         "models": models,
-        "unavailableEngines": [name for name in names if name in {"pi", "claude-code"}],
+        "unavailableEngines": [name for name in names if name in {"codex", "pi", "claude-code"}],
     }
 
 

@@ -1,4 +1,4 @@
-The Bello worker uses Pi 0.85.1 packages from https://github.com/earendil-works/pi,
+The Bello worker uses Pi 1.0.4 packages from https://github.com/earendil-works/pi,
 licensed under the MIT license in LICENSE-Pi. The worker is independently
 implemented integration code; Bello is not a fork of Pi.
 

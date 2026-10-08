@@ -107,8 +107,9 @@ def test_exact_host_runtime_file_is_readable_without_opening_parent(tmp_path, mo
     assert str(executable) not in result["runtimeWorkspaceRoots"]
 
 
-def test_mapping_is_stable_for_resume_and_does_not_inherit_external_config(tmp_path):
-    source = {"cwd": str(tmp_path), "config": {
+@pytest.mark.parametrize("mode", ["read-only", "workspace-write"])
+def test_mapping_is_stable_for_resume_and_does_not_inherit_external_config(tmp_path, mode):
+    source = {"cwd": str(tmp_path), "sandbox": mode, "config": {
         "default_permissions": ":danger-full-access",
         "permissions": {PROFILE_ID: {"extends": ":workspace"}},
     }}
@@ -116,4 +117,4 @@ def test_mapping_is_stable_for_resume_and_does_not_inherit_external_config(tmp_p
     resumed = native_permission_params(deepcopy(source))
     assert start == resumed
     assert "extends" not in profile(start)
-    assert "default_permissions" not in start["config"]
+    assert start["config"]["default_permissions"] == PROFILE_ID

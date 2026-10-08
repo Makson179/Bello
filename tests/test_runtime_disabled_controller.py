@@ -18,7 +18,7 @@ from supervisor.schemas import (
 )
 from supervisor.tui import UserCommand
 from supervisor.state import RUNTIME_METRICS
-from tests.test_bello_state import _FakeTUI, _runtime_controller
+from tests.support.controller import _FakeTUI, _runtime_controller
 from tests.test_runtime_preflight import controller_for
 
 

@@ -34,7 +34,7 @@ ROLES = ("coder", "runtime", "completion", "adversary")
 ASTRA_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 
 
-def test_astra_catalog_preserves_existing_defaults_and_effort_limits() -> None:
+def test_astra_catalog_preserves_existing_models_and_effort_limits() -> None:
     assert SUPPORTED_MODEL_CHOICES == (
         MODEL_GPT_6_ASTRA,
         MODEL_GPT_5_6_SOL,
@@ -42,7 +42,7 @@ def test_astra_catalog_preserves_existing_defaults_and_effort_limits() -> None:
         MODEL_GPT_5_6_LUNA,
         MODEL_GPT_5_5,
     )
-    assert DEFAULT_MODEL == MODEL_GPT_5_6_SOL
+    assert DEFAULT_MODEL == MODEL_GPT_6_ASTRA
     assert intelligence_choices_for_model(MODEL_GPT_6_ASTRA) == ASTRA_EFFORTS
     assert intelligence_choices_for_model(MODEL_GPT_5_6_SOL) == ASTRA_EFFORTS
     assert intelligence_choices_for_model(MODEL_GPT_5_6_TERRA) == ASTRA_EFFORTS

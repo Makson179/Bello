@@ -4,8 +4,8 @@
 Phases (run in order on a fresh runner with BELLO_RUNTIME_DIR unset, so the
 proof covers the default per-user runtime directory %USERPROFILE%\\.bello\\runtime):
 
-* ``sdk``     - claude-agent-sdk is the pinned release built from its sdist:
-                importable, bundled-CLI version 2.1.284, and no bundled claude.exe.
+* ``sdk``     - claude-agent-sdk is the pinned release 0.2.164, importable and
+                declaring bundled CLI 2.1.292 (wheel or sdist installation).
 * ``before``  - readiness fails closed with the setup command; doctor warns.
                 Nothing is downloaded.
 * ``runner-temp`` - informational and read-only: whether Bello's containing-
@@ -15,10 +15,10 @@ proof covers the default per-user runtime directory %USERPROFILE%\\.bello\\runti
                 in the default directory is used, its SHA-256 matches the pin,
                 real Windows ACLs are private from ``.bello`` down to claude.exe,
                 Windows reports a valid Authenticode signature by Anthropic, and
-                ``claude.exe --version`` reports 2.1.284.
+                ``claude.exe --version`` reports 2.1.293, not the older SDK bundle.
 * ``metadata``- a signed-out metadata handshake through Bello's own backend
                 (SDK initialize/get_server_info in an isolated CLAUDE_CONFIG_DIR)
-                lists claude-sonnet-5-5 with the pinned CLI. No login, no prompt,
+                lists claude-sonnet-5-5 and claude-haiku-5-5. No login, no prompt,
                 and no model request; any credential variable aborts the check.
 
 Exit status is non-zero on the first failed check. Output contains no
@@ -53,19 +53,20 @@ def check_sdk() -> None:
     import claude_agent_sdk
     from claude_agent_sdk._cli_version import __cli_version__
 
-    from supervisor.runtime.claude_cli import managed_release
+    from supervisor.runtime.claude_cli import check_sdk_pairing, managed_release
 
     release = managed_release()
     if release is None:
         fail("this runner is not a platform with a managed Claude Code CLI pin")
     version = metadata.version("claude-agent-sdk")
-    if version != release.sdk_version or __cli_version__ != release.cli_version:
+    expected_bundle = release.sdk_bundled_cli_version or release.cli_version
+    if version != release.sdk_version or __cli_version__ != expected_bundle:
         fail(f"claude-agent-sdk {version} declares CLI {__cli_version__}; expected {release.sdk_version}/"
-             f"{release.cli_version}")
+             f"{expected_bundle}")
+    check_sdk_pairing(release)
     bundled = Path(claude_agent_sdk.__file__).resolve().parent / "_bundled" / "claude.exe"
-    if bundled.exists():
-        fail("the pinned SDK unexpectedly contains a bundled claude.exe; the managed path would be unused")
-    ok(f"claude-agent-sdk {version} (sdist build, declares CLI {__cli_version__}) without a bundled CLI")
+    ok(f"claude-agent-sdk {version} declares CLI {__cli_version__}; bundled executable present: "
+       f"{bundled.is_file()}; explicitly paired managed CLI: {release.cli_version}")
 
 
 def default_runtime() -> Path:
@@ -201,15 +202,19 @@ def check_metadata() -> None:
 
     entries = asyncio.run(read())
     by_id = {entry["id"]: entry for entry in entries}
-    sonnet = by_id.get("claude-sonnet-5-5")
-    if sonnet is None:
-        fail("the pinned Windows CLI did not advertise claude-sonnet-5-5: " + ", ".join(sorted(by_id)))
-    efforts = sonnet["supportedEfforts"]
-    if efforts != ["low", "medium", "high", "xhigh", "max"]:
-        fail(f"unexpected Sonnet 5.5 efforts {efforts}")
-    alias = by_id.get("sonnet", {})
-    ok("signed-out metadata lists claude-sonnet-5-5 with efforts " + ", ".join(efforts)
-       + (f"; alias sonnet -> {alias.get('resolvedModel')}" if alias else ""))
+    for family in ("sonnet", "haiku"):
+        identifier = f"claude-{family}-5-5"
+        model = by_id.get(identifier)
+        if model is None:
+            fail(f"the pinned Windows CLI did not advertise {identifier}: " + ", ".join(sorted(by_id)))
+        efforts = model["supportedEfforts"]
+        if efforts != ["low", "medium", "high", "xhigh", "max"]:
+            fail(f"unexpected {identifier} efforts {efforts}")
+        alias = by_id.get(family, {})
+        if alias.get("resolvedModel") != identifier:
+            fail(f"the {family} alias did not resolve to {identifier}")
+        ok(f"signed-out metadata lists {identifier} with efforts " + ", ".join(efforts)
+           + f"; alias {family} -> {identifier}")
 
 
 def main() -> int:

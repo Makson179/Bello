@@ -21,6 +21,64 @@ sys.modules[spec.name] = proof
 spec.loader.exec_module(proof)
 
 
+async def test_native_stderr_collects_chunks_arriving_after_the_first_read(tmp_path):
+    session = proof.NativeSession(tmp_path / "codex", tmp_path, {})
+    stream = asyncio.StreamReader()
+    session.process = SimpleNamespace(stderr=stream)
+    drain = asyncio.create_task(session.read_stderr())
+    try:
+        for chunk in (b"early warning\n", b"later diagnostic\n", b"last line\n"):
+            stream.feed_data(chunk)
+            await asyncio.sleep(0)
+            assert not drain.done()
+        stream.feed_eof()
+        assert await asyncio.wait_for(drain, 1) == b"early warning\nlater diagnostic\nlast line\n"
+    finally:
+        drain.cancel()
+        await asyncio.gather(drain, return_exceptions=True)
+
+
+@pytest.mark.parametrize("chunks", [[], [b"one", b"two"], [b"12345", b"67890", b"still draining"]])
+async def test_native_stderr_drains_through_eof_with_bounded_retention(tmp_path, monkeypatch, chunks):
+    monkeypatch.setattr(proof, "LIMIT", 8)
+    stream = SimpleNamespace(read=AsyncMock(side_effect=[*chunks, b""]))
+    session = proof.NativeSession(tmp_path / "codex", tmp_path, {})
+    session.process = SimpleNamespace(stderr=stream)
+    assert await session.read_stderr() == b"".join(chunks)[:8]
+    assert stream.read.await_count == len(chunks) + 1
+    assert all(call.args == (64 * 1024,) for call in stream.read.await_args_list)
+
+
+async def test_native_session_start_and_close_preserve_bounded_stderr(tmp_path, monkeypatch):
+    monkeypatch.setattr(proof, "LIMIT", 8)
+    stdout, stderr = asyncio.StreamReader(), asyncio.StreamReader()
+    process = SimpleNamespace(returncode=None, stdout=stdout, stderr=stderr,
+                              stdin=SimpleNamespace(close=Mock()))
+
+    async def finish():
+        stdout.feed_eof()
+        stderr.feed_eof()
+        process.returncode = 0
+        return 0
+
+    process.wait = AsyncMock(side_effect=finish)
+    monkeypatch.setattr(proof.asyncio, "create_subprocess_exec", AsyncMock(return_value=process))
+    session = proof.NativeSession(tmp_path / "codex", tmp_path, {})
+    session.request, session.send = AsyncMock(), AsyncMock()
+    await session.start()
+    try:
+        for chunk in (b"early", b" later", b" beyond cap"):
+            stderr.feed_data(chunk)
+            await asyncio.sleep(0)
+        assert not session.stderr.done()
+    finally:
+        await session.close(tmp_path)
+    assert (tmp_path / "native-stderr.txt").read_bytes() == b"early la"
+    assert (tmp_path / "rpc.jsonl").read_text() == ""
+    process.stdin.close.assert_called_once_with()
+    process.wait.assert_awaited_once_with()
+
+
 @pytest.mark.parametrize("mode", ["direct", "code", "poll"])
 def test_extracts_only_exact_call_output(mode):
     value = "Chunk ID: a\nProcess exited with code 7\nOutput:\n" + proof.SELECTED if mode == "direct" else (

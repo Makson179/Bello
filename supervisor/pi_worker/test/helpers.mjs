@@ -183,7 +183,7 @@ export function createFakeSdk({ models = [fakeModel()], behavior = async (sessio
   const created = [];
   const modelRuntime = new FakeModelRuntime(models);
   return {
-    version: "0.85.1-test",
+    version: "1.0.4-test",
     created,
     modelRuntime,
     async createModelRuntime() {

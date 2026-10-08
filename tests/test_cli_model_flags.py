@@ -13,21 +13,22 @@ from supervisor.project_config import (
     MODEL_GPT_5_5,
     MODEL_GPT_5_6_LUNA,
     MODEL_GPT_5_6_SOL,
+    MODEL_GPT_6_ASTRA,
     LogDistillerConfig,
     ProjectConfig,
     project_config_path,
 )
 
 
-def test_role_models_default_to_gpt_56_sol() -> None:
+def test_new_role_models_default_to_verified_astra() -> None:
     settings = _resolve_run_settings(project_config=ProjectConfig())
 
-    assert DEFAULT_MODEL == MODEL_GPT_5_6_SOL
+    assert DEFAULT_MODEL == MODEL_GPT_6_ASTRA
     assert settings.plan_path is None
-    assert settings.coder_model == MODEL_GPT_5_6_SOL
-    assert settings.runtime_model == MODEL_GPT_5_6_SOL
-    assert settings.completion_model == MODEL_GPT_5_6_SOL
-    assert settings.adversary_model == MODEL_GPT_5_6_SOL
+    assert settings.coder_model == MODEL_GPT_6_ASTRA
+    assert settings.runtime_model == MODEL_GPT_6_ASTRA
+    assert settings.completion_model == MODEL_GPT_6_ASTRA
+    assert settings.adversary_model == MODEL_GPT_6_ASTRA
 
 
 def test_shared_model_flag_is_not_registered() -> None:
@@ -172,8 +173,8 @@ def test_legacy_super_flags_set_both_supervisor_roles() -> None:
     assert settings.completion_model == MODEL_GPT_5_5
     assert settings.runtime_intelligence == "high"
     assert settings.completion_intelligence == "high"
-    assert settings.coder_model == MODEL_GPT_5_6_SOL
-    assert settings.adversary_model == MODEL_GPT_5_6_SOL
+    assert settings.coder_model == MODEL_GPT_6_ASTRA
+    assert settings.adversary_model == MODEL_GPT_6_ASTRA
 
 
 @pytest.mark.parametrize(
@@ -223,6 +224,10 @@ def test_run_settings_use_independent_project_config_defaults() -> None:
 def test_run_settings_accept_ultra_independently_for_gpt_56_sol() -> None:
     settings = _resolve_run_settings(
         project_config=ProjectConfig(
+            coder_mod=MODEL_GPT_5_6_SOL,
+            runtime_mod=MODEL_GPT_5_6_SOL,
+            completion_mod=MODEL_GPT_5_6_SOL,
+            adversary_mod=MODEL_GPT_5_6_SOL,
             coder_intelligence="ultra",
             runtime_intelligence="xhigh",
             completion_intelligence="ultra",
@@ -489,8 +494,8 @@ def _resolve(project_config: ProjectConfig, **overrides):
 def test_fresh_project_uses_everyday_defaults() -> None:
     settings = _resolve(ProjectConfig())
 
-    assert settings.coder_model == MODEL_GPT_5_6_SOL
-    assert settings.runtime_model == MODEL_GPT_5_6_SOL
+    assert settings.coder_model == MODEL_GPT_6_ASTRA
+    assert settings.runtime_model == MODEL_GPT_6_ASTRA
     assert settings.coder_intelligence == "xhigh"
     assert settings.runtime_intelligence == "xhigh"
     assert settings.start_over is False

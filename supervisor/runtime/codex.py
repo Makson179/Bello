@@ -202,6 +202,7 @@ class CodexBackend:
             # Overrides apply only to the child, never the user's global config.
             command = [*command, "-c", 'forced_login_method="chatgpt"', "-c", 'model_provider="openai"',
                        "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false",
+                       "-c", "features.code_mode_interrupt=true",
                        "-c", "agents.enabled=false"]
             if _IS_WINDOWS:
                 # Bind the exact source home used by AppServerClient, without
@@ -452,12 +453,18 @@ class CodexBackend:
         # model metadata can still select native collaboration. agents.enabled
         # is the hard off switch, provided multi_agent_v2 is also disabled.
         # Delegation stays exclusively in Bello's policy-checked dynamic tools.
+        # Code Mode delegates own cancellation tokens independently of the
+        # outer turn. Native 0.155.1 leaves them running on turn/interrupt unless
+        # this feature is enabled. Pin it for both start and resume, including
+        # Smart Execution OFF; cancellation must stay scoped to this session.
         config.update({"model_provider": "openai", "forced_login_method": "chatgpt",
                        "features.multi_agent": False, "features.multi_agent_v2": False,
+                       "features.code_mode_interrupt": True,
                        "agents": {"enabled": False}})
         if isinstance(config.get("features"), dict):
             config["features"]["multi_agent"] = False
             config["features"]["multi_agent_v2"] = False
+            config["features"]["code_mode_interrupt"] = True
         tool_tmp = self._tool_tmp
         if params.get("runtimeScratchRoot") is not None:
             # The app-server is shared by every role. Assign review scratch in
@@ -535,6 +542,12 @@ class CodexBackend:
             windows_root_read=root_read, private_read_roots=private_read_roots)
         if "permissions" in permissions:
             native.pop("sandbox", None)
+            # Retained session config must select exactly the host-owned
+            # profile, including when Codex rebuilds it without typed request
+            # overrides. Dotted caller entries can otherwise amend its rules.
+            for key in list(config):
+                if key.split(".", 1)[0] in {"permissions", "default_permissions", "sandbox_mode"}:
+                    config.pop(key)
             config.pop("sandbox_workspace_write.network_access", None)
             if isinstance(config.get("sandbox_workspace_write"), dict):
                 config["sandbox_workspace_write"].pop("network_access", None)

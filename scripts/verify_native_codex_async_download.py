@@ -22,7 +22,7 @@ from scripts.verify_native_codex_download import snapshot
 from scripts.verify_native_codex_async import verify as verify_async
 
 CASES = frozenset({
-    "direct_off", "direct_on", "code_off", "code_on", "steer", "interrupt", "child_wait",
+    "direct_off", "direct_on", "code_off", "code_on", "steer", "interrupt", "code_interrupt", "child_wait",
     "async_and_selection_direct", "async_and_selection_code",
     "direct_on_repeat_2", "steer_repeat_2", "direct_on_repeat_3", "steer_repeat_3",
 })

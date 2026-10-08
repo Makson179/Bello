@@ -112,14 +112,15 @@ def _normalize_multi_agent(value: Any) -> dict[str, Any]:
 
 
 def _normalize(payload: dict[str, Any], *, config_exists: bool) -> dict[str, Any]:
-    legacy_super_model = _first(payload, ("super_mod", "supervisor_model", "model"), "gpt-5.6-sol", skip_none=True)
+    default_model = "gpt-5.6-sol" if config_exists else "gpt-6-astra"
+    legacy_super_model = _first(payload, ("super_mod", "supervisor_model", "model"), default_model, skip_none=True)
     legacy_super_effort = _first(
         payload,
         ("super_intelligence", "supervisor_intelligence"),
         "xhigh",
         skip_none=True,
     )
-    coder_model = _stripped(_first(payload, ("coder_mod", "coder_model", "model"), "gpt-5.6-sol", skip_none=True))
+    coder_model = _stripped(_first(payload, ("coder_mod", "coder_model", "model"), default_model, skip_none=True))
     coder_effort = _normalized_choice(
         _first(payload, ("coder_intelligence",), "xhigh", skip_none=True)
     )
@@ -134,7 +135,7 @@ def _normalize(payload: dict[str, Any], *, config_exists: bool) -> dict[str, Any
         _first(payload, ("completion_mod", "completion_model"), legacy_super_model, skip_none=True)
     )
     adversary_model = _stripped(
-        _first(payload, ("adversary_mod", "adversary_model"), "gpt-5.6-sol", skip_none=True)
+        _first(payload, ("adversary_mod", "adversary_model"), default_model, skip_none=True)
     )
 
     if payload.get("speed") is not None:

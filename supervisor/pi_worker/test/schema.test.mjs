@@ -8,8 +8,8 @@ import test from "node:test";
 import { realPiSdk } from "../src/pi-sdk.mjs";
 
 const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
-const python = [join(repositoryRoot, ".venv", "bin", "python"), join(repositoryRoot, ".venv", "Scripts", "python.exe")]
-  .find(existsSync);
+const python = [process.env.BELLO_TEST_PYTHON, join(repositoryRoot, ".venv", "bin", "python"),
+  join(repositoryRoot, ".venv", "Scripts", "python.exe")].filter(Boolean).find(existsSync);
 
 test("TypeBox validates Bello's real strict schemas including $defs/$ref", { skip: !python }, () => {
   const script = `

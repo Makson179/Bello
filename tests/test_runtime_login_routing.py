@@ -4,14 +4,20 @@ import pytest
 from click.testing import CliRunner
 
 from supervisor.main import cli
+from supervisor.runtime.claude_cli import OfficialCli
 
 
 @pytest.mark.parametrize("provider", ["openai-codex", "claude-code", "openai"])
 def test_login_keeps_native_and_api_auth_routes_separate(monkeypatch, tmp_path, provider):
     calls = []
+    readiness = []
     monkeypatch.setenv("BELLO_CODEX_BINARY", "/explicit/codex")
     monkeypatch.setattr("subprocess.run", lambda command, **kw: calls.append(command) or SimpleNamespace(returncode=0))
-    monkeypatch.setattr("supervisor.runtime.claude.ClaudeBackend._bundled_cli_path", lambda: tmp_path / "claude")
+    def official_cli(*, prepare=False):
+        readiness.append(prepare)
+        return OfficialCli(tmp_path / "claude", "managed-download", "2.1.293")
+
+    monkeypatch.setattr("supervisor.runtime.claude.ClaudeBackend._official_cli", staticmethod(official_cli))
     worker = tmp_path / "worker.mjs"
     worker.with_name("auth.mjs").write_text("fixture")
     monkeypatch.setattr("supervisor.runtime.install.worker_command", lambda: ["/trusted/node", str(worker)])
@@ -23,3 +29,4 @@ def test_login_keeps_native_and_api_auth_routes_separate(monkeypatch, tmp_path, 
         "openai": ["/trusted/node", str(worker.with_name("auth.mjs")), "openai"],
     }
     assert calls == [expected[provider]]
+    assert readiness == ([True] if provider == "claude-code" else [])

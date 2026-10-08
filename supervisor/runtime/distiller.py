@@ -11,6 +11,7 @@ from pathlib import Path
 import sys
 
 from supervisor.runtime.distiller_bundle import validate_bundle
+from supervisor.process_fence import create_subprocess_exec
 
 
 logger = logging.getLogger(__name__)
@@ -97,7 +98,7 @@ class LogDistiller:
             environment = dict(os.environ)
             environment.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
                                TOKENIZERS_PARALLELISM="false", CUDA_VISIBLE_DEVICES="")
-            self._spawn = asyncio.create_task(asyncio.create_subprocess_exec(
+            self._spawn = asyncio.create_task(create_subprocess_exec(
                 sys.executable, "-m", "supervisor.runtime.distiller_worker",
                 "--model-path", str(self.model_path), stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,

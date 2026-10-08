@@ -1,5 +1,7 @@
 import { join } from "node:path";
 import { installOpenRouterBackpressure } from "./openrouter-backpressure.mjs";
+import { createCatalogRuntime } from "./catalog.mjs";
+import { enforceExecutionBillingRoute } from "./billing-route.mjs";
 
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import {
@@ -11,7 +13,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Check, Errors } from "typebox/value";
 
-export const PI_SDK_VERSION = "0.85.1";
+export const PI_SDK_VERSION = "1.0.4";
 const DIRECT_OPENAI_RESPONSE_ROUTES = new Set([
   "openai/openai-responses",
   "openai-codex/openai-codex-responses",
@@ -28,8 +30,7 @@ const OPENAI_SERVICE_TIERS = ["auto", "default", "flex", "scale", "priority"];
 // session creation so an omitted effort is visible and never mistaken for an
 // explicitly requested `off`.
 const PI_DEFAULT_EFFORT_ORDER = ["medium", "high", "xhigh", "max", "low", "minimal", "off"];
-// Pi 0.85.1 predates the `ultra` spelling in its ModelThinkingLevel type and
-// therefore cannot advertise it from getSupportedThinkingLevels().  These are
+// Older Pi catalogs predate `ultra` in their ModelThinkingLevel metadata. These are
 // the exact Codex routes for which Bello 0.5.2 already allowed ultra.  Keep the
 // compatibility supplement deliberately provider-qualified: similarly named
 // API-key, gateway, Bedrock, or Copilot routes must use their own catalog.
@@ -69,12 +70,15 @@ function providerPayloadExtension(requestOptions) {
 export const realPiSdk = {
   version: PI_SDK_VERSION,
 
+  createCatalogRuntime,
+
   async createModelRuntime({ agentDir, allowModelNetwork }) {
-    return ModelRuntime.create({
+    const runtime = await ModelRuntime.create({
       authPath: join(agentDir, "auth.json"),
       modelsPath: join(agentDir, "models.json"),
       allowModelNetwork,
     });
+    return enforceExecutionBillingRoute(runtime);
   },
 
   createSessionManager({ cwd, sessionDir, threadId, sessionFile }) {
@@ -115,7 +119,7 @@ export const realPiSdk = {
       noThemes: true,
       noContextFiles: true,
       extensionFactories: [providerPayloadExtension(requestOptions)],
-      // Pi 0.85.1 discovers project/agent SYSTEM.md only when this option is
+      // Pi discovers project/agent SYSTEM.md only when this option is
       // nullish. An explicit empty source prevents those reads while retaining
       // Pi's generic base prompt when Bello supplies no custom system prompt.
       systemPrompt: typeof systemPrompt === "string" && systemPrompt.trim() ? systemPrompt : "",
@@ -141,11 +145,16 @@ export const realPiSdk = {
     installOpenRouterBackpressure(session.agent);
     session.setActiveToolsByName(activeToolNames);
     if (asyncAfterTurn) {
-      const previousStop = session.agent.shouldStopAfterTurn;
-      session.agent.shouldStopAfterTurn = async (turn, signal) => {
-        if (await previousStop?.(turn, signal)) return true;
+      // Pi 1.0 uses finishTurn decisions in place of shouldStopAfterTurn.
+      // Preserve the session's own hook and its end/continue decision. Error
+      // and abort turns are terminal and must never wait for more tool output.
+      const previousFinish = session.agent.finishTurn;
+      session.agent.finishTurn = async (turn, signal) => {
+        const decision = await previousFinish?.call(session.agent, turn, signal);
+        if (decision?.action === "end" || signal?.aborted
+            || ["error", "aborted"].includes(turn.message.stopReason)) return decision;
         await asyncAfterTurn(turn, signal);
-        return false;
+        return decision;
       };
     }
     return session;

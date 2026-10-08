@@ -2,6 +2,10 @@
 __pycache__/
 .pytest_cache/
 .test-runtime/
+.test-venv/
+.test-tmp/
+.verification/
+.pi-modernization/
 *.py[cod]
 *.egg-info/
 build/

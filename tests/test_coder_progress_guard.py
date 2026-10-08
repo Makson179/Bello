@@ -10,7 +10,7 @@ import supervisor.controller as module
 from supervisor.appserver import AppServerError, AppServerMessage
 from supervisor.schemas import BelloStatus
 from supervisor.state import EVENTS
-from tests.test_bello_state import _runtime_controller
+from tests.support.controller import _runtime_controller
 
 
 @pytest.fixture

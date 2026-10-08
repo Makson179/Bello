@@ -22,6 +22,7 @@ import stat
 import struct
 import subprocess
 from typing import Literal, TypeAlias
+from supervisor.process_fence import create_subprocess_exec
 
 
 RestrictedMode: TypeAlias = Literal["read-only", "workspace-write"]
@@ -420,7 +421,7 @@ async def _spawn(
     cwd: Path,
 ) -> asyncio.subprocess.Process:
     try:
-        return await asyncio.create_subprocess_exec(
+        return await create_subprocess_exec(
             os.fspath(helper),
             cwd=os.fspath(cwd),
             env=environment,

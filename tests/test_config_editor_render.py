@@ -263,7 +263,7 @@ def test_config_editor_hides_revision_profile_until_enabled() -> None:
 
 
 def test_config_editor_hides_only_adversary_dependencies_when_adversary_is_disabled() -> None:
-    config = ProjectConfig(completion_review=True, adversary=False, adversary_runs=2)
+    config = ProjectConfig(completion_review=True, adversary=False, adversary_runs=2, completion_mod=MODEL_GPT_5_6_SOL)
     params = parameter_defs(config)
     keys = {param.key for param in params}
 
@@ -335,7 +335,7 @@ def test_config_editor_render_uses_family_and_variant_model_options() -> None:
 
 def test_config_editor_render_has_independent_rows_for_all_agent_roles() -> None:
     for role in ("coder", "runtime", "completion", "adversary"):
-        config = ProjectConfig(completion_review=True, adversary=True)
+        config = ProjectConfig(completion_review=True, adversary=True, **{f"{role}_mod": MODEL_GPT_5_6_SOL})
         params = parameter_defs(config)
         effort_index = [param.key for param in params].index(f"{role}_intelligence")
         output = _render(
@@ -577,7 +577,7 @@ def test_config_editor_renders_role_specific_reviewer_subagent_labels() -> None:
 
 
 def test_config_editor_render_variant_row_has_sol_terra_luna_options() -> None:
-    config = ProjectConfig()
+    config = ProjectConfig(coder_mod=MODEL_GPT_5_6_SOL)
     params = parameter_defs(config)
     variant_index = [param.key for param in params].index("coder_mod_variant")
 

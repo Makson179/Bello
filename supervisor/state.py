@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import shutil
+import stat
 import tempfile
 import time
 from contextlib import contextmanager
@@ -180,10 +182,12 @@ def _atomic_replace(source: str, destination: Path) -> None:
 
 
 class StateStore:
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, *, create: bool = True):
         self.workspace = workspace.resolve()
         self.state_dir = require_inside_workspace(self.workspace, self.workspace / STATE_DIR_NAME)
-        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._digest_cache: dict[str, tuple[tuple[int, ...], str]] = {}
+        if create:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
 
     def path(self, name: str) -> Path:
         return require_inside_workspace(self.workspace, self.state_dir / name)
@@ -201,11 +205,22 @@ class StateStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
                 handle.write(text)
                 handle.flush()
                 os.fsync(handle.fileno())
             _atomic_replace(tmp_name, path)
+            metadata = path.stat()
+            self._digest_cache[str(path)] = (
+                (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns),
+                hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            )
+            if os.name != "nt":
+                directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
         finally:
             if os.path.exists(tmp_name):
                 os.unlink(tmp_name)
@@ -222,6 +237,20 @@ class StateStore:
         if not path.exists():
             return default
         return path.read_text(encoding="utf-8")
+
+    def content_digest(self, name: str) -> str:
+        """Use a digest captured by our atomic writer while its inode is unchanged."""
+        path = self.path(name)
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError(f"state digest requires an unshared regular file: {name}")
+        identity = (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
+        cached = self._digest_cache.get(str(path))
+        if cached is not None and cached[0] == identity:
+            return cached[1]
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        self._digest_cache[str(path)] = (identity, digest)
+        return digest
 
     def write_text_locked(self, name: str, text: str) -> None:
         with self.locked(name):
@@ -294,10 +323,12 @@ class StateStore:
     ) -> None:
         mode = mode or ("fresh" if overwrite else "resume")
         if mode == "fresh":
-            self._clear_state_dir(preserve=set())
+            # The controller lifetime lock must retain its inode across an
+            # explicit new run. Recovery artifacts are rotated by their owner.
+            self._clear_state_dir(preserve={"controller"})
         elif mode == "resume":
             self._clear_state_dir(
-                preserve={EVENTS, LOG, PREVIOUS_RUNS, RECOVERY, RUN_CHECKPOINT}
+                preserve={EVENTS, LOG, PREVIOUS_RUNS, RECOVERY, RUN_CHECKPOINT, "controller"}
             )
         else:
             raise ValueError(f"unknown bello initialization mode: {mode}")

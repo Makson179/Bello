@@ -160,7 +160,7 @@ test("real Bello/Pi non-OpenRouter session preserves normal adapter and existing
   t.after(()=>session.dispose());session.agent.getApiKey=async()=>"offline-not-real";
   // A public pre-existing stop hook remains authoritative under the transport
   // wrapper; this is not replaced by a provider retry or an agent-turn replay.
-  session.agent.shouldStopAfterTurn=async()=>{stopCalls++;return true;};
+  session.agent.finishTurn=async()=>{stopCalls++;return {action:"end"};};
   await session.prompt("Offline only",{expandPromptTemplates:false});
   assert.equal(providerCalls,1);assert.equal(fetchCalls,1);assert.equal(stopCalls,1);
 });

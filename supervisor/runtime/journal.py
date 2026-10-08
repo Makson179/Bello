@@ -54,6 +54,20 @@ class RuntimeJournal:
             "thread_id TEXT NOT NULL, call_id TEXT NOT NULL, fingerprint TEXT NOT NULL,"
             "status TEXT NOT NULL, result TEXT, PRIMARY KEY(thread_id, call_id));"
         )
+        self._recovery_tool_cache: tuple[int, tuple[str, bool]] | None = None
+
+    def recovery_tool_state(self) -> tuple[str, bool]:
+        """Fingerprint dispatched outcomes for controller recovery, never replay."""
+        generation = self._db.total_changes
+        if self._recovery_tool_cache is not None and self._recovery_tool_cache[0] == generation:
+            return self._recovery_tool_cache[1]
+        rows = self._db.execute(
+            "SELECT thread_id,call_id,fingerprint,status,result FROM tools ORDER BY thread_id,call_id"
+        ).fetchall()
+        value = (hashlib.sha256(json.dumps(rows, separators=(",", ":")).encode()).hexdigest(),
+                 any(row[3] != "completed" for row in rows))
+        self._recovery_tool_cache = (generation, value)
+        return value
 
     def close(self) -> None:
         self._db.close()

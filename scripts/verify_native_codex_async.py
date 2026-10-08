@@ -29,6 +29,49 @@ from scripts.verify_native_codex_selection import (
 )
 
 STEER_TEXT = "Acknowledge this steer while the command is running."
+SIBLING_TEXT = "Run the independent interrupt-scope fixture."
+RESUME_TEXT = "Run the successful command after interrupt in this same thread."
+
+
+def interrupt_request_kind(request):
+    texts = {part.get("text")
+             for item in request.get("input", [])
+             if item.get("type") == "message" and item.get("role") == "user"
+             for part in item.get("content", []) if isinstance(part, dict)}
+    if SIBLING_TEXT in texts:
+        return "sibling"
+    return "resume" if RESUME_TEXT in texts else "target"
+
+
+def interrupt_prefixes_stable(requests):
+    streams = {"target": [], "sibling": []}
+    for request in requests:
+        kind = "sibling" if interrupt_request_kind(request) == "sibling" else "target"
+        streams[kind].append(request)
+    return all(right.get("input", [])[:len(left.get("input", []))] == left.get("input", [])
+               for stream in streams.values() for left, right in zip(stream, stream[1:]))
+
+
+async def wait_for_turn(session, thread_id, turn_id, *, status, timeout=60):
+    """Match the exact turn without consuming another thread's completion."""
+    deferred = []
+    try:
+        async with asyncio.timeout(timeout):
+            while True:
+                event = await session.notifications.get()
+                if event.get("method") == "fixture/error":
+                    raise RuntimeError("Native fixture received unexpected approval/tool request")
+                params = event.get("params", {})
+                if (event.get("method") == "turn/completed"
+                        and params.get("threadId") == thread_id
+                        and params.get("turn", {}).get("id") == turn_id):
+                    if params["turn"].get("status") != status:
+                        raise RuntimeError("Native fixture turn did not reach " + status)
+                    return
+                deferred.append(event)
+    finally:
+        for event in deferred:
+            session.notifications.put_nowait(event)
 
 
 def steer_wakeup_proof(requests, times, slow_seconds):
@@ -111,12 +154,63 @@ class ScriptedProvider:
         self.interrupt_probe = interrupt_probe
         self.workspace = workspace
         self.slow_seconds = 12 if os.name == "nt" else 2.5
+        if interrupt_probe and os.name != "nt":
+            self.slow_seconds = 5
         self.requests, self.times, self.errors, self.tools = [], [], [], []
         self.rejected = []
 
+    def interrupt_followup(self, request):
+        kind = interrupt_request_kind(request)
+        if kind == "target":
+            return None
+        marker = "ASYNC_SCOPE_DONE" if kind == "sibling" else "ASYNC_RESUMED"
+        if sum(interrupt_request_kind(item) == kind for item in self.requests) > 1:
+            done = delivered(request, marker) == 1
+            if not done and not self.enabled:
+                packets = outputs(request)
+                latest = output_text(packets[-1]) if packets else ""
+                # Resume history can retain the interrupted call's old handle.
+                # Poll only the new probe's latest pending result.
+                if self.code and (match := re.search(r"Script running with cell ID ([^\s]+)", latest)):
+                    return [tool(f"{kind}-poll-{len(self.requests)}", "wait",
+                                 {"cell_id": match[1], "yield_time_ms": 1000})]
+                if not self.code and (match := re.search(r"Process running with session ID (\d+)", latest)):
+                    return [tool(f"{kind}-poll-{len(self.requests)}", "write_stdin",
+                                 {"session_id": int(match[1]), "chars": "", "yield_time_ms": 1000})]
+                raise ValueError("OFF interrupt fixture could not find the pending follow-up process/cell")
+            return [{"type": "message", "id": f"msg-{len(self.requests)}", "role": "assistant",
+                     "content": [{"type": "output_text", "text": "Done." if done else "Waiting for the result."}]}]
+        if os.name == "nt":
+            def quoted(name):
+                return "'" + str(self.workspace / name).replace("'", "''") + "'"
+            command = "$ErrorActionPreference = 'Stop'; "
+            if kind == "sibling":
+                command += (f"[IO.File]::WriteAllText({quoted('scope.started')}, 'started'); "
+                            f"Start-Sleep -Seconds {self.slow_seconds}; "
+                            f"[IO.File]::WriteAllText({quoted('scope.completed')}, 'survived'); ")
+            else:
+                command += f"[IO.File]::WriteAllText({quoted('cancel.resumed')}, 'resumed'); "
+            command += f"[Console]::Out.Write('{marker}')"
+        elif kind == "sibling":
+            command = (f"printf started > scope.started; sleep {self.slow_seconds}; "
+                       "printf survived > scope.completed; printf ASYNC_SCOPE_DONE")
+        else:
+            command = "printf resumed > cancel.resumed; printf ASYNC_RESUMED"
+        args = {"cmd": command, "yield_time_ms": 30_000 if self.code else 1,
+                "max_output_tokens": 200, "login": False}
+        if os.name == "nt":
+            args["shell"] = windows_shell()
+        if self.code:
+            source = "// @exec: {\"yield_time_ms\": 1}\ntext(await tools.exec_command(" + json.dumps(args) + "));"
+            return [tool(kind, "exec", source, custom=True)]
+        return [tool(kind, "exec_command", args)]
+
     def response(self, request):
         number = len(self.requests)
-        if number == 1:
+        followup = self.interrupt_followup(request) if self.interrupt_probe else None
+        if followup is not None:
+            items = followup
+        elif number == 1:
             command = f"sleep {self.slow_seconds}; printf ASYNC_SLOW_DONE"
             fast_command = "printf ASYNC_FAST_DONE"
             if os.name == "nt":
@@ -160,13 +254,13 @@ class ScriptedProvider:
                 items = [{"type": "message", "id": f"msg-{number}", "role": "assistant",
                           "content": [{"type": "output_text", "text": "Done." if done else "Waiting for the remaining result."}]}]
             elif self.code and (match := re.search(r"Script running with cell ID ([^\s]+)", latest)):
-                items = [tool(f"poll-{number}", "wait", {"cell_id": match[1], "yield_time_ms": 1000 if os.name == "nt" else 100})]
+                items = [tool(f"poll-{number}", "wait", {"cell_id": match[1], "yield_time_ms": 1000 if os.name == "nt" or self.interrupt_probe else 100})]
             else:
                 process_ids = [match[1] for item in packets
                                if (match := re.search(r"Process running with session ID (\d+)", output_text(item)))]
                 if not process_ids:
                     raise ValueError("OFF fixture could not find pending native process/cell")
-                items = [tool(f"poll-{number}", "write_stdin", {"session_id": int(process_ids[0]), "chars": "", "yield_time_ms": 1000 if os.name == "nt" else 100})]
+                items = [tool(f"poll-{number}", "write_stdin", {"session_id": int(process_ids[0]), "chars": "", "yield_time_ms": 1000 if os.name == "nt" or self.interrupt_probe else 100})]
         self.tools.extend(item.get("name") for item in items if "name" in item)
         response_id = f"response-{number}"
         events = [{"type": "response.created", "response": {"id": response_id}}]
@@ -258,6 +352,10 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
     interrupted = False
     interrupted_command_started = False
     requests_at_interrupt = None
+    resumed_same_thread = False
+    sibling_turn_completed = False
+    sibling_command_started = False
+    sibling_pending_at_interrupt = False
     try:
         if os.name == "nt":
             await provision_windows_sandbox(binary, home, session.env, output)
@@ -271,7 +369,8 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
             "cwd": str(workspace), "sandbox": "workspace-write" if signal == "interrupt" else "read-only",
             "approvalPolicy": "never", "ephemeral": True,
             "config": {"features.bello_async_tools": enabled, "features.code_mode": code,
-                       "features.code_mode_only": code, "features.shell_zsh_fork": False}}
+                       "features.code_mode_only": code, "features.code_mode_interrupt": True,
+                       "features.shell_zsh_fork": False}}
         if os.name == "nt":
             permissions = windows_permission_params(workspace, home, binary)
             params["config"].update(permissions.pop("config"))
@@ -299,18 +398,37 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
                     while not (workspace / "cancel.started").is_file():
                         await asyncio.sleep(0.01)
                 interrupted_command_started = True
+                # An unrelated turn in this same native process must survive.
+                # Killing all command children cannot satisfy this proof.
+                sibling = await session.request("thread/start", params)
+                sibling_id = sibling["thread"]["id"]
+                if sibling_id == reply["thread"]["id"]:
+                    raise ValueError("Interrupt-scope fixture requires a distinct sibling thread")
+                sibling_started = await session.request("turn/start", {"threadId": sibling_id,
+                    "input": [{"type": "text", "text": SIBLING_TEXT, "text_elements": []}]})
+                async with asyncio.timeout(20):
+                    while not (workspace / "scope.started").is_file():
+                        await asyncio.sleep(0.01)
+                sibling_command_started = True
+                sibling_pending_at_interrupt = not (workspace / "scope.completed").exists()
                 await session.request("turn/interrupt", {"threadId": reply["thread"]["id"], "turnId": started["turn"]["id"]})
-                async with asyncio.timeout(5):
-                    while True:
-                        event = await session.notifications.get()
-                        if event.get("method") == "turn/completed":
-                            interrupted = event["params"]["turn"]["status"] == "interrupted"
-                            break
-                requests_at_interrupt = len(provider.requests)
+                await wait_for_turn(session, reply["thread"]["id"], started["turn"]["id"],
+                                    status="interrupted", timeout=5)
+                interrupted = True
+                requests_at_interrupt = sum(interrupt_request_kind(item) == "target" for item in provider.requests)
                 # Keep the session alive beyond the original command lifetime:
                 # cancellation must stop both model continuations and the OS
                 # command's delayed write, even while this session stays alive.
                 await asyncio.sleep(provider.slow_seconds + 0.2)
+                await wait_for_turn(session, sibling_id, sibling_started["turn"]["id"], status="completed")
+                sibling_turn_completed = True
+                resumed = await session.request("turn/start", {"threadId": reply["thread"]["id"],
+                    "input": [{"type": "text", "text": RESUME_TEXT, "text_elements": []}]})
+                resumed_id = resumed.get("turn", {}).get("id")
+                if not resumed_id or resumed_id == started["turn"]["id"]:
+                    raise ValueError("Interrupt fixture did not start a fresh turn in the same thread")
+                await wait_for_turn(session, reply["thread"]["id"], resumed_id, status="completed")
+                resumed_same_thread = True
         if signal != "interrupt":
             await session.complete(reply["thread"]["id"], timeout=60)
     except Exception as error:
@@ -328,6 +446,8 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
     expected_requests = 2 if code else 3
     prefix_stable = all(right.get("input", [])[:len(left.get("input", []))] == left.get("input", [])
                         for left, right in zip(provider.requests[1:], provider.requests[2:]))
+    if signal == "interrupt":
+        prefix_stable = interrupt_prefixes_stable(provider.requests)
     no_polls = not ({"wait", "write_stdin"} & set(provider.tools))
     instructions = provider.requests[0].get("instructions", "") if provider.requests else ""
     if not instructions and provider.requests:
@@ -340,10 +460,25 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
                                      for part in item.get("content", []))), "")
     native_instructions = isinstance(instructions, str) and len(instructions) > 1000
     passed = failure is None and not provider.errors and terminal and fast_delivered and native_instructions and unique_resolutions
+    resume_output_delivered = False
+    sibling_scope_preserved = False
     if signal == "interrupt":
+        resume_requests = [item for item in provider.requests if interrupt_request_kind(item) == "resume"]
+        sibling_requests = [item for item in provider.requests if interrupt_request_kind(item) == "sibling"]
+        resume_output_delivered = bool(resume_requests and delivered(resume_requests[-1], "ASYNC_RESUMED") == 1
+                                      and (workspace / "cancel.resumed").is_file()
+                                      and (workspace / "cancel.resumed").read_bytes() == b"resumed")
+        sibling_scope_preserved = bool(sibling_command_started and sibling_pending_at_interrupt and sibling_turn_completed
+                                       and sibling_requests and delivered(sibling_requests[-1], "ASYNC_SCOPE_DONE") == 1
+                                       and (workspace / "scope.completed").is_file()
+                                       and (workspace / "scope.completed").read_bytes() == b"survived")
         passed = (failure is None and not provider.errors and interrupted and interrupted_command_started
+                  and native_instructions and unique_resolutions and no_polls == enabled and prefix_stable
                   and not (workspace / "cancel.orphan").exists()
-                  and requests_at_interrupt in (1, 2) and len(provider.requests) == requests_at_interrupt)
+                  and not any(delivered(item, "ASYNC_SLOW_DONE") for item in provider.requests)
+                  and requests_at_interrupt is not None and 1 <= requests_at_interrupt <= (2 if enabled else 40)
+                  and sum(interrupt_request_kind(item) == "target" for item in provider.requests) == requests_at_interrupt
+                  and resumed_same_thread and resume_output_delivered and sibling_scope_preserved)
     elif enabled:
         passed &= no_polls and prefix_stable
         if signal == "steer":
@@ -367,6 +502,9 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
             "interrupted_command_started": interrupted_command_started,
             "cancelled_command_late_write_absent": not (workspace / "cancel.orphan").exists() if signal == "interrupt" else None,
             "provider_requests_at_interrupt": requests_at_interrupt,
+            "same_thread_resume_completed": resumed_same_thread if signal == "interrupt" else None,
+            "resume_output_delivered": resume_output_delivered if signal == "interrupt" else None,
+            "sibling_turn_survived_interrupt": sibling_scope_preserved if signal == "interrupt" else None,
             "request_offsets": [round(value - provider.times[0], 3) for value in provider.times]}
 
 
@@ -385,6 +523,9 @@ async def verify(binary, output, *, concurrency_repeats=1):
         result = await verify_case(binary, output / signal, enabled=True, code=False, signal=signal)
         results.append(result)
         print(json.dumps({"case": signal, **result}), flush=True)
+    result = await verify_case(binary, output / "code_interrupt", enabled=True, code=True, signal="interrupt")
+    results.append(result)
+    print(json.dumps({"case": "code_interrupt", **result}), flush=True)
     result = await verify_case(binary, output / "child_wait", enabled=True, code=False, child_wait=True)
     results.append(result)
     print(json.dumps({"case": "child_wait", **result}), flush=True)

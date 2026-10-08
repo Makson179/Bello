@@ -170,6 +170,45 @@ async def test_async_tools_native_scoped_and_persisted_through_resume(tmp_path):
         await backend.stop()
 
 
+@pytest.mark.parametrize("async_tools", [False, True])
+async def test_code_mode_interrupt_cannot_be_disabled_on_start_or_resume(tmp_path, async_tools):
+    backend, _, clients = make_backend(tmp_path)
+    requested = {"features.code_mode_interrupt": False,
+                 "features": {"code_mode_interrupt": False, "other": True}}
+    try:
+        await backend.request("initialize")
+        clients[0].async_tools_supported = True
+        await backend.request("thread/start", thread_params(
+            tmp_path, asyncTools=async_tools, config=requested))
+        await backend.request("thread/resume", {"threadId": "host-thread", "config": requested})
+        assert "features.code_mode_interrupt=true" in clients[0].options["command"]
+        for method, params in clients[0].calls:
+            if method in {"thread/start", "thread/resume"}:
+                assert params["config"]["features.code_mode_interrupt"] is True
+                assert params["config"]["features"]["code_mode_interrupt"] is True
+                assert params["config"]["features"]["other"] is True
+        assert requested["features.code_mode_interrupt"] is False
+        assert requested["features"]["code_mode_interrupt"] is False
+    finally:
+        await backend.stop()
+
+
+async def test_code_mode_interrupt_is_enforced_when_resuming_pre_fix_journal(tmp_path):
+    first, _, clients = make_backend(tmp_path)
+    await first.request("thread/start", thread_params(tmp_path, config={
+        "features.code_mode_interrupt": False}))
+    await first.stop()
+    second, _, new_clients = make_backend(tmp_path)
+    try:
+        await second.request("thread/resume", {"threadId": "host-thread"})
+        resumed = next(params for method, params in new_clients[0].calls if method == "thread/resume")
+        assert resumed["threadId"] == "native-thread-1"
+        assert resumed["config"]["features.code_mode_interrupt"] is True
+        assert not any(method == "thread/start" for method, _ in new_clients[0].calls)
+    finally:
+        await second.stop()
+
+
 async def test_async_off_overrides_untrusted_native_config_flag(tmp_path):
     backend, _, clients = make_backend(tmp_path)
     try:
@@ -980,8 +1019,10 @@ async def test_native_scope_is_preserved_across_resume_and_turn(tmp_path, monkey
             if method in {"thread/start", "thread/resume"}:
                 if mode == "danger-full-access":
                     assert native["sandbox"] == mode and "permissions" not in native
+                    assert "default_permissions" not in native["config"]
                 else:
                     assert "sandbox" not in native and native["permissions"] == "bello-native"
+                    assert native["config"]["default_permissions"] == "bello-native"
                     assert native["runtimeWorkspaceRoots"] == [str(tmp_path), *read_roots]
                     assert "sandbox_workspace_write.network_access" not in native["config"]
                     profile = native["config"]["permissions"]["bello-native"]
@@ -990,6 +1031,104 @@ async def test_native_scope_is_preserved_across_resume_and_turn(tmp_path, monkey
             if method == "turn/start":
                 assert ("sandboxPolicy" in native) == (mode == "danger-full-access")
                 assert "permissions" not in native
+    finally:
+        await backend.stop()
+
+
+@pytest.mark.parametrize("mode", ["read-only", "workspace-write"])
+@pytest.mark.parametrize("network", [False, True])
+@pytest.mark.parametrize("windows", [False, True])
+async def test_retained_native_config_keeps_host_permissions_after_start_and_restart(
+        tmp_path, monkeypatch, mode, network, windows):
+    monkeypatch.setattr(codex_backend, "_IS_WINDOWS", windows)
+    monkeypatch.setattr(codex_backend, "native_toolchain_read_paths", lambda cwd: ())
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    private = tmp_path / "controller"
+    private.mkdir(mode=0o700)
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir(mode=0o700)
+    monkeypatch.setattr(codex_backend, "_codex_home_from_environment", lambda env: source_home)
+    requested = {
+        "default_permissions": ":danger-full-access",
+        "default_permissions.invalid": "caller",
+        "permissions": {"bello-native": {"extends": ":workspace", "filesystem": {":root": "write"}},
+                        "caller": {"filesystem": {":root": "write"}}},
+        "permissions.bello-native": {"extends": ":workspace"},
+        "permissions.bello-native.filesystem": {":root": "write"},
+        "permissions.bello-native.network.enabled": not network,
+        "sandbox_mode": "danger-full-access",
+        "sandbox_mode.invalid": "caller",
+        "sandbox_workspace_write.network_access": not network,
+        "model_auto_compact_token_limit": 12345,
+        "shell_environment_policy": {"inherit": "core"},
+    }
+    params = thread_params(workspace, sandbox=mode, networkAccess=network,
+        runtimeWorkspaceRoots=[str(workspace / "read-dependency")],
+        windowsNativeRootRead=windows, config=requested)
+    original = deepcopy(params)
+
+    def check_scope(backend, native):
+        config = native["config"]
+        assert native["permissions"] == config["default_permissions"] == "bello-native"
+        assert "sandbox" not in native
+        assert set(config["permissions"]) == {"bello-native"}
+        assert not any(key.startswith(("permissions.", "default_permissions.", "sandbox_mode")) for key in config)
+        assert "sandbox_workspace_write.network_access" not in config
+        assert config["model_auto_compact_token_limit"] == 12345
+        assert config["shell_environment_policy"]["inherit"] == "core"
+        profile = config["permissions"][config["default_permissions"]]
+        expected = {":minimal": "read", ":workspace_roots": "read"}
+        if mode == "workspace-write":
+            scratch = backend._windows_scratch[str(workspace)] if windows else backend._tool_tmp
+            expected.update({str(workspace): "write", str(scratch): "write",
+                **{str(workspace / name): "read" for name in (".git", ".agents", ".codex")}})
+        expected.update({str(path): "read" for path in backend._runtime_read_paths})
+        if windows:
+            expected[str(workspace.anchor)] = "read"
+            expected.update({str(path): "deny" for path in (
+                private, backend.state_dir, backend.state_dir / "codex-home", source_home)})
+            assert config["windows"]["sandbox"] == "elevated"
+        assert profile == {"filesystem": expected, "network": {"enabled": network}}
+        assert native["runtimeWorkspaceRoots"] == [str(workspace), str(workspace / "read-dependency")]
+
+    first, _, clients = make_backend(private, private_read_roots=(private,))
+    (first.state_dir / "codex-home").mkdir(mode=0o700)
+    try:
+        await first.request("thread/start", params)
+        await first.request("thread/resume", {"threadId": "host-thread", "config": requested})
+        for method, native in clients[0].calls:
+            if method in {"thread/start", "thread/resume"}:
+                check_scope(first, native)
+        assert params == original
+    finally:
+        await first.stop()
+    second, _, resumed_clients = make_backend(private, private_read_roots=(private,))
+    try:
+        # The journal contains the caller's original config, so a new backend
+        # must reapply the host selector as well as its profile and deny rules.
+        await second.request("thread/resume", {"threadId": "host-thread"})
+        resumed = next(p for m, p in resumed_clients[0].calls if m == "thread/resume")
+        check_scope(second, resumed)
+        assert params == original
+        assert not any(m == "thread/start" for m, _ in resumed_clients[0].calls)
+    finally:
+        await second.stop()
+
+
+async def test_explicit_full_access_preserves_legacy_caller_permission_config(tmp_path):
+    backend, _, clients = make_backend(tmp_path)
+    requested = {"default_permissions": "caller", "permissions": {"caller": {"extends": ":workspace"}},
+                 "sandbox_mode": "danger-full-access", "sandbox_workspace_write.network_access": True}
+    original = deepcopy(requested)
+    try:
+        await backend.request("thread/start", thread_params(tmp_path, sandbox="danger-full-access", config=requested))
+        await backend.request("thread/resume", {"threadId": "host-thread"})
+        for method, native in clients[0].calls:
+            if method in {"thread/start", "thread/resume"}:
+                assert native["sandbox"] == "danger-full-access" and "permissions" not in native
+                assert {key: native["config"][key] for key in requested} == original
+        assert requested == original
     finally:
         await backend.stop()
 

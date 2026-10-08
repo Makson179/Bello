@@ -43,6 +43,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from supervisor.process_fence import create_subprocess_exec, process_group_id, signal_process_group
 from typing import Literal
 
 from supervisor.executables import resolve_trusted_executable
@@ -1075,7 +1076,7 @@ async def _signal_process_group(group: int, sig: signal.Signals) -> None:
     deadline = asyncio.get_running_loop().time() + _TERMINATE_GRACE_SECONDS
     while True:
         try:
-            os.killpg(group, sig)
+            signal_process_group(group, sig)
             return
         except ProcessLookupError:
             return
@@ -1096,7 +1097,7 @@ async def _signal_process_group(group: int, sig: signal.Signals) -> None:
 
 async def _terminate_process_tree(process: asyncio.subprocess.Process, *, descendants_only: bool = False) -> None:
     if os.name == "posix":
-        group = process.pid
+        group = process_group_id(process)
         if not descendants_only and process.returncode is None:
             await _signal_process_group(group, signal.SIGTERM)
             try:
@@ -1117,7 +1118,7 @@ async def _terminate_process_tree(process: asyncio.subprocess.Process, *, descen
     system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
     taskkill = system_root / "System32" / "taskkill.exe"
     try:
-        killer = await asyncio.create_subprocess_exec(
+        killer = await create_subprocess_exec(
             str(taskkill), "/PID", str(process.pid), "/T", "/F",
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
@@ -1143,7 +1144,7 @@ async def _finish_cleanup(cleanup: asyncio.Task[None]) -> None:
 
 async def _spawn_owned_process(*args, **kwargs) -> asyncio.subprocess.Process:
     """Retain process-group ownership if cancellation races subprocess startup."""
-    spawn = asyncio.create_task(asyncio.create_subprocess_exec(*args, **kwargs))
+    spawn = asyncio.create_task(create_subprocess_exec(*args, **kwargs))
     try:
         return await asyncio.shield(spawn)
     except asyncio.CancelledError:

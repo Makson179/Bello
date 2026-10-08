@@ -519,10 +519,23 @@ class NativeSession:
             cwd=self.home, env=self.env, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, limit=LIMIT)
         self.reader = asyncio.create_task(self.read())
-        self.stderr = asyncio.create_task(self.process.stderr.read(LIMIT))
+        self.stderr = asyncio.create_task(self.read_stderr())
         await self.request("initialize", {"clientInfo": {"name": "bello_selection_fixture", "version": "1.0"},
                                            "capabilities": {"experimentalApi": True}})
         await self.send({"method": "initialized", "params": {}})
+
+    async def read_stderr(self) -> bytes:
+        """Drain until EOF, retaining only a bounded diagnostic prefix.
+
+        A single read may return only the first available chunk. Keep consuming
+        even after the retention cap so a full stderr pipe cannot block Codex.
+        """
+        output = bytearray()
+        while chunk := await self.process.stderr.read(64 * 1024):
+            remaining = LIMIT - len(output)
+            if remaining > 0:
+                output.extend(chunk[:remaining])
+        return bytes(output)
 
     async def send(self, message):
         self.process.stdin.write((json.dumps(message) + "\n").encode())

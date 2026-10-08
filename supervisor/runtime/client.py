@@ -167,13 +167,14 @@ class RuntimeClient(AppServerClient):
             return self._engines[name]
         if name == "pi":
             from supervisor.runtime.install import worker_command
+            from supervisor.runtime.pi import pi_agent_directory
             command = worker_command()
             backend = WorkerTransport(command, Path(command[1]).parent, emit=lambda raw: self._emit(raw, engine="pi"),
                                       tool=self._call_tool, on_error=lambda error: self._engine_failed("pi", error))
             await backend.start()
             try:
                 await backend.request("initialize", {"stateDir": str(self.state_dir / "pi"),
-                    "agentDir": os.environ.get("BELLO_PI_AGENT_DIR", str(Path.home() / ".pi" / "agent"))})
+                    "agentDir": str(pi_agent_directory())})
             except BaseException:
                 await backend.stop()
                 raise
@@ -305,7 +306,14 @@ class RuntimeClient(AppServerClient):
                 raise AppServerError("engines must contain codex, pi and/or claude-code")
             engines = set(requested_engines) if requested_engines else {
                 parse_model_selection(model).engine for model in self.required_models} or {"codex"}
+            if params.get("refresh") is not None:
+                if type(params["refresh"]) is not bool:
+                    raise AppServerError("refresh must be a boolean")
+                if params["refresh"] and (method != "model/list" or engines != {"pi"}):
+                    raise AppServerError("explicit local catalog refresh requires only the pi engine")
             responses = []
+            freshness = {}
+            catalog_errors = {}
             unavailable = {}
             for name in sorted(engines):
                 try:
@@ -317,6 +325,10 @@ class RuntimeClient(AppServerClient):
                         response["data"] = [item for item in response.get("data", [])
                             if item.get("provider") != "openai-codex"
                             and not str(item.get("qualifiedId", item.get("id", ""))).startswith("openai-codex/")]
+                        if isinstance(response.get("catalogFreshness"), dict):
+                            freshness[name] = response["catalogFreshness"]
+                        if response.get("catalogError"):
+                            catalog_errors[name] = "Pi local catalog has configuration errors; check the selected agent directory."
                     responses.append(response)
                 except Exception as exc:
                     if not optional:
@@ -334,7 +346,8 @@ class RuntimeClient(AppServerClient):
                 for item in list(data):
                     if isinstance(item, dict) and item.get("qualifiedId"):
                         data.append({**item, "id": item["qualifiedId"]})
-                return {"data": data, **reported}
+                return {"data": data, **({"catalogFreshness": freshness} if freshness else {}),
+                        **({"catalogErrors": catalog_errors} if catalog_errors else {}), **reported}
             return {"accounts": responses, **reported}
         if method == "account/rateLimits/read":
             if "codex" in self._engines or any(parse_model_selection(model).engine == "codex" for model in self.required_models):

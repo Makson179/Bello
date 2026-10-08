@@ -126,17 +126,18 @@ def _pytest_command(windows_python: Path | None = None) -> str:
     if windows_python is not None:
         return subprocess.list2cmdline([
             str(windows_python), "-I", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+            "-c", os.devnull, "--rootdir=.", "--confcutdir=.",
             "test_solution.py",
         ])
     executable = shutil.which("pytest")
     if executable is None:
         pytest.skip("the offline pipeline fixture requires pytest on the host")
     # The disposable coder workspace intentionally contains a denied
-    # .supervisor control link. Select the task test explicitly so pytest does
-    # not try to recurse into that private control surface during collection.
+    # .supervisor control link. Select the task test explicitly and suppress
+    # ancestor config discovery: the outer repository is outside its sandbox.
     return (
         f"{shlex_quote(str(Path(executable).resolve()))} "
-        "-q -p no:cacheprovider test_solution.py"
+        f"-q -p no:cacheprovider -c {shlex_quote(os.devnull)} --rootdir=. --confcutdir=. test_solution.py"
     )
 
 
@@ -805,7 +806,8 @@ async def test_real_pi_offline_coder_completion_adversary_pipeline(
             lambda _policy: sandbox._Toolchain(readable_roots=(windows_python.parent,)),
         )
     node = _supported_node()
-    worker_dir = Path(__file__).resolve().parents[1] / "supervisor" / "pi_worker"
+    worker_dir = Path(os.environ.get("BELLO_TEST_PI_WORKER_DIR",
+                                   Path(__file__).resolve().parents[1] / "supervisor" / "pi_worker"))
     worker = worker_dir / "worker.mjs"
     if not (worker_dir / "node_modules" / "@earendil-works" / "pi-coding-agent").is_dir():
         message = "the pinned Pi worker dependencies are not installed"
@@ -950,7 +952,7 @@ async def test_real_pi_offline_coder_completion_adversary_pipeline(
                     "allowModelNetwork": False,
                 },
             )
-            assert initialized["serverInfo"]["piSdkVersion"] == "0.85.1"
+            assert initialized["serverInfo"]["piSdkVersion"] == "1.0.4"
             client._engines["pi"] = transport
             inserted = True
 

@@ -22,6 +22,10 @@ Run `scripts/inspect_models.py` to obtain Bello's current catalog. It reports qu
 
 The same model name through `claude-code`, `anthropic`, and `openrouter` represents different execution/billing routes. An OpenAI subscription route is `openai-codex`, not `openai`. The host used to invoke this skill does not choose the route.
 
+As checked on October 6, 2026, [official Codex guidance](https://developers.openai.com/codex/models) recommends GPT-6.1 Sol for complex work when available and GPT-6 Luna for focused work. GPT-6 Astra remains a candidate for the hardest work. Check these candidates against the actual catalog. The pinned native client inspected locally advertises Astra and the GPT-5.6 variants, but does not yet advertise GPT-6.1 Sol or GPT-6 Luna in its unauthenticated catalog. Account-specific discovery remains authoritative. Preserve available GPT-5.6 choices; never change to an API connection to obtain a newer name.
+
+[GPT-5.5 retires from Codex with ChatGPT sign-in on October 14, 2026](https://developers.openai.com/codex/models#gpt-55-retirement). That announcement does not retire the OpenAI API model. Recommend an explicitly available replacement for the same billing route; do not rewrite a saved selection automatically.
+
 Never infer supported effort values from a family name or from another provider's labels. Reconcile the documentation with what Bello actually exposes. If a desired setting is absent, choose another supported profile or surface the incompatibility, rather than silently translating `ultra` to `max`. Do not assume any effort label automatically enables Bello's separately configured sub-agents.
 
 ## Compare the three objectives

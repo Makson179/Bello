@@ -24,6 +24,16 @@ route. They do not become API calls. Bello never changes the provider or billing
 route to work around a missing login or unavailable model. Provider-specific
 limits and billing rules still apply.
 
+Pi 1.0.4 also offers ChatGPT OAuth under its `openai` provider. Bello deliberately
+does not use that method for `openai/*`: these selections retain API-key billing.
+A stored OpenAI OAuth credential is reported as a route conflict, even if an API
+key is also present in the environment. Bello does not renew, overwrite, or fall
+back from that credential. The guard applies before session creation and on each
+SDK credential read, including requests from an existing session. To use ChatGPT
+subscription access, select native `openai-codex/*`; to use Pi OpenAI API access,
+explicitly configure that provider with an API key. Other Pi providers retain
+their existing authentication methods.
+
 Codex retains its own base instructions, native tools and conversation loop.
 Bello forwards native approvals and adapts thread/turn identities for its role
 controller. Configured cross-provider subagents use Bello's delegation tools;
@@ -87,17 +97,25 @@ bello runtime install
 bello doctor
 ```
 
-The Claude extra includes the pinned official Agent SDK and its official CLI.
-It can be omitted when no role uses `claude-code`. On native Windows the pinned
-`claude-agent-sdk==0.2.161` has no wheel with a bundled CLI; `bello runtime install
-claude-code` (also run by `bello update` and before a Claude run) downloads the
-identical official Claude Code 2.1.284 build from `downloads.claude.ai`, checks
-its pinned SHA-256 and keeps it in Bello's private runtime cache. See
+The Claude extra pins the official Agent SDK. It can be omitted when no role
+uses `claude-code`. This source tree pairs `claude-agent-sdk==0.2.164` (whose
+bundled CLI is 2.1.292) with the official Claude Code **2.1.293** release needed
+for Haiku 5.5. `bello runtime install claude-code` (also run by `bello update`
+and before a Claude run) downloads that exact build from `downloads.claude.ai`
+on supported macOS, Linux (glibc) and Windows platforms, checks the platform's pinned
+size and SHA-256, and keeps it in Bello's private runtime cache. It takes
+precedence over the SDK's older bundle; both the installed SDK version and its
+declared bundled-CLI version must match the explicit pairing. No arbitrary
+CLI path or automatic fallback is accepted. See
 [Windows](windows.md#claude-code-subscription-on-native-windows). Pi's exact dependency versions
 are installed from the bundled npm lockfile; the Node dependency tree is not
 copied into the Python wheel. `BELLO_NODE` can select an existing compatible
 Node executable. `BELLO_RUNTIME_DIR` can select the private Pi installation
-cache; `BELLO_PI_AGENT_DIR` selects the user's Pi authentication/config directory.
+cache. The worker pins Pi SDK 1.0.4 and verifies the installed version before use.
+Login, catalog discovery and execution resolve the Pi authentication/config
+directory in this order: nonempty `BELLO_PI_AGENT_DIR`, nonempty
+`PI_CODING_AGENT_DIR`, then `~/.pi/agent`. Relative overrides resolve from the
+launcher's working directory; `~` expands to the user's home directory.
 
 Linux restricted execution requires `bwrap` (the `bubblewrap` package) and
 working unprivileged user namespaces. macOS uses the operating system's Seatbelt
@@ -189,6 +207,33 @@ These login commands open each engine's normal sign-in flow. Bello does not
 extract a token from another installed coding agent. Pi API providers can be
 configured with their supported Pi login method or provider credentials; inspect
 the configured catalog with `bello runtime models --engine pi`.
+
+Pi discovery reads local metadata without refreshing OAuth credentials,
+executing credential commands, writing model caches or making provider
+requests. To reread local auth, model configuration and cached catalog metadata
+explicitly, use `bello runtime models --engine pi --refresh`. Refresh is rejected
+while the same worker is starting or running a session/turn. Output includes
+`catalogFreshness.pi` with a load timestamp, SDK version, `explicit-local`
+refresh policy and `remoteFreshness: unknown`. This timestamp describes a local
+read, not a successful login, quota check or remote provider refresh. Model
+execution and explicit login retain their normal authentication behavior.
+Refresh publishes a validated replacement atomically. A failed refresh keeps
+the previous catalog visible and blocks new execution until refresh succeeds.
+Session creation checks that model configuration still matches the catalog;
+changed endpoints or capabilities require refresh, and an existing session
+whose model metadata changed requires a fresh session.
+
+New configurations default the four primary roles to GPT-6 Astra at `xhigh`
+through the existing Codex subscription route. Saved selections, including
+GPT-5.6 variants, remain unchanged; omitted model fields in older saved files
+retain the historical GPT-5.6 Sol default. Children and command triage retain
+their existing defaults. A newer model is selectable only through its actual
+discovered provider identity and capabilities.
+
+As checked October 6, 2026, [OpenAI announces GPT-5.5 retirement from Codex with
+ChatGPT sign-in on October 14, 2026](https://developers.openai.com/codex/models#gpt-55-retirement).
+Bello warns on that subscription selection without replacing it. The announced
+retirement does not apply to the OpenAI API model.
 
 The Claude subscription route rejects environment variables that redirect it to
 an API key, alternative endpoint or cloud provider. It does not silently clear

@@ -296,9 +296,9 @@ def _ensure_claude_dependency() -> None:
         if not requirement.specifier.contains(metadata.version("claude-agent-sdk"), prereleases=True):
             raise UpdateCheckError("Claude SDK installation does not match this Bello release")
     # The same official-CLI readiness contract as doctor and backend startup.
-    # Where the pinned SDK has no wheel with a bundled CLI (native Windows),
-    # this prepares Bello's verified pinned download. Never log in or make a
-    # provider request here.
+    # This prepares Bello's explicit pinned SDK/CLI pair (or a same-build
+    # fallback for a bundle-less SDK). Never log in or make a provider request
+    # here.
     from supervisor.runtime.claude import ClaudeBackend
     try:
         ClaudeBackend._official_cli(prepare=True)

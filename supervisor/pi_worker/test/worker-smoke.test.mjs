@@ -39,7 +39,7 @@ test("the real pinned SDK worker initializes and reads its offline model/account
   const frames = running.stdout.trim().split("\n").map((line) => JSON.parse(line));
   assert.deepEqual(frames.map((frame) => frame.id).sort(), [1, 2, 3, 4, 5]);
   const initialized = frames.find((frame) => frame.id === 1);
-  assert.equal(initialized.result.serverInfo.piSdkVersion, "0.85.1");
+  assert.equal(initialized.result.serverInfo.piSdkVersion, "1.0.4");
   const listed = frames.find((frame) => frame.id === 2).result;
   assert.deepEqual(listed.data, []);
   assert.equal(Object.hasOwn(listed, "catalog"), false);

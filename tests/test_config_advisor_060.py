@@ -119,6 +119,20 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(run.call_count, 1)
         self.assertNotIn("private", str(error.exception))
 
+    def test_codex_discovery_failure_survives_normalization_without_private_details(self):
+        for unavailable in (
+            {"codex": "private login error", "pi": "private SDK error", "unknown": "private"},
+            ["codex", "pi", "unknown"],
+        ):
+            with self.subTest(unavailable=unavailable):
+                payload = {"data": [], "unavailableEngines": unavailable}
+                with mock.patch.object(MODELS.subprocess, "run", return_value=subprocess.CompletedProcess(
+                        [], 0, json.dumps(payload), "")):
+                    result = MODELS.load_catalog(timeout_seconds=5)
+                self.assertEqual(result["unavailableEngines"], ["codex", "pi"])
+                self.assertEqual(result["models"], [])
+                self.assertNotIn("private", json.dumps(result))
+
 
 class AdvisorValidationTests(unittest.TestCase):
     def test_old_complete_recommendations_keep_false_opt_in_defaults(self):
@@ -317,6 +331,37 @@ class AdvisorValidationTests(unittest.TestCase):
         candidate = config()
         candidate["adversary_intelligence"] = "xhigh"
         self.assertTrue(any("not advertised" in error for error in validate(candidate)))
+
+    def test_default_effort_matches_core_engine_semantics_without_rewriting(self):
+        from supervisor.config_validation import catalog_from_model_list, validate_project_config
+        from supervisor.project_config import _config_from_payload
+
+        for identity, default_effort, expected_valid in (
+            (SOL, None, True),
+            (CLAUDE, None, True),
+            (QWEN, None, False),
+            (QWEN, "off", True),
+        ):
+            with self.subTest(identity=identity, default_effort=default_effort):
+                candidate = config()
+                candidate["coder_mod"] = identity
+                candidate["coder_intelligence"] = "default"
+                original = copy.deepcopy(candidate)
+                catalog = copy.deepcopy(CATALOG)
+                selected = next(row for row in catalog["models"] if row["qualifiedId"] == identity)
+                selected["defaultEffort"] = default_effort
+                errors = validate(candidate, catalog=catalog)
+                core = _config_from_payload(candidate, path=Path("synthetic.json"))
+                core_catalog = catalog_from_model_list({"data": catalog["models"]})
+                self.assertEqual(not errors, expected_valid)
+                self.assertEqual(not validate_project_config(core, core_catalog).errors, expected_valid)
+                self.assertEqual(candidate, original)
+
+    def test_default_effort_does_not_make_a_missing_model_available(self):
+        candidate = config()
+        candidate["coder_mod"] = "claude-code/not-advertised"
+        candidate["coder_intelligence"] = "default"
+        self.assertTrue(any("not available" in error for error in validate(candidate)))
 
     def test_disabled_profile_needs_syntax_but_not_auth(self):
         candidate = config()

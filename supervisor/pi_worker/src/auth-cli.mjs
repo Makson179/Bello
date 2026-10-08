@@ -1,10 +1,11 @@
 import { mkdirSync } from "node:fs";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
 
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { piAgentDirectory } from "./agent-directory.mjs";
+import { OPENAI_API_ROUTE_ERROR } from "./billing-route.mjs";
 
 const PROVIDER_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
 const AUTH_TYPES = new Set(["oauth", "api_key"]);
@@ -97,12 +98,13 @@ export function createTerminalInteraction({ input, output, signal }) {
 
 export function availableAuthTypes(provider) {
   const types = [];
-  if (provider.auth?.oauth?.login) types.push("oauth");
+  if (provider.id !== "openai" && provider.auth?.oauth?.login) types.push("oauth");
   if (provider.auth?.apiKey?.login) types.push("api_key");
   return types;
 }
 
 export async function chooseAuthType(provider, requestedType, interaction) {
+  if (provider.id === "openai" && requestedType === "oauth") throw new Error(OPENAI_API_ROUTE_ERROR);
   const available = availableAuthTypes(provider);
   if (available.length === 0) throw new Error(`${provider.name} has no interactive login method`);
   if (requestedType !== undefined) {
@@ -150,8 +152,7 @@ export async function authMain({
     output.write("Usage: node auth.mjs PROVIDER [--method oauth|api_key]\n");
     return 0;
   }
-  const configuredDir = env.BELLO_PI_AGENT_DIR || env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
-  const agentDir = resolve(configuredDir);
+  const agentDir = piAgentDirectory({ env });
   mkdirSync(agentDir, { recursive: true, mode: 0o700 });
   const controller = new AbortController();
   const onInterrupt = () => controller.abort(new Error("Authentication cancelled"));

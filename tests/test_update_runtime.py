@@ -10,6 +10,7 @@ import pytest
 from supervisor import update_check
 from supervisor.runtime import install
 from supervisor.runtime.claude import ClaudeBackend
+from supervisor.runtime.claude_cli import OfficialCli
 
 
 def _info():
@@ -127,13 +128,25 @@ def _claude_metadata(monkeypatch, version):
     monkeypatch.setattr(update_check.metadata, "version", installed)
     monkeypatch.setattr(update_check, "_running_inside_venv", lambda: True)
     monkeypatch.setattr(update_check, "detect_install_mode", lambda: "venv")
-    monkeypatch.setattr(ClaudeBackend, "_bundled_cli_path", lambda: Path("bundled-claude"))
+    readiness = []
+
+    def official_cli(*, prepare=False):
+        # This unit test deliberately supplies a future release's package
+        # metadata. Its official-CLI contract is a separate dependency, not
+        # today's production SDK/CLI pair or a bundle-only shortcut.
+        assert prepare is True
+        assert version[0] == "0.9.123"
+        readiness.append(prepare)
+        return OfficialCli(Path("verified-claude"), "managed-download", "fixture-future-cli")
+
+    monkeypatch.setattr(ClaudeBackend, "_official_cli", staticmethod(official_cli))
+    return readiness
 
 
 @pytest.mark.parametrize("previous", [None, "0.2.152"])
 def test_claude_sync_reads_new_extra_pin_not_old_constant(monkeypatch, previous):
     version = [previous]
-    _claude_metadata(monkeypatch, version)
+    readiness = _claude_metadata(monkeypatch, version)
     commands = []
     def run(command, **kwargs):
         commands.append(command)
@@ -143,12 +156,14 @@ def test_claude_sync_reads_new_extra_pin_not_old_constant(monkeypatch, previous)
     assert len(commands) == 1
     assert commands[0][-1] == "claude-agent-sdk==0.9.123"
     assert "--include-injected" not in commands[0]
+    assert readiness == [True]
 
 
 def test_matching_claude_is_reused_without_install(monkeypatch):
-    _claude_metadata(monkeypatch, ["0.9.123"])
+    readiness = _claude_metadata(monkeypatch, ["0.9.123"])
     monkeypatch.setattr(update_check, "_run_package_command", lambda *args, **kwargs: pytest.fail("already compatible"))
     update_check._ensure_claude_dependency()
+    assert readiness == [True]
 
 
 def test_claude_sync_rejects_installer_success_without_correct_version(monkeypatch):
