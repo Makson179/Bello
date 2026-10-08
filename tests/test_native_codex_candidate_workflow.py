@@ -93,7 +93,7 @@ def test_build_recipe_is_exact_candidate_only_and_all_expensive_work_cache_gated
         command = _field(step, "run") or ""
         action = _action(step)
         if (step in upstream or "rust-toolchain" in action or "setup-msvc-env" in action
-                or any(marker in command for marker in ("cargo build", " prepare ", " verify-v8 ",
+                or any(marker in command for marker in ("cargo build", "cargo test", " prepare ", " verify-v8 ",
                     " snapshot-build ", "RUSTY_V8_ARCHIVE", "apt-get install", "CARGO_TARGET_DIR="))):
             assert _miss_required(step), step
         assert "verify_native_codex_candidate.py" not in command
@@ -109,7 +109,7 @@ def test_build_recipe_is_exact_candidate_only_and_all_expensive_work_cache_gated
 
 
 @pytest.mark.parametrize("platform", ["linux", "windows"])
-def test_all_caches_are_exact_separate_and_every_candidate_is_verified_before_save(workflow, platform):
+def test_ready_cache_is_exact_cargo_fallback_is_target_scoped_and_candidates_verified(workflow, platform):
     steps = _steps(_jobs(workflow)[f"{platform}-build"])
     restores = [step for step in steps if _action(step) == "actions/cache/restore"]
     assert len(restores) == 2
@@ -117,7 +117,11 @@ def test_all_caches_are_exact_separate_and_every_candidate_is_verified_before_sa
         settings = _block(step, "with")
         kind = "ready" if _field(step, "id") == "candidate" else "cargo"
         assert _field(settings, "key") == f"native-codex-candidate-0161-{platform}-x64-{kind}-v1-${{{{ steps.identity.outputs.key }}}}"
-        assert _field(settings, "restore-keys") is None
+        if kind == "ready":
+            assert _field(settings, "restore-keys") is None
+        else:
+            assert _field(settings, "restore-keys") == f"native-codex-candidate-0161-{platform}-x64-cargo-v1-"
+            assert "native-candidate" not in _field(settings, "path")
     commands = [_field(step, "run") or "" for step in steps]
     verify = f"python scripts/build_native_codex_candidate.py verify-build --target {platform}-x64 --candidate native-candidate"
     checks = [(index, step) for index, step in enumerate(steps) if _field(step, "run") == verify]
@@ -137,6 +141,27 @@ def test_all_caches_are_exact_separate_and_every_candidate_is_verified_before_sa
     identity = next(step for step in steps if _field(step, "id") == "identity")
     assert f"build-key --target {platform}-x64" in _field(identity, "run")
     assert "github.sha" in _field(identity, "run") and "github.run_attempt" in _field(identity, "run")
+
+
+@pytest.mark.parametrize("platform,target", [
+    ("linux", "x86_64-unknown-linux-gnu"),
+    ("windows", "x86_64-pc-windows-msvc"),
+])
+def test_real_path_uri_rust_tests_gate_every_new_candidate_snapshot(workflow, platform, target):
+    steps = _steps(_jobs(workflow)[f"{platform}-build"])
+    commands = [_field(step, "run") or "" for step in steps]
+    indices = [i for i, command in enumerate(commands) if "cargo test" in command]
+    assert len(indices) == 1
+    test_index = indices[0]
+    test = steps[test_index]
+    assert commands[test_index] == f"cargo test --locked --release --target {target} -p codex-utils-path-uri --lib"
+    assert _miss_required(test)
+    assert _field(test, "working-directory") == "native-source/codex-rs"
+    assert _field(test, "continue-on-error") is None
+    snapshot = next(i for i, command in enumerate(commands) if " snapshot-build " in command)
+    prepare = next(i for i, command in enumerate(commands) if " prepare " in command)
+    assert prepare < test_index < snapshot
+    assert all(test_index < i for i, step in enumerate(steps) if _action(step) == "actions/cache/save")
 
 
 def test_linux_bwrap_is_final_before_codex_compiles(workflow):

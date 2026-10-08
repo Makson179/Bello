@@ -158,12 +158,28 @@ def test_identity_platform_recipe_and_legacy_pins_are_separate(recipe):
     assert legacy.UPSTREAM_REVISION == "be2951ea34f0d295ed0becf97079f92fa5f6950e"
 
 
+@pytest.mark.parametrize("target", build.TARGETS)
 @pytest.mark.parametrize("name", (*prepare.INPUTS, *build.RECIPE_INPUTS))
-def test_every_named_recipe_input_invalidates_build_key(recipe, name):
-    before = build.identity("linux-x64", recipe)
+def test_every_named_recipe_input_invalidates_build_key(recipe, name, target):
+    before = build.identity(target, recipe)
     path = recipe / name
     path.write_text(path.read_text() + "changed\n")
-    assert build.identity("linux-x64", recipe)["build_key"] != before["build_key"]
+    assert build.identity(target, recipe)["build_key"] != before["build_key"]
+
+
+def test_candidate_retains_scoped_drive_root_conversion_and_native_regressions():
+    patch = (prepare.ROOT / prepare.PATCH).read_text(encoding="utf-8")
+    assert "+        let path = file_url_for_native_conversion(&self.0)" in patch
+    assert "+fn file_url_for_native_conversion(url: &Url) -> Cow<'_, Url>" in patch
+    assert "+    let is_drive_root = url.host_str().is_none()" in patch
+    assert "+            .is_some_and(is_windows_drive_uri_segment);" in patch
+    for test in (
+        "native_conversion_url_restores_only_bare_windows_drive_roots",
+        "windows_config_and_parent_roots_keep_native_conversion_separator",
+        "host_windows_drive_root_config_and_parent_round_trip",
+        "host_windows_drive_root_repair_preserves_invalid_path_refusals",
+    ):
+        assert f"+fn {test}()" in patch
 
 
 def test_transport_crlf_does_not_change_recipe_key(recipe):

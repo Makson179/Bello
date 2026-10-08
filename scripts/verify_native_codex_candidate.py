@@ -109,7 +109,10 @@ def require_platform(target: str) -> None:
 @contextmanager
 def isolated_environment(output: Path):
     original = dict(os.environ)
-    allowed = {"PATH", "SYSTEMROOT", "WINDIR", "PATHEXT", "COMSPEC", "USERNAME"}
+    allowed = {"PATH", "SYSTEMROOT", "WINDIR", "PATHEXT", "COMSPEC", "USERNAME",
+               "PROCESSOR_ARCHITECTURE", "PROCESSOR_ARCHITEW6432"}
+    # Fresh Python 3.11 workers on Windows determine platform.machine() from
+    # these nonsecret OS architecture fields; newer Python can also use WMI.
     clean = {key: value for key, value in original.items() if key.upper() in allowed}
     home, temporary = output / "empty-home", output / "tmp"
     home.mkdir(mode=0o700)
@@ -257,10 +260,11 @@ async def qualify(candidate: Path, target: str, output: Path, *, modernbert: boo
     output.mkdir(parents=True, exist_ok=False)
     report = {"schema": SCHEMA, "passed": False, "published": False, "target": target,
         "paid_model_calls": 0, "external_provider_requests_forwarded": 0, "modernbert_requested": modernbert,
-        "platform": platform.platform(), "python": platform.python_version(), "proofs": {}, "phase": "build_before",
+        "proofs": {}, "phase": "worker_metadata",
         "scope": "proof-worker-only; successful guardian finalization is also required"}
     before = None
     try:
+        report.update(platform=platform.platform(), python=platform.python_version(), phase="build_before")
         before = verify_build(target, candidate)
         if before.get("proof_status") != "not-run":
             raise ValueError("Build receipt must remain separate from qualification")
@@ -313,6 +317,44 @@ async def qualify(candidate: Path, target: str, output: Path, *, modernbert: boo
             report["passed"] = report["passed"] and unchanged
         write_report(output / "qualification.json", report)
     return report
+
+
+def _proof_worker(candidate: Path, target: str, output: Path, *, modernbert: bool) -> dict:
+    """Keep early startup failures bounded and durable, without weakening proof."""
+    phase = "worker_authentication"
+    try:
+        from supervisor.process_fence import configure_worker, is_guarded_worker
+        configure_worker()
+        if not is_guarded_worker():
+            raise RuntimeError("Qualification worker requires an authenticated production guardian")
+        phase = "worker_preflight"
+        return asyncio.run(qualify(candidate, target, output, modernbert=modernbert))
+    except Exception as exc:
+        report = {"schema": SCHEMA, "passed": False, "published": False, "target": target,
+                  "paid_model_calls": 0, "proofs": {}, "phase": phase,
+                  "error_type": type(exc).__name__, "failure_code": phase + "_failed"}
+        try:
+            try:
+                output.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                return report
+            destination, source = output.resolve(), candidate.resolve()
+            if (destination == source or destination.is_relative_to(source)
+                    or source.is_relative_to(destination)):
+                return report
+            # Startup diagnostics may create only a fresh output directory.
+            # Never replace an earlier proof, follow an existing output alias,
+            # or write into the candidate when preflight rejected its layout.
+            destination.mkdir(parents=True, exist_ok=False)
+            with (destination / "qualification.json").open("x", encoding="utf-8") as stream:
+                stream.write(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        except (OSError, ValueError):
+            # Failure to persist diagnostics is still a failed worker. The
+            # parent requires both a passing report and proven tree cleanup.
+            pass
+        return report
 
 
 def guarded_qualification(candidate: Path, target: str, output: Path, *, modernbert: bool) -> dict:
@@ -394,11 +436,7 @@ def main() -> int:
     parser.add_argument("--proof-worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.proof_worker:
-        from supervisor.process_fence import configure_worker, is_guarded_worker
-        configure_worker()
-        if not is_guarded_worker():
-            raise RuntimeError("Qualification worker requires an authenticated production guardian")
-        report = asyncio.run(qualify(args.candidate, args.target, args.output_dir, modernbert=args.modernbert))
+        report = _proof_worker(args.candidate, args.target, args.output_dir, modernbert=args.modernbert)
     else:
         report = guarded_qualification(args.candidate, args.target, args.output_dir, modernbert=args.modernbert)
     print(json.dumps({"passed": report["passed"], "phase": report["phase"], "proofs": list(report["proofs"])}), flush=True)

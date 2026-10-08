@@ -4,6 +4,8 @@ from copy import deepcopy
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -174,6 +176,98 @@ def test_platform_mismatch_never_starts_candidate(monkeypatch):
     monkeypatch.setattr(proof.platform, "system", lambda: "Darwin")
     with pytest.raises(ValueError, match="native x64"):
         proof.require_platform("linux-x64")
+
+
+@pytest.mark.parametrize("architecture,native_architecture,accepted", [
+    ("AMD64", "", True), ("x86", "AMD64", True),
+    ("ARM64", "", False), ("x86", "", False), ("", "", False),
+])
+def test_isolated_fresh_worker_retains_python311_windows_architecture(
+    tmp_path, monkeypatch, architecture, native_architecture, accepted,
+):
+    monkeypatch.setenv("PROCESSOR_ARCHITECTURE", architecture)
+    monkeypatch.setenv("PROCESSOR_ARCHITEW6432", native_architecture)
+    monkeypatch.setenv("OPENAI_API_KEY", "fixture-secret-never-forward")
+    # CPython 3.11's Windows machine detector uses only these two OS fields.
+    # A fresh interpreter avoids platform.uname's parent-process cache masking
+    # the exact regression that stopped the native Windows 2022 proof worker.
+    code = """
+import json, os
+from scripts import verify_native_codex_candidate as proof
+proof.platform.system = lambda: 'Windows'
+proof.platform.machine = lambda: (os.environ.get('PROCESSOR_ARCHITEW6432', '')
+                                 or os.environ.get('PROCESSOR_ARCHITECTURE', ''))
+try:
+    proof.require_platform('windows-x64')
+    accepted = True
+except ValueError:
+    accepted = False
+print(json.dumps({'accepted': accepted, 'credential_absent': 'OPENAI_API_KEY' not in os.environ}))
+"""
+    with proof.isolated_environment(tmp_path):
+        child = subprocess.run([sys.executable, "-B", "-c", code], cwd=proof.ROOT,
+                               capture_output=True, text=True, timeout=20)
+    assert child.returncode == 0
+    assert json.loads(child.stdout) == {"accepted": accepted, "credential_absent": True}
+
+
+@pytest.mark.parametrize("failure", ["authentication", "platform", "candidate", "metadata"])
+def test_worker_startup_failure_writes_only_bounded_safe_diagnostic(
+    tmp_path, monkeypatch, failure,
+):
+    from supervisor import process_fence
+    candidate, output = tmp_path / "candidate", tmp_path / "proof"
+    if failure != "candidate":
+        candidate.mkdir()
+    def fail(*args, **kwargs):
+        raise ValueError("fixture-secret and arbitrary command must not appear")
+    monkeypatch.setattr(process_fence, "configure_worker", fail if failure == "authentication" else lambda: None)
+    monkeypatch.setattr(process_fence, "is_guarded_worker", lambda: True)
+    monkeypatch.setattr(proof, "require_platform", fail if failure == "platform" else lambda _: None)
+    if failure == "metadata":
+        monkeypatch.setattr(proof.platform, "platform", fail)
+    report = proof._proof_worker(candidate, "windows-x64", output, modernbert=False)
+    assert report["passed"] is False and report["proofs"] == {}
+    expected = {"authentication": "worker_authentication", "platform": "worker_preflight",
+                "candidate": "worker_preflight", "metadata": "worker_metadata"}[failure]
+    assert report["phase"] == expected
+    assert report["error_type"] == ("FileNotFoundError" if failure == "candidate" else "ValueError")
+    assert report["failure_code"] == expected + "_failed"
+    assert proof.read_report(output / "qualification.json") == report
+    assert "fixture-secret" not in json.dumps(report)
+    assert "arbitrary command" not in json.dumps(report)
+
+
+@pytest.mark.parametrize("existing", ["report", "candidate-overlap"])
+def test_worker_startup_diagnostics_never_overwrite_existing_or_candidate_files(
+    tmp_path, monkeypatch, existing,
+):
+    from supervisor import process_fence
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    output = candidate if existing == "candidate-overlap" else tmp_path / "proof"
+    output.mkdir(exist_ok=True)
+    path = output / "qualification.json"
+    path.write_bytes(b"preserved exact previous bytes")
+    monkeypatch.setattr(process_fence, "configure_worker", lambda: None)
+    monkeypatch.setattr(process_fence, "is_guarded_worker", lambda: False)
+    report = proof._proof_worker(candidate, "windows-x64", output, modernbert=False)
+    assert not report["passed"]
+    assert path.read_bytes() == b"preserved exact previous bytes"
+
+
+def test_worker_startup_diagnostics_reject_dangling_output_link(tmp_path, monkeypatch):
+    from supervisor import process_fence
+    candidate, outside, output = tmp_path / "candidate", tmp_path / "outside", tmp_path / "proof"
+    candidate.mkdir()
+    try:
+        output.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlink privilege unavailable")
+    monkeypatch.setattr(process_fence, "configure_worker", lambda: None)
+    monkeypatch.setattr(process_fence, "is_guarded_worker", lambda: False)
+    report = proof._proof_worker(candidate, "windows-x64", output, modernbert=False)
+    assert not report["passed"] and not outside.exists()
 
 
 def test_ambiguous_json_report_is_rejected(tmp_path):

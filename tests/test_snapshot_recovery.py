@@ -235,10 +235,13 @@ def test_rejects_mutated_authority_and_topology_without_repair(
         snapshot.snapshot_root.rename(restored_path)
         snapshot.snapshot_root.mkdir()
     before = (tmp_path / "app.py").read_bytes()
+    rejection = (
+        "runtime exposure refuses filesystem links or reparse points"
+        if kind == "dependency" and snapshot.runtime_exposure_mode == "copy"
+        else "snapshot recovery rejected"
+    )
     try:
-        with pytest.raises(
-            ops.WorkspaceSnapshotError, match="snapshot recovery rejected"
-        ):
+        with pytest.raises(ops.WorkspaceSnapshotError, match=rejection):
             recovery.restore_snapshot_authority(
                 authority, run_id=run_id, expected_digest=digest, project_root=tmp_path
             )
@@ -247,6 +250,21 @@ def test_rejects_mutated_authority_and_topology_without_repair(
         if restored_path is not None:
             snapshot.snapshot_root.rmdir()
             restored_path.rename(snapshot.snapshot_root)
+
+
+def test_rejects_copy_dependency_link_without_repair(tmp_path, monkeypatch, request):
+    # Exercise Windows' copied-root rejection on every test host. This is a
+    # strategy regression, not a substitute for native Windows guard tests.
+    monkeypatch.setattr(ops, "_is_windows_platform", lambda: True)
+    monkeypatch.setattr(
+        ops, "_runtime_exposure_mode", lambda: ops.RUNTIME_EXPOSURE_COPY
+    )
+    monkeypatch.setattr(ops, "_native_windows_runtime_controls_enabled", lambda: False)
+    saved = request.getfixturevalue("saved_snapshot")
+    assert saved[0].runtime_exposure_mode == "copy"
+    test_rejects_mutated_authority_and_topology_without_repair(
+        saved, tmp_path, "dependency"
+    )
 
 
 @pytest.mark.parametrize(

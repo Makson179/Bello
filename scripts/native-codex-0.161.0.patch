@@ -4501,3 +4501,180 @@ index 00000000..54d56a98
 +    }
 +    assert!(request_lock_sid(&serde_json::json!({"mode": "provision-only"})).is_err());
 +}
+diff --git a/codex-rs/utils/path-uri/src/lib.rs b/codex-rs/utils/path-uri/src/lib.rs
+index 7a42363d..f7caa6f5 100644
+--- a/codex-rs/utils/path-uri/src/lib.rs
++++ b/codex-rs/utils/path-uri/src/lib.rs
+@@ -608,14 +608,16 @@ impl PathUri {
+             ));
+         }
+ 
+-        let path = self.0.to_file_path().map_err(|()| {
+-            io::Error::new(
+-                io::ErrorKind::InvalidInput,
+-                PathUriParseError::InvalidFileUriPath {
+-                    path: self.to_string(),
+-                },
+-            )
+-        })?;
++        let path = file_url_for_native_conversion(&self.0)
++            .to_file_path()
++            .map_err(|()| {
++                io::Error::new(
++                    io::ErrorKind::InvalidInput,
++                    PathUriParseError::InvalidFileUriPath {
++                        path: self.to_string(),
++                    },
++                )
++            })?;
+         AbsolutePathBuf::from_absolute_path_checked(path).map_err(|_| {
+             io::Error::new(
+                 io::ErrorKind::InvalidInput,
+@@ -766,6 +768,28 @@ fn decode_bad_path_uri(url: &Url) -> Option<Vec<u8>> {
+         .then_some(path_bytes)
+ }
+ 
++/// PathUri's lexical parent/join operations can represent a drive root without
++/// a trailing slash. url::Url otherwise renders that as drive-relative `D:` on
++/// Windows. Restore the separator only for host conversion; do not change URI
++/// identity or reinterpret a host authority, child path, or encoded separator.
++/// The caller must retain the native-convention and containment checks first.
++fn file_url_for_native_conversion(url: &Url) -> Cow<'_, Url> {
++    let is_drive_root = url.host_str().is_none()
++        && url
++            .path()
++            .strip_prefix('/')
++            .is_some_and(is_windows_drive_uri_segment);
++    if !is_drive_root {
++        return Cow::Borrowed(url);
++    }
++    let mut rooted = url.clone();
++    rooted
++        .path_segments_mut()
++        .expect("validated file URI has path segments")
++        .push("");
++    Cow::Owned(rooted)
++}
++
+ fn is_windows_drive_uri_segment(segment: &str) -> bool {
+     matches!(
+         segment.as_bytes(),
+diff --git a/codex-rs/utils/path-uri/src/tests.rs b/codex-rs/utils/path-uri/src/tests.rs
+index 49dbd278..38e6cae7 100644
+--- a/codex-rs/utils/path-uri/src/tests.rs
++++ b/codex-rs/utils/path-uri/src/tests.rs
+@@ -532,6 +532,114 @@ fn file_uri_round_trips_literal_percent_characters() {
+     assert_eq!(uri.basename(), Some("file".to_string()));
+ }
+ 
++#[test]
++fn native_conversion_url_restores_only_bare_windows_drive_roots() {
++    for input in ["file:///D:", "file:///d:", "file:///D%3A", "file:///D%3a"] {
++        let uri = PathUri::parse(input).expect(input);
++        let canonical = uri.to_string();
++        assert_eq!(
++            file_url_for_native_conversion(&uri.0).as_str(),
++            format!("{canonical}/"),
++            "{input}"
++        );
++        assert_eq!(uri.to_string(), canonical, "URI identity must not change");
++    }
++    for input in [
++        "file:///D:/",
++        "file:///D:/child",
++        "file://server/share",
++        "file:///D:/child%2Fother",
++        "file:///D:/child%5Cother",
++        "file:///tmp/root",
++        "file:///",
++    ] {
++        let uri = PathUri::parse(input).expect(input);
++        assert!(
++            matches!(file_url_for_native_conversion(&uri.0), Cow::Borrowed(_)),
++            "{input}: {uri}"
++        );
++    }
++}
++
++#[test]
++fn windows_config_and_parent_roots_keep_native_conversion_separator() {
++    for input in [r"D:\", "D:/", r"D:\\", "D://", r"D:\.", "D:/child/.."] {
++        let uri = PathUri::resolve_config_path_uri(input, PathConvention::Windows, None, None)
++            .expect(input);
++        assert_eq!(uri.to_string(), "file:///D:", "{input}");
++        assert_eq!(
++            file_url_for_native_conversion(&uri.0).as_str(),
++            "file:///D:/"
++        );
++    }
++    let parent = PathUri::parse("file:///D:/child")
++        .expect("child URI")
++        .parent()
++        .expect("drive-root parent");
++    assert_eq!(parent.to_string(), "file:///D:");
++    assert_eq!(
++        file_url_for_native_conversion(&parent.0).as_str(),
++        "file:///D:/"
++    );
++    assert!(parent.parent().is_none());
++}
++
++#[cfg(windows)]
++#[test]
++fn host_windows_drive_root_config_and_parent_round_trip() {
++    let expected = AbsolutePathBuf::from_absolute_path_checked(r"D:\").expect("drive root");
++    for input in ["file:///D:", "file:///D:/", "file:///d:", "file:///D%3A"] {
++        let uri = PathUri::parse(input).expect(input);
++        let native = uri.to_abs_path().expect(input);
++        assert!(native.as_path().is_absolute(), "{input}");
++        assert_eq!(native, expected, "{input}");
++        assert_eq!(
++            PathUri::from_abs_path(&native)
++                .to_abs_path()
++                .expect("round trip"),
++            expected
++        );
++    }
++    for input in [r"D:\", "D:/", r"D:\\", "D://", r"D:\.", "D:/child/.."] {
++        let configured =
++            PathUri::resolve_config_path_uri(input, PathConvention::Windows, None, None)
++                .expect(input);
++        assert_eq!(configured.to_abs_path().expect(input), expected, "{input}");
++        let native = PathUri::from_host_native_path(input).expect(input);
++        assert_eq!(native.to_abs_path().expect(input), expected, "{input}");
++    }
++    let parent = PathUri::parse("file:///D:/child")
++        .expect("child URI")
++        .parent()
++        .expect("drive-root parent");
++    assert_eq!(parent.to_abs_path().expect("parent conversion"), expected);
++}
++
++#[cfg(windows)]
++#[test]
++fn host_windows_drive_root_repair_preserves_invalid_path_refusals() {
++    for input in [
++        "file:///tmp/foreign",
++        "file:///D:/child%2Fother",
++        "file:///D:/child%5Cother",
++        "file:///D%3A/child%2fother",
++        "file://server/share/child%5cother",
++    ] {
++        let uri = PathUri::parse(input).expect(input);
++        assert_eq!(
++            uri.to_abs_path().expect_err(input).kind(),
++            io::ErrorKind::InvalidInput,
++            "{input}"
++        );
++    }
++    for input in ["D:", "D:relative", r"\rooted", "/foreign"] {
++        assert!(
++            PathUri::resolve_config_path_uri(input, PathConvention::Windows, None, None).is_err(),
++            "ambiguous native input must remain rejected: {input}"
++        );
++    }
++}
++
+ #[cfg(windows)]
+ #[test]
+ fn host_windows_paths_round_trip_through_file_uris() {

@@ -48,6 +48,18 @@ The separate `native-codex-candidate.yml` workflow is limited to
 normalized lockfile, licenses and every executable hash. Its `proof_status`
 remains `not-run`: reusable compiled binaries are not a passing qualification.
 
+The candidate also repairs native conversion of an already-absolute Windows
+drive-root URI such as `file:///D:` after lexical parent/config resolution. It
+restores only the missing root separator during conversion; native-convention
+and encoded-separator rejection still run first, and no filesystem permission
+grant changes. Both native builds run the `codex-utils-path-uri` library tests
+before saving a build. Windows-specific root/config/parent roundtrips therefore
+run on Windows, not merely as portable source-contract tests.
+
+Cargo intermediate caches may reuse an older recipe on the same target, with
+`cargo --locked` rebuilding affected inputs. Ready-candidate caches never use
+that fallback: their exact source/build key and complete receipt must match.
+
 On the matching native Linux or Windows x64 host, qualify that explicit directory:
 
 ```sh
