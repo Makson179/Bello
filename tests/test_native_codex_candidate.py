@@ -17,7 +17,9 @@ def input_root(tmp_path):
     for name in candidate.INPUTS:
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("fixture input\n")
+        # A canonical LF fixture avoids accidentally converting native CRLF to
+        # CRCRLF in the explicit transport-normalization test below.
+        path.write_bytes(b"fixture input\n")
     return root
 
 
@@ -48,6 +50,13 @@ def test_identity_normalizes_crlf_transport_only(input_root):
     patch = input_root / candidate.PATCH
     patch.write_bytes(patch.read_bytes().replace(b"\n", b"\r\n"))
     assert candidate.identity(input_root) == before
+
+
+def test_identity_preserves_extra_carriage_return_as_content(input_root):
+    before = candidate.identity(input_root)
+    patch = input_root / candidate.PATCH
+    patch.write_bytes(patch.read_bytes().replace(b"\n", b"\r\r\n"))
+    assert candidate.identity(input_root) != before
 
 
 def test_missing_patch_cannot_produce_an_identity(input_root):
@@ -120,8 +129,9 @@ def test_candidate_preparation_with_real_git_preserves_patch_and_external_depend
     git("config", "core.autocrlf", "false")
     lock = source / "codex-rs/Cargo.lock"
     lock.write_text('version = 4\n\n[[package]]\nname = "codex-core"\nversion = "0.0.0"\ndependencies = []\n'
-                    '\n[[package]]\nname = "external"\nversion = "0.0.0"\nsource = "registry+pinned"\n')
-    (source / "file.txt").write_text("before\n\ncontext\n")
+                    '\n[[package]]\nname = "external"\nversion = "0.0.0"\nsource = "registry+pinned"\n',
+                    encoding="utf-8", newline="\n")
+    (source / "file.txt").write_bytes(b"before\n\ncontext\n")
     git("add", ".")
     git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "fixture")
     monkeypatch.setattr(candidate, "UPSTREAM_REVISION", git("rev-parse", "HEAD").strip())

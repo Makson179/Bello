@@ -466,7 +466,11 @@ def guardian_main() -> int:
     try:
         if os.name == "nt":
             from supervisor.appserver import _WindowsKillJob, _resume_windows_process
-            worker = subprocess.Popen(command, env=worker_env, creationflags=subprocess.CREATE_SUSPENDED)
+            # CREATE_SUSPENDED is a Win32 flag, not a public subprocess export
+            # on supported CPython versions. Assign the Job before any worker
+            # code runs, regardless of whether Python exposes that constant.
+            worker = subprocess.Popen(command, env=worker_env,
+                                      creationflags=getattr(subprocess, "CREATE_SUSPENDED", 0x00000004))
             job = _WindowsKillJob.create(worker.pid)
             _resume_windows_process(worker.pid)
         else:

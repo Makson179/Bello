@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import os
 import stat
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Self
 
@@ -19,6 +20,19 @@ from supervisor.snapshot_services import SnapshotServices
 # A later close() retry removes the entry only after completion and handle close.
 _RETAINED_WINDOWS_WATCHERS: dict[int, _WindowsDirectoryChangeWatcher] = {}
 _WINDOWS_WATCHER_CANCEL_TIMEOUT_MS = 5000
+
+# Quarantined Python cycles alone do not survive interpreter teardown. Capture
+# the C callable and its argument conversion while ctypes is fully available.
+# Only uncertain finalization uses this deliberate process-lifetime reference;
+# normal close/GC never pins, and no manual decrement can race native I/O.
+if sys.implementation.name == "cpython":
+    import ctypes
+
+    _PIN_WINDOWS_WATCHER = ctypes.pythonapi.Py_IncRef
+    _PIN_WINDOWS_WATCHER.argtypes = [ctypes.py_object]
+    _PIN_WINDOWS_WATCHER.restype = None
+else:
+    _PIN_WINDOWS_WATCHER = None
 
 
 def _windows_api_path(ops: SnapshotServices, /, path: Path) -> str:
@@ -152,6 +166,14 @@ class _WindowsRuntimeFileGuard:
             self.handle = 0
             ops._close_windows_handle(handle)
 
+    def __del__(self) -> None:
+        # Explicit close is still required by the snapshot lifecycle. A dropped
+        # restored snapshot must not leave a permanent file sharing lock behind.
+        try:
+            self.close()
+        except BaseException:
+            pass
+
 
 @dataclass
 class _WindowsDirectoryChangeWatcher:
@@ -164,6 +186,9 @@ class _WindowsDirectoryChangeWatcher:
     buffer: object
     closed: bool = False
     pending: bool = False
+    _finalizer_pinned: bool = field(
+        default=False, init=False, repr=False, compare=False
+    )
 
     @classmethod
     def _services(cls) -> SnapshotServices:
@@ -175,6 +200,10 @@ class _WindowsDirectoryChangeWatcher:
         if os.name != "nt":
             raise ops.WorkspaceSnapshotError(
                 "Windows directory watchers require native Windows"
+            )
+        if _PIN_WINDOWS_WATCHER is None:
+            raise ops.WorkspaceSnapshotError(
+                "Windows directory watchers require CPython lifetime protection"
             )
         import ctypes
         from ctypes import wintypes
@@ -366,6 +395,27 @@ class _WindowsDirectoryChangeWatcher:
             _RETAINED_WINDOWS_WATCHERS.pop(id(self), None)
         if errors:
             raise errors[0]
+
+    def __del__(
+        self, _retained=_RETAINED_WINDOWS_WATCHERS, _pin=_PIN_WINDOWS_WATCHER
+    ) -> None:
+        # ReadDirectoryChangesW holds raw pointers, not Python references. The
+        # final reference can disappear without lifecycle cleanup (including
+        # restored snapshots and cyclic GC), while the kernel still writes to
+        # OVERLAPPED/buffer. Finalize before Python releases either allocation.
+        # An unproven request receives a deliberate process-lifetime CPython
+        # reference, since even captured dictionaries can be collected during
+        # final interpreter teardown. Retrying close may release proved handles
+        # but never unpins this rare quarantined object's storage. Other Python
+        # implementations cannot open native watchers without this protection.
+        try:
+            self.close()
+        except BaseException:
+            if getattr(self, "pending", False):
+                if not getattr(self, "_finalizer_pinned", False) and _pin is not None:
+                    _pin(self)
+                    self._finalizer_pinned = True
+                _retained[id(self)] = self
 
     def _cancel_and_drain(self) -> None:
         """Prove completion before releasing buffers, OVERLAPPED or handles.

@@ -45,10 +45,10 @@ def recipe(tmp_path):
     for name in (*prepare.INPUTS, *build.RECIPE_INPUTS):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("fixture " + name + "\n")
+        path.write_bytes(("fixture " + name + "\n").encode("utf-8"))
     (root / prepare.PATCH).write_text(
         "diff --git a/changed.txt b/changed.txt\n--- a/changed.txt\n+++ b/changed.txt\n"
-        "@@ -1 +1 @@\n-before\n+after\n"
+        "@@ -1 +1 @@\n-before\n+after\n", encoding="utf-8", newline="\n"
     )
     return root
 
@@ -59,14 +59,17 @@ def prepared_source(tmp_path, recipe, monkeypatch):
     (source / "codex-rs/vendor/bubblewrap").mkdir(parents=True)
     (source / "codex-rs/Cargo.lock").write_text(
         'version = 4\n\n[[package]]\nname = "codex-core"\nversion = "0.0.0"\n'
-        '\n[[package]]\nname = "external"\nversion = "0.0.0"\nsource = "registry+pinned"\n'
+        '\n[[package]]\nname = "external"\nversion = "0.0.0"\nsource = "registry+pinned"\n',
+        encoding="utf-8", newline="\n"
     )
     (source / "codex-rs/vendor/bubblewrap/COPYING").write_text(
         "bubblewrap fixture license"
     )
     (source / "LICENSE").write_text("upstream fixture license")
     (source / "NOTICE").write_text("upstream fixture notice")
-    (source / "changed.txt").write_text("before\n")
+    # This synthetic Git repository explicitly disables autocrlf below, so
+    # create its canonical LF source bytes on Windows as well as POSIX.
+    (source / "changed.txt").write_bytes(b"before\n")
 
     def git(*args):
         return subprocess.check_output(["git", "-C", str(source), *args])

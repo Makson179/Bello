@@ -103,6 +103,68 @@ def test_normal_terminal_provider_and_user_stop_never_restart(tmp_path, mode, ex
     assert not (recovery_root(tmp_path) / "watchdog.json").exists()
 
 
+def test_windows_guardian_uses_unexported_win32_suspend_flag_before_job_assignment(monkeypatch):
+    """Exercise the Windows guardian branch without inventing subprocess flags."""
+    import threading
+    from types import SimpleNamespace
+    from supervisor import appserver
+
+    events, messages = [], []
+    command = ["fixture-python", "fixture-worker"]
+    environment = {
+        "BELLO_GUARDIAN_ADDRESS": json.dumps(["127.0.0.1", 1234]),
+        "BELLO_GUARDIAN_SECRET": "00" * 32,
+        "BELLO_GUARDIAN_COMMAND": json.dumps(command),
+    }
+    worker = SimpleNamespace(pid=4321, returncode=0, poll=lambda: 0,
+                             wait=lambda **kwargs: events.append("wait-worker"))
+
+    def spawn(actual_command, *, env, creationflags):
+        assert actual_command == command
+        assert creationflags == 0x00000004
+        assert "BELLO_GUARDIAN_SECRET" not in env
+        events.append("spawn-suspended")
+        return worker
+
+    job = SimpleNamespace(close=lambda: events.append("close-job"))
+
+    class Job:
+        @classmethod
+        def create(cls, pid):
+            assert pid == worker.pid and events == ["spawn-suspended"]
+            events.append("assign-job")
+            return job
+
+    def resume(pid):
+        assert pid == worker.pid and events == ["spawn-suspended", "assign-job"]
+        events.append("resume-worker")
+
+    def terminate(owned):
+        assert owned is job
+        events.append("fence-job")
+        return True
+
+    control = SimpleNamespace(send=messages.append, close=lambda: events.append("close-control"))
+    listener = SimpleNamespace(address=("127.0.0.1", 4321), close=lambda: events.append("close-listener"))
+    monkeypatch.setattr(process_fence, "os", SimpleNamespace(name="nt", environ=environment))
+    # CPython exposes neither CREATE_SUSPENDED nor POSIX process-group APIs on
+    # this minimal Windows surface. The production fallback must supply 0x4.
+    monkeypatch.setattr(process_fence, "subprocess", SimpleNamespace(Popen=spawn))
+    monkeypatch.setattr(process_fence, "Client", lambda *args, **kwargs: control)
+    monkeypatch.setattr(process_fence, "Listener", lambda *args, **kwargs: listener)
+    monkeypatch.setattr(process_fence, "_enable_linux_subreaper", lambda: False)
+    monkeypatch.setattr(process_fence, "_terminate_windows_job", terminate)
+    monkeypatch.setattr(process_fence, "threading", SimpleNamespace(Event=threading.Event, Lock=threading.Lock,
+        Thread=lambda **kwargs: SimpleNamespace(start=lambda: events.append("serve-worker"))))
+    monkeypatch.setattr(appserver, "_WindowsKillJob", Job)
+    monkeypatch.setattr(appserver, "_resume_windows_process", resume)
+
+    assert process_fence.guardian_main() == 0
+    assert events == ["spawn-suspended", "assign-job", "resume-worker", "serve-worker",
+                      "fence-job", "close-job", "wait-worker", "close-listener", "close-control"]
+    assert messages == [{"started": 4321}, {"exit_code": 0, "fenced": True, "scope": "tree"}]
+
+
 def test_worker_crash_kills_separate_backend_group_before_restart(tmp_path):
     assert watchdog.watch_command(command(tmp_path, "child"), project_root=tmp_path,
         disposition=classify, backoff=(), required_scope=fixture_scope(), report=lambda _: None) == 0
@@ -255,15 +317,23 @@ def test_lost_guardian_cannot_fall_back_to_signalling_old_numeric_group(monkeypa
 
 
 def test_linux_reused_child_pid_is_rejected_before_any_signal(monkeypatch):
+    from types import SimpleNamespace
+
     closed = []
     monkeypatch.setattr(process_fence, "_linux_children", lambda parent: {77})
-    monkeypatch.setattr(process_fence.os, "pidfd_open", lambda pid: 707, raising=False)
+    # Model the complete Linux syscall surface, including constants absent on
+    # Windows. This identity-safety regression must run on every test host.
+    monkeypatch.setattr(process_fence, "os", SimpleNamespace(
+        getpid=lambda: 1000, pidfd_open=lambda pid: 707, close=closed.append,
+        WNOHANG=1, waitpid=lambda *_: (_ for _ in ()).throw(ChildProcessError()),
+    ))
     monkeypatch.setattr(process_fence, "_linux_pid_matches", lambda fd, pid: True)
     # This is the process occupying an auto-reaped child's old numeric PID.
     monkeypatch.setattr(process_fence, "_linux_parent_pid", lambda pid: -999)
-    monkeypatch.setattr(process_fence.signal, "pidfd_send_signal", lambda *_: pytest.fail("unowned process signalled"), raising=False)
-    monkeypatch.setattr(process_fence.os, "close", closed.append)
-    monkeypatch.setattr(process_fence.os, "waitpid", lambda *_: (_ for _ in ()).throw(ChildProcessError()))
+    monkeypatch.setattr(process_fence, "signal", SimpleNamespace(
+        SIGSTOP=19, SIGKILL=9,
+        pidfd_send_signal=lambda *_: pytest.fail("unowned process signalled"),
+    ))
     assert not process_fence._kill_linux_tree(timeout=0.1)
     assert closed == [707]
 

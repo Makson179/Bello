@@ -78,8 +78,13 @@ def native_api(monkeypatch):
     )
     watcher.pending = True
     yield state, api, watcher
-    # A failed mock cleanup must not keep test-only state alive between cases.
-    windows._RETAINED_WINDOWS_WATCHERS.pop(id(watcher), None)
+    # Drain while fake APIs are still installed. On Windows a later finalizer
+    # must never pass test-only handle numbers into the real kernel functions.
+    state.complete = True
+    api.CancelIoEx.call = lambda *args: True
+    api.GetOverlappedResult.call = lambda *args: True
+    ops._close_windows_handle = close
+    watcher.close()
 
 
 def test_close_waits_for_cancellation_before_closing_handles(native_api):
@@ -95,6 +100,197 @@ def test_close_waits_for_cancellation_before_closing_handles(native_api):
     ]
     assert not watcher.pending
     assert watcher.closed and watcher.handle == watcher.event_handle == 0
+
+
+def test_discarded_watcher_drains_before_python_releases_native_storage(native_api):
+    state, _, fixture_watcher = native_api
+    watcher = type(fixture_watcher)(
+        Path("discarded-dependency"),
+        30,
+        40,
+        ctypes.c_ulong(0),
+        ctypes.create_string_buffer(64),
+        pending=True,
+    )
+    watcher_ref = weakref.ref(watcher)
+    overlapped_ref = weakref.ref(watcher.overlapped)
+    buffer_ref = weakref.ref(watcher.buffer)
+    del watcher
+    gc.collect()
+    assert state.complete, "pending kernel writes outlived their Python storage"
+    assert state.events == [
+        "cancel",
+        "result",
+        "wait",
+        "result",
+        "close:30",
+        "close:40",
+    ]
+    assert watcher_ref() is overlapped_ref() is buffer_ref() is None
+
+
+@pytest.mark.parametrize("failure", ["timeout", "exception", "shutdown-global"])
+def test_discarded_pending_watcher_survives_failed_finalization(
+    native_api, monkeypatch, failure
+):
+    state, api, fixture_watcher = native_api
+    watcher = type(fixture_watcher)(
+        Path("discarded-dependency"),
+        30,
+        40,
+        ctypes.c_ulong(0),
+        ctypes.create_string_buffer(64),
+        pending=True,
+    )
+    if failure == "timeout":
+        api.WaitForSingleObject.call = lambda *args: 258
+    elif failure == "exception":
+
+        def interrupted(*args):
+            raise KeyboardInterrupt("synthetic finalizer interruption")
+
+        api.CancelIoEx.call = interrupted
+    else:
+        # Model module teardown before close() can install its quarantine.
+        monkeypatch.setattr(windows, "_RETAINED_WINDOWS_WATCHERS", None)
+    retained = windows._WindowsDirectoryChangeWatcher.__del__.__defaults__[0]
+    reference = weakref.ref(watcher)
+    overlapped_ref = weakref.ref(watcher.overlapped)
+    buffer_ref = weakref.ref(watcher.buffer)
+    key = id(watcher)
+    del watcher
+    gc.collect()
+    try:
+        assert retained[key] is reference()
+        assert reference().pending
+        assert reference()._finalizer_pinned
+        assert overlapped_ref() is not None and buffer_ref() is not None
+        assert not any(event.startswith("close:") for event in state.events)
+    finally:
+        monkeypatch.setattr(windows, "_RETAINED_WINDOWS_WATCHERS", retained)
+        state.complete = True
+        api.CancelIoEx.call = lambda *args: True
+        api.GetOverlappedResult.call = lambda *args: True
+        retained[key].close()
+    gc.collect()
+    # The deliberately rare lifetime pin is never manually decremented, even
+    # when a later retry can safely release the operating-system handles.
+    assert reference() is not None
+    assert not reference().pending
+    assert reference().handle == reference().event_handle == 0
+    assert key not in retained
+    assert overlapped_ref() is not None and buffer_ref() is not None
+
+
+def test_uncertain_finalizer_pins_once_but_success_never_pins(native_api):
+    state, api, watcher = native_api
+    pins = []
+    api.WaitForSingleObject.call = lambda *args: 258
+    watcher.__del__(_pin=pins.append)
+    watcher.__del__(_pin=pins.append)
+    assert pins == [watcher]
+    assert watcher._finalizer_pinned
+    state.complete = True
+    watcher.close()
+    watcher.__del__(_pin=pins.append)
+    assert pins == [watcher]
+
+
+def test_successful_finalization_never_pins(native_api):
+    _, _, watcher = native_api
+    watcher.__del__(_pin=lambda _: pytest.fail("successful cleanup pinned storage"))
+    assert not watcher._finalizer_pinned
+    assert not watcher.pending
+    assert watcher.handle == watcher.event_handle == 0
+
+
+@pytest.mark.parametrize(
+    "native",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(os.name != "nt", reason="native Windows I/O"),
+        ),
+    ],
+)
+def test_pending_finalizer_pin_survives_all_python_registry_references(
+    tmp_path, native
+):
+    script = r"""
+import ctypes,gc,json,sys,weakref
+from pathlib import Path
+from supervisor import snapshot_windows,workspace_snapshot
+native=sys.argv[2]=="True"
+class Watcher(snapshot_windows._WindowsDirectoryChangeWatcher):
+    def close(self):
+        raise OSError("simulate unavailable teardown services")
+if native:
+    watcher=workspace_snapshot._WindowsDirectoryChangeWatcher.open(Path(sys.argv[1]))
+    def cannot_close():
+        raise OSError("simulate unavailable teardown services")
+    watcher.close=cannot_close
+else:
+    watcher=Watcher(Path("synthetic"),10,20,ctypes.c_ulong(0),ctypes.create_string_buffer(64),pending=True)
+reference=weakref.ref(watcher)
+buffer_reference=weakref.ref(watcher.buffer)
+overlapped_reference=weakref.ref(watcher.overlapped)
+del watcher
+snapshot_windows._RETAINED_WINDOWS_WATCHERS.clear()
+for _ in range(3):gc.collect()
+assert reference() is not None and reference()._finalizer_pinned
+assert reference().pending and buffer_reference() is not None and overlapped_reference() is not None
+if native:
+    # This intentionally quarantined request still owns its native storage and
+    # handles until OS process teardown; it must survive new kernel writes.
+    for i in range(100):(Path(sys.argv[1])/str(i)).write_bytes(b"after GC")
+print(json.dumps({"status":"PASS","registry_empty":not snapshot_windows._RETAINED_WINDOWS_WATCHERS}))
+"""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-X",
+            "faulthandler",
+            "-c",
+            script,
+            str(tmp_path),
+            str(native),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout) == {"status": "PASS", "registry_empty": True}
+
+
+def test_native_watcher_rejects_interpreter_without_lifetime_pin(
+    native_api, monkeypatch, tmp_path
+):
+    _, _, watcher = native_api
+    monkeypatch.setattr(windows, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(windows, "_PIN_WINDOWS_WATCHER", None)
+    with pytest.raises(RuntimeError, match="CPython lifetime protection"):
+        type(watcher).open(tmp_path)
+
+
+def test_discarded_file_guard_releases_its_sharing_lock():
+    closed = []
+
+    class Guard(windows._WindowsRuntimeFileGuard):
+        @classmethod
+        def _services(cls):
+            return SimpleNamespace(_close_windows_handle=closed.append)
+
+    guard = Guard(Path("task"), 30, (1, 2))
+    reference = weakref.ref(guard)
+    del guard
+    gc.collect()
+    assert reference() is None
+    assert closed == [30]
 
 
 @pytest.mark.parametrize(
@@ -399,9 +595,10 @@ def test_closed_watcher_never_silently_rearms(native_api):
     os.name != "nt",
     reason="requires native Windows asynchronous I/O and process handle counts",
 )
-def test_native_windows_repeated_cancel_gc_isolated_process(tmp_path):
+@pytest.mark.parametrize("ownership", ["explicit-close", "discard", "cyclic-discard"])
+def test_native_windows_repeated_cancel_gc_isolated_process(tmp_path, ownership):
     script = r"""
-import ctypes,gc,json,sys,time
+import ctypes,gc,json,sys,time,weakref
 from ctypes import wintypes
 from pathlib import Path
 from supervisor import snapshot_windows, workspace_snapshot
@@ -416,6 +613,7 @@ def handles():
         raise ctypes.WinError(ctypes.get_last_error())
     return count.value
 root=Path(sys.argv[1])
+ownership=sys.argv[2]
 def cycle(number):
     folder=root/str(number)
     folder.mkdir()
@@ -427,11 +625,22 @@ def cycle(number):
         while not watcher.consume_changes():
             assert time.monotonic()<deadline,"native notification did not complete"
             time.sleep(.001)
-    watcher.close()
-    assert not watcher.pending and not watcher.handle and not watcher.event_handle
+    if ownership=="explicit-close":
+        watcher.close()
+        assert not watcher.pending and not watcher.handle and not watcher.event_handle
+    elif ownership=="cyclic-discard":
+        watcher.test_cycle=watcher
+    reference=weakref.ref(watcher)
+    overlapped_reference=weakref.ref(watcher.overlapped)
+    buffer_reference=weakref.ref(watcher.buffer)
     del watcher
     gc.collect()
+    assert reference() is overlapped_reference() is buffer_reference() is None
     assert not snapshot_windows._RETAINED_WINDOWS_WATCHERS
+    # Trigger kernel notifications only AFTER discarded storage was collected.
+    # An unclosed native request could otherwise silently corrupt a later test.
+    (folder/"after-gc").write_bytes(b"notification after collection")
+    (folder/"after-gc").unlink()
     if (folder/"entry").exists():
         (folder/"entry").unlink()
     folder.rmdir()
@@ -441,10 +650,19 @@ for number in range(5,205):cycle(number)
 gc.collect()
 after=handles()
 assert before==after,(before,after)
-print(json.dumps({"status":"PASS","iterations":200,"handles_before":before,"handles_after":after}))
+print(json.dumps({"status":"PASS","iterations":200,"ownership":ownership,"handles_before":before,"handles_after":after}))
 """
     result = subprocess.run(
-        [sys.executable, "-B", "-X", "faulthandler", "-c", script, str(tmp_path)],
+        [
+            sys.executable,
+            "-B",
+            "-X",
+            "faulthandler",
+            "-c",
+            script,
+            str(tmp_path),
+            ownership,
+        ],
         cwd=Path(__file__).resolve().parents[1],
         capture_output=True,
         text=True,
@@ -454,4 +672,5 @@ print(json.dumps({"status":"PASS","iterations":200,"handles_before":before,"hand
     assert result.returncode == 0, result.stdout + result.stderr
     receipt = json.loads(result.stdout)
     assert receipt["status"] == "PASS" and receipt["iterations"] == 200
+    assert receipt["ownership"] == ownership
     assert receipt["handles_before"] == receipt["handles_after"]

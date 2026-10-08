@@ -18,7 +18,7 @@ from supervisor import workspace_snapshot as ops
 def saved_snapshot(tmp_path: Path):
     (tmp_path / ".supervisor").mkdir()
     (tmp_path / "TASK.md").write_text("Implement the task.\n")
-    (tmp_path / "app.py").write_text("value = 1\n")
+    (tmp_path / "app.py").write_bytes(b"value = 1\n")
     (tmp_path / "node_modules").mkdir()
     (tmp_path / "node_modules" / "dependency.js").write_text("export default 1;\n")
     snapshot = ops.create_workspace_snapshot(tmp_path, tmp_path / "TASK.md")
@@ -33,6 +33,9 @@ def saved_snapshot(tmp_path: Path):
 
 def _restore(saved):
     snapshot, authority, run_id, digest = saved
+    # Model a fenced/dead predecessor, not two live controllers protecting the
+    # same Windows runtime projection with independently owned native handles.
+    snapshot.close_windows_runtime_controls()
     return recovery.restore_snapshot_authority(
         authority,
         run_id=run_id,
@@ -43,6 +46,7 @@ def _restore(saved):
 
 def _child(saved, script: str) -> subprocess.CompletedProcess[str]:
     snapshot, authority, run_id, digest = saved
+    snapshot.close_windows_runtime_controls()
     return subprocess.run(
         [
             sys.executable,
@@ -63,11 +67,12 @@ def _child(saved, script: str) -> subprocess.CompletedProcess[str]:
 
 
 _RESTORE_SCRIPT = """
-import sys
+import atexit, sys
 from pathlib import Path
 from supervisor import workspace_snapshot as ops
 from supervisor.snapshot_recovery import restore_snapshot_authority
 snapshot = restore_snapshot_authority(Path(sys.argv[1]), run_id=sys.argv[2], expected_digest=sys.argv[3], project_root=Path(sys.argv[4]))
+atexit.register(snapshot.close_windows_runtime_controls)
 """
 
 
@@ -191,6 +196,9 @@ def test_rejects_mutated_authority_and_topology_without_repair(
     saved_snapshot, tmp_path: Path, kind: str
 ):
     snapshot, authority, run_id, digest = saved_snapshot
+    # These are offline recovery-authority checks after the predecessor has
+    # stopped. Native live guards correctly prevent the mutations on Windows.
+    snapshot.close_windows_runtime_controls()
     restored_path = None
     if kind == "bytes":
         authority.write_bytes(authority.read_bytes() + b" ")
@@ -216,7 +224,7 @@ def test_rejects_mutated_authority_and_topology_without_repair(
         )
     elif kind == "dependency":
         dependency = snapshot.snapshot_root / "node_modules"
-        dependency.unlink()
+        ops._remove_path(dependency)
         dependency.symlink_to(tmp_path, target_is_directory=True)
     elif kind == "git_link":
         (snapshot.snapshot_root / ".git" / "linked-data").symlink_to(
@@ -290,6 +298,7 @@ def test_authority_cannot_live_inside_the_model_workspace(saved_snapshot):
 
 def test_detached_export_is_not_live_recovery_authority(saved_snapshot):
     snapshot, _authority, _run_id, _digest = saved_snapshot
+    snapshot.close_windows_runtime_controls()
     ops._detach_recovery_workspace(snapshot)
     with pytest.raises(ops.WorkspaceSnapshotError, match="snapshot recovery rejected"):
         _restore(saved_snapshot)
@@ -308,12 +317,16 @@ def test_detached_plan_persists_without_reexposure(tmp_path: Path):
         recovery.persist_snapshot_authority(snapshot, path, run_id=run_id)
         assert snapshot.detach_plan_exposure()
         digest = recovery.persist_snapshot_authority(snapshot, path, run_id=run_id)
+        snapshot.close_windows_runtime_controls()
         restored = recovery.restore_snapshot_authority(
             path, run_id=run_id, expected_digest=digest, project_root=tmp_path
         )
-        assert not restored.plan_exposed
-        assert restored.plan_bytes == b"private plan"
-        assert restored.plan_path is not None and not restored.plan_path.exists()
+        try:
+            assert not restored.plan_exposed
+            assert restored.plan_bytes == b"private plan"
+            assert restored.plan_path is not None and not restored.plan_path.exists()
+        finally:
+            restored.close_windows_runtime_controls()
     finally:
         snapshot.cleanup()
 
@@ -323,7 +336,7 @@ def test_killed_apply_is_never_replayed_in_another_process(
     saved_snapshot, boundary: str
 ):
     snapshot, authority, _run_id, _digest = saved_snapshot
-    (snapshot.snapshot_root / "app.py").write_text("value = 2\n")
+    (snapshot.snapshot_root / "app.py").write_bytes(b"value = 2\n")
     hook = (
         """
 def crash(*args, **kwargs):
@@ -368,13 +381,16 @@ def test_committed_apply_is_idempotent_and_detects_later_original_edits(
     (snapshot.snapshot_root / "app.py").write_text("value = 2\n")
     result = ops.apply_snapshot_patch(snapshot)
     restored = _restore(saved_snapshot)
-    monkeypatch.setattr(
-        ops, "_apply_snapshot_patch", lambda *a, **kw: pytest.fail("replayed patch")
-    )
-    assert ops.apply_snapshot_patch(restored) == result
-    (snapshot.original_root / "app.py").write_text("value = 3\n")
-    with pytest.raises(ops.WorkspaceSnapshotError, match="refusing to reapply"):
-        ops.apply_snapshot_patch(restored)
+    try:
+        monkeypatch.setattr(
+            ops, "_apply_snapshot_patch", lambda *a, **kw: pytest.fail("replayed patch")
+        )
+        assert ops.apply_snapshot_patch(restored) == result
+        (snapshot.original_root / "app.py").write_text("value = 3\n")
+        with pytest.raises(ops.WorkspaceSnapshotError, match="refusing to reapply"):
+            ops.apply_snapshot_patch(restored)
+    finally:
+        restored.close_windows_runtime_controls()
 
 
 def test_process_killed_after_durable_commit_returns_result_without_reapplication(

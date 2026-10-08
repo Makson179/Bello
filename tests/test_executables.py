@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import ntpath
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,6 +11,40 @@ import supervisor.appserver as appserver_module
 import supervisor.executables as executables_module
 from supervisor.appserver import AppServerError
 from supervisor.executables import resolve_trusted_executable
+
+
+@pytest.mark.parametrize(("candidate", "workspace", "blocked"), [
+    (r"C:\hostedtoolcache\Python\python.exe", r"D:\a\project", False),
+    (r"D:\trusted-bin\node.exe", r"C:\workspace", False),
+    (r"\\server\tools\node.exe", r"\\server\workspace\project", False),
+    (r"D:\a\project\node.exe", r"D:\a\project", True),
+    (r"d:\A\PROJECT\node.exe", r"D:\a\project", True),
+    (r"D:\a\project-sibling\node.exe", r"D:\a\project", False),
+    (r"C:relative.exe", r"D:\a\project", True),
+    (r"C:\trusted\node.exe", r"D:relative-workspace", True),
+    (r"relative.exe", r"relative-workspace", True),
+])
+def test_windows_canonical_containment_handles_distinct_drives(
+    candidate, workspace, blocked, monkeypatch,
+):
+    # Exercise Windows path semantics on every host; these stand-ins are the
+    # already-resolved paths consumed by the containment check, not executables.
+    canonical = lambda value: SimpleNamespace(resolve=lambda strict=False: value)
+    monkeypatch.setattr(executables_module, "os", SimpleNamespace(path=ntpath))
+    assert executables_module._path_is_blocked(
+        canonical(candidate), [canonical(workspace)],
+    ) is blocked
+
+
+@pytest.mark.parametrize("broken_side", ["candidate", "workspace"])
+def test_canonical_containment_rejects_unresolvable_paths(broken_side, monkeypatch):
+    def invalid(*, strict=False):
+        raise ValueError("ambiguous path")
+    candidate = SimpleNamespace(resolve=lambda strict=False: r"C:\trusted\node.exe")
+    workspace = SimpleNamespace(resolve=lambda strict=False: r"D:\a\project")
+    (candidate if broken_side == "candidate" else workspace).resolve = invalid
+    monkeypatch.setattr(executables_module, "os", SimpleNamespace(path=ntpath))
+    assert executables_module._path_is_blocked(candidate, [workspace])
 
 
 def _touch(path: Path, content: str = "fixture") -> Path:

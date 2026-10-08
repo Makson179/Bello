@@ -81,10 +81,16 @@ async def main() -> None:
     if mode == "provider":
         raise SystemExit(2)
     if mode == "interrupt":
-        os.kill(os.getpid(), signal.SIGINT)
+        # On Windows os.kill(SIGINT) terminates with exit code 2; it does not
+        # deliver a Python interrupt. Match the guardian's cooperative stop.
+        import _thread
+        _thread.interrupt_main()
         await asyncio.sleep(1)
     os._exit(86)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)

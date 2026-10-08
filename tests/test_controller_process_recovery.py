@@ -168,7 +168,9 @@ def test_duplicate_distribution_discovery_does_not_change_identity_but_real_depe
 
 def test_changed_engine_binary_blocks_before_any_state_write(saved_run, tmp_path):
     c = saved_run
-    binary = tmp_path / "engine-binary"
+    # Python 3.14's Windows lookup requires a PATHEXT executable suffix even
+    # for an absolute path. This identity-only fixture is never launched.
+    binary = tmp_path / "engine-binary.exe"
     binary.write_bytes(b"first engine")
     c.client.command = [str(binary)]
     binary.chmod(0o700)
@@ -371,10 +373,13 @@ def test_legacy_running_state_without_a_thread_is_not_silently_reset(tmp_path):
     c.store.update_bello_config(lambda cfg: cfg.model_copy(update={"status": BelloStatus.RUNNING}))
     with RunOwner(tmp_path, controller=True):
         c._durable_run = DurableRun(c)
-        before = _bytes(c.store.state_dir)
+    # Read the complete state only outside the mandatory Windows byte lock.
+    # Creating the lock first keeps it included in the exact before/after check.
+    before = _bytes(c.store.state_dir)
+    with RunOwner(tmp_path, controller=True):
         with pytest.raises(RecoveryBlocked, match="legacy interrupted run"):
             c.initialize_state()
-        assert _bytes(c.store.state_dir) == before
+    assert _bytes(c.store.state_dir) == before
 
 
 def test_uncertain_or_later_completed_tools_block_restore(tmp_path):
