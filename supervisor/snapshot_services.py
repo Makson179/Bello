@@ -304,6 +304,7 @@ class SnapshotServices(Protocol):
         *,
         mode: str,
         safe_destination_root: Path | None = None,
+        excluded_root_names: tuple[str, ...] = (),
     ) -> None: ...
 
     def _ensure_safe_runtime_destination_parent(
@@ -311,7 +312,7 @@ class SnapshotServices(Protocol):
     ) -> None: ...
 
     def _runtime_exposure_manifest(
-        self, path: Path
+        self, path: Path, *, excluded_root_names: tuple[str, ...] = (),
     ) -> tuple[tuple[str, SnapshotPathState], ...]: ...
 
     def _runtime_directory_manifest(
@@ -320,6 +321,8 @@ class SnapshotServices(Protocol):
         directory: Path,
         expected: os.stat_result,
         entries: list[tuple[str, SnapshotPathState]],
+        *,
+        excluded_root_names: tuple[str, ...] = (),
     ) -> None: ...
 
     def _create_readonly_link(self, destination: Path, source: Path) -> None: ...

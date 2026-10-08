@@ -784,6 +784,7 @@ def _create_runtime_exposure(
     *,
     mode: str,
     safe_destination_root: Path | None = None,
+    excluded_root_names: tuple[str, ...] = (),
 ) -> None:
     return _runtime._create_runtime_exposure(
         _services(),
@@ -791,6 +792,7 @@ def _create_runtime_exposure(
         source,
         mode=mode,
         safe_destination_root=safe_destination_root,
+        excluded_root_names=excluded_root_names,
     )
 
 
@@ -800,8 +802,12 @@ def _ensure_safe_runtime_destination_parent(destination: Path, root: Path) -> No
     )
 
 
-def _runtime_exposure_manifest(path: Path) -> tuple[tuple[str, SnapshotPathState], ...]:
-    return _state._runtime_exposure_manifest(_services(), path)
+def _runtime_exposure_manifest(
+    path: Path, *, excluded_root_names: tuple[str, ...] = (),
+) -> tuple[tuple[str, SnapshotPathState], ...]:
+    return _state._runtime_exposure_manifest(
+        _services(), path, excluded_root_names=excluded_root_names,
+    )
 
 
 def _runtime_directory_manifest(
@@ -809,9 +815,12 @@ def _runtime_directory_manifest(
     directory: Path,
     expected: os.stat_result,
     entries: list[tuple[str, SnapshotPathState]],
+    *,
+    excluded_root_names: tuple[str, ...] = (),
 ) -> None:
     return _state._runtime_directory_manifest(
-        _services(), root, directory, expected, entries
+        _services(), root, directory, expected, entries,
+        excluded_root_names=excluded_root_names,
     )
 
 

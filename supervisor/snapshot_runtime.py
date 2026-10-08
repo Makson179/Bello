@@ -109,13 +109,17 @@ def _restore_runtime_links(
                 )
                 destination_manifest = ops._runtime_exposure_manifest(destination)
         else:
-            source_manifest = ops._runtime_exposure_manifest(source)
+            excluded = ("controller",) if label == "supervisor_state" else ()
+            source_manifest = ops._runtime_exposure_manifest(
+                source, excluded_root_names=excluded,
+            )
             if destination_manifest != source_manifest:
                 ops._create_runtime_exposure(
                     destination,
                     source,
                     mode=ops.RUNTIME_EXPOSURE_COPY,
                     safe_destination_root=snapshot.snapshot_root,
+                    excluded_root_names=excluded,
                 )
                 destination_manifest = ops._runtime_exposure_manifest(destination)
         snapshot.runtime_copy_manifests[label] = destination_manifest
@@ -410,18 +414,27 @@ def _create_runtime_exposure(
     *,
     mode: str,
     safe_destination_root: Path | None = None,
+    excluded_root_names: tuple[str, ...] = (),
 ) -> None:
     if safe_destination_root is not None:
         ops._ensure_safe_runtime_destination_parent(destination, safe_destination_root)
     if mode == ops.RUNTIME_EXPOSURE_SYMLINK:
+        if excluded_root_names:
+            raise ops.WorkspaceSnapshotError("a linked runtime exposure cannot exclude private entries")
         ops._create_readonly_link(destination, source)
         return
     if mode != ops.RUNTIME_EXPOSURE_COPY:
         raise ops.WorkspaceSnapshotError(f"unknown runtime exposure mode: {mode}")
 
+    excluded = {ops._name_key(name) for name in excluded_root_names}
     destination.parent.mkdir(parents=True, exist_ok=True)
     for attempt in range(2):
-        before = ops._runtime_exposure_manifest(source)
+        # Only the original state source is projected. Destination/temporary
+        # manifests stay complete so unexpected private entries fail integrity
+        # checks rather than disappearing from those checks as well.
+        before = ops._runtime_exposure_manifest(
+            source, excluded_root_names=excluded_root_names,
+        )
         source_state = before[0][1] if before else ops.SnapshotPathState(kind="absent")
         temporary: Path
         if source_state.kind == "directory":
@@ -437,6 +450,11 @@ def _create_runtime_exposure(
                     dirs_exist_ok=True,
                     symlinks=False,
                     copy_function=shutil.copy2,
+                    ignore=lambda directory, names: {
+                        name for name in names
+                        if Path(directory) == source
+                        and ops._name_key(name) in excluded
+                    },
                 )
             except BaseException:
                 ops._remove_path(temporary)
@@ -460,7 +478,9 @@ def _create_runtime_exposure(
 
         try:
             copied = ops._runtime_exposure_manifest(temporary)
-            after = ops._runtime_exposure_manifest(source)
+            after = ops._runtime_exposure_manifest(
+                source, excluded_root_names=excluded_root_names,
+            )
             if before == after and copied == before:
                 ops._remove_path(destination)
                 os.replace(temporary, destination)

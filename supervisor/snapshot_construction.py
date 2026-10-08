@@ -248,6 +248,10 @@ def create_workspace_snapshot(
                 state_source,
                 mode=exposure_mode,
                 safe_destination_root=snapshot_root,
+                # Ownership locks and recovery authority are controller-private,
+                # not part of the Windows agent-visible runtime state copy.
+                excluded_root_names=("controller",)
+                if exposure_mode == ops.RUNTIME_EXPOSURE_COPY else (),
             )
             if exposure_mode == ops.RUNTIME_EXPOSURE_COPY:
                 runtime_copy_manifests["supervisor_state"] = (

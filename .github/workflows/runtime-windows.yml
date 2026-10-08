@@ -146,7 +146,7 @@ jobs:
         env:
           BELLO_REQUIRE_NATIVE_SANDBOX: "1"
           BELLO_WINDOWS_SANDBOX_TIMING_REPORT: ${{ runner.temp }}\bello-windows-sandbox-timing-pytest.json
-        run: python -m pytest -v -o faulthandler_timeout=120 tests/test_runtime_sandbox.py tests/test_runtime_windows_sandbox.py
+        run: python -m pytest -v -o faulthandler_timeout=120 tests/test_runtime_sandbox.py tests/test_runtime_windows_sandbox.py tests/test_snapshot_controller_state.py tests/test_windows_watcher_lifecycle.py
       - name: Run real Bello and Pi integration with the local test provider
         id: pi_integration_tests
         continue-on-error: true

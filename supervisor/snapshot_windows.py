@@ -14,6 +14,13 @@ from typing import Self
 from supervisor.snapshot_services import SnapshotServices
 
 
+# CancelIoEx is asynchronous. A failed/timeout cleanup must retain ownership
+# even when the construction/lifecycle caller drops its watcher collection.
+# A later close() retry removes the entry only after completion and handle close.
+_RETAINED_WINDOWS_WATCHERS: dict[int, _WindowsDirectoryChangeWatcher] = {}
+_WINDOWS_WATCHER_CANCEL_TIMEOUT_MS = 5000
+
+
 def _windows_api_path(ops: SnapshotServices, /, path: Path) -> str:
     """Return an absolute extended-length spelling for Win32 file APIs."""
 
@@ -156,6 +163,7 @@ class _WindowsDirectoryChangeWatcher:
     overlapped: object
     buffer: object
     closed: bool = False
+    pending: bool = False
 
     @classmethod
     def _services(cls) -> SnapshotServices:
@@ -242,6 +250,10 @@ class _WindowsDirectoryChangeWatcher:
 
     def _arm(self) -> None:
         ops = self._services()
+        if self.closed or self.pending:
+            raise ops.WorkspaceSnapshotError(
+                "cannot reuse an active or closed Windows watcher"
+            )
         import ctypes
         from ctypes import wintypes
 
@@ -266,6 +278,9 @@ class _WindowsDirectoryChangeWatcher:
         self.overlapped.Offset = 0
         self.overlapped.OffsetHigh = 0
         self.overlapped.hEvent = self.event_handle
+        # Set ownership before entering the native API, including the narrow
+        # interruption window between its return and Python's next instruction.
+        self.pending = True
         if not kernel32.ReadDirectoryChangesW(
             self.handle,
             self.buffer,
@@ -278,6 +293,7 @@ class _WindowsDirectoryChangeWatcher:
         ):
             error = ctypes.get_last_error()
             if error != 997:  # ERROR_IO_PENDING is expected for overlapped I/O.
+                self.pending = False
                 raise ctypes.WinError(error)
 
     def consume_changes(self) -> bool:
@@ -311,7 +327,11 @@ class _WindowsDirectoryChangeWatcher:
             ctypes.byref(transferred),
             False,
         ):
-            raise ctypes.WinError(ctypes.get_last_error())
+            error = ctypes.get_last_error()
+            if error == 995:  # ERROR_OPERATION_ABORTED is a completed request.
+                self.pending = False
+            raise ctypes.WinError(error)
+        self.pending = False
         # A zero-byte completion means the change buffer overflowed.  That is
         # still a definite integrity event, so it fails closed like any write.
         self._arm()
@@ -319,20 +339,91 @@ class _WindowsDirectoryChangeWatcher:
 
     def close(self) -> None:
         ops = self._services()
-        if self.closed:
+        if (
+            self.closed
+            and not self.pending
+            and not self.handle
+            and not self.event_handle
+        ):
             return
         self.closed = True
+        _RETAINED_WINDOWS_WATCHERS[id(self)] = self
+        if self.pending:
+            self._cancel_and_drain()
+        errors: list[OSError] = []
+        for attribute in ("handle", "event_handle"):
+            handle = getattr(self, attribute)
+            if handle:
+                # Completion is already proved. Invalidate before CloseHandle
+                # so interruption after its native return cannot retry a now
+                # reusable numeric handle on a later close().
+                setattr(self, attribute, 0)
+                try:
+                    ops._close_windows_handle(handle)
+                except OSError as error:
+                    errors.append(error)
+        if not self.handle and not self.event_handle:
+            _RETAINED_WINDOWS_WATCHERS.pop(id(self), None)
+        if errors:
+            raise errors[0]
+
+    def _cancel_and_drain(self) -> None:
+        """Prove completion before releasing buffers, OVERLAPPED or handles.
+
+        CancelIoEx merely requests cancellation, including when it succeeds.
+        ERROR_NOT_FOUND can race ordinary completion; it is not itself proof.
+        Keep both handles and all storage alive on any unproven outcome.
+        """
         import ctypes
         from ctypes import wintypes
 
+        if not self.handle or not self.event_handle:
+            raise OSError("pending Windows watcher has lost its completion handles")
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.CancelIoEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
         kernel32.CancelIoEx.restype = wintypes.BOOL
-        if self.handle:
-            kernel32.CancelIoEx(self.handle, ctypes.byref(self.overlapped))
-        if self.handle:
-            ops._close_windows_handle(self.handle)
-            self.handle = 0
-        if self.event_handle:
-            ops._close_windows_handle(self.event_handle)
-            self.event_handle = 0
+        kernel32.GetOverlappedResult.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_void_p,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.BOOL,
+        ]
+        kernel32.GetOverlappedResult.restype = wintypes.BOOL
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+
+        cancelled = kernel32.CancelIoEx(self.handle, ctypes.byref(self.overlapped))
+        cancel_error = None if cancelled else ctypes.get_last_error()
+
+        def completed() -> bool:
+            transferred = wintypes.DWORD()
+            if kernel32.GetOverlappedResult(
+                self.handle,
+                ctypes.byref(self.overlapped),
+                ctypes.byref(transferred),
+                False,
+            ):
+                self.pending = False
+                return True
+            error = ctypes.get_last_error()
+            if error == 995:  # ERROR_OPERATION_ABORTED: cancellation completed.
+                self.pending = False
+                return True
+            if error == 996:  # ERROR_IO_INCOMPLETE: kernel still owns the storage.
+                return False
+            raise ctypes.WinError(error)
+
+        if completed():
+            return
+        if cancel_error not in (None, 1168):  # ERROR_NOT_FOUND may race completion.
+            raise ctypes.WinError(cancel_error)
+        status = kernel32.WaitForSingleObject(
+            self.event_handle,
+            _WINDOWS_WATCHER_CANCEL_TIMEOUT_MS,
+        )
+        if status == 258:  # WAIT_TIMEOUT: retain storage and handles for retry.
+            raise TimeoutError("Windows watcher cancellation did not complete")
+        if status != 0:  # WAIT_OBJECT_0
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not completed():
+            raise OSError("Windows watcher signalled before I/O completion was proved")

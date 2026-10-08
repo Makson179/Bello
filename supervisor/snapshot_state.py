@@ -332,7 +332,7 @@ def _looks_like_build_artifact(
 
 
 def _runtime_exposure_manifest(
-    ops: SnapshotServices, /, path: Path
+    ops: SnapshotServices, /, path: Path, *, excluded_root_names: tuple[str, ...] = (),
 ) -> tuple[tuple[str, SnapshotPathState], ...]:
     try:
         root_metadata = path.lstat()
@@ -352,7 +352,9 @@ def _runtime_exposure_manifest(
         )
 
     entries: list[tuple[str, SnapshotPathState]] = [(".", root_state)]
-    ops._runtime_directory_manifest(path, path, root_metadata, entries)
+    ops._runtime_directory_manifest(
+        path, path, root_metadata, entries, excluded_root_names=excluded_root_names,
+    )
     return tuple(sorted(entries, key=lambda item: item[0]))
 
 
@@ -363,11 +365,18 @@ def _runtime_directory_manifest(
     directory: Path,
     expected: os.stat_result,
     entries: list[tuple[str, SnapshotPathState]],
+    *,
+    excluded_root_names: tuple[str, ...] = (),
 ) -> None:
     expected = ops._assert_stable_regular_entry(
         directory, expected, require_directory=True
     )
-    children = sorted(directory.iterdir(), key=lambda child: child.name)
+    excluded = {ops._name_key(name) for name in excluded_root_names}
+    children = sorted(
+        (child for child in directory.iterdir()
+         if directory != root or ops._name_key(child.name) not in excluded),
+        key=lambda child: child.name,
+    )
     expected = ops._assert_stable_regular_entry(
         directory, expected, require_directory=True
     )
