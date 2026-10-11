@@ -12,7 +12,10 @@ def advance_markdown_fence(
 ) -> tuple[MarkdownFenceState, bool]:
     """Track CommonMark-style fenced blocks without interpreting their contents."""
 
-    candidate = line.lstrip(" \t")
+    indentation = len(line) - len(line.lstrip(" "))
+    if indentation > 3:
+        return state, False
+    candidate = line[indentation:]
     if state is None:
         opening = re.match(r"^(`{3,}|~{3,})(.*)$", candidate)
         if opening is None:
