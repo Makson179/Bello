@@ -140,7 +140,8 @@ class ContextProvider(ScriptedProvider):
     def command(self, number):
         if os.name == "nt":
             command = (f"[IO.File]::AppendAllText('execution-{number}.txt', 'x'); "
-                       f"Get-Content -Raw history-{number}.data")
+                       f"$fixtureBytes = [IO.File]::ReadAllBytes('history-{number}.data'); "
+                       "[Console]::OpenStandardOutput().Write($fixtureBytes, 0, $fixtureBytes.Length)")
             extra = {"shell": windows_shell()}
         else:
             command = f"printf x >> execution-{number}.txt; cat history-{number}.data"
@@ -292,7 +293,7 @@ async def verify_case(binary, output, *, enabled=True, failure=None, pending=Fal
     home, workspace = output / "private-native-home", output / "work"
     home.mkdir(); workspace.mkdir()
     for number in range(1, ROUNDS + 1):
-        (workspace / f"history-{number}.data").write_text(fixture_text(number))
+        (workspace / f"history-{number}.data").write_bytes(fixture_text(number).encode("utf-8"))
     provider = ContextProvider(workspace, enabled=enabled, failure=failure, pending=pending,
                                legacy_envelope=legacy_envelope)
     server = ThreadingHTTPServer(("127.0.0.1", 0), provider.handler())

@@ -1,6 +1,7 @@
 """Keep the native loopback proof fail-closed without executing a provider."""
 import copy
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -33,6 +34,85 @@ def evaluate(provider):
 
 def test_valid_off_receipt_proves_exact_native_tail_and_prefix():
     assert all(evaluate(off_fixture()).values())
+
+
+def replace_all_retained_payloads(provider, payload):
+    for value in provider.regular:
+        value["input"] = copy.deepcopy(value["input"])
+        for item in value["input"]:
+            if item.get("type") == "function_call_output":
+                item["output"] = payload
+
+
+def test_windows_text_writer_reproduces_false_whole_tail_receipt(tmp_path):
+    path = tmp_path / "old-history.data"
+    # Reproduce Windows newline=None translation on every test platform.
+    path.write_text(proof.fixture_text(1), encoding="utf-8", newline="\r\n")
+    payload = path.read_bytes().decode("utf-8")
+    assert "\r\n" in payload
+    provider = off_fixture()
+    replace_all_retained_payloads(provider, payload)
+    checks = evaluate(provider)
+    assert [name for name, passed in checks.items() if not passed] == [
+        "whole_oversized_latest_round_retained"]
+
+
+@pytest.mark.asyncio
+async def test_history_producer_writes_canonical_bytes_with_windows_text_translation(tmp_path, monkeypatch):
+    original_write_text = Path.write_text
+
+    def windows_write_text(path, data, *args, **kwargs):
+        kwargs["newline"] = "\r\n"
+        return original_write_text(path, data, *args, **kwargs)
+
+    class FixturePrepared(Exception):
+        pass
+
+    def stop_before_provider(*_args, **_kwargs):
+        raise FixturePrepared
+
+    monkeypatch.setattr(Path, "write_text", windows_write_text)
+    monkeypatch.setattr(proof, "ContextProvider", stop_before_provider)
+    output = tmp_path / "case"
+    # Exercise the actual file producer, stopping before any server or runtime.
+    with pytest.raises(FixturePrepared):
+        await proof.verify_case(tmp_path / "not-executed", output)
+    for number in range(1, proof.ROUNDS + 1):
+        assert (output / "work" / f"history-{number}.data").read_bytes() == proof.fixture_text(number).encode("utf-8")
+    provider = off_fixture()
+    replace_all_retained_payloads(provider, (output / "work" / "history-1.data").read_bytes().decode("utf-8"))
+    assert all(evaluate(provider).values())
+
+
+def test_windows_command_emits_file_bytes_without_powershell_formatting(tmp_path, monkeypatch):
+    provider = proof.ContextProvider(tmp_path, enabled=True)
+    monkeypatch.setattr(proof, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(proof, "windows_shell", lambda: "synthetic-powershell.exe")
+    command = provider.command(3)
+    assert command["call_id"] == "round-3"
+    assert json.loads(command["arguments"]) == {
+        "cmd": "[IO.File]::AppendAllText('execution-3.txt', 'x'); "
+               "$fixtureBytes = [IO.File]::ReadAllBytes('history-3.data'); "
+               "[Console]::OpenStandardOutput().Write($fixtureBytes, 0, $fixtureBytes.Length)",
+        "yield_time_ms": 30000, "max_output_tokens": 16000, "login": False,
+        "shell": "synthetic-powershell.exe"}
+
+
+@pytest.mark.parametrize("damage", ["dropped", "truncated", "interior_mutation"])
+def test_identically_damaged_retained_payloads_still_fail_whole_tail(damage):
+    payload = proof.fixture_text(1)
+    if damage == "dropped":
+        payload = ""
+    elif damage == "truncated":
+        payload = payload[:-1]
+    else:
+        middle = len(payload) // 2
+        payload = payload[:middle] + "!" + payload[middle + 1:]
+    provider = off_fixture()
+    replace_all_retained_payloads(provider, payload)
+    checks = evaluate(provider)
+    assert checks["retained_native_blocks_unchanged"]
+    assert not checks["whole_oversized_latest_round_retained"]
 
 
 def test_native_reasoning_null_content_is_not_a_message():
