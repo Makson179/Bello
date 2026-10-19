@@ -861,45 +861,49 @@ async function resumeFixture(t, { policyOverride, summarize, toolOutput }) {
   return { initial, tool, resume };
 }
 
-test("disk resume preserves a new immutable system entry and continues repeated NNC checkpoints", async (t) => {
-  const selected = { enabled: true, thresholdTokens: 20000, retainPercent: 25 };
-  const { initial, resume } = await resumeFixture(t, { policyOverride: selected,
-    toolOutput: (id) => `private-output-${id} ` + "neutral evidence ".repeat(700) });
-  scriptedSteps(initial.session, initial.model, "first", 10);
-  await initial.session.prompt("Original task must remain unchanged across resume.", { expandPromptTemplates: false });
-  await initial.session.flushContextCompactionNotifications();
-  assert.ok(initial.events.some((event) => event.status === "completed"));
-  const sessionFile = initial.manager.getSessionFile();
-  const journalBefore = readFileSync(sessionFile);
-  const originalPrefix = clone(initial.manager.buildSessionProjection().messages.slice(0, 2));
-  initial.session.dispose();
-  const resumedCwd = join(initial.root, "resumed-workspace");
-  mkdirSync(resumedCwd);
-  const { manager, session: resumed, events, requests } = await resume({ cwd: resumedCwd, steps: 24 });
-  const correction = "Continue the same task; preserve this latest correction verbatim.";
-  await resumed.prompt(correction, { expandPromptTemplates: false });
-  await resumed.flushContextCompactionNotifications();
-  assert.equal(requests.length, 25);
-  assert.ok(events.filter((event) => event.status === "completed").length >= 3);
-  assert.ok(requests.at(-1).checkpoints >= 3, "later real SDK requests use post-resume checkpoints");
-  const raw = manager.getEntries();
-  const systemEntries = raw.filter((entry) => entry.type === "message" && entry.message.role === "system");
-  assert.ok(systemEntries.length >= 2, "changing resume cwd creates the real SDK immutable middle system entry");
-  assert.ok(systemEntries.some((entry) => JSON.stringify(entry.message).includes(resumedCwd)));
-  const immutableIds = new Set(systemEntries.map((entry) => entry.id));
-  assert.equal(raw.some((entry) => entry.type === "context_edit" && immutableIds.has(entry.targetId)), false);
-  const projected = manager.buildSessionProjection().messages;
-  assert.deepEqual(projected.filter((message) => message.role === "system"), systemEntries.map((entry) => entry.message),
-    "all system/loadout entries keep their exact content and relative order");
-  assert.deepEqual(projected.slice(0, originalPrefix.length), originalPrefix);
-  assert.ok(projected.some((message) => message.role === "user" && JSON.stringify(message).includes(correction)));
-  assert.deepEqual(readFileSync(sessionFile).subarray(0, journalBefore.length), journalBefore, "old journal bytes remain append-only");
-  for (const { context } of requests) {
-    const ids = new Set(context.messages.flatMap((message) => message.role === "assistant"
-      ? message.content.filter((block) => block.type === "toolCall").map((block) => block.id) : []));
-    for (const message of context.messages) if (message.role === "toolResult") assert.ok(ids.has(message.toolCallId));
-  }
-});
+for (const directoryName of ["resumed-workspace", "resumed\\workspace"]) {
+  test(`disk resume preserves a new immutable system entry and continues repeated NNC checkpoints (${directoryName})`, async (t) => {
+    const selected = { enabled: true, thresholdTokens: 20000, retainPercent: 25 };
+    const { initial, resume } = await resumeFixture(t, { policyOverride: selected,
+      toolOutput: (id) => `private-output-${id} ` + "neutral evidence ".repeat(700) });
+    scriptedSteps(initial.session, initial.model, "first", 10);
+    await initial.session.prompt("Original task must remain unchanged across resume.", { expandPromptTemplates: false });
+    await initial.session.flushContextCompactionNotifications();
+    assert.ok(initial.events.some((event) => event.status === "completed"));
+    const sessionFile = initial.manager.getSessionFile();
+    const journalBefore = readFileSync(sessionFile);
+    const originalPrefix = clone(initial.manager.buildSessionProjection().messages.slice(0, 2));
+    initial.session.dispose();
+    const resumedCwd = join(initial.root, directoryName);
+    mkdirSync(resumedCwd, { recursive: true });
+    const { manager, session: resumed, events, requests } = await resume({ cwd: resumedCwd, steps: 24 });
+    const correction = "Continue the same task; preserve this latest correction verbatim.";
+    await resumed.prompt(correction, { expandPromptTemplates: false });
+    await resumed.flushContextCompactionNotifications();
+    assert.equal(requests.length, 25);
+    assert.ok(events.filter((event) => event.status === "completed").length >= 3);
+    assert.ok(requests.at(-1).checkpoints >= 3, "later real SDK requests use post-resume checkpoints");
+    const raw = manager.getEntries();
+    const systemEntries = raw.filter((entry) => entry.type === "message" && entry.message.role === "system");
+    assert.ok(systemEntries.length >= 2, "changing resume cwd creates the real SDK immutable middle system entry");
+    // Pi stores cwd in a structured section and normalizes Windows separators.
+    const expectedCwd = `<cwd>\n${resumedCwd.replace(/\\/g, "/")}\n</cwd>`;
+    assert.ok(systemEntries.some((entry) => entry.message.sections?.cwd === expectedCwd));
+    const immutableIds = new Set(systemEntries.map((entry) => entry.id));
+    assert.equal(raw.some((entry) => entry.type === "context_edit" && immutableIds.has(entry.targetId)), false);
+    const projected = manager.buildSessionProjection().messages;
+    assert.deepEqual(projected.filter((message) => message.role === "system"), systemEntries.map((entry) => entry.message),
+      "all system/loadout entries keep their exact content and relative order");
+    assert.deepEqual(projected.slice(0, originalPrefix.length), originalPrefix);
+    assert.ok(projected.some((message) => message.role === "user" && JSON.stringify(message).includes(correction)));
+    assert.deepEqual(readFileSync(sessionFile).subarray(0, journalBefore.length), journalBefore, "old journal bytes remain append-only");
+    for (const { context } of requests) {
+      const ids = new Set(context.messages.flatMap((message) => message.role === "assistant"
+        ? message.content.filter((block) => block.type === "toolCall").map((block) => block.id) : []));
+      for (const message of context.messages) if (message.role === "toolResult") assert.ok(ids.has(message.toolCallId));
+    }
+  });
+}
 
 test("the checkpoint retry threshold persists across a disk resume", async (t) => {
   const selected = { enabled: true, thresholdTokens: 5000, retainPercent: 10 };

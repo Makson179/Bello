@@ -219,13 +219,18 @@ def test_published_download_gate_has_no_local_archive_substitution_or_publicatio
         selector = outputs[0].replace('$RUNNER_TEMP', temporary) + '/worker/tmp/bello-sel-12345678/selector.sock'
         assert len(selector.encode('utf-8')) == size <= maximum
     uploads = [step for step in steps if _action(step) == 'actions/upload-artifact']
-    assert len(uploads) == 1 and _field(uploads[0], 'if') == 'always()'
+    assert len(uploads) == 2 and all(_field(upload, 'if') == 'always()' for upload in uploads)
     prefix = '${{ runner.temp }}/published-release-proof/'
     paths = _field(_block(uploads[0], 'with'), 'path').splitlines()
     assert {path.strip() for path in paths if path.strip()} == {
         prefix + 'installed-proof.json', prefix + 'worker/report.json',
         prefix + 'worker/*/report.json', prefix + 'worker/*/*/result.json',
         prefix + 'worker/context/*/receipt.json',
+    }
+    wheel_prefix = '${{ runner.temp }}/installed-wheel-proof/'
+    wheel_paths = _field(_block(uploads[1], 'with'), 'path').splitlines()
+    assert {path.strip() for path in wheel_paths if path.strip()} == {
+        wheel_prefix + 'wheel.json', wheel_prefix + 'preparation.json', wheel_prefix + 'RESULT.json',
     }
     for step in steps:
         if _action(step) == 'actions/checkout':
