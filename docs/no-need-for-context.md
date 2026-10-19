@@ -76,9 +76,12 @@ where the provider supports it, and later sections are rebuilt.
   to 64,000 output tokens, and the request is admitted only if it fits the
   reported context capacity with that allowance and a safety margin.
 - **Native Codex** requires a helper that advertises the
-  `bello_context_compaction` capability. The currently published helpers do not
-  include it, so enabling the feature with them stops before the first model
-  turn; Bello does not switch engines. The helper source patch implements the
-  feature with a 4,000-token output reserve and a 4,096-token margin (the default
-  threshold needs at least 257,096 usable tokens). A built and qualified helper
-  has not been published yet.
+  `bello_context_compaction` capability. The pinned
+  `native-codex-0.161.0-nnc-se-20261019` helpers include it and have passed platform
+  qualification and local-archive installed-cache proofs on Linux x64, Windows
+  x64 and macOS arm64. A helper without the capability still stops before the first
+  model turn; Bello does not switch engines. The helper uses a
+  4,000-token output reserve and a 4,096-token margin (the default threshold needs
+  at least 257,096 usable tokens). See the [qualification and delivery details](native-codex-candidate.md)
+  for the separate production-HTTPS and final installed-wheel checks; publication
+  alone is not proof that those checks or live-model tests passed.

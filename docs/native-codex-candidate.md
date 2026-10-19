@@ -5,7 +5,7 @@ targets upstream commit `979011409de0a60b52f179721948e65531d26144`
 (`rust-v0.161.0`). The managed selection and Smart Execution pins now select the
 same published 0.161.0 archive for each supported platform: Linux x64, Windows
 x64 and macOS Apple Silicon. The native assets use the GitHub-only release
-`native-codex-0.161.0-smart-execution-v1`, separate from Bello package publication.
+`native-codex-0.161.0-nnc-se-20261019`, separate from Bello package publication.
 The existing `native-codex-selection.patch` and 0.155.1 build workflows are retained
 as historical recipes, not relabelled as 0.161.0 builds.
 
@@ -116,11 +116,14 @@ own estimate is far below the threshold is not summarized again just because the
 restored usage figure predates the checkpoint. No sandbox, readable-root, network or
 approval setting depends on this feature.
 
-The published `smart-execution-v1` helper does not advertise the capability. Bello
-checks for `bello_context_compaction` before any thread or turn and fails closed with
-a clear message; it does not fall back to another engine and never changes the global
-Codex. The rebuilt helper needs its own native build and platform qualification before
-any pin is published. The patch itself can be checked without a Rust toolchain:
+The pinned `native-codex-0.161.0-nnc-se-20261019` helper includes this capability.
+Its archives passed platform qualification and the local-archive installed-cache
+suites described below, including all eight context-compaction cases. The
+[qualified release ledger](../scripts/native-codex-0.161.0-qualified-release.json)
+binds the exact archives and their qualification provenance. Bello still checks for
+`bello_context_compaction` before any thread or turn and fails closed with a clear
+message if it is absent; it does not fall back to another engine or change the global
+Codex. The patch itself can be checked without a Rust toolchain:
 
 ```sh
 python scripts/verify_native_codex_patch_structure.py
@@ -171,13 +174,13 @@ gate must download the pinned archive through the normal HTTPS downloader and
 verify unchanged cache reuse. That manual gate expects the full fifteen-case async
 proof, including completion batching, and all eight context-compaction cases, which
 the earlier `smart-execution-v1` archives do not qualify for;
-run it only after the rebuilt archives are pinned. Passing source or candidate tests
+run it against the currently pinned release. Passing source or candidate tests
 alone does not mean these archive and HTTPS gates have passed.
 
 Archive checksums must exist before setting public download pins. Native helper
 assets are published separately from the Bello package release. The managed
 helper is selected for native Smart Execution, log distillation or No Need For
-Context (the last also needs the rebuilt helper described above); ordinary Codex
+Context; ordinary Codex
 execution without those features continues to use the user's host Codex. No global
 Codex installation is replaced by this release path.
 
