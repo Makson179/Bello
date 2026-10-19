@@ -4,17 +4,22 @@ import json
 
 import pytest
 
+from supervisor.appserver import (
+    AppServerError, _prepare_persistent_codex_home, _validate_persistent_codex_home,
+)
 from supervisor.approval_triage import CheapRuntimeReviewer, DEFAULT_TRIAGE_MODEL
 from supervisor.runtime.client import RuntimeClient
 from supervisor.runtime.codex import CodexBackend
+from supervisor.runtime import client as runtime_client, codex as codex_backend
 from tests.test_runtime_codex_backend import FakeNative
 
 
 class TriageNative(FakeNative):
     """Neutral native protocol: unrelated user effort is ultra unless overridden."""
 
-    def __init__(self, **kwargs):
+    def __init__(self, *, neutral_source_home, **kwargs):
         super().__init__(**kwargs)
+        self.neutral_source_home = neutral_source_home
         self.early_events = False
         self.models = [{
             "id": DEFAULT_TRIAGE_MODEL,
@@ -25,6 +30,13 @@ class TriageNative(FakeNative):
             ],
             "defaultReasoningEffort": "medium",
         }]
+
+    async def start(self):
+        # Match AppServerClient.start's owned persistent-home preparation, using
+        # only the missing neutral test source, never the user's actual home.
+        self._isolated_codex_home = _prepare_persistent_codex_home(
+            self.neutral_source_home, self.options["persistent_isolated_home"])
+        await super().start()
 
     async def request(self, method, params=None, timeout=30):
         if method == "thread/start":
@@ -39,14 +51,20 @@ class TriageNative(FakeNative):
 
 
 @pytest.mark.parametrize("model", [DEFAULT_TRIAGE_MODEL, f"openai-codex/{DEFAULT_TRIAGE_MODEL}"])
-async def test_cheap_runtime_builtin_effort_does_not_inherit_unsupported_native_default(tmp_path, monkeypatch, model):
+@pytest.mark.parametrize("windows", [False, True], ids=["posix-scope", "windows-scope"])
+async def test_cheap_runtime_builtin_effort_does_not_inherit_unsupported_native_default(tmp_path, monkeypatch, model, windows):
+    # Exercise the Windows scope branch on every host without changing os.name.
+    monkeypatch.setattr(runtime_client, "_IS_WINDOWS", windows)
+    monkeypatch.setattr(codex_backend, "_IS_WINDOWS", windows)
+    source_home = tmp_path / "neutral-source-home"
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
     monkeypatch.delenv("BELLO_CODEX_SELECTION_MANIFEST", raising=False)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     instances = []
 
     def factory(**kwargs):
-        native = TriageNative(**kwargs)
+        native = TriageNative(neutral_source_home=source_home, **kwargs)
         instances.append(native)
         return native
 
@@ -74,9 +92,30 @@ async def test_cheap_runtime_builtin_effort_does_not_inherit_unsupported_native_
         assert starts[0]["model"] == turns[0]["model"] == DEFAULT_TRIAGE_MODEL
         assert starts[0]["config"]["model_reasoning_effort"] == turns[0]["effort"] == "medium"
         assert requested_turns[0]["effort"] == "medium"
+        home = backend.state_dir / "codex-home"
+        _validate_persistent_codex_home(home)
+        assert instances[0]._isolated_codex_home == home.resolve()
+        assert (home / "rules").is_dir()
+        assert not source_home.exists()
+        if windows:
+            profile = starts[0]["config"]["permissions"]["bello-native"]
+            assert profile["filesystem"][str(home)] == "deny"
+            assert profile["filesystem"][str(backend.state_dir)] == "deny"
         assert all(record["closed"] for record in client._threads.values())
     finally:
         await client.stop()
+
+
+async def test_triage_native_start_rejects_unrecognized_persistent_home(tmp_path):
+    state = tmp_path / "native-state"
+    state.mkdir(mode=0o700)
+    home = state / "codex-home"
+    home.mkdir(mode=0o700)
+    native = TriageNative(neutral_source_home=tmp_path / "neutral-source-home",
+                          persistent_isolated_home=home)
+    with pytest.raises(AppServerError, match="unrecognized persistent Codex home"):
+        await native.start()
+    assert not native.started
 
 
 @pytest.mark.parametrize("model", ["gpt-6-sol", "claude-code/claude-sonnet-5-5", "openai/gpt-5.6-luna"])
