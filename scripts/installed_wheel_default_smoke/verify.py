@@ -76,7 +76,10 @@ def wheel_payload(wheel: Path) -> dict[str, str]:
 
 
 def clean_environment(home: Path, runtime: Path) -> dict[str, str]:
-    env = {key: os.environ[key] for key in ("SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "USERNAME")
+    # CPython 3.11 platform.machine() on Windows needs these nonsecret CPU
+    # identity fields; removing them makes a valid x64 installation unknown.
+    env = {key: os.environ[key] for key in ("SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "USERNAME",
+                                           "PROCESSOR_ARCHITECTURE", "PROCESSOR_ARCHITEW6432")
            if os.environ.get(key)}
     for name in ("tmp", "config", "data", "cache", "codex"):
         (home / name).mkdir(parents=True, exist_ok=True)

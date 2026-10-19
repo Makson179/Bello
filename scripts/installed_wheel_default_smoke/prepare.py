@@ -121,7 +121,10 @@ def qualified_ledger(wheel: Path, helper_ledger: Path, target: str, source_sha: 
 
 
 def clean_environment(home: Path, scripts: Path) -> dict[str, str]:
-    system_names = ("SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "USERNAME")
+    # Preserve Windows CPU identity for CPython 3.11 platform detection in
+    # subprocesses; provider credentials and explicit helper overrides stay out.
+    system_names = ("SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "USERNAME",
+                    "PROCESSOR_ARCHITECTURE", "PROCESSOR_ARCHITEW6432")
     env = {key: os.environ[key] for key in system_names if os.environ.get(key)}
     for name in ("tmp", "config", "data", "cache", "codex"):
         (home / name).mkdir(parents=True, exist_ok=True)

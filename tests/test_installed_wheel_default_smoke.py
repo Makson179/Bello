@@ -167,12 +167,36 @@ def test_explicit_helper_override_is_rejected(override):
         verify.require_default_environment({override: "neutral-forbidden-override"})
 
 
-def test_isolated_environment_does_not_inherit_provider_credentials(tmp_path, monkeypatch):
+@pytest.mark.parametrize("builder", [prepare.clean_environment, verify.clean_environment])
+def test_isolated_environment_does_not_inherit_provider_credentials(tmp_path, monkeypatch, builder):
     for name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "BELLO_CODEX_BINARY", "BELLO_CODEX_SELECTION_MANIFEST"):
         monkeypatch.setenv(name, "neutral-test-only-value")
-    environment = verify.clean_environment(tmp_path / "home", tmp_path / "cache")
+    environment = builder(tmp_path / "home", tmp_path / "cache")
     assert not any(name in environment for name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY",
                                                    "BELLO_CODEX_BINARY", "BELLO_CODEX_SELECTION_MANIFEST"))
+
+
+@pytest.mark.parametrize("builder", [prepare.clean_environment, verify.clean_environment])
+@pytest.mark.parametrize("architecture,wow64,expected", [
+    ("AMD64", None, "AMD64"), ("x86", "AMD64", "AMD64"), (None, None, ""),
+])
+def test_isolated_environment_preserves_windows_architecture_detection(
+    tmp_path, monkeypatch, builder, architecture, wow64, expected,
+):
+    # CPython 3.11 platform._get_machine_win32 uses these environment fields;
+    # it has no newer-Python WMI fallback. Preserve identity, never invent it.
+    original = {"PROCESSOR_ARCHITECTURE": architecture, "PROCESSOR_ARCHITEW6432": wow64}
+    for name, value in original.items():
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    environment = builder(tmp_path / "home", tmp_path / "cache")
+    assert {name: environment[name] for name in original if name in environment} == {
+        name: value for name, value in original.items() if value is not None
+    }
+    machine = environment.get("PROCESSOR_ARCHITEW6432", "") or environment.get("PROCESSOR_ARCHITECTURE", "")
+    assert machine == expected
 
 
 def test_imported_modules_must_be_exact_installed_wheel_bytes(tmp_path, monkeypatch):
