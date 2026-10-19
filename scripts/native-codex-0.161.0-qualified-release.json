@@ -1,0 +1,72 @@
+{
+  "schema": "bello.qualified-helper-release.v1",
+  "helper_source_sha": "37c6e69624924528df3d83592aa6b62fcb5ec6df",
+  "targets": {
+    "linux-x64": {
+      "bundle": {
+        "url": "https://github.com/Makson179/Bello/releases/download/native-codex-0.161.0-nnc-se-20261019/bello-native-codex-0.161.0-x86_64-unknown-linux-gnu.tar.gz",
+        "archive_sha256": "dace587b72401effc572d5702d670da95fee08f79f808c5ae01e02a6032e513a",
+        "manifest_sha256": "73bb2613cd29a2a799713c7098c8a28fd2923fe3f705a50faf56389329ddd77b"
+      },
+      "files": {
+        "BUILD-INFO": "bd99cfeb08abc467deedee5c493b006704db5e68a19cc3e7ad7153e13828f89e",
+        "LICENSE": "d17f227e4df5da1600391338865ce0f3055211760a36688f816941d58232d8dc",
+        "NOTICE": "9d71575ecfd9a843fc1677b0efb08053c6ba9fd686a0de1a6f5382fd3c220915",
+        "THIRD-PARTY-NOTICES": "337d876f734ddcc23ea0e53ae3e3427c0114d06992dfe427614128377dfcdf31",
+        "bin/codex": "2ac25b212bf800d6dd01832031afc20962ff7e66d61c565de2a81dc4242d7eff",
+        "bin/codex-code-mode-host": "25cda04ee615de1560271ab4c332bc63af95ebcafbd15b3cb9b3d5b1c229430c",
+        "bin/codex-resources/bwrap": "58fcb55c11aba96896a7eb6d33b0a1da365410a46f26ca6ea54cdd65afd9266b",
+        "native-codex-selection.patch": "5c754e431dd4fe7e2ed32ee9a0d402e9cfacd016e9d5be6ced1f8b21a1036b00"
+      },
+      "release_provenance": {
+        "build_receipt_sha256": "3398ae98022312c9b52e2767d822c60383e47787606d5659ab3b343b31aaf8a3",
+        "qualification_sha256": "1ba252bb241c620f806bf14ea23fd9ba767715ee5c44ffbb42a4fb9e0097c73d",
+        "worker_sha256": "7ddc19c96bd3838b78a168a149faca4c0a00b1d4e1b4d7b386bb64613cd083b9"
+      }
+    },
+    "darwin-arm64": {
+      "bundle": {
+        "url": "https://github.com/Makson179/Bello/releases/download/native-codex-0.161.0-nnc-se-20261019/bello-native-codex-0.161.0-aarch64-apple-darwin.tar.gz",
+        "archive_sha256": "111cfe5cd8ccb7451bc439d0e61f1c0b47ab9ecbec955c0207c23eef401ecc85",
+        "manifest_sha256": "91d82250f699f7483f9c91b0a4d661ef544f5e23851bddf8f336a9227ae9aae6"
+      },
+      "files": {
+        "BUILD-INFO": "888cb10e65cc9709fbdad57ea6add026b150c57bac106177133a4c85fbd90baa",
+        "LICENSE": "d17f227e4df5da1600391338865ce0f3055211760a36688f816941d58232d8dc",
+        "NOTICE": "9d71575ecfd9a843fc1677b0efb08053c6ba9fd686a0de1a6f5382fd3c220915",
+        "THIRD-PARTY-NOTICES": "dde38790cc891b194d36d7429e17d1b6ff1cb169df437f84b6651baed226b0eb",
+        "bin/codex": "8a093d48afe750b22ab9f70b64a7ec7d58fbaf93e3a49e5a125616e98b485e54",
+        "bin/codex-code-mode-host": "fa1acdff337c2007feeed88e4b91c440cb8bfcaa890f861420927113cdee840e",
+        "native-codex-selection.patch": "5c754e431dd4fe7e2ed32ee9a0d402e9cfacd016e9d5be6ced1f8b21a1036b00"
+      },
+      "release_provenance": {
+        "build_receipt_sha256": "6bd172fc2e5f4f1a32887bc426a67a1f4e08920b6a1a2e72562c2f24b099f2f2",
+        "qualification_sha256": "d3fd7f50edc198f68303dd2ebf75ac261fa3858b3616fd7dd03d80a4d8d536c0",
+        "worker_sha256": "cd332d0536bc01efe84205b83b6d89609dfc2e3938ec7ec318c2c13fc4d8e543"
+      }
+    },
+    "windows-x64": {
+      "bundle": {
+        "url": "https://github.com/Makson179/Bello/releases/download/native-codex-0.161.0-nnc-se-20261019/bello-native-codex-0.161.0-x86_64-pc-windows-msvc.tar.gz",
+        "archive_sha256": "135f8e721f5393ecafa0a4febd28659c0e8f2ceb5649a1028351c28b87cc2f12",
+        "manifest_sha256": "22e290e3adbe4b5be631885427b443c101109809daabf9859987911821cbdc36"
+      },
+      "files": {
+        "BUILD-INFO": "d99ede0db912c255f33428aefb260aa8643d7793910371f19dfd66e443f4e8d7",
+        "LICENSE": "aa5e89edcbbd01fc3fb188a527d8bdc0da5812305cab220c84348c14ea427288",
+        "NOTICE": "3c505dc54be731583470ef3584e5cb96d60df7add3e7e36294cf4dea8316a5cb",
+        "THIRD-PARTY-NOTICES": "e6d795dfc68c58a7e05586190aff0796121174d386935a58e745946d4bbd6e8b",
+        "bin/codex-code-mode-host.exe": "4a4772457710cf06b32f23de7c3e5ade5226ac4668bf3ce91cf0dade8906361c",
+        "bin/codex-command-runner.exe": "44ee34311d788bfa0d78b0df162d5432c84cadec2f581bb0075f4dacbad25011",
+        "bin/codex-windows-sandbox-setup.exe": "9d1f271b0a59e9eab6101c634ac9f1fb03a4c3b3287ea8d414e8ff72f5417be4",
+        "bin/codex.exe": "fc50c186d1c4ba22e504e6461f0a9f82569068cf143a4340e2757dde1a261a6c",
+        "native-codex-selection.patch": "c73bddb97a53b018754a5d8a4e52ec23438e312a4074c6a57a45bd3bae7cbfc3"
+      },
+      "release_provenance": {
+        "build_receipt_sha256": "3aaff95a295135b64878db243c4f027b801309c5219c4119be557bff712be108",
+        "qualification_sha256": "cf3ec763fc3c06a5c459b5b90e158ab6de5912326af0b7728b7a614f2f6c4003",
+        "worker_sha256": "b69a0825d6fd08abd0e56cb90b0aa37651a00e52a639d94d734c13eb100490e2"
+      }
+    }
+  }
+}
