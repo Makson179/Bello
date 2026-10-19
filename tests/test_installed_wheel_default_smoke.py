@@ -9,7 +9,8 @@ from pathlib import Path
 import re
 import textwrap
 from types import SimpleNamespace
-from zipfile import ZipFile
+import zipfile
+from zipfile import ZipFile, ZipInfo
 
 import pytest
 
@@ -193,7 +194,32 @@ def test_imported_modules_must_be_exact_installed_wheel_bytes(tmp_path, monkeypa
 def test_unsafe_wheel_members_are_rejected(tmp_path, unsafe):
     wheel = tmp_path / "neutral.whl"
     with ZipFile(wheel, "w") as archive:
-        archive.writestr(unsafe, b"neutral")
+        # ZipInfo's constructor normalizes backslashes on Windows. Construct
+        # the intentionally invalid archive name after that normalization.
+        member = ZipInfo("neutral")
+        member.filename = member.orig_filename = unsafe
+        archive.writestr(member, b"neutral")
+    with ZipFile(wheel) as archive:
+        assert archive.infolist()[0].orig_filename == unsafe
+    with pytest.raises(ValueError, match="Unsafe wheel member"):
+        verify.wheel_payload(wheel)
+
+
+def test_wheel_original_name_is_checked_before_host_normalization(tmp_path, monkeypatch):
+    wheel = tmp_path / "neutral.whl"
+    unsafe = "supervisor\\escape"
+    with ZipFile(wheel, "w") as archive:
+        member = ZipInfo("neutral")
+        member.filename = member.orig_filename = unsafe
+        archive.writestr(member, b"neutral")
+        archive.writestr("supervisor/runtime/native_codex_install.py", b"# neutral fixture\n")
+    # Exercise Windows ZipInfo normalization without changing the host's os
+    # module or pathlib. The archive bytes and original filename stay intact.
+    monkeypatch.setattr(zipfile, "os", SimpleNamespace(**(vars(zipfile.os) | {"sep": "\\"})))
+    with ZipFile(wheel) as archive:
+        member = archive.infolist()[0]
+        assert member.orig_filename == unsafe
+        assert member.filename == "supervisor/escape"
     with pytest.raises(ValueError, match="Unsafe wheel member"):
         verify.wheel_payload(wheel)
 

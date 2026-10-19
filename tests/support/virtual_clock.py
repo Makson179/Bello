@@ -46,6 +46,10 @@ class VirtualClockLoop(asyncio.SelectorEventLoop):
     def __init__(self) -> None:
         super().__init__()
         self._virtual_now = 0.0
+        # asyncio batches timers within the clock's resolution. This synthetic
+        # clock has nanosecond resolution, not the host monotonic clock's (which
+        # can be ~15 ms on Windows and fire a 500 s deadline at 499.999 s).
+        self._clock_resolution = 1e-9
         self._selector = _VirtualSelector(self._selector, self)  # type: ignore[assignment]
 
     def time(self) -> float:

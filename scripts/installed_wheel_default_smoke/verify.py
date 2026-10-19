@@ -57,7 +57,9 @@ def wheel_payload(wheel: Path) -> dict[str, str]:
     result = {}
     with ZipFile(wheel) as archive:
         for info in archive.infolist():
-            name = info.filename
+            # Windows ZipInfo normalizes backslashes in filename. Validate the
+            # original archive spelling so host normalization cannot hide it.
+            name = info.orig_filename
             require(not PurePosixPath(name).is_absolute() and ".." not in PurePosixPath(name).parts
                     and "\\" not in name, "Unsafe wheel member")
             if info.is_dir():

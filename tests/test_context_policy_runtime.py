@@ -624,18 +624,29 @@ async def test_preflight_fails_closed_for_a_native_helper_without_the_capability
         await client.stop()
 
 
-async def test_client_fails_closed_before_any_model_turn_when_native_helper_lacks_the_capability(tmp_path, monkeypatch):
-    backend, root, _, clients, _ = make_native(tmp_path, monkeypatch, supported=False)
+@pytest.mark.parametrize("windows", [False, True])
+async def test_client_fails_closed_before_any_model_turn_when_native_helper_lacks_the_capability(tmp_path, monkeypatch, windows):
+    monkeypatch.setattr("supervisor.runtime.client._IS_WINDOWS", windows)
+    backend, root, _, clients, _ = make_native(tmp_path, monkeypatch, supported=False, windows=windows)
     project = tmp_path / "project"
     project.mkdir()
     client = RuntimeClient(cwd=project, backends={"codex": backend})
-    client.configure_run(no_need_for_context=POLICY)
+    # Reach capability discovery with an explicitly supported Windows scope.
+    # The real permission validator stays enabled; consent is host-owned.
+    client.configure_run(no_need_for_context=POLICY, windows_native_root_read=True)
     try:
         with pytest.raises(AppServerError, match="(?i)bello_context_compaction.*no engine or API fallback"):
             await client.thread_start({"cwd": str(root), "runtimeWorkspaceRoots": [str(root)], "model": "gpt-6-astra",
                 "sandbox": "workspace-write", "approvalPolicy": "on-request"})
+        assert len(clients) == 1
+        assert any(method == "experimentalFeature/list" for method, _ in clients[0].calls)
         assert not any(method in {"thread/start", "turn/start"} for method, _ in clients[0].calls)
-        assert all(record["closed"] for record in client._threads.values())
+        assert len(client._threads) == 1
+        record = next(iter(client._threads.values()))
+        assert record["closed"] and record["noNeedForContext"] == POLICY.to_backend_data()
+        assert record["sandbox"] == "workspace-write" and record["approvalPolicy"] == "on-request"
+        assert record["runtimeWorkspaceRoots"] == [str(root)]
+        assert record.get("windowsNativeRootRead", False) is windows
     finally:
         await client.stop()
 

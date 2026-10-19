@@ -1099,9 +1099,11 @@ class ClaudeBackend:
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + claude_context.SUMMARY_TIMEOUT_SECONDS
+        deadline_expired = False
 
         async def attempt(note: str | None, stream: claude_context.SummaryStream,
                           receipt: dict[str, Any], stop: asyncio.Future[None]) -> tuple[str, str]:
+            nonlocal deadline_expired
             from claude_agent_sdk import ResultMessage
 
             summarizer = self._new_client(self._summary_options(record, params))
@@ -1112,6 +1114,7 @@ class ClaudeBackend:
             dispatch: asyncio.Task[None] | None = None
             reading: asyncio.Task[Any] | None = None
             submitted_at: float | None = None
+            summary_timeout = asyncio.timeout_at(deadline)
 
             def honor_stop() -> None:
                 # Setup steps are bounded and finish first: cancelling SDK
@@ -1124,7 +1127,7 @@ class ClaudeBackend:
                 # The shared deadline; see SUMMARY_TIMEOUT_SECONDS for exactly
                 # what it covers. The stop/drain and the transport close below
                 # run after it, under their own short bounds.
-                async with asyncio.timeout_at(deadline):
+                async with summary_timeout:
                     receipt["phase"] = "connect"
                     honor_stop()
                     try:
@@ -1195,6 +1198,11 @@ class ClaudeBackend:
                         # continuation, before the CLI's own result.
                         stream.observe(message)
             except BaseException:
+                # asyncio may deliver a timer up to one clock-resolution early.
+                # Once our shared timeout fired, its budget is spent even if
+                # loop.time() is still just below the deadline. A provider's own
+                # TimeoutError does not expire this context and remains retryable.
+                deadline_expired = deadline_expired or summary_timeout.expired()
                 # Failure, timeout or stop: a query that may be in flight is
                 # interrupted and drained by the task that owns the client.
                 if dispatch is not None:
@@ -1215,7 +1223,7 @@ class ClaudeBackend:
         attempts: list[dict[str, Any]] = []
         note: str | None = None
         for number in range(1, claude_context.SUMMARY_ATTEMPTS + 1):
-            if number > 1 and loop.time() >= deadline:
+            if number > 1 and (deadline_expired or loop.time() >= deadline):
                 break  # the one summary deadline is spent: there is no time for a retry
             self._check_context_cancel(command_task, record)
             stream = claude_context.SummaryStream()

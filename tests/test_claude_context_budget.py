@@ -10,14 +10,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from supervisor.runtime import claude_context
-from tests.support.claude_summary_timing import (Delay, Recorder, TimedScriptFactory, run_turn, start_thread,
+from tests.support.claude_summary_timing import (Delay, Recorder, TimedScriptClient, TimedScriptFactory, run_turn, start_thread,
                                                  timed_backend)
 from tests.support.virtual_clock import VirtualClockLoop, run_virtual
-from tests.test_runtime_claude_context_summary import BARE, HANDOFF, answer, assistant, result, text, thinking
+from tests.test_runtime_claude_context_summary import BARE, HANDOFF, HANG, answer, assistant, result, text, thinking
 
 
 def test_virtual_clock_fires_timers_at_their_exact_instant():
@@ -34,6 +35,18 @@ def test_virtual_clock_fires_timers_at_their_exact_instant():
         return slept, fired
 
     assert run_virtual(scenario) == (121.0, 621.0)
+
+
+def test_virtual_clock_does_not_inherit_coarse_host_timer_resolution(monkeypatch):
+    monkeypatch.setattr(asyncio.base_events.time, "get_clock_info",
+                        lambda _name: SimpleNamespace(resolution=0.015625))
+
+    async def scenario():
+        async with asyncio.timeout(500):
+            await asyncio.sleep(499.999)
+        return asyncio.get_running_loop().time()
+
+    assert run_virtual(scenario) == 499.999
 
 
 def summary_turn(tmp_path, scripts, *, configure=None, during=None):
@@ -111,6 +124,47 @@ def test_the_deadline_is_exactly_500_seconds_and_a_spent_deadline_is_not_retried
     assert len(factory.summary_prompts) == 1
     assert params["summaryTimeoutSeconds"] == 500 and params["category"] == "timeout"
     assert run["turn"]["usage"]["input_tokens"] == 7 * 3 + 1000  # the stopped session, once
+
+
+@pytest.mark.parametrize("phase", ["streaming", "dispatch"])
+def test_fired_shared_deadline_cannot_retry_even_when_coarse_clock_is_still_early(tmp_path, phase):
+    def configure(factory):
+        if phase == "dispatch":
+            factory.dispatch_gate = asyncio.Event()
+
+    async def during(_instance, _factory):
+        loop = asyncio.get_running_loop()
+        # Emulate asyncio's allowed early delivery on a coarse Windows clock.
+        # A ready timer just before 500 makes the shared deadline fire at 499.99.
+        loop._clock_resolution = 0.015625
+        loop.call_later(499.99, lambda: None)
+
+    run = summary_turn(tmp_path, [[assistant(text("{")), HANG]], configure=configure, during=during)
+    [failed] = run["recorder"].context()
+    attempts = failed["params"]["attempts"]
+    assert run["now"] == 499.99 < claude_context.SUMMARY_TIMEOUT_SECONDS
+    assert attempts[0]["outcome"] == "timeout" and attempts[0]["phase"] == phase
+    assert [attempt["outcome"] for attempt in attempts] == ["timeout"]
+    assert run["factory"].interrupted_at == [499.99]
+    [summarizer] = run["factory"].summarizers()
+    assert summarizer.disconnect_finished and len(run["factory"].summary_prompts) == 1
+    assert run["turn"]["usage"]["input_tokens"] == 7 * 3 + 1000
+
+
+def test_provider_timeout_before_shared_deadline_still_allows_retry(tmp_path, monkeypatch):
+    query = TimedScriptClient.query
+
+    async def provider_timeout_once(client, prompt):
+        await query(client, prompt)
+        if client.summarizer and len(client.factory.summary_prompts) == 1:
+            raise TimeoutError("synthetic provider timeout, not the shared budget")
+
+    monkeypatch.setattr(TimedScriptClient, "query", provider_timeout_once)
+    run = summary_turn(tmp_path, [[HANG], response_after(1.0)])
+    [compacted] = run["recorder"].context()
+    assert [attempt["outcome"] for attempt in compacted["params"]["attempts"]] == ["timeout", "accepted"]
+    assert run["now"] == 1.0 and run["factory"].interrupted_at == [0.0]
+    assert run["instance"]._record("thread-1")["contextState"]["generation"] == 1
 
 
 def test_a_retry_runs_only_in_the_time_the_first_attempt_left(tmp_path):

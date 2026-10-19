@@ -122,7 +122,8 @@ async def test_rollover_preserves_logical_thread_and_exact_whole_round(tmp_path)
     ("", False),  # plain text: empty
     ("A plain-text handoff that stopped at the output limit.", True),  # plain text: truncated
     ("x" * (claude_context.SUMMARY_MAX_CHARS + 1), False),  # over the maximum: rejected, never truncated
-])
+], ids=["legacy-refused", "legacy-empty", "legacy-truncated", "text-refused",
+        "text-empty", "text-truncated", "text-oversized"])
 async def test_invalid_summary_retries_twice_without_changing_native_session(tmp_path, summary, truncated):
     factory = ContextFactory(summary=summary, truncate_summary=truncated)
     instance = backend(tmp_path, factory, events := [])
@@ -496,7 +497,7 @@ def assert_query_state_consistent(factory):
         assert state["disk_generation"] == state["memory_generation"]
 
 
-@pytest.mark.parametrize("fault", ["post_chmod", "post_replace", "pre_replace", "pre_fsync"])
+@pytest.mark.parametrize("fault", ["post_finalize", "post_replace", "pre_replace", "pre_fsync"])
 async def test_checkpoint_write_fault_reconciles_session_before_continuing(tmp_path, monkeypatch, fault):
     from supervisor.runtime import claude as claude_module
 
@@ -505,6 +506,7 @@ async def test_checkpoint_write_fault_reconciles_session_before_continuing(tmp_p
     factory.backend = instance
     fired = False
     original_replace, original_chmod, original_fsync = claude_module.os.replace, claude_module.os.chmod, claude_module.os.fsync
+    original_unlink = Path.unlink
 
     def candidate():
         return instance._record("thread-1")["contextState"]["generation"] == 1
@@ -520,10 +522,24 @@ async def test_checkpoint_write_fault_reconciles_session_before_continuing(tmp_p
 
     def chmod(path, mode, *args, **kwargs):
         nonlocal fired
-        if fault == "post_chmod" and not fired and Path(path) == instance._state_file and candidate():
+        if fault == "post_finalize" and not fired and Path(path) == instance._state_file and candidate():
             fired = True
             raise OSError("synthetic post-replace chmod failure")
         return original_chmod(path, mode, *args, **kwargs)
+
+    def unlink(path, *args, **kwargs):
+        nonlocal fired
+        # Windows deliberately has no POSIX chmod. Its real post-replace
+        # finalization boundary is temporary-file cleanup; exercise that error
+        # instead of waiting for an unreachable chmod or skipping the case.
+        if (fault == "post_finalize" and claude_module.os.name == "nt" and not fired
+                and path.parent == instance.state_dir and path.name.startswith(".threads-") and candidate()):
+            disk = json.loads(instance._state_file.read_text())["threads"]["thread-1"]
+            assert disk["claudeSessionId"] == instance._record("thread-1")["claudeSessionId"]
+            assert disk["contextState"]["generation"] == 1
+            fired = True
+            raise OSError("synthetic post-replace cleanup failure")
+        return original_unlink(path, *args, **kwargs)
 
     def fsync(descriptor):
         nonlocal fired
@@ -538,6 +554,7 @@ async def test_checkpoint_write_fault_reconciles_session_before_continuing(tmp_p
         monkeypatch.setattr(claude_module.os, "replace", replace)
         monkeypatch.setattr(claude_module.os, "chmod", chmod)
         monkeypatch.setattr(claude_module.os, "fsync", fsync)
+        monkeypatch.setattr(Path, "unlink", unlink)
         await instance.request("turn/start", {"threadId": "thread-1", "turnId": "outer", "input": [{"type": "text", "text": "Synthetic task."}]})
         completed = await wait_completed(events)
         assert fired and completed["params"]["turn"]["status"] == "completed"
