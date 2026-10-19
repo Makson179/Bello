@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -85,6 +86,7 @@ class MultiAgentConfig:
 
 RUNTIME_SYNC_FIELDS = (
     "task",
+    "goal",
     "coder_mod",
     "revision_coder_enabled",
     "revision_coder_mod",
@@ -99,6 +101,7 @@ RUNTIME_SYNC_FIELDS = (
     "speed",
     "runtime_enabled",
     "async_tools",
+    "no_need_for_context",
     "windows_native_root_read",
     "cheap_runtime",
     "log_distiller",
@@ -118,6 +121,40 @@ RUNTIME_SYNC_FIELDS = (
 
 class ProjectConfigError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class NoNeedForContextConfig:
+    enabled: bool = False
+    threshold_tokens: int = 249000
+    retain_percent: float = 10
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ProjectConfigError("no_need_for_context.enabled must be a boolean")
+        if type(self.threshold_tokens) is not int or self.threshold_tokens <= 0:
+            raise ProjectConfigError("no_need_for_context.threshold_tokens must be a positive integer")
+        if (type(self.retain_percent) not in (int, float)
+                or not 0 < self.retain_percent <= 50
+                or not math.isfinite(self.retain_percent)):
+            raise ProjectConfigError("no_need_for_context.retain_percent must be a finite number greater than 0 and at most 50")
+
+    def to_json_data(self) -> dict[str, Any]:
+        return {"enabled": self.enabled, "threshold_tokens": self.threshold_tokens,
+                "retain_percent": self.retain_percent}
+
+    def to_backend_data(self) -> dict[str, Any]:
+        return {"enabled": self.enabled, "thresholdTokens": self.threshold_tokens,
+                "retainPercent": self.retain_percent}
+
+
+def _no_need_for_context_config(value: Any, *, path: Path) -> NoNeedForContextConfig:
+    if not isinstance(value, dict) or set(value) - {"enabled", "threshold_tokens", "retain_percent"}:
+        raise ProjectConfigError(f"{path}: no_need_for_context must contain only enabled, threshold_tokens and retain_percent")
+    try:
+        return NoNeedForContextConfig(**value)
+    except ProjectConfigError as exc:
+        raise ProjectConfigError(f"{path}: {exc}") from exc
 
 
 @dataclass(frozen=True)
@@ -151,6 +188,12 @@ def _log_distiller_config(value: Any, *, path: Path) -> LogDistillerConfig:
 @dataclass(frozen=True)
 class ProjectConfig:
     task: str | None = None
+    # Opt-in: keep working toward the original task. While on, runtime supervision
+    # and completion review are mandatory (see the effective_* properties) and
+    # completion returns are unlimited. It changes nothing else: Smart Execution,
+    # the revision coder, No Need For Context and the log distiller keep their own
+    # switches.
+    goal: bool = False
     coder_mod: str = DEFAULT_MODEL
     revision_coder_enabled: bool = False
     revision_coder_mod: str = DEFAULT_MODEL
@@ -164,7 +207,10 @@ class ProjectConfig:
     adversary_intelligence: str = DEFAULT_INTELLIGENCE
     speed: str = "usual"
     runtime_enabled: bool = True
-    async_tools: bool = False
+    # Smart Execution defaults on for new configurations; a saved explicit false
+    # is preserved when the file is loaded.
+    async_tools: bool = True
+    no_need_for_context: NoNeedForContextConfig = field(default_factory=NoNeedForContextConfig)
     # Explicit user consent for the native Windows read-root prerequisite.
     windows_native_root_read: bool = False
     cheap_runtime: bool = True
@@ -186,13 +232,24 @@ class ProjectConfig:
         return self.speed == "fast"
 
     @property
+    def effective_runtime_enabled(self) -> bool:
+        """Runtime supervision is mandatory while Goal is on, whatever was saved."""
+        return self.goal or self.runtime_enabled
+
+    @property
+    def effective_completion_review(self) -> bool:
+        """Completion review is mandatory while Goal is on, whatever was saved."""
+        return self.goal or self.completion_review
+
+    @property
     def effective_cheap_runtime(self) -> bool:
-        return self.runtime_enabled and self.cheap_runtime
+        return self.effective_runtime_enabled and self.cheap_runtime
 
     def to_json_data(self) -> dict[str, Any]:
         return {
             REVIEW_LIMIT_FORMAT_FIELD: EXPLICIT_REVIEW_LIMIT_FORMAT,
             "task": self.task,
+            "goal": self.goal,
             "coder_mod": self.coder_mod,
             "revision_coder_enabled": self.revision_coder_enabled,
             "revision_coder_mod": self.revision_coder_mod,
@@ -207,6 +264,7 @@ class ProjectConfig:
             "speed": self.speed,
             "runtime_enabled": self.runtime_enabled,
             "async_tools": self.async_tools,
+            "no_need_for_context": self.no_need_for_context.to_json_data(),
             "windows_native_root_read": self.windows_native_root_read,
             "cheap_runtime": self.cheap_runtime,
             "log_distiller": self.log_distiller.to_json_data(),
@@ -388,6 +446,7 @@ def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfi
     )
     return ProjectConfig(
         task=_optional_string(_first_present(payload, ("task", "task_path"), default.task, skip_none=True), "task_path", path=path),
+        goal=_bool(payload.get("goal", default.goal), "goal", path=path),
         coder_mod=coder_mod,
         revision_coder_enabled=_bool(
             payload.get("revision_coder_enabled", default.revision_coder_enabled),
@@ -431,6 +490,8 @@ def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfi
         speed=_speed_from_payload(payload, default.speed, path=path),
         runtime_enabled=_bool(payload.get("runtime_enabled", default.runtime_enabled), "runtime_enabled", path=path),
         async_tools=_bool(payload.get("async_tools", default.async_tools), "async_tools", path=path),
+        no_need_for_context=_no_need_for_context_config(
+            payload.get("no_need_for_context", default.no_need_for_context.to_json_data()), path=path),
         windows_native_root_read=_bool(payload.get("windows_native_root_read", default.windows_native_root_read), "windows_native_root_read", path=path),
         cheap_runtime=_bool(
             _first_present(payload, ("cheap_runtime", "cheap_runtime_enabled"), default.cheap_runtime),
@@ -704,6 +765,8 @@ def _runtime_config_from_project_config(project_root: Path, config: ProjectConfi
 def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) -> dict[str, Any]:
     selected = set(fields)
     updates: dict[str, Any] = {}
+    if "goal" in selected:
+        updates["goal"] = config.goal
     if "task" in selected:
         updates["task"] = config.task
         updates["task_path"] = config.task or ""
@@ -748,9 +811,11 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
         updates["runtime_enabled"] = config.runtime_enabled
     if "async_tools" in selected:
         updates["async_tools"] = config.async_tools
+    if "no_need_for_context" in selected:
+        updates["no_need_for_context"] = config.no_need_for_context.to_json_data()
     if "windows_native_root_read" in selected:
         updates["windows_native_root_read"] = config.windows_native_root_read
-    if selected.intersection({"cheap_runtime", "runtime_enabled"}):
+    if selected.intersection({"cheap_runtime", "runtime_enabled", "goal"}):
         updates["cheap_runtime"] = config.effective_cheap_runtime
     if "log_distiller" in selected:
         updates["log_distiller"] = config.log_distiller.to_json_data()

@@ -17,6 +17,7 @@ import pytest
 
 from supervisor.runtime import native_codex_install as install
 from supervisor.runtime.client import RuntimeClient
+from supervisor.project_config import NoNeedForContextConfig
 
 
 def test_async_native_selection_never_downloads_legacy_bundle(tmp_path, monkeypatch):
@@ -862,3 +863,43 @@ async def test_other_engine_never_prepares_native(tmp_path, monkeypatch):
     client = RuntimeClient(cwd=tmp_path)
     client._distiller = object()
     assert await client._load_engine("claude-code") is fake
+
+
+def test_published_selection_and_async_pins_are_intact_and_not_disabled():
+    platforms = {("Linux", "x86_64"), ("Darwin", "arm64"), ("Windows", "x86_64")}
+    # A local override must never empty the published pins: Smart Execution and the
+    # distiller keep their verified helpers, and NNC reuses the same installer.
+    assert set(install.BUNDLES) == set(install.ASYNC_BUNDLES) == platforms
+    for key in platforms:
+        assert install.ASYNC_BUNDLES[key] == install.BUNDLES[key]
+        assert install.ASYNC_BUNDLES[key].url.startswith(
+            "https://github.com/Makson179/Bello/releases/download/native-codex-0.161.0-smart-execution-v1/")
+
+
+@pytest.mark.parametrize("distiller", [False, True])
+@pytest.mark.parametrize("async_tools", [False, True])
+async def test_context_preparation_does_not_claim_verified_capability(tmp_path, monkeypatch, async_tools, distiller):
+    events = []
+    def prepare():
+        events.append("prepare")
+        return ["/fixture/codex", "app-server"], None
+    class Backend:
+        def __init__(self, **kwargs):
+            events.append("construct")
+            self.settings = kwargs
+        async def request(self, method, params):
+            events.append(method)
+            return {}
+    monkeypatch.setattr(install, "ensure_native_async", prepare)
+    monkeypatch.setattr(install, "ensure_native_selection", lambda: pytest.fail("legacy selection helper cannot satisfy context"))
+    monkeypatch.setattr("supervisor.runtime.codex.CodexBackend", Backend)
+    client = RuntimeClient(cwd=tmp_path)
+    client.configure_run(async_tools=async_tools, no_need_for_context=NoNeedForContextConfig(enabled=True))
+    client._distiller = object() if distiller else None
+    backend = await client._load_engine("codex")
+    assert events == ["prepare", "construct", "initialize"]
+    assert backend.settings["command"] == ["/fixture/codex", "app-server"]
+    # Installation only chooses a binary; the executable must advertise the
+    # context feature before dispatch. A manifest/async pin is not this proof.
+    assert "context_compaction_verified" not in backend.settings
+    assert await client._load_engine("codex") is backend

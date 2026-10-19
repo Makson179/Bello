@@ -165,6 +165,22 @@ def test_complete_bound_qualification_and_exact_deterministic_installer_archive(
     assert before == {name: release.sha256(f.candidate / name) for name in before}
 
 
+@pytest.mark.parametrize("target", release.TARGETS)
+@pytest.mark.parametrize("count", [14, 15])
+def test_legacy_async_report_without_completion_batching_never_qualifies(fixture, target, count):
+    f = fixture(target)
+    path = f.qualification / "worker/async/report.json"
+    report = release.read_json(path)
+    assert len(report["results"]) == 15
+    report["results"] = [row for row in report["results"] if row["case"] != "completion_batching"]
+    assert len(report["results"]) == 14
+    put(path, report)
+    f.worker["proofs"]["async"]["cases"] = count
+    refresh(f, "async")
+    with pytest.raises(ValueError):
+        release.validate_qualification(f.target, f.candidate, f.qualification)
+
+
 @pytest.mark.parametrize("field,value", [("passed", False), ("phase", "partial"), ("target", "other"),
     ("published", True), ("candidate_unchanged", False), ("modernbert_requested", False),
     ("paid_model_calls", 1), ("paid_model_calls", False), ("external_provider_requests_forwarded", 1),
@@ -208,7 +224,7 @@ def test_all_saved_case_hashes_counts_and_semantics_required(fixture, change):
     f = fixture()
     if change == "missing-proof": del f.worker["proofs"]["modernbert"]
     elif change == "extra-proof": f.worker["proofs"]["unknown"] = {"report": "unknown/report.json"}
-    elif change == "wrong-count": f.worker["proofs"]["async"]["cases"] = 13
+    elif change == "wrong-count": f.worker["proofs"]["async"]["cases"] = 14
     elif change == "report-path": f.worker["proofs"]["selection"]["report"] = "../selection/report.json"
     elif change == "report-bytes":
         path = f.qualification / "worker/selection/report.json"

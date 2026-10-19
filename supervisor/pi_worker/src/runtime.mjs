@@ -15,6 +15,7 @@ import { ProtocolError } from "./protocol.mjs";
 import { AsyncToolCoordinator, lateToolMessage } from "./async-tools.mjs";
 import { piAgentDirectory } from "./agent-directory.mjs";
 import { billingRouteError } from "./billing-route.mjs";
+import { normalizeContextPolicy } from "./context-policy.mjs";
 
 const STATE_VERSION = 1;
 const ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/;
@@ -219,6 +220,7 @@ function publicTurn(turn) {
     ...(turn.error ? { error: turn.error } : {}),
     ...(turn.structuredResult !== undefined ? { structuredResult: turn.structuredResult } : {}),
     ...(turn.usage ? { usage: turn.usage } : {}),
+    ...(turn.usageIncomplete ? { usageIncomplete: true } : {}),
   });
 }
 
@@ -336,7 +338,7 @@ export class PiWorkerRuntime {
 
   initializeResult() {
     return {
-      serverInfo: { name: "bello-pi-worker", version: "0.7.2", piSdkVersion: this.sdk.version },
+      serverInfo: { name: "bello-pi-worker", version: "0.8.0", piSdkVersion: this.sdk.version },
       protocolVersion: 1,
       capabilities: {
         multiplex: true,
@@ -388,7 +390,9 @@ export class PiWorkerRuntime {
     if (meta.version !== STATE_VERSION) throw new ProtocolError(`unsupported thread metadata version in ${filename}`, "state_corrupt");
     const threadId = requireId(meta.threadId, `thread metadata ${filename} id`);
     if (`${threadId}.json` !== filename) throw new ProtocolError(`thread metadata filename does not match its id: ${filename}`, "state_corrupt");
-    canonicalPath(meta.cwd, `thread metadata ${filename} cwd`);
+    // Archived reviewers can outlive their temporary evidence workspace. Their
+    // history stays readable without that directory; execution checks it again.
+    canonicalPath(meta.cwd, `thread metadata ${filename} cwd`, meta.archived !== true);
     requireString(meta.provider, `thread metadata ${filename} provider`);
     requireString(meta.model, `thread metadata ${filename} model`);
     normalizeTools(meta.tools);
@@ -686,6 +690,7 @@ export class PiWorkerRuntime {
   }
 
   async threadStart(params) {
+    const noNeedForContext = normalizeContextPolicy(params.noNeedForContext);
     const threadId = requireId(params.threadId, "threadId");
     if (this.threads.has(threadId)) throw new ProtocolError(`duplicate Pi thread: ${threadId}`, "thread_exists");
     const cwd = canonicalPath(params.cwd, "cwd");
@@ -710,6 +715,7 @@ export class PiWorkerRuntime {
       serviceTier: serviceTier ?? null,
       tools,
       asyncTools: params.asyncTools === true,
+      noNeedForContext,
       developerInstructions: typeof params.developerInstructions === "string" ? params.developerInstructions : null,
       systemPrompt: typeof params.systemPrompt === "string" ? params.systemPrompt : null,
       approvalPolicy: typeof params.approvalPolicy === "string" ? params.approvalPolicy : null,
@@ -748,6 +754,9 @@ export class PiWorkerRuntime {
   }
 
   async loadSession(record, knownModel) {
+    // Even a loaded session must not run in a workspace that was removed or
+    // replaced since the thread was created.
+    this.validateExecutionCwd(record.meta);
     if (record.session) {
       this.threadModel(record);
       return record.session;
@@ -812,6 +821,23 @@ export class PiWorkerRuntime {
         developerInstructions: meta.developerInstructions,
         systemPrompt: meta.systemPrompt,
         requestOptions: record.requestOptions,
+        noNeedForContext: meta.noNeedForContext,
+        pendingCallIds: () => [...(record.active?.asyncCoordinator?.jobs.values() ?? [])]
+          .filter((job) => !job.delivered).map((job) => job.callId),
+        onContextCompaction: async (data) => {
+          const active = record.active;
+          if (active) {
+            for (const usage of data.usage) {
+              const reported = assistantUsage({ role: "assistant", usage, provider: data.provider,
+                model: data.model, api: model.api }, `${active.turn.id}-compaction-${active.usageResponses.length + 1}`);
+              if (reported) active.usageResponses.push(reported);
+            }
+            active.turn.usage = aggregateUsage(active.usageResponses);
+            if (data.usageIncomplete) active.turn.usageIncomplete = true;
+            this.save(record);
+          }
+          await this.emit({ method: "thread/contextCompaction", params: { threadId: meta.threadId, turnId: record.active?.turn.id, ...data } });
+        },
         asyncAfterTurn: meta.asyncTools ? async (turn, signal) => {
           const active = record.active;
           if (!active?.asyncCoordinator || signal?.aborted) return;
@@ -926,6 +952,13 @@ export class PiWorkerRuntime {
   onAgentEvent(record, event) {
     const active = record.active;
     if (!active) return;
+    if (event.type === "tool_execution_end") {
+      // Pi ends a call that it could not run (unknown tool, invalid arguments,
+      // truncated response) without ever calling execute(). It has no result to
+      // wait for, so it must not keep the rest of its batch from finishing.
+      active.asyncCoordinator?.skip(event.toolCallId);
+      return;
+    }
     if (event.type === "message_start" && event.message?.role === "assistant") {
       const id = `${active.turn.id}-message-${++record.assistantSequence}`;
       record.currentAssistantItemId = id;
@@ -976,6 +1009,13 @@ export class PiWorkerRuntime {
   async threadResume(params) {
     const record = this.getRecord(params.threadId);
     const meta = record.meta;
+    // Check before unarchiving or changing persisted state. A replaced symlink
+    // must not silently move a persisted thread into a different workspace.
+    this.validateExecutionCwd(meta);
+    if (params.noNeedForContext !== undefined
+        && !sameJson(normalizeContextPolicy(params.noNeedForContext), normalizeContextPolicy(meta.noNeedForContext))) {
+      throw new ProtocolError("thread/resume cannot change noNeedForContext", "scope_mismatch");
+    }
     if (params.asyncTools !== undefined && params.asyncTools !== (meta.asyncTools === true)) {
       throw new ProtocolError("thread/resume cannot change asyncTools", "scope_mismatch");
     }
@@ -1057,6 +1097,7 @@ export class PiWorkerRuntime {
     const record = this.getRecord(params.threadId);
     if (record.meta.archived) throw new ProtocolError("cannot start a turn on an archived thread", "thread_archived");
     if (record.active) throw new ProtocolError("thread already has an active turn", "turn_active");
+    this.validateExecutionCwd(record.meta);
     const turnId = requireId(params.turnId, "turnId");
     if (record.meta.turns.some((turn) => turn.id === turnId)) throw new ProtocolError(`duplicate turn id: ${turnId}`, "turn_exists");
     const input = normalizeInput(params.input);
@@ -1098,6 +1139,14 @@ export class PiWorkerRuntime {
     return { turn: publicTurn(turn) };
   }
 
+  // The persisted workspace must still be the exact directory the thread was
+  // created for: not removed, and not redirected through a replaced symlink.
+  validateExecutionCwd(meta) {
+    if (canonicalPath(meta.cwd, "thread cwd") !== meta.cwd) {
+      throw new ProtocolError("thread cwd no longer resolves to its original workspace", "scope_mismatch");
+    }
+  }
+
   async runTurn(record) {
     const active = record.active;
     if (!active) return;
@@ -1128,7 +1177,7 @@ export class PiWorkerRuntime {
         serviceTier: active.serviceTier,
       };
       await session.prompt(active.input, { expandPromptTemplates: false });
-      while (active.asyncCoordinator?.pending && !active.interrupted && !["error", "aborted"].includes(active.lastAssistant?.stopReason)) {
+      while (active.asyncCoordinator?.pending && !active.interrupted && !["error", "aborted", "length"].includes(active.lastAssistant?.stopReason)) {
         const results = await active.asyncCoordinator.ready({ wait: true });
         if (results.length) await session.sendCustomMessage(lateToolMessage(results), { triggerTurn: true });
       }
@@ -1138,6 +1187,16 @@ export class PiWorkerRuntime {
       } else if (active.lastAssistant?.stopReason === "error") {
         status = "failed";
         errorMessage = active.lastAssistant.errorMessage || "Provider returned an error.";
+      } else if (active.lastAssistant?.stopReason === "length") {
+        // An empty or partial output-limit response is not completed work.
+        // Publish a terminal failure so the controller never waits on a silent
+        // idle state or reviews a half-written answer as if it were final.
+        status = "failed";
+        errorMessage = "Provider response was truncated at the output-token limit (stopReason=length); the turn is incomplete.";
+      } else if (active.structuredResult === undefined && !active.turn.items.some((item) =>
+        item.type === "hostTool" || (item.type === "agentMessage" && item.text?.trim()))) {
+        status = "failed";
+        errorMessage = "Provider ended the turn without assistant text, tool work or a structured result; the turn is incomplete.";
       } else {
         // A normal final JSON message is also a valid delivery path, as in
         // Bello 0.5.2. Leave its text intact for the existing Python decision
@@ -1168,10 +1227,35 @@ export class PiWorkerRuntime {
       errorMessage = error instanceof Error ? error.message : String(error);
     } finally {
       await active.asyncCoordinator?.cancel();
+      // Compaction usage reaches the turn before it becomes terminal. A drain
+      // failure never hides an earlier failure or interruption.
+      if (!await this.drainContextAccounting(record, active) && status === "completed") {
+        status = "failed";
+        errorMessage = "Context compaction accounting could not be persisted before turn completion.";
+      }
       if (record.active === active) record.requestOptions.current = undefined;
     }
     // Cleanup must finish before the idle/terminal event permits a new turn.
+    if (active.interrupted) {
+      status = "interrupted";
+      errorMessage = "Turn was interrupted.";
+    }
     this.finishTurn(record, active, status, errorMessage);
+  }
+
+  // Abort and the normal prompt-finally path can settle concurrently. Both wait
+  // for the same bounded drain before either publishes the terminal state.
+  async drainContextAccounting(record, active) {
+    active.accountingDrainPromise ??= (async () => {
+      try {
+        await record.session?.flushContextCompactionNotifications?.();
+        return true;
+      } catch {
+        active.turn.usageIncomplete = true;
+        return false;
+      }
+    })();
+    return active.accountingDrainPromise;
   }
 
   finishTurn(record, active, status, errorMessage) {
@@ -1214,6 +1298,7 @@ export class PiWorkerRuntime {
     const cancelTools = active.asyncCoordinator?.cancel();
     if (record.session) await record.session.abort();
     await cancelTools;
+    await this.drainContextAccounting(record, active);
     if (active.turn.status === "inProgress") this.finishTurn(record, active, "interrupted", "Turn was interrupted.");
   }
 

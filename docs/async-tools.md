@@ -1,11 +1,13 @@
-# Async tools
+# Async tools (Smart Execution)
 
-An opt-in execution mode for reducing model turns spent waiting for tools.
+An execution mode for reducing model turns spent waiting for tools.
 It does not change the model, billing route, sandbox, approvals, or review stages.
 
-Enable for one run with `bello --async-tools`, or set `"async_tools": true` in
-the project configuration (`bello config` also exposes **async-tools**).
-`--no-async-tools` overrides the saved setting. The default is off.
+Smart Execution is on by default for new configurations. A configuration that
+already saves `"async_tools": false` keeps it off; change it with `bello config`
+(**async-tools**) or in the project configuration. `bello --no-async-tools` and
+`bello --async-tools` select it for a run; like the other run switches, the
+choice is recorded in `.supervisor/config.json` for recovery and later runs.
 
 The setting is fixed for a run and inherited by coder, completion reviewer,
 adversary, their subagents, and repair/revision threads. Runtime supervision and
@@ -28,13 +30,20 @@ Execution deadlines and cancellation still apply.
   This is not an API-provider replacement or a claim that the closed SDK has
   the same scheduling interface as Pi/native Codex.
 
-A batch has a one-second collection window. All-finished batches return early.
-If the window expires without a result, the program continues waiting; expiry
-alone does not call the model. Ready results can be delivered while other work
-continues. Finishing an answer with pending work waits for the remaining results
-instead of completing the Bello turn. Late results are appended, not substituted
-into previously sent history. Existing provider caching stays enabled in both
-modes; this feature does not request a one-hour cache.
+The first ready result opens a one-second collection window. Further completions
+from the same batch restart that window while it is still open and other siblings
+are running. This also applies to late results after an earlier delivery, so
+nearby completions of long-running tools can reach the model together.
+All-finished batches return immediately. Each batch keeps its own window;
+unrelated batches and progress messages do not extend it.
+
+If no result is ready, the program continues waiting; expiry alone does not call
+the model. User steering and cancellation interrupt the wait. Ready batches can
+be delivered while other work continues. Finishing an answer with pending work
+waits for the remaining results instead of completing the Bello turn. Each late
+result is delivered once and appended, not substituted into previously sent
+history. Existing provider caching stays enabled in both modes; Smart Execution
+does not request a one-hour cache.
 
 Long custom commands are held to completion by the tool host. Excess commands
 queue within existing concurrency limits. For server checks, start the server,
@@ -48,9 +57,11 @@ losing a finding after interrupted delivery.
 ## Native build
 
 Native Codex must advertise the experimental `bello_async_tools` capability.
-The older published selection-only bundles do not contain it. An incompatible
-binary is rejected before starting a task; enabling the flag is not a silent
-fallback to Pi or a partial native implementation.
+The older published selection-only bundles do not contain it. Bello downloads a
+compatible helper on Apple Silicon, Windows x86_64 and Linux x86_64 (glibc 2.35+);
+elsewhere, point `BELLO_CODEX_BINARY` at a compatible build or turn Smart
+Execution off. An incompatible binary is rejected before starting a task;
+enabling the flag is not a silent fallback to Pi or a partial native implementation.
 
 For source-build testing, use `BELLO_CODEX_BINARY` to select the compatible
 binary. Distillation additionally uses its selection manifest as before.

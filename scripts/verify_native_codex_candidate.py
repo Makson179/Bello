@@ -30,7 +30,7 @@ SCHEMA = "bello.native-codex-candidate-qualification.v1"
 SELECTION_CASES = {"direct_off", "direct_on", "code_off", "code_on", "poll_off", "poll_on",
                    "missing_focus", "task_protected", "help_protected"}
 ASYNC_CASES = {"direct_off", "direct_on", "code_off", "code_on", "steer", "interrupt",
-               "code_interrupt", "child_wait", "async_and_selection_direct", "async_and_selection_code",
+               "code_interrupt", "child_wait", "async_and_selection_direct", "async_and_selection_code", "completion_batching",
                "direct_on_repeat_2", "steer_repeat_2", "direct_on_repeat_3", "steer_repeat_3"}
 MODERNBERT_CASES = {"short_cold", "short_warm", "long_cold", "long_warm", "task_protected", "help_protected"}
 PROOF_INPUTS = (

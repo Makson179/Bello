@@ -76,3 +76,51 @@ async def test_retained_runtime_trigger_policy_remains_a_separate_bounded_retry(
 @pytest.mark.parametrize("detail,expected", [("did not produce an agent message", "no_message"), ("timeout", "tool_timeout")])
 def test_existing_untyped_recovery_classification_is_unchanged(detail, expected):
     assert _classify_supervisor_agent_error(SupervisorAgentError(detail)) == expected
+
+
+async def test_length_limited_provider_failure_after_review_cannot_leave_running_idle_or_review_again(tmp_path, monkeypatch):
+    from supervisor.appserver import AppServerMessage
+
+    controller, store, reviewer = _runtime_controller(tmp_path)
+    store.update_bello_config(lambda cfg: cfg.model_copy(update={
+        "status": BelloStatus.RUNNING, "active_coder_turn_id": "after-review-turn"}))
+    controller._last_no_marker_review_key = "0:135:0"
+    controller.completion_attempt_count = 1
+
+    async def forbidden_review(**kwargs):
+        pytest.fail("an incomplete provider turn must not trigger another completion review")
+
+    monkeypatch.setattr(controller, "_handle_coder_turn_completed", forbidden_review)
+    message = AppServerMessage({"method": "turn/completed", "params": {
+        "threadId": "thread", "turn": {"id": "after-review-turn", "status": "failed",
+        "error": {"message": "Provider response was truncated at the output-token limit; the turn is incomplete."}}}})
+    await controller.handle_notification(message)
+    await controller.handle_notification(message)  # a replayed terminal event is ignored
+    assert store.get_bello_config().status == BelloStatus.PROVIDER_FAILURE
+    assert store.get_bello_config().active_coder_turn_id is None
+    assert not controller.running
+    assert controller.completion_attempt_count == 1
+    assert controller.provider_failure_recovery_counts == {}
+    assert "output-token limit" in store.path(FINAL_REPORT).read_text()
+
+
+async def test_failed_coder_turn_releases_its_owned_turn_before_finalization(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from supervisor.appserver import AppServerMessage
+
+    controller, store, _ = _runtime_controller(tmp_path)
+    controller.coder = SimpleNamespace(thread_id="thread", active_turn_id="failed-turn")
+    store.update_bello_config(lambda cfg: cfg.model_copy(update={
+        "status": BelloStatus.RUNNING, "active_coder_turn_id": "failed-turn"}))
+    observed = []
+
+    async def finalize(message, **kwargs):
+        # The stale active identity must already be gone when finalization starts.
+        observed.append((controller.coder.active_turn_id, store.get_bello_config().active_coder_turn_id))
+        controller.running = False
+
+    monkeypatch.setattr(controller, "finalize", finalize)
+    await controller.handle_notification(AppServerMessage({"method": "turn/completed", "params": {
+        "threadId": "thread", "turn": {"id": "failed-turn", "status": "failed", "error": {"message": "stopped"}}}}))
+    assert observed == [(None, None)]

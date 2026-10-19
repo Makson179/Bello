@@ -56,7 +56,7 @@ async def test_complete_worker_is_not_a_guardian_or_full_tree_claim(harness, tmp
     assert report["passed"] and report["candidate_unchanged"]
     assert report["full_tree_recovery_proven"] is False and "not proven" in report["scope"]
     assert report["proofs"]["selection"]["cases"] == 9
-    assert report["proofs"]["async"]["cases"] == 14
+    assert report["proofs"]["async"]["cases"] == 15
     assert report["proofs"]["history"]["cases"] == 1
     if modernbert:
         assert report["proofs"]["modernbert"]["cases"] == 6

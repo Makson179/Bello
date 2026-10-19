@@ -6,6 +6,7 @@ __pycache__/
 .test-tmp/
 .verification/
 .pi-modernization/
+.local-experiments/
 *.py[cod]
 *.egg-info/
 build/

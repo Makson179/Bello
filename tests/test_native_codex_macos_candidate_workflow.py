@@ -71,7 +71,7 @@ def test_native_format_receipt_and_signature_check_precede_proof_execution():
     assert TEXT.index("Verify every byte and native signature before executing candidate") < TEXT.index("Install CPU inference")
     assert TEXT.index("Preserve binaries independently") < TEXT.index("  macos-proof:")
     assert "needs: macos-build" in TEXT
-    assert "--modernbert" in step("Prove selection9 async14 history1 and CPU inference4 plus bypass2")
+    assert "--modernbert" in step("Prove selection9 async15 history1 and CPU inference4 plus bypass2")
 
 
 def test_qualification_package_install_upload_order_and_scope():

@@ -74,6 +74,7 @@ class CompletionPort(CoordinatorPort):
         '_finalize_bounded_completion',
         '_finalize_completion_review_disabled',
         '_generation_has_coder_turn',
+        '_goal_enabled',
         '_handle_no_marker_idle',
         '_mark_adversary_thread_done',
         '_mark_adversary_thread_started',
@@ -823,6 +824,11 @@ class Completion:
             if not self.ports._effective_completion_review():
                 await self.ports._finalize_adversary_only("adversary report contained no findings to return")
                 return
+            if self.ports._goal_enabled():
+                # Goal never completes on a spent review budget: the completion
+                # review (unlimited returns) still has to accept after the adversary.
+                self.ports._queue_supervisor_check("Goal completion after adversary", completion_review=True)
+                return
             await self.ports._finalize_bounded_completion(
                 reason=(
                     "completion review budget reached and the normalized adversary "
@@ -907,6 +913,12 @@ class Completion:
         *,
         packet: compat.SupervisorWakePacket | None = None,
     ) -> Literal["adversary", "complete"] | None:
+        if self.ports._goal_enabled():
+            # Goal keeps completion returns unlimited until acceptance, both before and
+            # after the optional adversary. The configured adversary passes are unchanged:
+            # they run after a completion accept (`_should_run_adversary_before_complete`),
+            # never because a return budget ran out.
+            return None
         cfg = self.ports.store.get_bello_config()
         if self.ports._effective_max_adversary_runs() <= 0:
             limit = cfg.max_completion_returns_before_adversary

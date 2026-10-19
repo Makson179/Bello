@@ -63,6 +63,15 @@ def tool_definitions(*, distiller: bool = False, runtime_enabled: bool = True,
                 + ("Explicit outside-sandbox requests require approval." if runtime_enabled else
                    "Network access is enabled; outside-sandbox execution is unavailable.")
             )
+        if entry["name"] == "exec_command" and (async_tools or not runtime_enabled):
+            # These modes replace the base description; keep its cwd contract.
+            entry["description"] += (
+                " Omit cwd to use the assigned workspace; a task/source file's location is not necessarily "
+                "your writable workspace. Each call starts independently: cd and environment changes do not "
+                "carry into later calls. Relative cwd values resolve from the assigned workspace, with no "
+                "~ or environment-variable expansion. Command escalation does not change file-tool scope "
+                "or cwd path checks."
+            )
         if async_tools and entry["name"] == "wait_agent":
             entry["description"] = (
                 "Wait for a child result when needed. Waiting is managed by the host, not repeated model polls; "
@@ -97,6 +106,9 @@ class ToolScope:
     async_tools: bool = False
     task_path: Path | None = None
     temp_root: Path | None = None
+    # Goal mode's optional GOAL_MAP.md: output-selection metadata only (like task_path), never
+    # an access grant or a readable root, and the file need not exist.
+    goal_map_path: Path | None = None
 
 
 def tool_result(text: str, *, details: dict[str, Any] | None = None, error: bool = False) -> dict[str, Any]:
@@ -223,6 +235,7 @@ class ToolHost:
     async def _distill_result(self, result: dict[str, Any], name: str, args: dict[str, Any], *, command: str | None = None, scope: ToolScope | None = None) -> dict[str, Any]:
         if preserve_tool_output(name, args, command=command,
                                 task_path=scope.task_path if scope else None,
+                                goal_map_path=scope.goal_map_path if scope else None,
                                 workspace=scope.root if scope else None):
             return result
         focus = args.get("focus")
@@ -276,7 +289,12 @@ class ToolHost:
         workspace = scope.root.resolve()
         roots = (workspace,) if writing else (workspace, *scope.readable_roots)
         if scope.mode != "danger-full-access" and not any(path == root or path.is_relative_to(root) for root in roots):
-            raise PermissionError("path is outside this agent's assigned workspace")
+            raise PermissionError(
+                "path is outside this agent's assigned workspace or permitted readable roots. "
+                f"Assigned workspace: {workspace}. Use a workspace-relative path for generated files "
+                "and cwd; a task/source file's location is not necessarily writable. "
+                "Command escalation does not change file-tool scope or cwd path checks."
+            )
         # Runtime-off removes name guesses, not filesystem authority. Readonly
         # external dependencies and explicit escapes keep the full secret check.
         check_path_heuristics = scope.runtime_enabled or not path.is_relative_to(workspace)
@@ -328,7 +346,13 @@ class ToolHost:
                     approval_method, {**approval, "belloApprovalPolicy": scope.approval_policy}
                 ):
                     item.update(status="declined", exitCode=None)
-                    return tool_result("Bello denied this action. No command was executed.", error=True)
+                    return tool_result(
+                        "Bello denied this action. No command was executed. "
+                        "This denied call created no command session or output files. Do not poll it or "
+                        "assume the expected output exists. Do not retry unchanged or reroute outputs "
+                        "to bypass the denial; address the approval reason or ask for clarification.",
+                        error=True,
+                    )
             # Scope may have been cancelled/revised while approval was pending.
             self.scope_for(thread_id, turn_id)
             runner = self.runner_factory(SandboxPolicy(

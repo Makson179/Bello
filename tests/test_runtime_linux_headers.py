@@ -65,7 +65,8 @@ def test_header_addition_is_readonly_and_preserves_private_namespace_contract(mo
     assert ("--unshare-net" in invocation.argv) is not network
     assert "--share-net" not in invocation.argv
     assert not any(value.endswith("-try") for value in invocation.argv)
-    assert set(invocation.env) == {"HOME", "LANG", "LC_ALL", "PATH", "TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR"}
+    assert set(invocation.env) == {"HOME", "LANG", "LC_ALL", "PATH", "TMPDIR", "CLAUDE_CODE_TMPDIR", "XDG_CACHE_HOME",
+                                   "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR"}
 
 
 def test_private_namespace_symlink_into_new_header_authority_still_fails_closed(monkeypatch, tmp_path):

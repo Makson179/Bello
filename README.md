@@ -145,6 +145,18 @@ Claude Code plugins reads the task and the repository and recommends one
 complete setup for the priority you name. Every setting is also in
 `bello config`.
 
+### Goal mode
+
+For tasks with a measurable target, `bello --task TASK.md --goal` (or `goal` in
+`bello config`) keeps the run going until the completion reviewer accepts the
+original objectives. Runtime supervision and completion review are always on in
+this mode, and completion returns are unlimited before and after the optional
+adversary. The reviewer returns work only for a concrete unmet requirement, such
+as a score of 65/100 where 70/100 is required, and does not add requirements or
+block on polish. The coder keeps a short `GOAL_MAP.md` of what it tried, what
+happened and what is left to try. Goal is off by default; see
+[docs/runtime.md](./docs/runtime.md#independent-run-controls).
+
 ## Results
 
 Scores are ProgramBench completion scores unless a task has its own evaluator.
@@ -166,7 +178,8 @@ Terra, 6.5 on Sol, and 6.0 on Astra.
 ### Smart Execution: fewer model calls, lower cost
 
 Smart Execution runs independent tool calls in parallel and delivers results as
-they become ready. The agent can continue other necessary work while commands
+they become ready. It is on by default for new configurations;
+`--no-async-tools` or `bello config` turns it off. The agent can continue other necessary work while commands
 run; when it needs to wait, Bello handles the wait without repeated model calls
 to check progress. Unlike the log distiller, Smart Execution does not itself
 compress tool output.
@@ -302,10 +315,13 @@ bello --task TASK.md --adversary  # run flags override the saved settings for on
 ```
 
 The editor covers the model and reasoning effort of each role, subagent pools
-and concurrency, review budgets, and the four switches. `bello --help` lists
-the run flags.
+and concurrency, review budgets, the four switches, Goal mode, Smart Execution,
+and No Need For Context. `bello --help` lists the run flags.
 
 - [Providers, sign-in, switches, and the distiller](./docs/runtime.md)
+- [Smart Execution](./docs/async-tools.md)
+- [No Need For Context](./docs/no-need-for-context.md): optional summarizing of
+  older context for long runs, off by default
 - [Native Codex distiller setup](./docs/native-codex-selection.md)
 - [Windows sandbox](./docs/windows.md)
 

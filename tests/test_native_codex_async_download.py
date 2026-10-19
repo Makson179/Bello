@@ -31,6 +31,13 @@ def good_proof():
                         for name in sorted(smoke.CASES)]}
 
 
+def test_legacy_launch_only_proof_is_not_completion_batching_qualification():
+    proof = good_proof()
+    proof["results"] = [row for row in proof["results"] if row["case"] != "completion_batching"]
+    with pytest.raises(ValueError, match="every credential-free proof"):
+        smoke.validate_proof(proof)
+
+
 @pytest.mark.parametrize("corruption", ["missing", "duplicate", "failed", "forwarded", "paid", "prompt"])
 def test_incomplete_or_unsafe_proof_rejected(corruption):
     proof = good_proof()
@@ -95,7 +102,7 @@ def setup(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_cold_install_full_proof_cache_reuse_and_environment_restore(setup):
     result = await smoke.verify(setup.runtime, setup.output)
-    assert result["passed"] and result["cases_passed"] == 14
+    assert result["passed"] and result["cases_passed"] == 15
     assert result["cold_cache"] and result["cache_unchanged"]
     assert setup.calls == ["install", "install"]
     assert setup.env == setup.original

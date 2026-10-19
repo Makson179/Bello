@@ -43,6 +43,14 @@ def result(name, binary):
         "tampered_bwrap_exit_code": 8, "system_bwrap_on_path": False}
 
 
+def test_native_async_qualification_requires_completion_batching_proof(tmp_path):
+    report = result("async", tmp_path / "codex")
+    proof.validate_proof("async", report, tmp_path, tmp_path / "codex", "linux-x64")
+    report["results"] = [row for row in report["results"] if row["case"] != "completion_batching"]
+    with pytest.raises(ValueError, match="every distinct required case"):
+        proof.validate_proof("async", report, tmp_path, tmp_path / "codex", "linux-x64")
+
+
 @pytest.fixture
 def harness(tmp_path, monkeypatch):
     candidate = tmp_path / "candidate"
@@ -87,7 +95,7 @@ async def test_exact_candidate_all_requested_proofs_and_receipts(harness, tmp_pa
     report = await proof.qualify(harness.candidate, target, tmp_path / "proof", modernbert=modernbert)
     assert report["passed"] and report["candidate_unchanged"]
     assert harness.calls == ["selection", "async", "history"] + (["sandbox"] if target == "linux-x64" else []) + (["modernbert"] if modernbert else [])
-    assert report["proofs"]["async"]["cases"] == 14
+    assert report["proofs"]["async"]["cases"] == 15
     assert report["proofs"]["selection"]["cases"] == 9
     assert os.environ == before
     assert "unit-secret" not in json.dumps(report)

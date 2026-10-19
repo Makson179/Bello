@@ -30,6 +30,17 @@ from supervisor.runtime.transport import WorkerTransport
 _IS_WINDOWS = os.name == "nt"
 
 
+def _goal_map_path(value: Any, cwd: str | Path) -> str | None:
+    """Goal mode's GOAL_MAP.md, resolved against the thread's cwd.
+
+    Host-owned output-selection metadata for the log distiller, like the task path:
+    it grants no filesystem access and the optional file need not exist.
+    """
+    if not isinstance(value, str) or not value or "\x00" in value:
+        return None
+    return os.path.normpath(os.path.join(str(cwd), value))
+
+
 class RuntimeClient(AppServerClient):
     """Route the established controller contract to an explicit provider engine."""
 
@@ -56,13 +67,15 @@ class RuntimeClient(AppServerClient):
         self._stop_task: asyncio.Task | None = None
         self.runtime_enabled = True
         self.async_tools = False
+        from supervisor.project_config import NoNeedForContextConfig
+        self.no_need_for_context = NoNeedForContextConfig()
         self.windows_native_root_read = False
         self._distiller = None
         self._distiller_path: Path | None = None
         self._distiller_auto = False
 
     def configure_run(self, *, runtime_enabled: bool = True, async_tools: bool = False,
-                      windows_native_root_read: bool = False, log_distiller=None) -> None:
+                      windows_native_root_read: bool = False, log_distiller=None, no_need_for_context=None) -> None:
         """Controller-owned policy. Never configurable by a provider tool call."""
         if not isinstance(runtime_enabled, bool):
             raise ValueError("runtime_enabled must be a boolean")
@@ -70,6 +83,9 @@ class RuntimeClient(AppServerClient):
             raise ValueError("async_tools must be a boolean")
         if type(windows_native_root_read) is not bool:
             raise ValueError("windows_native_root_read must be a boolean")
+        from supervisor.project_config import NoNeedForContextConfig
+        context_policy = (no_need_for_context if isinstance(no_need_for_context, NoNeedForContextConfig)
+                          else NoNeedForContextConfig(**(no_need_for_context or {})))
         config = log_distiller.to_json_data() if hasattr(log_distiller, "to_json_data") else (log_distiller or {})
         enabled = config.get("enabled", False)
         path = None
@@ -85,6 +101,7 @@ class RuntimeClient(AppServerClient):
                 path = Path(value).expanduser()
                 path = (self.cwd / path).resolve() if not path.is_absolute() else path.resolve()
         if self._started and (runtime_enabled != self.runtime_enabled or async_tools != self.async_tools
+                              or context_policy != self.no_need_for_context
                               or windows_native_root_read != self.windows_native_root_read
                               or path != self._distiller_path):
             raise AppServerError("run policy changes require stopping the runtime first")
@@ -101,6 +118,7 @@ class RuntimeClient(AppServerClient):
             self._distiller = None
         self.runtime_enabled, self._distiller_path = runtime_enabled, path
         self.async_tools = async_tools
+        self.no_need_for_context = context_policy
         self.windows_native_root_read = windows_native_root_read
         self._distiller_auto = automatic
 
@@ -119,6 +137,7 @@ class RuntimeClient(AppServerClient):
         if self._distiller_path is not None and self._distiller is None:
             self.configure_run(runtime_enabled=self.runtime_enabled,
                                async_tools=self.async_tools,
+                               no_need_for_context=self.no_need_for_context,
                                windows_native_root_read=self.windows_native_root_read,
                                log_distiller={"enabled": True, "model_path": (
                                    None if self._distiller_auto else str(self._distiller_path))})
@@ -181,12 +200,12 @@ class RuntimeClient(AppServerClient):
         elif name == "codex":
             from supervisor.runtime.codex import CodexBackend
             command, manifest = None, None
-            if self._distiller is not None or self.async_tools:
+            if self._distiller is not None or self.async_tools or self.no_need_for_context.enabled:
                 from supervisor.runtime.native_codex_install import ensure_native_async, ensure_native_selection
                 # Installation is not an app-server request and can take longer
                 # than an RPC deadline on the first run. Never change global Codex.
                 command, manifest = await asyncio.to_thread(
-                    ensure_native_async if self.async_tools else ensure_native_selection)
+                    ensure_native_async if self.async_tools or self.no_need_for_context.enabled else ensure_native_selection)
             backend = CodexBackend(state_dir=self.state_dir / "codex",
                                    emit=lambda raw: self._emit(raw, engine="codex"),
                                    tool_handler=self._call_tool,
@@ -255,7 +274,8 @@ class RuntimeClient(AppServerClient):
                          runtime_enabled=self.runtime_enabled,
                          async_tools=record.get("asyncTools", False),
                          temp_root=Path(record["runtimeScratchRoot"]) if record.get("runtimeScratchRoot") else None,
-                         task_path=Path(record["runtimeTaskPath"]) if record.get("runtimeTaskPath") else None)
+                         task_path=Path(record["runtimeTaskPath"]) if record.get("runtimeTaskPath") else None,
+                         goal_map_path=Path(record["runtimeGoalMapPath"]) if record.get("runtimeGoalMapPath") else None)
 
     async def reconcile_terminal_turn(self, thread_id: str, turn_id: str,
                                       turn: dict[str, Any]) -> bool:
@@ -296,7 +316,10 @@ class RuntimeClient(AppServerClient):
             backend = await self._engine(selection.engine)
             return await backend.request(method, {**params, "provider": selection.provider,
                                                    "model": selection.model,
-                                                   "asyncTools": self.async_tools and params.get("belloRole") != "runtime"},
+                                                   "asyncTools": self.async_tools and params.get("belloRole") != "runtime",
+                                                   # Lets native Codex fail closed on a helper without the
+                                                   # compaction capability before any paid probe or model turn.
+                                                   "noNeedForContext": self._context_policy_for(params.get("belloRole"))},
                                          timeout=timeout)
         if method in {"model/list", "account/read"}:
             requested_engines = params.pop("engines", None)
@@ -370,9 +393,11 @@ class RuntimeClient(AppServerClient):
             role = record.get("belloRole", record.get("config", {}).get("agents", {}).get("role"))
             expected_distiller = self._distiller is not None and role == "coder"
             expected_async = self.async_tools and role != "runtime"
+            expected_context = self._context_policy_for(role)
             if (record.get("networkAccess", False) != (not self.runtime_enabled)
                     or record.get("distillerEnabled", False) != expected_distiller
                     or record.get("asyncTools", False) != expected_async
+                    or record.get("noNeedForContext", self._default_context_policy()) != expected_context
                     or (params.get("belloRole") is not None and params["belloRole"] != role)):
                 raise AppServerError(
                     "Saved thread uses a different runtime/distiller/async tool policy; start a fresh run "
@@ -394,6 +419,7 @@ class RuntimeClient(AppServerClient):
             if selection.qualified != record["qualifiedModel"]:
                 raise AppServerError("model changes require an explicitly created new thread")
             self._validate_scope_overrides(record, params)
+            self._adopt_goal_map(thread_id, record, params)
             turn_id = str(uuid4())
             record["activeTurnId"] = turn_id
             record.pop("interruptedTurnId", None)
@@ -464,8 +490,10 @@ class RuntimeClient(AppServerClient):
             self._validate_scope_overrides(record, params)
             if record.get("activeTurnId"):
                 raise AppServerError("cannot resume a thread while its turn is active")
+            self._adopt_goal_map(thread_id, record, params)
             params.update({"tools": record["tools"], "provider": record["provider"], "model": record["model"],
                            "asyncTools": record.get("asyncTools", False),
+                           "noNeedForContext": record.get("noNeedForContext", self._default_context_policy()),
                            "developerInstructions": record.get("developerInstructions", "")})
         response = await engine.request(method, params, timeout=timeout)
         if method == "thread/resume":
@@ -488,6 +516,12 @@ class RuntimeClient(AppServerClient):
         if params.get("runtimeScratchRoot") is not None:
             scratch_policy = SandboxPolicy(root=root, mode=mode, temp_root=Path(params["runtimeScratchRoot"]))
             params["runtimeScratchRoot"] = str(scratch_policy.temp_root)
+        if "runtimeGoalMapPath" in params:
+            goal_map = _goal_map_path(params["runtimeGoalMapPath"], root)
+            if goal_map is None:
+                params.pop("runtimeGoalMapPath")
+            else:
+                params["runtimeGoalMapPath"] = goal_map
         if self.state_dir.resolve().is_relative_to(root):
             # The model must receive a disposable workspace, not the trusted
             # controller directory that stores its sessions and approvals.
@@ -510,6 +544,8 @@ class RuntimeClient(AppServerClient):
         distill = self._distiller is not None and coder
         async_mode = self.async_tools and role != "runtime"
         params["asyncTools"] = async_mode
+        # Override caller/child settings: this policy belongs to the run owner.
+        params["noNeedForContext"] = self._context_policy_for(role)
         if async_mode:
             from supervisor.runtime.async_tools import ASYNC_TOOLS_GUIDANCE
             previous = params.get("developerInstructions") or ""
@@ -570,7 +606,34 @@ class RuntimeClient(AppServerClient):
                     exc.add_note(f"Closing the unacknowledged runtime thread failed: {type(cleanup_error).__name__}")
             raise
 
+    def _adopt_goal_map(self, thread_id: str, record: dict[str, Any], params: dict[str, Any]) -> None:
+        """A validated resume or later turn may supply Goal mode's GOAL_MAP.md (output selection only)."""
+        if "runtimeGoalMapPath" not in params:
+            return
+        goal_map = _goal_map_path(params["runtimeGoalMapPath"], record["cwd"])
+        if goal_map is None:
+            params.pop("runtimeGoalMapPath")
+            return
+        params["runtimeGoalMapPath"] = goal_map
+        if record.get("runtimeGoalMapPath") != goal_map:
+            record["runtimeGoalMapPath"] = goal_map
+            self._save(thread_id)
+
+    @staticmethod
+    def _default_context_policy() -> dict[str, Any]:
+        from supervisor.project_config import NoNeedForContextConfig
+        return NoNeedForContextConfig().to_backend_data()
+
+    def _context_policy_for(self, role: str | None) -> dict[str, Any]:
+        policy = self.no_need_for_context.to_backend_data()
+        if role == "runtime":
+            policy["enabled"] = False
+        return policy
+
     def _validate_scope_overrides(self, record: dict[str, Any], params: dict[str, Any]) -> None:
+        if ("noNeedForContext" in params and
+                params["noNeedForContext"] != record.get("noNeedForContext", self._default_context_policy())):
+            raise AppServerError("a resumed thread cannot change its context compaction policy")
         if ("windowsNativeRootRead" in params and
                 (type(params["windowsNativeRootRead"]) is not bool or
                  params["windowsNativeRootRead"] != record.get("windowsNativeRootRead", False))):
@@ -671,6 +734,10 @@ class RuntimeClient(AppServerClient):
         return await self._host.call(params)
 
     async def _approve(self, method: str, params: dict[str, Any]) -> bool:
+        # No Need For Context changes model context, not filesystem or command
+        # authority. Explicit escalation follows this same approval path with it
+        # on or off; approved host access may include the persisted conversation
+        # archive, exactly as it can without the feature.
         request_id = "approval-" + str(uuid4())
         raw = {"id": request_id, "method": method, "params": params}
         if params.pop("belloApprovalPolicy", None) == "never":
@@ -728,7 +795,8 @@ class RuntimeClient(AppServerClient):
                 if len(children) >= agents.get("max_concurrent_threads_per_session", 1):
                     raise AppServerError("subagent concurrency limit reached; wait for an active child first")
                 child_params = {key: deepcopy(record[key]) for key in (
-                    "cwd", "sandbox", "approvalPolicy", "runtimeWorkspaceRoots", "runtimeTaskPath", "runtimeScratchRoot", "serviceTier", "belloRole"
+                    "cwd", "sandbox", "approvalPolicy", "runtimeWorkspaceRoots", "runtimeTaskPath", "runtimeGoalMapPath",
+                    "runtimeScratchRoot", "serviceTier", "belloRole"
                 ) if key in record}
                 # An allowed `default` profile deliberately sends no effort.
                 child_effort = engine_effort(args["effort"])

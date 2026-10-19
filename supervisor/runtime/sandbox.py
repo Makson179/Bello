@@ -210,6 +210,8 @@ def _clean_environment(home: str, temp: str, path_entries: Iterable[Path]) -> di
         "LC_ALL": "C.UTF-8",
         "PATH": os.pathsep.join(path),
         "TMPDIR": temp,
+        # Claude Code otherwise defaults to /tmp on macOS even when TMPDIR is set.
+        "CLAUDE_CODE_TMPDIR": temp,
         "XDG_CACHE_HOME": f"{temp.rstrip('/')}/cache",
         "XDG_CONFIG_HOME": f"{home.rstrip('/')}/.config",
         "XDG_DATA_HOME": f"{home.rstrip('/')}/.local/share",
@@ -802,7 +804,7 @@ def _mac_invocation(
     )
     env = _clean_environment(str(scratch / "home"), str(scratch / "tmp"), paths)
     if policy.temp_root is not None:
-        env.update({key: str(policy.temp_root) for key in ("TMPDIR", "TMP", "TEMP")})
+        env.update({key: str(policy.temp_root) for key in ("TMPDIR", "TMP", "TEMP", "CLAUDE_CODE_TMPDIR")})
     return _Invocation(tuple(argv), env, cwd, "sandbox-exec")
 
 
@@ -947,6 +949,7 @@ def _linux_invocation(
         "--clearenv",
         "--setenv", "HOME", "/home/bello",
         "--setenv", "TMPDIR", str(policy.temp_root) if policy.temp_root is not None else "/tmp",
+        "--setenv", "CLAUDE_CODE_TMPDIR", str(policy.temp_root) if policy.temp_root is not None else "/tmp",
         "--setenv", "XDG_CACHE_HOME", "/tmp/cache",
         "--setenv", "XDG_CONFIG_HOME", "/home/bello/.config",
         "--setenv", "XDG_DATA_HOME", "/home/bello/.local/share",

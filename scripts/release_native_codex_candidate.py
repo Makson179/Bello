@@ -251,7 +251,8 @@ def validate_suite(proofs: dict, root: Path, binary: Path, target: str) -> dict[
     expected = proof_names(target)
     if not isinstance(proofs, dict) or set(proofs) != expected:
         raise ValueError("Every release proof, including real CPU ModernBERT, is required")
-    counts = {"selection": 9, "async": 14, "history": 1, "modernbert": 6, "sandbox": 1}
+    counts = {"selection": len(common.SELECTION_CASES), "async": len(common.ASYNC_CASES),
+              "history": 1, "modernbert": len(common.MODERNBERT_CASES), "sandbox": 1}
     hashes = {}
     for name in sorted(expected):
         saved = proofs[name]

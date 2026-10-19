@@ -250,7 +250,7 @@ def qualify(artifact: Path, runtime_root: Path, output: Path) -> None:
             require(Path(command[0]).resolve() == binary.resolve() and found_manifest == manifest
                     and snapshot(expected) == before, "Installed cache changed during async proof")
             shutil.copyfile(runtime_root / "installed-cache.json", output / "installed-cache.json")
-            result.update(passed=True, phase="complete", selection_cases=9, async_cases=13,
+            result.update(passed=True, phase="complete", selection_cases=9, async_cases=len(proof["results"]),
                           archive_sha256=checksums["archive_sha256"], manifest_sha256=checksums["manifest_sha256"],
                           binary_sha256=digest(binary), cache_unchanged=True,
                           selection_report_sha256=digest(output / "selection/report.json"),

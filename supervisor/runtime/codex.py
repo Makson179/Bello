@@ -38,6 +38,18 @@ _APPROVALS = frozenset({"item/commandExecution/requestApproval", "item/fileChang
     "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval"})
 _IDENTITY_FIELDS = {"threadId", "parentThreadId", "senderThreadId", "receiverThreadId"}
 _IS_WINDOWS = os.name == "nt"
+_ASYNC_TOOLS_UNSUPPORTED = (
+    "Smart Execution (async tools) requires a native Codex build with bello_async_tools support. "
+    "It is on by default for new configurations and this native Codex cannot run it; no engine "
+    "or API fallback was used. Run with --no-async-tools, set async_tools to false in "
+    "`bello config`, or point BELLO_CODEX_BINARY at a compatible build."
+)
+_CONTEXT_COMPACTION_UNSUPPORTED = (
+    "No Need For Context requires a native Codex build with bello_context_compaction support; "
+    "the published Smart Execution helper does not include it. No engine or API fallback was used "
+    "and no model turn was started. Turn No Need For Context off (--no-no-need-for-context, or "
+    "no_need_for_context.enabled in `bello config`), or point BELLO_CODEX_BINARY at a rebuilt helper."
+)
 
 
 def _scratch_directory_identity(path: Path) -> tuple[int, int]:
@@ -93,6 +105,7 @@ class CodexBackend:
         self._selection_lock = asyncio.Lock()
         self._async_tools_verified = False
         self._async_tools_checked = False
+        self._context_compaction_verified = False
         self._native_command = None
         self._runtime_read_paths: tuple[Path, ...] = ()
         self._private_read_roots = tuple(Path(path).absolute() for path in private_read_roots)
@@ -270,6 +283,8 @@ class CodexBackend:
             raise AppServerError("unsupported native Codex service tier")
         if params.get("distillerEnabled"):
             await self._validate_selection()
+        if params.get("noNeedForContext", {}).get("enabled"):
+            await self._validate_context_compaction(timeout)
         if params.get("asyncTools"):
             await self._validate_async_tools(timeout)
         elif not self._async_tools_checked:
@@ -288,13 +303,15 @@ class CodexBackend:
         if self._async_tools_verified:
             return
         if self._async_tools_checked:
-            raise AppServerError("Async tools requires a native Codex build with bello_async_tools support")
+            raise AppServerError(_ASYNC_TOOLS_UNSUPPORTED)
         cursor, seen = None, set()
         while True:
             params = {"limit": 100}
             if cursor:
                 params["cursor"] = cursor
             response = await self._client.request("experimentalFeature/list", params, timeout=timeout)
+            if any(f.get("name") == "bello_context_compaction" for f in response.get("data", []) if isinstance(f, dict)):
+                self._context_compaction_verified = True
             if any(feature.get("name") == "bello_async_tools" for feature in response.get("data", [])
                    if isinstance(feature, dict)):
                 self._async_tools_verified = True
@@ -305,11 +322,25 @@ class CodexBackend:
                 break
             seen.add(cursor)
         self._async_tools_checked = True
-        raise AppServerError(
-            "Async tools requires a native Codex build with bello_async_tools support. "
-            "This binary cannot run the requested mode; no engine or API fallback was used. "
-            "Set BELLO_CODEX_BINARY to a compatible build or turn async_tools off."
-        )
+        raise AppServerError(_ASYNC_TOOLS_UNSUPPORTED)
+
+    async def _validate_context_compaction(self, timeout: float) -> None:
+        if self._context_compaction_verified:
+            return
+        cursor, seen = None, set()
+        while True:
+            request = {"limit": 100}
+            if cursor:
+                request["cursor"] = cursor
+            response = await self._client.request("experimentalFeature/list", request, timeout=timeout)
+            if any(f.get("name") == "bello_context_compaction" for f in response.get("data", []) if isinstance(f, dict)):
+                self._context_compaction_verified = True
+                return
+            cursor = response.get("nextCursor")
+            if not cursor or cursor in seen:
+                break
+            seen.add(cursor)
+        raise AppServerError(_CONTEXT_COMPACTION_UNSUPPORTED)
 
     async def _validate_selection(self) -> None:
         if self._bridge is None:
@@ -393,6 +424,16 @@ class CodexBackend:
             validate_windows_native_scope(params)
         root_read = _IS_WINDOWS and params.get("windowsNativeRootRead", False)
         private_read_roots: tuple[Path, ...] = ()
+        context_policy = params.get("noNeedForContext", {})
+        context_enabled = context_policy.get("enabled", False)
+        if context_enabled:
+            # Context compaction is a conversation-history policy only: it adds
+            # no sandbox, readable-root, network or approval restriction.
+            from supervisor.project_config import NoNeedForContextConfig
+            NoNeedForContextConfig(enabled=context_enabled, threshold_tokens=context_policy.get("thresholdTokens", 249000),
+                                   retain_percent=context_policy.get("retainPercent", 10))
+            if not self._context_compaction_verified:
+                raise AppServerError("native context compaction requested without verified capability")
         if root_read:
             # Host-derived directories only. Never create a missing deny path:
             # the native deny resolver would turn it into a directory.
@@ -436,6 +477,17 @@ class CodexBackend:
         if params.get("provider", "openai-codex") != "openai-codex" or params.get("baseInstructions") is not None:
             raise AppServerError("native Codex retains its native provider and base instructions")
         config = deepcopy(params.get("config") or {})
+        if isinstance(config.get("features"), dict):
+            config["features"].pop("bello_context_compaction", None)
+        config.pop("features.bello_context_compaction", None)
+        config.pop("bello_context_retain_percent", None)
+        if self._context_compaction_verified:
+            config["features.bello_context_compaction"] = context_enabled
+        if context_enabled:
+            config.update(model_auto_compact_token_limit=context_policy.get("thresholdTokens", 249000),
+                          model_auto_compact_token_limit_scope="total",
+                          model_post_turn_compact_threshold_percent=0,
+                          bello_context_retain_percent=context_policy.get("retainPercent", 10))
         if params.get("asyncTools") and not self._async_tools_verified:
             raise AppServerError("native Async tools requested without verified capability")
         if isinstance(config.get("features"), dict):
@@ -502,7 +554,11 @@ class CodexBackend:
         if params.get("distillerEnabled"):
             if self._bridge is None or not self._selection_verified:
                 raise AppServerError("native log distiller requested without a verified native selection bridge")
-            self._bridge.register_scope(Path(params["cwd"]), Path(params["runtimeTaskPath"]) if params.get("runtimeTaskPath") else None)
+            # Goal mode's optional GOAL_MAP.md is output-selection metadata like the task path.
+            goal_scope = {"goal_map_path": Path(params["runtimeGoalMapPath"])} if params.get("runtimeGoalMapPath") else {}
+            self._bridge.register_scope(
+                Path(params["cwd"]), Path(params["runtimeTaskPath"]) if params.get("runtimeTaskPath") else None,
+                **goal_scope)
             config.update(self._bridge.thread_config)
         elif self._selection_verified:
             config["features.bello_native_selection"] = False
@@ -626,6 +682,7 @@ class CodexBackend:
 
     async def _resume(self, record: dict[str, Any], params: dict[str, Any], timeout: float) -> dict[str, Any]:
         combined = {**record["params"], **params}
+        self._validate_context_override(record, params)
         if bool(combined.get("asyncTools", False)) != bool(record["params"].get("asyncTools", False)):
             raise AppServerError("native resume cannot change Async tools mode; start a new run")
         if _model(combined["model"]) != record["model"] or str(Path(combined["cwd"]).resolve()) != str(Path(record["cwd"]).resolve()):
@@ -650,6 +707,7 @@ class CodexBackend:
             host_turn = _identifier(params.get("turnId"), "turnId")
             if record.get("closed") or record.get("activeTurnId") or host_turn in record["turnIds"].values():
                 raise AppServerError("native Codex turn is closed, active or already dispatched")
+            self._validate_context_override(record, params)
             if record["id"] not in self._loaded:
                 await self._resume(record, {}, timeout)
             await self._subscription(timeout)
@@ -683,6 +741,13 @@ class CodexBackend:
                 raise
             finally:
                 self._pending_turns.pop(record["nativeId"], None)
+
+    @staticmethod
+    def _validate_context_override(record: dict[str, Any], params: dict[str, Any]) -> None:
+        from supervisor.project_config import NoNeedForContextConfig
+        saved = record["params"].get("noNeedForContext", NoNeedForContextConfig().to_backend_data())
+        if "noNeedForContext" in params and params["noNeedForContext"] != saved:
+            raise AppServerError("native resume/turn cannot change context compaction policy; start a new run")
 
     def _bind_turn(self, record: dict[str, Any], native: str, host: str) -> None:
         existing = record["turnIds"].get(native)

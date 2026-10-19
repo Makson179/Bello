@@ -40,6 +40,7 @@ from supervisor.process_fence import create_subprocess_exec
 from supervisor.runtime.models import validate_effort
 from supervisor.runtime.claude_async import BATCH_GUIDANCE, BATCH_TOOL_NAME, ClaudeAsyncBatches
 from supervisor.runtime.claude_cli import OfficialCli, resolve_official_cli, sdk_bundled_cli
+from supervisor.runtime import claude_context
 
 
 SUPPORTED_EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -133,6 +134,40 @@ class _AsyncDelivery:
     content: list[dict[str, Any]]
 
 
+class _ContextCancelled(Exception):
+    def __init__(self, command: _Command):
+        self.command = command
+
+
+class _SummaryStopped(Exception):
+    """A summary attempt ended at Bello's cooperative stop request."""
+
+
+class _ContextPersistenceUncertain(AppServerError):
+    pass
+
+
+class _CheckpointFailure(AppServerError):
+    """A checkpoint failed before commit, with a closed category and receipts."""
+
+    def __init__(self, category: str, attempts: list[dict[str, Any]] | None = None):
+        super().__init__(f"Claude context checkpoint failed ({category})")
+        self.category = category
+        self.attempts = attempts or []
+
+
+# SDK exception classes whose names are safe, content-free labels.
+_SDK_TRANSPORT_ERRORS = frozenset({
+    "CLIConnectionError", "CLINotFoundError", "ProcessError", "ResultError",
+    "CLIJSONDecodeError", "MessageParseError",
+})
+
+
+async def _block_native_compaction(_input: Any, _tool_use_id: Any, _context: Any) -> dict[str, Any]:
+    # This hook neither reads the native transcript nor injects its contents.
+    return {"decision": "block", "reason": "Bello manages context checkpoints between completed tool rounds."}
+
+
 class ClaudeBackend:
     """Normalized thread/turn API over a first-party Claude Code session."""
 
@@ -161,6 +196,11 @@ class ClaudeBackend:
         self._owners: dict[str, _Owner] = {}
         self._async_batches: dict[tuple[str, str], ClaudeAsyncBatches] = {}
         self._async_usage: dict[tuple[str, str], dict[str, Any]] = {}
+        # Turns with model work whose terminal usage could not be read (for
+        # example a stopped summary whose final result never arrived). Their
+        # usage is a lower bound and is reported as such, never estimated.
+        self._usage_incomplete: set[tuple[str, Any]] = set()
+        self._state_persistence_uncertain = False
         self._closing = False
         self._state_file = self.state_dir / "threads.json"
         if environment is not None and client_factory is None:
@@ -298,6 +338,7 @@ class ClaudeBackend:
             await self._initialize()
 
     async def _thread_start(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._assert_state_persistence_known()
         await self._ensure_initialized()
         if self._closing:
             raise AppServerError("Claude Code backend is stopping")
@@ -316,6 +357,7 @@ class ClaudeBackend:
             raise AppServerError("developerInstructions must be text")
         effort = params.get("effort")
         self._validate_effort(effort, SUPPORTED_EFFORTS)
+        context_policy = claude_context.context_policy(params.get("noNeedForContext"))
         record: dict[str, Any] = {
             "id": thread_id,
             "model": model,
@@ -328,7 +370,10 @@ class ClaudeBackend:
             "effort": effort,
             "turns": [],
             "closed": False,
+            "noNeedForContext": context_policy,
         }
+        if context_policy["enabled"]:
+            record["contextState"] = claude_context.new_context()
         for key in ("parentThreadId", "ephemeral"):
             if key in params:
                 record[key] = deepcopy(params[key])
@@ -342,8 +387,11 @@ class ClaudeBackend:
         return {"thread": thread}
 
     async def _thread_resume(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._assert_state_persistence_known()
         await self._ensure_initialized()
         record = self._record(params.get("threadId"))
+        if "noNeedForContext" in params and claude_context.context_policy(params["noNeedForContext"]) != record.get("noNeedForContext", claude_context.context_policy(None)):
+            raise AppServerError("resuming a Claude Code thread cannot change noNeedForContext")
         if "asyncTools" in params and params["asyncTools"] != record.get("asyncTools", False):
             raise AppServerError("resuming a Claude Code thread cannot change asyncTools")
         if "model" in params and self._model(params["model"]) != record["model"]:
@@ -370,6 +418,7 @@ class ClaudeBackend:
         return {"thread": self._public_thread(record, include_turns=False)}
 
     async def _turn_start(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._assert_state_persistence_known()
         record = self._record(params.get("threadId"))
         if record.get("closed"):
             raise AppServerError("cannot start a turn on an archived Claude Code thread")
@@ -393,6 +442,8 @@ class ClaudeBackend:
         record["turns"].append(turn)
         record["activeTurnId"] = turn_id
         record["effort"] = effort
+        if record.get("contextState") is not None:
+            claude_context.begin_request(record["contextState"], prompt)
         self._persist()
         await self._ensure_owner(record)
         await self.emit(
@@ -409,6 +460,7 @@ class ClaudeBackend:
         return {"turn": deepcopy(turn)}
 
     async def _turn_steer(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._assert_state_persistence_known()
         record = self._record(params.get("threadId"))
         expected = self._identifier(params.get("expectedTurnId"), "expectedTurnId")
         if record.get("activeTurnId") != expected:
@@ -497,21 +549,28 @@ class ClaudeBackend:
         interrupt_requested = False
         stop_owner = False
         waiting_async = False
+        # The result held back while late batch results were outstanding, and
+        # the usage before it was merged (restored if it becomes final).
+        deferred_result = None
+        deferred_usage: dict[str, Any] | None = None
         if record.get("asyncTools"):
             self._async_batches[async_key] = ClaudeAsyncBatches()
         try:
             self._assert_subscription_environment()
-            options = self._options(record, params)
-            client = self._new_client(options)
-            await client.connect()
-            info = await client.get_server_info()
-            self._validate_connected_account(info)
-            self._validate_model_effort(record["model"], params.get("effort"), info)
-            await self._validate_mcp_boundary(client)
+            if record.get("contextState") is not None:
+                command_task = asyncio.create_task(queue.get())
+            client, checkpoint_prompt = await self._connect_context_client(record, params, command_task)
             # A stop/interrupt can arrive while the official CLI is starting.
             # Honor it before writing the first prompt, so a slow connection
             # cannot turn an already-cancelled turn into a paid model request.
             queued: list[_Command] = []
+            if command_task is not None:
+                if not command_task.done():
+                    command_task.cancel()
+                    await asyncio.gather(command_task, return_exceptions=True)
+                if not command_task.cancelled():
+                    queued.append(command_task.result())
+            command_task = None
             while not queue.empty():
                 queued.append(queue.get_nowait())
             cancelled_before_query = any(
@@ -528,11 +587,13 @@ class ClaudeBackend:
                         self._reject(command, AppServerError("Claude Code turn was interrupted before query"))
                 await self._complete_turn(record, turn_id, "interrupted", {}, "Turn interrupted")
                 return stop_owner
-            await client.query(params["prompt"])
+            await self._query(client, checkpoint_prompt or params["prompt"])
             for command in queued:
                 if command.kind == "steer" and command.params.get("turnId") == turn_id:
                     try:
-                        await client.query(command.params["prompt"])
+                        if record.get("contextState") is not None:
+                            claude_context.append_input(record["contextState"], command.params["prompt"], steering=True)
+                        await self._query(client, command.params["prompt"])
                     except Exception:
                         self._reject(command, AppServerError("Claude Code control request failed"))
                         raise
@@ -553,25 +614,57 @@ class ClaudeBackend:
                         raise AppServerError("Claude Code response ended without a result")
                     from claude_agent_sdk import ResultMessage
 
+                    context_state = record.get("contextState")
                     batches = self._async_batches.get(async_key)
+                    if context_state is not None and not isinstance(message, _AsyncDelivery):
+                        claude_context.observe_message(context_state, message)
+                        if isinstance(message, ResultMessage):
+                            claude_context.finish_round(context_state, turn_id, async_pending=bool(batches and batches.pending))
+                    internal_limit = (
+                        context_state is not None and isinstance(message, ResultMessage)
+                        and message.subtype == "error_max_turns"
+                        and message.terminal_reason == "max_turns"
+                    )
                     control = command_task.result() if command_task in done else None
                     if isinstance(message, _AsyncDelivery) and control is not None and control.kind in {"stop", "interrupt"}:
                         # A ready result must not start another paid query
                         # when cancellation is already queued in this tick.
                         waiting_async = True
+                    elif isinstance(message, _AsyncDelivery) and not message.content and deferred_result is not None:
+                        # Nothing is owed any more (a batch call ended without a
+                        # committed response). Finish with the held-back result
+                        # instead of waking the model with an empty delivery.
+                        waiting_async = False
+                        if deferred_usage is not None:
+                            self._async_usage[async_key] = deferred_usage
+                        if context_state is not None:
+                            claude_context.finish_round(context_state, turn_id)
+                        final, deferred_result, deferred_usage = deferred_result, None, None
+                        result_seen = await self._handle_message(
+                            record, turn_id, final, params.get("outputSchema"), interrupt_requested
+                        )
                     elif isinstance(message, _AsyncDelivery):
                         waiting_async = False
+                        deferred_result, deferred_usage = None, None
                         content = [
                             {"type": "text", "text": "Previously pending Bello tool results are now available. Use these results before finishing the task or review."},
                             *message.content,
                         ]
-                        await client.query(self._async_prompt(content))
+                        if context_state is not None:
+                            claude_context.append_input(context_state, content)
+                            await client.disconnect()
+                            client, checkpoint_prompt = await self._connect_context_client(record, params, command_task)
+                        else:
+                            checkpoint_prompt = None
+                        self._check_context_cancel(command_task, record if context_state is not None else None)
+                        await self._query(client, checkpoint_prompt or self._async_prompt(content))
                         iterator = client.receive_response().__aiter__()
                         receive_task = asyncio.create_task(anext(iterator))
-                    elif isinstance(message, ResultMessage) and batches and batches.pending and not message.is_error and not interrupt_requested and message.terminal_reason not in {"aborted_streaming", "aborted_tools", "cancelled"}:
+                    elif isinstance(message, ResultMessage) and batches and batches.pending and (not message.is_error or internal_limit) and not interrupt_requested and message.terminal_reason not in {"aborted_streaming", "aborted_tools", "cancelled"}:
                         # A Claude response may finish while a batch's original
                         # commands still run. Do not finalize the Bello turn or
                         # validate an early review verdict; await actual output.
+                        deferred_result, deferred_usage = message, dict(self._async_usage.get(async_key, {}))
                         self._async_usage[async_key] = self._merge_usage(self._async_usage.get(async_key, {}), message.usage)
                         if self._valid_uuid(message.session_id):
                             record["claudeSessionId"] = message.session_id
@@ -580,6 +673,22 @@ class ClaudeBackend:
                         await iterator.aclose()
                         waiting_async = True
                         receive_task = asyncio.create_task(self._wait_async_delivery(batches))
+                    elif internal_limit and not interrupt_requested:
+                        # max_turns stops after the SDK finishes the current tool
+                        # round. Reconnect/resume even below the checkpoint budget:
+                        # an error_max_turns CLI may exit after emitting its result.
+                        self._async_usage[async_key] = self._merge_usage(self._async_usage.get(async_key, {}), message.usage)
+                        if self._valid_uuid(message.session_id):
+                            record["claudeSessionId"] = message.session_id
+                            record["hasSession"] = True
+                        self._persist()
+                        await iterator.aclose()
+                        await client.disconnect()
+                        client, checkpoint_prompt = await self._connect_context_client(record, params, command_task)
+                        self._check_context_cancel(command_task, record)
+                        await self._query(client, checkpoint_prompt or claude_context.CONTINUE_PROMPT)
+                        iterator = client.receive_response().__aiter__()
+                        receive_task = asyncio.create_task(anext(iterator))
                     else:
                         result_seen = await self._handle_message(
                             record, turn_id, message, params.get("outputSchema"), interrupt_requested
@@ -597,10 +706,25 @@ class ClaudeBackend:
                                 ready_during_steer = []
                                 if waiting_async:
                                     ready_during_steer = await self._settle_async_wait_for_steer(receive_task)
-                                if ready_during_steer:
-                                    await client.query(self._async_prompt([*ready_during_steer, {"type": "text", "text": command.params["prompt"]}]))
+                                if record.get("contextState") is not None:
+                                    claude_context.append_input(record["contextState"], command.params["prompt"], steering=True)
+                                    if ready_during_steer:
+                                        claude_context.append_input(record["contextState"], ready_during_steer)
+                                    if waiting_async:
+                                        await client.disconnect()
+                                        client, checkpoint_prompt = await self._connect_context_client(record, params)
+                                    else:
+                                        checkpoint_prompt = None
                                 else:
-                                    await client.query(command.params["prompt"])
+                                    checkpoint_prompt = None
+                                if record.get("contextState") is not None:
+                                    self._check_context_cancel(None, record)
+                                if checkpoint_prompt:
+                                    await self._query(client, checkpoint_prompt)
+                                elif ready_during_steer:
+                                    await self._query(client, self._async_prompt([*ready_during_steer, {"type": "text", "text": command.params["prompt"]}]))
+                                else:
+                                    await self._query(client, command.params["prompt"])
                                 if waiting_async:
                                     waiting_async = False
                                     iterator = client.receive_response().__aiter__()
@@ -642,6 +766,12 @@ class ClaudeBackend:
             if stop_owner and not result_seen:
                 await self._complete_turn(record, turn_id, "interrupted", self._async_usage.get(async_key, {}), "Turn interrupted")
             return stop_owner
+        except _ContextCancelled as exc:
+            self._resolve(exc.command, {})
+            command_task = None
+            stop_owner = exc.command.kind == "stop"
+            await self._complete_turn(record, turn_id, "interrupted", self._async_usage.get(async_key, {}), "Turn interrupted")
+            return stop_owner
         except asyncio.CancelledError:
             if record.get("activeTurnId") == turn_id:
                 await self._complete_turn(record, turn_id, "interrupted", self._async_usage.get(async_key, {}), "Turn interrupted")
@@ -654,7 +784,15 @@ class ClaudeBackend:
             batches = self._async_batches.pop(async_key, None)
             if batches is not None:
                 await batches.cancel()
+            try:
+                # Every path above ends its turn; a turn must still never
+                # outlive the task that drives it. A no-op once it is terminal.
+                await self._complete_turn(record, turn_id, "failed", self._async_usage.get(async_key, {}),
+                                          "Claude Code turn ended without a result")
+            except Exception:
+                pass
             self._async_usage.pop(async_key, None)
+            self._usage_incomplete.discard(async_key)
             # If response completion raced queue.get(), put an unprocessed
             # command back for the idle owner.  Otherwise a stop/interrupt
             # future could be orphaned after queue.get() had consumed it.
@@ -674,6 +812,650 @@ class ClaudeBackend:
                     await client.disconnect()
                 except Exception:
                     pass
+
+    def _check_context_cancel(self, command_task: asyncio.Task[Any] | None, record: dict[str, Any] | None = None) -> None:
+        self._assert_state_persistence_known()
+        if command_task is not None and command_task.done() and not command_task.cancelled():
+            command = command_task.result()
+            if command.kind in {"stop", "interrupt"}:
+                raise _ContextCancelled(command)
+        if record is not None:
+            queue = self._owners[record["id"]].queue
+            queued = []
+            while not queue.empty():
+                queued.append(queue.get_nowait())
+            cancellation = next((command for command in queued if command.kind in {"stop", "interrupt"}), None)
+            if cancellation is not None:
+                for command in queued:
+                    if command.kind in {"stop", "interrupt"}:
+                        self._resolve(command, {})
+                    else:
+                        self._reject(command, AppServerError("Turn interrupted during context preparation"))
+                if command_task is not None and command_task.done() and not command_task.cancelled():
+                    self._reject(command_task.result(), AppServerError("Turn interrupted during context preparation"))
+                raise _ContextCancelled(cancellation)
+            for command in queued:
+                queue.put_nowait(command)
+
+    async def _connect_context_client(
+        self,
+        record: dict[str, Any],
+        params: dict[str, Any],
+        command_task: asyncio.Task[Any] | None = None,
+    ) -> tuple[Any, Any]:
+        """Connect at a completed SDK round, optionally replacing its context.
+
+        Only private Bello state is replaced. Native transcripts remain intact
+        and are never used as a writable history API. A failed summary or new
+        connection leaves the original session ID and context untouched.
+        """
+        self._check_context_cancel(command_task, record)
+        pending_state = record.get("contextState")
+        if pending_state is not None and pending_state.get("bootstrapPending") and record.get("hasSession"):
+            # The native session of a committed checkpoint exists but never
+            # confirmed its bootstrap (the process stopped or the turn failed
+            # first), so it may already hold all or part of it. Sending it again
+            # would duplicate the quoted history there and inflate the context
+            # toward another checkpoint: continue in a clean native session.
+            pending_state["archivedSessions"].append(record["claudeSessionId"])
+            record["claudeSessionId"] = str(uuid4())
+            record["hasSession"] = False
+            self._persist()
+        client = self._new_client(self._options(record, params))
+        try:
+            await self._validate_context_connection(client, record, params)
+            self._check_context_cancel(command_task, record)
+            state = record.get("contextState")
+            if state is None:
+                return client, None
+            usage = await client.get_context_usage()
+            self._check_context_cancel(command_task, record)
+            total = usage.get("totalTokens") if isinstance(usage, dict) else None
+            if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+                raise AppServerError("Claude SDK did not report reliable context usage")
+            policy = record["noNeedForContext"]
+            threshold = policy["thresholdTokens"]
+            effective_limit = usage.get("maxTokens")
+            if (not isinstance(effective_limit, int) or isinstance(effective_limit, bool)
+                    or effective_limit <= 8192):
+                raise AppServerError("Claude SDK did not report a usable model context capacity")
+            maximum_threshold = effective_limit - max(8192, int(effective_limit * 0.05))
+            if threshold > maximum_threshold:
+                raise AppServerError(
+                    f"Configured context threshold {threshold} exceeds the Claude model input capacity "
+                    f"{maximum_threshold} after output and safety reserves; choose a compatible threshold or model"
+                )
+            if state.get("bootstrapPending"):
+                prompt = claude_context.bootstrap_input(state)
+                limit = usage.get("maxTokens")
+                if not isinstance(limit, int) or total + claude_context.estimate_tokens(prompt) >= limit - 8192:
+                    raise AppServerError("Claude cannot safely restore the protected context checkpoint")
+                return client, prompt if isinstance(prompt, str) else self._async_prompt(prompt)
+            # The configured threshold is authoritative. The owned PreCompact
+            # hook blocks the SDK's independent automatic-compaction policy;
+            # its advertised trigger must not silently lower Bello's setting.
+            batches = self._async_batches.get((record["id"], record.get("activeTurnId")))
+            older, retained = claude_context.partition_rounds(state, policy)
+            projected = total + (claude_context.estimate_tokens(state["pending"]) if state["pending"] else 0)
+            if projected < threshold or (batches is not None and batches.pending):
+                return client, None
+            if not older:
+                if projected >= effective_limit - 4096:
+                    raise AppServerError("Claude context cannot fit the protected task and newest whole tool round")
+                return client, None
+            # Required: the next request may no longer fit. Otherwise a
+            # checkpoint waits for the persisted schedule: after a failed one,
+            # until the context has grown by a larger step than before and
+            # for at most a few consecutive failures; after a committed one,
+            # until the fresh session has grown (see claude_context).
+            required = projected >= effective_limit - 4096
+            if not claude_context.checkpoint_due(state, threshold, projected, required=required):
+                return client, None
+            trigger = "inputLimit" if required else "threshold"
+            prior_failures = claude_context.failed_checkpoints(state)
+            fresh = None
+            original_disconnected = False
+            stage = "summary"
+            attempts: list[dict[str, Any]] = []
+            try:
+                summary, summary_format, attempts = await self._context_summary(record, params, older, command_task)
+                self._check_context_cancel(command_task, record)
+                stage = "candidate"
+                candidate = deepcopy(state)
+                candidate["summary"] = summary
+                candidate["rounds"] = retained
+                if candidate.get("openAsyncRoundStart") is not None:
+                    candidate["openAsyncRoundStart"] -= len(older)
+                candidate["generation"] += 1
+                candidate["bootstrapPending"] = True
+                candidate["archivedSessions"].append(record["claudeSessionId"])
+                prompt = claude_context.bootstrap_input(candidate)
+                if claude_context.estimate_tokens(prompt) >= total:
+                    raise _CheckpointFailure("not_reducing", attempts)
+                if claude_context.estimate_tokens(prompt) >= effective_limit - 8192:
+                    raise _CheckpointFailure("candidate_too_large", attempts)
+                new_record = {**record, "claudeSessionId": str(uuid4()), "hasSession": False,
+                              "contextState": candidate}
+                # MCP callbacks must retain the live logical record, not a
+                # snapshot whose active-turn guard would become stale.
+                fresh_options = self._options(record, params)
+                fresh_options.resume = None
+                fresh_options.session_id = new_record["claudeSessionId"]
+                # SDK connect()/disconnect() own an AnyIO cancellation scope.
+                # Two clients in this task must be closed in stack order, so
+                # close the idle old connection before opening the candidate.
+                # Its durable transcript still provides the rollback target.
+                stage = "connect"
+                await client.disconnect()
+                original_disconnected = True
+                fresh = self._new_client(fresh_options)
+                await self._validate_context_connection(fresh, new_record, params)
+                stage = "measure"
+                fresh_usage = await fresh.get_context_usage()
+                baseline = fresh_usage.get("totalTokens") if isinstance(fresh_usage, dict) else None
+                fresh_limit = fresh_usage.get("maxTokens") if isinstance(fresh_usage, dict) else None
+                if (not isinstance(baseline, int) or isinstance(baseline, bool) or baseline < 0
+                        or not isinstance(fresh_limit, int) or isinstance(fresh_limit, bool) or fresh_limit <= 0):
+                    raise _CheckpointFailure("fresh_budget_unavailable", attempts)
+                projected_fresh = baseline + claude_context.estimate_tokens(prompt)
+                if projected_fresh >= min(projected, fresh_limit - 8192):
+                    raise _CheckpointFailure("candidate_too_large", attempts)
+                if not required and projected_fresh >= threshold:
+                    # Committing would leave the fresh session at or above the
+                    # threshold, so the very next round would summarize again:
+                    # an immediate compaction loop. Keep the original instead.
+                    raise _CheckpointFailure("not_reducing", attempts)
+                self._check_context_cancel(command_task, record)
+                claude_context.note_checkpoint_commit(candidate, threshold, projected_fresh)
+                stage = "archive"
+                self._archive_context(record)
+                stage = "commit"
+                self._persist_context_checkpoint(record, new_record)
+                try:
+                    await self.emit({"method": "thread/contextCompacted", "params": {
+                        "threadId": record["id"], "generation": candidate["generation"],
+                        "retainedRounds": len(retained), "summarizedRounds": len(older),
+                        "previousTokens": total, "freshTokens": projected_fresh,
+                        "configuredThresholdTokens": policy["thresholdTokens"],
+                        "effectiveThresholdTokens": threshold,
+                        "historyRepresentation": "quoted-transcript",
+                        "trigger": trigger, "summaryFormat": summary_format, "summaryChars": len(summary),
+                        "attempts": attempts, **self._summary_budget_fields(),
+                        "priorFailedCheckpoints": prior_failures,
+                    }})
+                except Exception:
+                    pass  # The checkpoint is already committed durably.
+                return fresh, prompt if isinstance(prompt, str) else self._async_prompt(prompt)
+            except (_ContextCancelled, asyncio.CancelledError, _ContextPersistenceUncertain):
+                if fresh is not None:
+                    await fresh.disconnect()
+                raise
+            except Exception as error:
+                if fresh is not None:
+                    await fresh.disconnect()
+                if original_disconnected:
+                    client = self._new_client(self._options(record, params))
+                    await self._validate_context_connection(client, record, params)
+                category = self._checkpoint_category(error, stage)
+                schedule = claude_context.note_checkpoint_failure(state, threshold, projected)
+                self._persist_schedule()
+                try:
+                    await self.emit({"method": "thread/contextCompactionFailed", "params": {
+                        "threadId": record["id"], "message": "Context checkpoint failed; the original session was preserved.",
+                        "generation": state["generation"], "trigger": trigger,
+                        "stage": "summary" if stage == "summary" else "replacement",
+                        "category": category,
+                        "attempts": error.attempts if isinstance(error, _CheckpointFailure) else attempts,
+                        "previousTokens": total, "projectedTokens": projected,
+                        "summarizedRounds": len(older), "retainedRounds": len(retained),
+                        **self._summary_budget_fields(),
+                        "configuredThresholdTokens": threshold, **schedule,
+                        "originalContextContinues": not required,
+                    }})
+                except Exception:
+                    pass  # Telemetry is best effort; the original context is intact.
+                if required:
+                    raise AppServerError(
+                        f"Claude context checkpoint failed ({category}) and the original context cannot safely continue"
+                    )
+                return client, None
+        except BaseException:
+            await client.disconnect()
+            raise
+
+    async def _validate_context_connection(self, client: Any, record: dict[str, Any], params: dict[str, Any]) -> None:
+        await client.connect()
+        info = await client.get_server_info()
+        self._validate_connected_account(info)
+        self._validate_model_effort(record["model"], params.get("effort"), info)
+        await self._validate_mcp_boundary(client)
+
+    def _summary_options(self, record: dict[str, Any], params: dict[str, Any]) -> Any:
+        """The role's model, effort and account boundary, with no tools.
+
+        ``output_format`` stays unset on purpose. The pinned CLI implements a
+        JSON schema as a synthetic StructuredOutput tool that it adds even with
+        ``tools=[]``; a plain-text answer then gets an injected corrective turn,
+        which ``max_turns=1`` ends as ``error_max_turns``. The summary is an
+        ordinary plain-text handoff validated by ``claude_context.inspect_summary``.
+        ``CLAUDE_CODE_MAX_OUTPUT_TOKENS`` is forwarded by the managed CLI as the
+        request's ``max_tokens``, which adaptive thinking shares with the text.
+        """
+        options = self._options(record, params)
+        options.system_prompt = claude_context.SUMMARY_SYSTEM
+        options.mcp_servers = {}
+        options.allowed_tools = []
+        options.tools = []
+        options.resume = None
+        options.session_id = str(uuid4())
+        options.output_format = None
+        options.max_turns = 1
+        options.env = {**options.env, "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(claude_context.SUMMARY_MAX_OUTPUT_TOKENS)}
+        return options
+
+    @staticmethod
+    def _summary_budget_fields() -> dict[str, int]:
+        """The effective summary budget, as content-free receipt fields."""
+        return {"summaryTimeoutSeconds": claude_context.SUMMARY_TIMEOUT_SECONDS,
+                "summaryMaxOutputTokens": claude_context.SUMMARY_MAX_OUTPUT_TOKENS}
+
+    @staticmethod
+    def _summary_failure(error: BaseException) -> tuple[str, dict[str, Any]]:
+        """Map one failed attempt to a closed category and content-free details."""
+        if isinstance(error, claude_context.SummaryRejected):
+            return error.category, dict(error.details)
+        if isinstance(error, TimeoutError):
+            return "timeout", {}
+        name = type(error).__name__
+        if name in _SDK_TRANSPORT_ERRORS:
+            return "transport_error", {"errorType": name}
+        return "unexpected_error", {}
+
+    @staticmethod
+    def _checkpoint_category(error: BaseException, stage: str) -> str:
+        if isinstance(error, _CheckpointFailure):
+            return error.category
+        return {
+            "candidate": "candidate_invalid", "connect": "candidate_connection_failed",
+            "measure": "fresh_budget_unavailable", "archive": "archive_failed", "commit": "commit_failed",
+        }.get(stage, "unexpected_error")
+
+    async def _context_summary(
+        self, record: dict[str, Any], params: dict[str, Any], older: list,
+        command_task: asyncio.Task[Any] | None,
+    ) -> tuple[str, str, list[dict[str, Any]]]:
+        """Return ``(summary, format, attempt receipts)`` or raise _CheckpointFailure.
+
+        The whole step, its retry included, shares ONE deadline of
+        ``SUMMARY_TIMEOUT_SECONDS``: a second attempt only runs in the time the
+        first left, and an attempt that exhausted it is not retried.
+
+        Each attempt task owns its summarizer from connect to disconnect. An
+        interrupt, a stop or cancellation of this task reaches it only as a
+        cooperative stop request, never as ``Task.cancel()``: the pinned SDK's
+        AnyIO-shielded transport close does not defer an asyncio cancellation,
+        and a query that may have been submitted must still be interrupted and
+        its final usage read. Cancellation is never a checkpoint failure.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + claude_context.SUMMARY_TIMEOUT_SECONDS
+
+        async def attempt(note: str | None, stream: claude_context.SummaryStream,
+                          receipt: dict[str, Any], stop: asyncio.Future[None]) -> tuple[str, str]:
+            from claude_agent_sdk import ResultMessage
+
+            summarizer = self._new_client(self._summary_options(record, params))
+            key = (record["id"], record.get("activeTurnId"))
+            # Set before the query is written, not after its await returns: a
+            # cancelled or timed-out write may already have reached the CLI.
+            dispatched = False
+            dispatch: asyncio.Task[None] | None = None
+            reading: asyncio.Task[Any] | None = None
+            submitted_at: float | None = None
+
+            def honor_stop() -> None:
+                # Setup steps are bounded and finish first: cancelling SDK
+                # connect could abort its own shielded cleanup. No query is
+                # pending yet, so nothing needs an interrupt.
+                if stop.done():
+                    raise _SummaryStopped()
+
+            try:
+                # The shared deadline; see SUMMARY_TIMEOUT_SECONDS for exactly
+                # what it covers. The stop/drain and the transport close below
+                # run after it, under their own short bounds.
+                async with asyncio.timeout_at(deadline):
+                    receipt["phase"] = "connect"
+                    honor_stop()
+                    try:
+                        await self._validate_context_connection(summarizer, record, params)
+                    except AppServerError as error:
+                        raise claude_context.SummaryRejected("connection_rejected") from error
+                    honor_stop()
+                    status = await summarizer.get_mcp_status()
+                    if any(server.get("status") not in {"disabled", "failed"}
+                           for server in status.get("mcpServers", [])):
+                        raise claude_context.SummaryRejected("tools_exposed")
+                    honor_stop()
+                    self._check_context_cancel(command_task, record)
+                    receipt["phase"] = "measure"
+                    prompt = claude_context.summary_prompt(record["contextState"], older, note=note)
+                    summary_usage = await summarizer.get_context_usage()
+                    summary_limit = summary_usage.get("maxTokens") if isinstance(summary_usage, dict) else None
+                    summary_baseline = summary_usage.get("totalTokens") if isinstance(summary_usage, dict) else None
+                    if (not isinstance(summary_limit, int) or isinstance(summary_limit, bool) or summary_limit <= 0
+                            or not isinstance(summary_baseline, int) or isinstance(summary_baseline, bool)
+                            or summary_baseline < 0):
+                        raise claude_context.SummaryRejected("usage_unavailable")
+                    receipt["inputTokensEstimate"] = claude_context.estimate_tokens(prompt)
+                    # The whole combined output/reasoning cap plus a margin for
+                    # the character estimate must fit before anything is sent;
+                    # neither the cap nor the effort is lowered to make it fit.
+                    admission = claude_context.summary_admission(
+                        summary_baseline, receipt["inputTokensEstimate"], summary_limit)
+                    receipt.update(contextBaselineTokens=summary_baseline, contextCapacityTokens=summary_limit,
+                                   admissionRequiredTokens=admission["requiredTokens"])
+                    if not admission["fits"]:
+                        raise claude_context.SummaryRejected("input_too_large")
+                    honor_stop()
+                    self._check_context_cancel(command_task, record)
+                    receipt["phase"] = "dispatch"
+                    dispatched = True
+                    dispatch = asyncio.create_task(
+                        self._query(summarizer, prompt if isinstance(prompt, str) else self._async_prompt(prompt)))
+                    if await self._stop_requested_first(dispatch, stop):
+                        raise _SummaryStopped()
+                    dispatch, sent = None, dispatch
+                    sent.result()
+                    submitted_at = loop.time()
+                    receipt["phase"] = "await_first_message"
+                    iterator = summarizer.receive_response().__aiter__()
+                    while True:
+                        honor_stop()
+                        reading = asyncio.create_task(anext(iterator))
+                        if await self._stop_requested_first(reading, stop):
+                            raise _SummaryStopped()  # the drain still consults this read
+                        reading, read = None, reading
+                        try:
+                            message = read.result()
+                        except StopAsyncIteration:
+                            raise claude_context.SummaryRejected("no_result") from None
+                        if receipt["phase"] == "await_first_message":
+                            receipt["phase"] = "streaming"
+                            receipt["firstMessageMs"] = max(0, int((loop.time() - submitted_at) * 1000))
+                        if isinstance(message, ResultMessage):
+                            # This fresh session's result usage covers all of its
+                            # model responses; it is the only usage counted.
+                            receipt["phase"] = "result"
+                            receipt["responseMs"] = max(0, int((loop.time() - submitted_at) * 1000))
+                            self._count_summary_usage(key, receipt, message)
+                            stream.observe_result(message)
+                            return claude_context.inspect_summary(message, stream)
+                        # Raises at a tool call, provider error or injected
+                        # continuation, before the CLI's own result.
+                        stream.observe(message)
+            except BaseException:
+                # Failure, timeout or stop: a query that may be in flight is
+                # interrupted and drained by the task that owns the client.
+                if dispatch is not None:
+                    await self._discard_task(dispatch)
+                if dispatched and not receipt.get("usageReported"):
+                    pending, reading = reading, None
+                    await self._stop_summarizer(summarizer, key, receipt, pending)
+                raise
+            finally:
+                if reading is not None:
+                    await self._discard_task(reading)
+                try:
+                    await summarizer.disconnect()
+                except Exception:
+                    # A delivered result stays valid; record the cleanup fault.
+                    receipt["cleanupError"] = True
+
+        attempts: list[dict[str, Any]] = []
+        note: str | None = None
+        for number in range(1, claude_context.SUMMARY_ATTEMPTS + 1):
+            if number > 1 and loop.time() >= deadline:
+                break  # the one summary deadline is spent: there is no time for a retry
+            self._check_context_cancel(command_task, record)
+            stream = claude_context.SummaryStream()
+            receipt: dict[str, Any] = {"attempt": number, "retryNote": True if note else None}
+            started = loop.time()
+            stop: asyncio.Future[None] = loop.create_future()
+            task = asyncio.create_task(attempt(note, stream, receipt, stop))
+            watcher = None
+            held: list[_Command] = []
+            try:
+                # A queued steering message must not hide a later interrupt
+                # for the duration of a summary. Observe further controls while
+                # preserving their original FIFO order for the owner loop.
+                queue = self._owners[record["id"]].queue
+                while not task.done():
+                    watch_primary = command_task is not None and not command_task.done()
+                    watcher = command_task if watch_primary else asyncio.create_task(queue.get())
+                    await asyncio.wait({task, watcher}, return_when=asyncio.FIRST_COMPLETED)
+                    if watcher.done():
+                        command = watcher.result()
+                        if not watch_primary:
+                            held.append(command)
+                        if command.kind in {"stop", "interrupt"}:
+                            for pending in held:
+                                if pending is not command:
+                                    self._reject(pending, AppServerError("Turn interrupted during context preparation"))
+                            held.clear()
+                            if command_task is not None and command_task.done() and command_task is not watcher:
+                                self._reject(command_task.result(), AppServerError("Turn interrupted during context preparation"))
+                            raise _ContextCancelled(command)
+                    elif not watch_primary:
+                        watcher.cancel()
+                        await asyncio.gather(watcher, return_exceptions=True)
+                    watcher = None
+                queued = []
+                while not queue.empty():
+                    queued.append(queue.get_nowait())
+                for command in [*held, *queued]:
+                    queue.put_nowait(command)
+                self._check_context_cancel(command_task, record)
+                summary, summary_format = task.result()
+            except (_ContextCancelled, asyncio.CancelledError, _ContextPersistenceUncertain) as error:
+                helpers: list[asyncio.Task[Any]] = []
+                if watcher is not None and watcher is not command_task:
+                    if not watcher.done():
+                        watcher.cancel()
+                        helpers.append(watcher)
+                    elif not watcher.cancelled() and watcher.exception() is None:
+                        # A control obtained in the tick this task was cancelled.
+                        late = watcher.result()
+                        if late is not getattr(error, "command", None) and all(item is not late for item in held):
+                            held.append(late)
+                for pending in held:
+                    if pending.kind not in {"stop", "interrupt"}:
+                        self._reject(pending, AppServerError("Context preparation was interrupted"))
+                cancelled_again = await self._settle_summary_attempt(task, stop, helpers)
+                for pending in held:
+                    if pending.kind in {"stop", "interrupt"}:
+                        self._resolve(pending, {})  # honored by this cancellation
+                if cancelled_again and not isinstance(error, asyncio.CancelledError):
+                    # This task was itself cancelled during the bounded cleanup.
+                    # Acknowledge the command already honored, then propagate
+                    # the cancellation instead of swallowing it.
+                    if isinstance(error, _ContextCancelled):
+                        self._resolve(error.command, {})
+                    raise asyncio.CancelledError() from error
+                raise
+            except Exception as error:
+                category, details = self._summary_failure(error)
+                attempts.append(self._attempt_receipt(receipt, stream, started, outcome=category, **details))
+                if not claude_context.retryable(category):
+                    break
+                note = claude_context.retry_note(category, details)
+                continue
+            attempts.append(self._attempt_receipt(receipt, stream, started, outcome="accepted",
+                                                  summaryFormat=summary_format, summaryChars=len(summary)))
+            return summary, summary_format, attempts
+        raise _CheckpointFailure(attempts[-1]["outcome"] if attempts else "unexpected_error", attempts)
+
+    async def _stop_summarizer(self, summarizer: Any, key: tuple[str, Any], receipt: dict[str, Any],
+                               pending: asyncio.Task[Any] | None = None) -> None:
+        """Interrupt an unfinished summary and count its final usage once.
+
+        Closing stdin alone lets the CLI finish its own output-limit
+        continuations (further paid requests) before the SDK's exit grace
+        period ends. The interrupt stops that loop; the CLI's single result for
+        this fresh session then reports usage that was not yet merged.
+
+        ``pending`` is a read already waiting when the attempt stopped. It gets
+        the stream's next message first, so it is consulted together with a
+        fresh read; whichever delivers the terminal result is counted, once.
+        A terminal result that a read has ALREADY delivered is counted first:
+        the response is over, so nothing is left to interrupt, and a failing
+        interrupt can never discard usage that was available. Interrupt and
+        drain share one bound. A missing or later result is never estimated:
+        the receipt and the turn are marked incomplete instead.
+        """
+        from claude_agent_sdk import ResultMessage
+
+        readers: set[asyncio.Task[Any]] = {pending} if pending is not None else set()
+        try:
+            if self._count_delivered_result(key, receipt, readers):
+                return
+            async with asyncio.timeout(claude_context.SUMMARY_STOP_TIMEOUT_SECONDS):
+                try:
+                    await summarizer.interrupt()
+                except Exception:
+                    # The control request failed: count a result delivered in
+                    # the meantime, but never wait for one that may not come.
+                    self._count_delivered_result(key, receipt, readers)
+                    return
+                fresh = summarizer.receive_response().__aiter__()
+                following = asyncio.create_task(anext(fresh))
+                readers.add(following)
+                while readers:
+                    done, _ = await asyncio.wait(readers, return_when=asyncio.FIRST_COMPLETED)
+                    for reader in done:
+                        readers.discard(reader)
+                        if reader.cancelled() or reader.exception() is not None:
+                            continue  # this read ended without a message
+                        message = reader.result()
+                        if isinstance(message, ResultMessage):
+                            self._count_summary_usage(key, receipt, message)
+                            return
+                        if reader is following:
+                            following = asyncio.create_task(anext(fresh))
+                            readers.add(following)
+        except Exception:
+            pass  # timeout or closed stream: recorded below
+        finally:
+            if not receipt.get("usageReported"):
+                # A read that finished within the bound delivered real usage.
+                self._count_delivered_result(key, receipt, readers)
+            for reader in readers:
+                await self._discard_task(reader)
+            if not receipt.get("usageReported"):
+                receipt["stopIncomplete"] = True
+                self._usage_incomplete.add(key)
+
+    def _count_delivered_result(self, key: tuple[str, Any], receipt: dict[str, Any],
+                                readers: set[asyncio.Task[Any]]) -> bool:
+        """Count a terminal result that a finished read already delivered, once.
+
+        Finished reads are removed from ``readers``; unfinished ones are left
+        for the caller. Never waits and never cancels anything.
+        """
+        from claude_agent_sdk import ResultMessage
+
+        for reader in [reader for reader in readers if reader.done()]:
+            readers.discard(reader)
+            if reader.cancelled() or reader.exception() is not None:
+                continue
+            message = reader.result()
+            if isinstance(message, ResultMessage):
+                self._count_summary_usage(key, receipt, message)
+                return True
+        return False
+
+    def _count_summary_usage(self, key: tuple[str, Any], receipt: dict[str, Any], message: Any) -> None:
+        """Merge one summary session's terminal usage at most once per attempt."""
+        if receipt.get("usageReported"):
+            return
+        self._async_usage[key] = self._merge_usage(self._async_usage.get(key, {}), message.usage)
+        receipt["usageReported"] = True
+
+    @staticmethod
+    async def _stop_requested_first(work: asyncio.Future[Any], stop: asyncio.Future[None]) -> bool:
+        """Wait for ``work`` or a stop request, cancelling neither.
+
+        Completed work wins a tie, so a result delivered in the same tick as
+        the stop request is still observed, and its usage counted, once.
+        """
+        if not work.done() and not stop.done():
+            await asyncio.wait({work, stop}, return_when=asyncio.FIRST_COMPLETED)
+        return not work.done()
+
+    @staticmethod
+    async def _discard_task(task: asyncio.Task[Any]) -> None:
+        """Cancel a summary read or write helper and wait until it has ended."""
+        task.cancel()
+        await asyncio.wait({task})
+        if not task.cancelled():
+            task.exception()  # retrieved; the outcome is no longer needed
+
+    @staticmethod
+    async def _settle_summary_attempt(task: asyncio.Task[Any], stop: asyncio.Future[None],
+                                      helpers: list[asyncio.Task[Any]]) -> bool:
+        """Ask a summary attempt to stop and wait for its bounded cleanup.
+
+        The attempt interrupts, drains and disconnects its own client in its
+        own task; it is never cancelled from here. Further cancellation of this
+        task is deferred until that cleanup has ended and is then reported, so
+        the caller propagates it: no background work outlives the request.
+        """
+        if not stop.done():
+            stop.set_result(None)
+        cancelled = False
+        waiting = [item for item in (task, *helpers) if not item.done()]
+        while waiting:
+            try:
+                await asyncio.wait(waiting)
+            except asyncio.CancelledError:
+                cancelled = True
+            waiting = [item for item in waiting if not item.done()]
+        if not task.cancelled():
+            task.exception()  # a stopped attempt's outcome is not a checkpoint result
+        return cancelled
+
+    @staticmethod
+    def _attempt_receipt(receipt: dict[str, Any], stream: claude_context.SummaryStream,
+                         started: float, **fields: Any) -> dict[str, Any]:
+        """One bounded attempt record: categories, protocol enums and counts only."""
+        values = {**receipt, **fields, **stream.summary(),
+                  "durationMs": max(0, int((asyncio.get_running_loop().time() - started) * 1000))}
+        return {key: value for key, value in values.items() if value is not None}
+
+    def _archive_context(self, record: dict[str, Any]) -> None:
+        directory = self.state_dir / "context-archives"
+        if directory.is_symlink():
+            raise AppServerError("Claude context archive directory cannot be a symlink")
+        directory.mkdir(mode=0o700, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(prefix=".context-", suffix=".json", dir=directory)
+        try:
+            if os.name != "nt":
+                os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                descriptor = -1
+                json.dump({"nativeSessionId": record["claudeSessionId"], "contextState": record["contextState"]},
+                          handle, ensure_ascii=False, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            target = directory / f"{record['claudeSessionId']}-{record['contextState']['generation']}.json"
+            os.replace(temporary, target)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                Path(temporary).unlink()
+            except FileNotFoundError:
+                pass
 
     async def _handle_message(
         self,
@@ -760,7 +1542,7 @@ class ClaudeBackend:
         blocks = []
         for block in content:
             if block.get("type") == "image":
-                blocks.append({"type": "image", "source": {"type": "base64", "media_type": block["mimeType"], "data": block["data"]}})
+                blocks.append(deepcopy(block) if "source" in block else {"type": "image", "source": {"type": "base64", "media_type": block["mimeType"], "data": block["data"]}})
             else:
                 blocks.append(deepcopy(block))
         yield {"type": "user", "message": {"role": "user", "content": blocks}, "parent_tool_use_id": None}
@@ -810,6 +1592,11 @@ class ClaudeBackend:
             return
         turn["status"] = status
         turn["usage"] = usage
+        if (record["id"], turn_id) in self._usage_incomplete:
+            # Adapter-owned and content-free: some model work's terminal usage
+            # was unavailable, so ``usage`` is a lower bound, not an estimate.
+            self._usage_incomplete.discard((record["id"], turn_id))
+            turn["usageIncomplete"] = True
         if error:
             turn["error"] = {"message": error}
             if output_schema_failure:
@@ -817,7 +1604,10 @@ class ClaudeBackend:
                 turn["error"]["belloFailureKind"] = "output_schema_validation"
         if record.get("activeTurnId") == turn_id:
             record.pop("activeTurnId", None)
-        self._persist()
+        if record.get("contextState") is not None:
+            record["contextState"]["openAsyncRoundStart"] = None
+        if not self._state_persistence_uncertain:
+            self._persist()
         await self.emit(
             {
                 "method": "turn/completed",
@@ -863,7 +1653,7 @@ class ClaudeBackend:
             ),
             "env": {
                 "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
-                "CLAUDE_AGENT_SDK_CLIENT_APP": "bello/0.7.2",
+                "CLAUDE_AGENT_SDK_CLIENT_APP": "bello/0.8.0",
             },
             "extra_args": {"disable-slash-commands": None, "no-chrome": None},
             "effort": params.get("effort"),
@@ -877,6 +1667,19 @@ class ClaudeBackend:
             kwargs["resume"] = record["claudeSessionId"]
         else:
             kwargs["session_id"] = record["claudeSessionId"]
+        if record.get("noNeedForContext", {}).get("enabled"):
+            from claude_agent_sdk import HookMatcher
+
+            # Checkpoints need one SDK turn per round (Bello continues between
+            # rounds) and the SDK's own compaction blocked. Permissions, tools,
+            # readable roots and approvals are exactly those of a session
+            # without checkpoints: the private archive restricts nothing.
+            kwargs["max_turns"] = 1
+            kwargs["hooks"] = {"PreCompact": [HookMatcher(hooks=[_block_native_compaction])]}
+            kwargs["settings"] = json.dumps(
+                {"autoMemoryEnabled": False, "disableAllHooks": False, "enabledPlugins": {}},
+                separators=(",", ":"),
+            )
         return ClaudeAgentOptions(**kwargs)
 
     def _metadata_options(self) -> Any:
@@ -903,7 +1706,7 @@ class ClaudeBackend:
             ),
             env={
                 "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
-                "CLAUDE_AGENT_SDK_CLIENT_APP": "bello/0.7.2",
+                "CLAUDE_AGENT_SDK_CLIENT_APP": "bello/0.8.0",
             },
             extra_args={"disable-slash-commands": None, "no-chrome": None},
         )
@@ -1021,7 +1824,7 @@ class ClaudeBackend:
         server_ref: dict[str, Any] = {}
         config = create_sdk_mcp_server(
             _MCP_SERVER,
-            version="0.7.2",
+            version="0.8.0",
             tools=self._sdk_tools(record, server_ref),
         )
         server = config["instance"]
@@ -1394,9 +2197,16 @@ class ClaudeBackend:
                         turn["status"] = "interrupted"
                         turn["usage"] = {}
                         turn["error"] = {"message": "Bello restarted before Claude Code reported completion"}
+            state = record.get("contextState")
+            if isinstance(state, dict):
+                # Asynchronous batches live in the previous process: no late
+                # result can ever close an async round that was open when it
+                # stopped, so it must not swallow every later round.
+                state["openAsyncRoundStart"] = None
             self._threads[thread_id] = record
 
     def _persist(self) -> None:
+        self._assert_state_persistence_known()
         payload = {"version": _STATE_VERSION, "threads": self._threads}
         descriptor, temporary = tempfile.mkstemp(prefix=".threads-", suffix=".json", dir=self.state_dir)
         try:
@@ -1417,6 +2227,75 @@ class ClaudeBackend:
                 Path(temporary).unlink()
             except FileNotFoundError:
                 pass
+
+    def _persist_schedule(self) -> None:
+        """Persist the checkpoint schedule after a failed checkpoint, best effort.
+
+        The schedule only delays the next attempt: if this write fails, the
+        running backend still follows it from memory and a resumed thread
+        re-evaluates sooner. The ambiguous-commit latch still blocks inference.
+        """
+        try:
+            self._persist()
+        except Exception:
+            pass
+
+    def _assert_state_persistence_known(self) -> None:
+        if self._state_persistence_uncertain:
+            raise _ContextPersistenceUncertain(
+                "Claude checkpoint commit status is unknown; restart the backend before further inference or state writes"
+            )
+
+    async def _query(self, client: Any, prompt: Any) -> None:
+        # Every main-model and summarizer query passes this shared latch. The
+        # state file contains all logical threads, so an uncertain write blocks
+        # the whole backend until a fresh instance validates its durable state.
+        self._assert_state_persistence_known()
+        await client.query(prompt)
+
+    def _persist_context_checkpoint(self, record: dict[str, Any], candidate: dict[str, Any]) -> None:
+        self._assert_state_persistence_known()
+        previous = {key: record[key] for key in ("claudeSessionId", "hasSession", "contextState")}
+        try:
+            previous_bytes = self._state_file.read_bytes()
+        except OSError:
+            previous_bytes = None
+        record.update({key: candidate[key] for key in previous})
+        try:
+            expected_bytes = json.dumps(
+                {"version": _STATE_VERSION, "threads": self._threads},
+                ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8")
+        except BaseException:
+            record.update(previous)
+            raise
+        try:
+            # This writer is synchronous: cancellation cannot interleave an
+            # await between publication and the following reconciliation.
+            self._persist()
+        except BaseException as error:
+            try:
+                actual_bytes = None if self._state_file.is_symlink() else self._state_file.read_bytes()
+            except OSError:
+                actual_bytes = None
+            if actual_bytes == expected_bytes:
+                # rename may have succeeded before chmod/cleanup (or its caller)
+                # raised. The temporary file was already fchmod(0600), and the
+                # exact candidate now owns the durable session identity.
+                if not isinstance(error, Exception):
+                    raise
+                return
+            if previous_bytes is not None and actual_bytes == previous_bytes:
+                record.update(previous)
+                raise
+            # Do not overwrite unknown durable state during failure completion,
+            # nor reconnect the previous session and silently continue inference.
+            self._state_persistence_uncertain = True
+            if not isinstance(error, Exception):
+                raise
+            raise _ContextPersistenceUncertain(
+                "Claude checkpoint commit status is unknown; restart the backend before further inference or state writes"
+            ) from error
 
     def _thread_list(self, params: dict[str, Any]) -> dict[str, Any]:
         records = [record for record in self._threads.values() if not record.get("closed")]

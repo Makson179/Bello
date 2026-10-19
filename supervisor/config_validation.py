@@ -115,19 +115,21 @@ def adversary_active(config: ProjectConfig) -> bool:
 def project_profiles(config: ProjectConfig) -> tuple[ProfileUse, ...]:
     """Active profiles of a saved configuration, as a run would check them."""
     adversary = adversary_active(config)
-    review = config.completion_review or adversary
+    # Goal makes completion review and runtime supervision mandatory.
+    completion_review = config.effective_completion_review
+    review = completion_review or adversary
     policies: list[tuple[str, MultiAgentConfig]] = [("multi_agent", config.multi_agent)]
-    if config.completion_review:
+    if completion_review:
         policies.append(("completion_multi_agent", config.completion_multi_agent))
     if adversary:
         policies.append(("adversary_multi_agent", config.adversary_multi_agent))
     return preflight_profiles(
         coder=(config.coder_mod, config.coder_intelligence),
-        completion=(config.completion_mod, config.completion_intelligence) if config.completion_review else None,
+        completion=(config.completion_mod, config.completion_intelligence) if completion_review else None,
         revision_coder=((config.revision_coder_mod, config.revision_coder_intelligence)
                         if config.revision_coder_enabled and review else None),
         adversary=(config.adversary_mod, config.adversary_intelligence) if adversary else None,
-        runtime=(config.runtime_mod, config.runtime_intelligence) if config.runtime_enabled else None,
+        runtime=(config.runtime_mod, config.runtime_intelligence) if config.effective_runtime_enabled else None,
         policies=policies,
     )
 
@@ -477,7 +479,7 @@ def validate_project_config(
             issues.append(ConfigIssue("error", "dependency", "Distiller dependencies missing", str(exc),
                                       ("log_distiller_enabled",)))
 
-    if config.runtime_enabled and config.cheap_runtime and catalog.discovered:
+    if config.effective_cheap_runtime and catalog.discovered:
         model = triage_model or _default_triage_model()
         if model and not catalog.available(model):
             issues.append(ConfigIssue(

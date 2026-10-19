@@ -26,10 +26,12 @@ from tests.support.controller import (
         ("adversary_report_controller", 0),
     ],
 )
+@pytest.mark.parametrize("goal", [False, True])
 async def test_review_returns_switch_once_and_reuse_revision_coder_thread(
     tmp_path: Path,
     first_source: str,
     first_completion_return_count: int,
+    goal: bool,
 ) -> None:
     task = tmp_path / "TASK.md"
     task.write_text("# Task", encoding="utf-8")
@@ -101,6 +103,7 @@ async def test_review_returns_switch_once_and_reuse_revision_coder_thread(
     controller.client = client
     controller.coder = initial_coder
     controller.project_config = project_config
+    controller.goal = goal
     controller.fast = True
     controller.approvals = None
     controller.pending_approvals = {}
@@ -179,6 +182,15 @@ async def test_review_returns_switch_once_and_reuse_revision_coder_thread(
     assert ".supervisor/PROGRESS.md" in first_prompt
     assert first_prompt.count("BELLO_READY_FOR_REVIEW") == 1
     assert "on its own line" in first_prompt
+    # Goal reaches the switched-to revision coder: its GOAL_MAP.md metadata and brief guidance.
+    from supervisor.prompts.supervisor import GOAL_CODER_GUIDANCE
+    assert controller.coder.goal is goal
+    assert ("runtimeGoalMapPath" in client.thread_starts[0]) is goal
+    assert ("runtimeGoalMapPath" in client.turn_starts[0]) is goal
+    assert (GOAL_CODER_GUIDANCE in first_prompt) is goal
+    if goal:
+        expected_map = str(snapshot.snapshot_root.resolve() / "GOAL_MAP.md")
+        assert client.thread_starts[0]["runtimeGoalMapPath"] == client.turn_starts[0]["runtimeGoalMapPath"] == expected_map
     assert str(snapshot.plan_path) not in first_prompt
     assert "PRIVATE INITIAL IMPLEMENTATION PLAN" not in first_prompt
     assert snapshot.plan_exposed is False
@@ -238,6 +250,7 @@ async def test_review_returns_switch_once_and_reuse_revision_coder_thread(
     assert len(client.turn_starts) == 2
     assert client.turn_starts[1]["threadId"] == "revision-thread-1"
     assert client.turn_starts[1]["input"][0]["text"] == second_feedback
+    assert ("runtimeGoalMapPath" in client.turn_starts[1]) is goal
     assert client.turn_steers == []
     assert store.get_bello_config().completion_return_count == 1
     events = [json.loads(line) for line in store.path(EVENTS).read_text(encoding="utf-8").splitlines()]

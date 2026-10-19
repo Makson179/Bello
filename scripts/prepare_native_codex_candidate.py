@@ -42,6 +42,41 @@ ROOT_ROUNDTRIP_SOURCE_MARKERS = {
         "fn bello_permission_path_roundtrip_native_windows_root()",
     ),
 }
+CONTEXT_SOURCE_MARKERS = {
+    "codex-rs/core/src/bello_compact.rs": (
+        "fn checked_summary(", "fn plan(", "async fn run(",
+        "replace_compacted_history_from_snapshot(", "pending_call_ids()",
+        # Plain-text summary, one 500 s deadline for both attempts, and rejection
+        # (never truncation) of a summary over the maximum length.
+        "const SUMMARY_TIMEOUT: Duration = Duration::from_secs(500);",
+        "tokio::time::timeout(SUMMARY_TIMEOUT, attempts)",
+        "summary.chars().count() > BELLO_SUMMARY_MAX_CHARS",
+        "bello_input_budget(hard_limit)",
+    ),
+    "codex-rs/core/src/session/context_window.rs": (
+        # 16,000-character prompt target, 48,000-character limit and the input
+        # budget that leaves the summary output reserve plus a safety margin.
+        "pub(crate) const BELLO_SUMMARY_TARGET_CHARS: usize = 16_000;",
+        "pub(crate) const BELLO_SUMMARY_MAX_CHARS: usize = 48_000;",
+        "pub(crate) const BELLO_CONTEXT_SAFETY_MARGIN: i64 = 4_096;",
+        "pub(crate) fn bello_input_budget(",
+    ),
+    "codex-rs/core/src/session/mod.rs": (
+        "async fn replace_compacted_history_from_snapshot(",
+        "current.starts_with(expected)",
+        "items.extend_from_slice(&current[expected.len()..])",
+    ),
+    "codex-rs/core/src/compact.rs": (
+        'bello_compact.rs', "codex_features::Feature::BelloContextCompaction",
+        "return bello::run(",
+    ),
+    "codex-rs/features/src/lib.rs": (
+        'key: "bello_context_compaction",\n        stage: Stage::UnderDevelopment,\n        default_enabled: false,',
+    ),
+    "codex-rs/config/src/config_toml.rs": (
+        "pub bello_context_retain_percent: Option<f64>",
+    ),
+}
 
 
 def verify_root_roundtrip_source(source: Path) -> None:
@@ -55,6 +90,19 @@ def verify_root_roundtrip_source(source: Path) -> None:
         contents = path.read_text(encoding="utf-8")
         if any(marker not in contents for marker in markers):
             raise ValueError("Candidate root-roundtrip source contract is incomplete")
+
+
+def verify_context_source(source: Path) -> None:
+    """Require opt-in routing and guarded replacement, not proof of a binary."""
+    for name, markers in CONTEXT_SOURCE_MARKERS.items():
+        path = source / name
+        status = path.lstat()
+        if (not stat.S_ISREG(status.st_mode)
+                or getattr(status, "st_file_attributes", 0) & 0x400):
+            raise ValueError("Candidate context source must be a regular file")
+        contents = path.read_text(encoding="utf-8")
+        if any(marker not in contents for marker in markers):
+            raise ValueError("Candidate context source contract is incomplete")
 
 
 def identity(root: Path = ROOT) -> dict:
@@ -85,6 +133,7 @@ def prepare(source: Path, *, root: Path = ROOT) -> dict:
     if identity(root) != before:
         raise ValueError("Candidate preparation inputs changed during application")
     verify_root_roundtrip_source(source)
+    verify_context_source(source)
     return before
 
 

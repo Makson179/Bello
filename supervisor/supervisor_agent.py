@@ -20,6 +20,7 @@ from supervisor.coder import (
 )
 from supervisor.completion_context import CompletionContextStore
 from supervisor.project_config import MultiAgentConfig
+from supervisor.runtime_context import RuntimeContextStore
 from supervisor.runtime_errors import bounded_provider_error
 from supervisor.prompts import (
     build_adv_report_controller_prompt,
@@ -58,7 +59,7 @@ from supervisor.schemas.models import (
     openai_strict_json_schema_for_completion_review_decision,
     openai_strict_json_schema_for_supervisor_decision,
 )
-from supervisor.state import DECISIONS, HANDOFF, PROGRESS, STATE_DIR_NAME, StateStore
+from supervisor.state import DECISIONS, HANDOFF, PROGRESS, StateStore
 from supervisor.workspace_snapshot import (
     VerificationWorkspaceSnapshot,
     WorkspaceSnapshot,
@@ -119,6 +120,7 @@ class StatelessSupervisorAgent:
         completion_multi_agent: MultiAgentConfig | None = None,
         before_completion_thread_cleanup: Callable[[str, Path], Awaitable[None]] | None = None,
         on_thread_start: Callable[[str], None] | None = None,
+        goal: bool = False,
     ):
         self.client = client
         self.store = store
@@ -135,21 +137,38 @@ class StatelessSupervisorAgent:
         self.completion_multi_agent = completion_multi_agent or MultiAgentConfig()
         self.before_completion_thread_cleanup = before_completion_thread_cleanup
         self.on_thread_start = on_thread_start
+        # Goal mode only adds the brief completion guidance to completion-review prompts.
+        self.goal = goal
         self.completion_thread_id: str | None = None
         self.completion_workspace_snapshot: VerificationWorkspaceSnapshot | None = None
         self.completion_context_store: CompletionContextStore | None = None
 
     async def decide(self, packet: SupervisorWakePacket) -> SupervisorDecision:
-        packet = _prepare_runtime_packet(packet)
-        prompt_packet, prompt = _stateless_prompt_with_budget(packet)
-        return await self._decide(
-            prompt_packet,
-            prompt=prompt,
-            schema=openai_strict_json_schema_for_supervisor_decision(),
-            model_cls=SupervisorDecision,
-            use_case="runtime_monitor",
-            timeout_seconds=self.timeout_seconds,
+        prepared = _prepare_runtime_packet(packet)
+        # Runtime tools cannot read the private supervisor state, so the complete
+        # ledger text omitted from an excerpt is exported as exact read-only copies.
+        context = RuntimeContextStore(
+            progress=(packet.progress if prepared.progress.strip() != packet.progress.strip() else None),
+            decisions=(packet.decisions if prepared.decisions.strip() != packet.decisions.strip() else None),
         )
+        try:
+            prepared = prepared.model_copy(update=context.paths)
+            prompt_packet, prompt = _stateless_prompt_with_budget(prepared)
+            context.assert_unchanged()
+            decision = await self._decide(
+                prompt_packet,
+                prompt=prompt,
+                schema=openai_strict_json_schema_for_supervisor_decision(),
+                model_cls=SupervisorDecision,
+                use_case="runtime_monitor",
+                timeout_seconds=self.timeout_seconds,
+                additional_runtime_roots=context.readable_roots,
+            )
+            context.assert_unchanged()
+            return decision
+        finally:
+            # _decide closes the stateless reviewer before these copies vanish.
+            context.cleanup()
 
     async def decide_completion(self, packet: SupervisorWakePacket) -> CompletionReviewDecision:
         try:
@@ -273,7 +292,7 @@ class StatelessSupervisorAgent:
             selective_context = self.completion_context_store.write_packet(
                 packet, task_in_file=task_in_file,
             )
-            prompt = build_completion_review_prompt(packet, selective_context=selective_context)
+            prompt = build_completion_review_prompt(packet, selective_context=selective_context, goal=self.goal)
             if retry_error is not None:
                 prompt = _minimal_completion_review_retry_prompt(
                     context_prompt=prompt, error=retry_error, packet=packet,
@@ -1189,11 +1208,11 @@ def _prepare_runtime_packet(packet: SupervisorWakePacket) -> SupervisorWakePacke
     return packet.model_copy(
         update={
             "progress": progress,
-            "progress_path": f"{STATE_DIR_NAME}/{PROGRESS}",
+            "progress_path": None,
             "progress_total_entries": progress_total,
             "progress_omitted_entries": max(0, progress_total - progress_included),
             "decisions": decisions,
-            "decisions_path": f"{STATE_DIR_NAME}/{DECISIONS}",
+            "decisions_path": None,
             "decisions_total_entries": decisions_total,
             "decisions_omitted_entries": max(0, decisions_total - decisions_included),
             "validations": _select_runtime_validations(

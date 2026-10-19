@@ -44,16 +44,21 @@ def policy_distiller(monkeypatch):
 
 def test_async_switch_defaults_roundtrip_editor_and_cli(tmp_path):
     config = ProjectConfig()
-    assert config.async_tools is False
-    enabled = replace(config, async_tools=True)
-    save_project_config(tmp_path, enabled)
-    assert load_project_config(tmp_path, create=False).async_tools is True
-    assert _resolve_run_settings(project_config=enabled).async_tools is True
-    assert _resolve_run_settings(project_config=enabled, async_tools=False).async_tools is False
+    # Smart Execution is on for a new configuration; an explicit off survives a round trip.
+    assert config.async_tools is True
+    disabled = replace(config, async_tools=False)
+    save_project_config(tmp_path, disabled)
+    assert load_project_config(tmp_path, create=False).async_tools is False
+    assert _resolve_run_settings(project_config=disabled).async_tools is False
+    assert _resolve_run_settings(project_config=disabled, async_tools=True).async_tools is True
+    assert _resolve_run_settings(project_config=config).async_tools is True
+    assert _resolve_run_settings(project_config=config, async_tools=False).async_tools is False
     parameter = next(p for p in parameter_defs(config) if p.key == "async_tools")
+    assert parameter.value == "true"
     assert [option.value for option in parameter.options] == [True, False]
     option = next(p for p in cli.params if p.name == "async_tools")
     assert option.opts == ["--async-tools"] and option.secondary_opts == ["--no-async-tools"]
+    assert "default: on" in option.help
 
 
 @pytest.mark.asyncio

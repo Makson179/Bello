@@ -19,14 +19,14 @@ def test_every_smoke_module_is_an_actual_release_module():
     assert all(importlib.util.find_spec(name) is not None for name in verify.PROBE_MODULES)
 
 
-def wheel(path: Path, *, windows=False, version="0.7.2", remove=None, extra=None, relocated=False):
+def wheel(path: Path, *, windows=False, version="0.8.0", remove=None, extra=None, relocated=False):
     tag = "py3-none-win_amd64" if windows else "py3-none-any"
     files = {name: b"resource" for name in verify.REQUIRED}
     files.update({
-        "supervisor/__init__.py": b'__version__ = "0.7.2"\n',
-        "bello-0.7.2.dist-info/METADATA": f"Metadata-Version: 2.4\nName: Bello\nVersion: {version}\n".encode(),
-        "bello-0.7.2.dist-info/WHEEL": f"Wheel-Version: 1.0\nTag: {tag}\n".encode(),
-        "bello-0.7.2.dist-info/RECORD": b"record",
+        "supervisor/__init__.py": b'__version__ = "0.8.0"\n',
+        "bello-0.8.0.dist-info/METADATA": f"Metadata-Version: 2.4\nName: Bello\nVersion: {version}\n".encode(),
+        "bello-0.8.0.dist-info/WHEEL": f"Wheel-Version: 1.0\nTag: {tag}\n".encode(),
+        "bello-0.8.0.dist-info/RECORD": b"record",
     })
     if windows:
         pe = bytearray(80)
@@ -42,7 +42,7 @@ def wheel(path: Path, *, windows=False, version="0.7.2", remove=None, extra=None
     with ZipFile(path, "w") as archive:
         for name, value in files.items():
             if relocated and name.startswith("supervisor/"):
-                name = "bello-0.7.2.data/purelib/" + name
+                name = "bello-0.8.0.data/purelib/" + name
             archive.writestr(name, value)
     return files
 
@@ -75,7 +75,7 @@ def test_invalid_wheel_payload_is_rejected(tmp_path, case):
     if case == "traversal":
         options["extra"] = {"../outside": b"outside"}
     if case == "duplicate_install":
-        options["extra"] = {"bello-0.7.2.data/purelib/supervisor/__init__.py": b"duplicate"}
+        options["extra"] = {"bello-0.8.0.data/purelib/supervisor/__init__.py": b"duplicate"}
     wheel(path, windows=windows, **options)
     with pytest.raises(verify.VerificationError):
         verify.wheel_payload(path, windows=not windows if case == "wrong_platform" else windows)
@@ -111,12 +111,12 @@ def build_fixture(tmp_path, monkeypatch):
         path = source / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"source")
-    wheel(dist / "bello-0.7.2-py3-none-any.whl")
-    wheel(rebuilt / "bello-0.7.2-py3-none-any.whl")
-    with tarfile.open(dist / "bello-0.7.2.tar.gz", "w:gz") as archive:
+    wheel(dist / "bello-0.8.0-py3-none-any.whl")
+    wheel(rebuilt / "bello-0.8.0-py3-none-any.whl")
+    with tarfile.open(dist / "bello-0.8.0.tar.gz", "w:gz") as archive:
         for path in source.rglob("*"):
             if path.is_file():
-                archive.add(path, arcname="bello-0.7.2/" + path.relative_to(source).as_posix())
+                archive.add(path, arcname="bello-0.8.0/" + path.relative_to(source).as_posix())
     monkeypatch.setattr(verify.subprocess, "check_output", lambda *args, **kwargs: "a" * 40 + "\n")
     return argparse.Namespace(source_root=source, source_sha="a" * 40, dist_dir=dist,
                               rebuilt_dir=rebuilt, windows=False)
@@ -127,7 +127,7 @@ def test_build_receipt_binds_exact_wheel_sdist_rebuild_and_native_sources(tmp_pa
     result = verify.build_check(args)
     assert result["status"] == "PASS" and result["source_sha"] == "a" * 40
     assert result["rebuilt_wheel"]["payload_matches"]
-    assert set(result["artifacts"]) == {"bello-0.7.2-py3-none-any.whl", "bello-0.7.2.tar.gz"}
+    assert set(result["artifacts"]) == {"bello-0.8.0-py3-none-any.whl", "bello-0.8.0.tar.gz"}
 
 
 @pytest.mark.parametrize("case", ["wrong_head", "changed_rebuild", "changed_native_source", "missing_rebuild"])
@@ -136,7 +136,7 @@ def test_build_receipt_rejects_unbound_inputs(tmp_path, monkeypatch, case):
     if case == "wrong_head":
         args.source_sha = "b" * 40
     elif case == "changed_rebuild":
-        wheel(args.rebuilt_dir / "bello-0.7.2-py3-none-any.whl", extra={"supervisor/__init__.py": b"changed"})
+        wheel(args.rebuilt_dir / "bello-0.8.0-py3-none-any.whl", extra={"supervisor/__init__.py": b"changed"})
     elif case == "changed_native_source":
         (args.source_root / "native/windows-sandbox/src/extra.rs").write_bytes(b"changed")
     else:
@@ -186,7 +186,7 @@ def test_clean_install_refuses_unverified_artifact_before_pip(tmp_path, monkeypa
     args = build_fixture(tmp_path, monkeypatch)
     receipt = verify.build_check(args)
     if case == "changed_wheel":
-        wheel(args.dist_dir / "bello-0.7.2-py3-none-any.whl", extra={"supervisor/__init__.py": b"changed"})
+        wheel(args.dist_dir / "bello-0.8.0-py3-none-any.whl", extra={"supervisor/__init__.py": b"changed"})
     elif case == "wrong_head":
         receipt["source_sha"] = "b" * 40
     elif case == "changed_verifier":

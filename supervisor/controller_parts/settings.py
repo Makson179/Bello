@@ -31,6 +31,7 @@ class SettingsPort(CoordinatorPort):
         '_adversary_model_required_for_preflight',
         '_adversary_multi_agent_config',
         '_async_tools_enabled',
+        '_no_need_for_context_config',
         '_canonical_task_text',
         '_cheap_runtime_enabled',
         '_cleanup_preflight_probe_thread',
@@ -48,6 +49,7 @@ class SettingsPort(CoordinatorPort):
         '_fast_mode',
         '_generate_schema_hash',
         '_generate_schema_hash_async',
+        '_goal_enabled',
         '_log_distiller_config',
         '_multi_agent_config',
         '_persist_model_config',
@@ -57,6 +59,7 @@ class SettingsPort(CoordinatorPort):
         '_revision_coder_enabled',
         '_revision_coder_intelligence',
         '_revision_coder_model',
+        '_runtime_choice',
         '_runtime_enabled',
         '_runtime_intelligence',
         '_runtime_model',
@@ -68,6 +71,7 @@ class SettingsPort(CoordinatorPort):
         'adversary_intelligence',
         'adversary_model',
         'async_tools',
+        'no_need_for_context',
         'clean_workspace',
         'client',
         'coder_intelligence',
@@ -79,6 +83,7 @@ class SettingsPort(CoordinatorPort):
         'declared_grading_roots',
         'fast',
         'finalize',
+        'goal',
         'log_distiller',
         'model',
         'overwrite_state',
@@ -161,7 +166,31 @@ class Settings:
             project_config = getattr(self.ports, "project_config", None)
             return bool(project_config.cheap_runtime) if project_config is not None else True
 
+    def _goal_enabled(self) -> bool:
+        override = getattr(self.ports, "goal", None)
+        if override is not None:
+            return bool(override)
+        config = getattr(self.ports, "project_config", None)
+        if config is not None:
+            return bool(getattr(config, "goal", False))
+        try:
+            return bool(self.ports.store.get_bello_config().goal)
+        except Exception:
+            return False
+
     def _runtime_enabled(self) -> bool:
+        # Runtime supervision is mandatory while Goal is on: neither a saved
+        # false nor a one-run override can disable it.
+        if self.ports._goal_enabled():
+            return True
+        return self.ports._runtime_choice()
+
+    def _runtime_choice(self) -> bool:
+        """The run's runtime switch before Goal forces supervision on.
+
+        Persisted run state records this choice, so a Goal run never rewrites a
+        saved runtime preference; every reader applies Goal first.
+        """
         override = getattr(self.ports, "runtime_enabled", None)
         if override is not None:
             return bool(override)
@@ -177,13 +206,28 @@ class Settings:
         return self.ports._effective_completion_review() or self.ports._adversary_model_required_for_preflight()
 
     def _async_tools_enabled(self) -> bool:
+        # Smart Execution defaults on; only an explicit saved or per-run false
+        # turns it off, and Goal never changes it either way.
         override = getattr(self.ports, "async_tools", None)
         if override is not None:
             return bool(override)
         config = getattr(self.ports, "project_config", None)
         if config is not None:
-            return bool(getattr(config, "async_tools", False))
-        return bool(self.ports.store.read_json(compat.CONFIG, {}).get("async_tools", False))
+            return bool(getattr(config, "async_tools", True))
+        return bool(self.ports.store.read_json(compat.CONFIG, {}).get("async_tools", True))
+
+    def _no_need_for_context_config(self) -> compat.NoNeedForContextConfig:
+        override = getattr(self.ports, "no_need_for_context", None)
+        if override is not None:
+            return override
+        config = getattr(self.ports, "project_config", None)
+        if config is not None:
+            return config.no_need_for_context
+        try:
+            saved = self.ports.store.read_json(compat.CONFIG, {})
+            return compat.NoNeedForContextConfig(**saved.get("no_need_for_context", {}))
+        except (AttributeError, FileNotFoundError):
+            return compat.NoNeedForContextConfig()
 
     def _log_distiller_config(self) -> compat.LogDistillerConfig:
         override = getattr(self.ports, "log_distiller", None)
@@ -211,7 +255,10 @@ class Settings:
 
         CLI override wins; otherwise the persisted project-config mirror. With the gate
         off, the independently configured adversary can still review coder readiness.
+        Goal makes the review mandatory, whatever was saved or passed for this run.
         """
+        if self.ports._goal_enabled():
+            return True
         override = getattr(self.ports, "completion_review", None)
         if override is not None:
             return bool(override)
@@ -241,6 +288,7 @@ class Settings:
             return config
         return compat.ProjectConfig(
             task=compat._workspace_display_path(self.ports.project_root, str(self.ports.task_path)),
+            goal=self.ports._goal_enabled(),
             coder_mod=self.ports._coder_model() or compat.DEFAULT_MODEL,
             runtime_mod=self.ports._runtime_model() or compat.DEFAULT_MODEL,
             completion_mod=self.ports._completion_model() or compat.DEFAULT_MODEL,
@@ -250,9 +298,10 @@ class Settings:
             completion_intelligence=self.ports._completion_intelligence() or compat.DEFAULT_INTELLIGENCE,
             adversary_intelligence=self.ports._adversary_intelligence() or compat.DEFAULT_INTELLIGENCE,
             speed="fast" if self.ports._fast_mode() else "usual",
-            runtime_enabled=self.ports._runtime_enabled(),
+            runtime_enabled=self.ports._runtime_choice(),
             log_distiller=self.ports._log_distiller_config(),
             async_tools=self.ports._async_tools_enabled(),
+            no_need_for_context=self.ports._no_need_for_context_config(),
             windows_native_root_read=self.ports._windows_native_root_read_enabled(),
             start_over=self.ports.overwrite_state,
             adversary=self.ports._adversary_enabled_for_config(),
@@ -280,7 +329,7 @@ class Settings:
                 f"on({self.ports._revision_coder_model()}/{self.ports._revision_coder_intelligence()})"
             )
         return (
-            "settings: "
+            f"settings: {'goal=true ' if self.ports._goal_enabled() else ''}"
             f"task={compat._workspace_display_path(self.ports.project_root, str(self.ports.task_path))} "
             f"coder-mod={self.ports._coder_model()} "
             f"runtime-mod={self.ports._runtime_model()} "
@@ -294,6 +343,7 @@ class Settings:
             f"speed={speed} "
             f"runtime={compat._format_bool(self.ports._runtime_enabled())} "
             f"async-tools={compat._format_bool(self.ports._async_tools_enabled())} "
+            f"no-need-for-context={compat._format_bool(self.ports._no_need_for_context_config().enabled)} "
             f"windows-native-root-read={compat._format_bool(self.ports._windows_native_root_read_enabled())} "
             f"log-distiller={compat._format_bool(self.ports._log_distiller_config().enabled)} "
             f"cheap-runtime={compat._format_bool(self.ports._cheap_runtime_enabled())} "
@@ -619,33 +669,43 @@ class Settings:
     async def _structured_output_self_test(self) -> None:
         if not self.ports._runtime_enabled():
             return
-        agent = compat.StatelessSupervisorAgent(
-            self.ports.client,
-            self.ports.store,
-            self.ports.task_path,
-            workspace_root=self.ports._active_workspace_root(),
-            task_contents=self.ports._canonical_task_text(),
-            model=self.ports._runtime_model(),
-            fast=self.ports._fast_mode(),
-            intelligence=self.ports._runtime_intelligence(),
-        )
         cfg = self.ports.store.get_bello_config()
-        packet = compat.SupervisorWakePacket(
-            wake_sequence=1,
-            latest_event_sequence=cfg.last_event_sequence,
-            generation=cfg.generation,
-            restart_count=cfg.restart_count,
-            task_path=str(self.ports.task_path),
-            task_contents="Structured output self-test. Return noop.",
-            progress="",
-            decisions="",
-            last_actions=[],
-            health=self.ports.store.get_health().model_dump(mode="json"),
-            recent_events=[],
-            current_summary="Startup structured-output self-test. Return decision noop.",
-            coder_thread_id=None,
-            active_coder_turn_id=None,
-        )
-        decision = await compat.asyncio.wait_for(agent.decide(packet), timeout=240)
+        # Probe the selected runtime's decision transport, not the user's task. A
+        # neutral packet paired with the real task path/workspace would still grant
+        # unrelated read authority and can turn startup into task exploration.
+        with compat.tempfile.TemporaryDirectory(prefix="bello-runtime-self-test-") as raw_root:
+            root = compat.Path(raw_root).resolve()
+            task = root / "TASK.md"
+            task_contents = "Structured output self-test. Return noop."
+            task.write_text(task_contents, encoding="utf-8")
+            agent = compat.StatelessSupervisorAgent(
+                self.ports.client,
+                self.ports.store,
+                task,
+                workspace_root=root,
+                task_contents=task_contents,
+                model=self.ports._runtime_model(),
+                fast=self.ports._fast_mode(),
+                intelligence=self.ports._runtime_intelligence(),
+            )
+            packet = compat.SupervisorWakePacket(
+                wake_sequence=1,
+                latest_event_sequence=cfg.last_event_sequence,
+                generation=cfg.generation,
+                restart_count=cfg.restart_count,
+                task_path=str(task),
+                task_contents=task_contents,
+                progress="",
+                decisions="",
+                last_actions=[],
+                health={},
+                recent_events=[],
+                current_summary="Startup structured-output self-test. Return decision noop.",
+                coder_thread_id=None,
+                active_coder_turn_id=None,
+            )
+            # decide closes its stateless reviewer before the fixture is removed,
+            # including when this outer timeout cancels the probe.
+            decision = await compat.asyncio.wait_for(agent.decide(packet), timeout=240)
         if decision.decision not in {compat.SupervisorDecisionKind.NOOP, compat.SupervisorDecisionKind.PAUSE}:
             raise RuntimeError("structured-output supervisor self-test returned an unexpected decision")

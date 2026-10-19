@@ -559,13 +559,21 @@ async def test_runtime_prompt_uses_recent_state_and_relevant_ledgers(tmp_path: P
     payload = json.loads(client.prompt)
     assert client.prompt.startswith('{"instructions":')
     assert len(client.prompt) < 120_000
-    assert payload["progress_path"] == ".supervisor/PROGRESS.md"
+    # The omitted ledger text is exported outside the private state for the reviewer's lifetime only.
+    progress_export = Path(payload["progress_path"])
+    assert progress_export.is_absolute()
+    assert progress_export.name == "PROGRESS.md"
+    assert ".supervisor" not in progress_export.parts
+    assert not progress_export.exists()  # stateless reviewer has closed
     assert payload["progress_total_entries"] == 40
     assert payload["progress_omitted_entries"] == 10
     assert "progress entry 39" in payload["progress"]
     assert "progress entry 0\n" not in payload["progress"]
     assert any("Read the complete progress file" in instruction for instruction in payload["instructions"])
-    assert payload["decisions_path"] == ".supervisor/DECISIONS.md"
+    decisions_export = Path(payload["decisions_path"])
+    assert decisions_export.parent == progress_export.parent
+    assert decisions_export.name == "DECISIONS.md"
+    assert not decisions_export.exists()
     assert payload["decisions_total_entries"] == 30
     assert payload["decisions_omitted_entries"] == 10
     assert "decision entry 29" in payload["decisions"]

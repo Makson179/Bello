@@ -298,6 +298,11 @@ def test_fresh_final_qualification_and_failure_receipts(qualification, mode):
         with pytest.raises(ValueError): repack.qualify(state["artifact"], state["runtime"], state["output"])
     report = json.loads((state["output"] / "report.json").read_text())
     assert report["passed"] is (mode == "good") and report["paid_model_calls"] == 0
+    if mode == "good":
+        from scripts import verify_native_codex_async_download as validator
+        # Reported from the validated proof, never a stale literal: 15 including completion batching.
+        assert report["selection_cases"] == 9
+        assert report["async_cases"] == len(validator.CASES) == 15
     assert os.environ == before
     if mode == "good": assert state["events"] == ["install-final", "async-final", "cache"]
     if mode in {"path", "helper"}: assert state["events"] == ["install-final"]

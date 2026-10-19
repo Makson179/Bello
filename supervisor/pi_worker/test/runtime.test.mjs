@@ -86,6 +86,252 @@ test("async failed-turn cleanup settles before terminal publication and a new tu
   await waitFor(() => setupResult.events.filter((event) => event.method === "turn/completed").length === 2);
 });
 
+for (const output of [undefined, "", "Partial answer that ended before completion"]) {
+  test(`output-limit ${output === undefined ? "missing" : output ? "partial" : "empty"} response is a failed terminal turn, not idle success`, async (t) => {
+    let requests = 0;
+    const { runtime, workspace, events } = await setup(t, { behavior: async (session) => {
+      requests++;
+      session.emitAssistant(output, { stopReason: "length", usage: { input: 100, output: 1 } });
+    } });
+    t.after(() => runtime.close());
+    await startThread(runtime, workspace);
+    await runtime.dispatch("turn/start", { threadId: "thread-1", turnId: "truncated", input: "neutral task" });
+    await waitFor(() => events.some((event) => event.method === "turn/completed"));
+    const terminal = events.filter((event) => event.method === "turn/completed");
+    assert.equal(terminal.length, 1);
+    assert.equal(terminal[0].params.turn.status, "failed");
+    assert.match(terminal[0].params.turn.error.message, /truncated.*stopReason=length.*incomplete/);
+    assert.equal(requests, 1, "no automatic retry or false completion");
+    assert.equal(runtime.getRecord("thread-1").active, undefined);
+    const read = await runtime.dispatch("thread/read", { threadId: "thread-1" });
+    assert.equal(read.thread.turns.at(-1).status, "failed");
+    assert.equal(read.thread.status, "idle", "the thread accepts a following turn");
+  });
+}
+
+test("an output-limit stop does not wait for pending asynchronous tool results", async (t) => {
+  let runtime;
+  let slowAborted = false;
+  const setupResult = await setup(t, {
+    hostCalls: { async call(params, signal) {
+      if (params.arguments.command === "slow") {
+        await new Promise((_resolve, reject) => signal.addEventListener("abort", () => {
+          slowAborted = true;
+          reject(new DOMException("Cancelled", "AbortError"));
+        }, { once: true }));
+      }
+      return { content: [{ type: "text", text: "ok" }], details: {}, isError: false };
+    } },
+    behavior: async (session, _input, signal) => {
+      const scheduler = runtime.getRecord("thread-1").active.asyncCoordinator;
+      scheduler.graceMs = 0;
+      scheduler.beginBatch(["fast", "slow"]);
+      const tool = session.state.tools[0];
+      await Promise.all([tool.execute("fast", { command: "fast" }, signal), tool.execute("slow", { command: "slow" }, signal)]);
+      assert.equal(scheduler.pending, true, "the slow call is still outstanding when the response is cut off");
+      session.emitAssistant("Cut off", { stopReason: "length" });
+    },
+  });
+  runtime = setupResult.runtime;
+  t.after(() => runtime.close());
+  await startThread(runtime, setupResult.workspace, { asyncTools: true });
+  await runtime.dispatch("turn/start", { threadId: "thread-1", turnId: "limited", input: "neutral task" });
+  await waitFor(() => setupResult.events.some((event) => event.method === "turn/completed"));
+  const turn = setupResult.events.find((event) => event.method === "turn/completed").params.turn;
+  assert.equal(turn.status, "failed");
+  assert.match(turn.error.message, /stopReason=length/);
+  assert.equal(slowAborted, true, "the outstanding call is cancelled with the turn");
+  assert.equal(runtime.getRecord("thread-1").active, undefined);
+});
+
+test("the worker runtime module graph has no static Pi SDK import", () => {
+  // The runtime receives its SDK by injection; context-policy.mjs is the SDK-free
+  // home of the No Need For Context policy validation it needs.
+  const root = new URL("../src/", import.meta.url);
+  const seen = new Set();
+  const visit = (name) => {
+    if (seen.has(name)) return;
+    seen.add(name);
+    const text = readFileSync(new URL(name, root), "utf8");
+    assert.doesNotMatch(text, /from\s+["']@earendil-works\//, `${name} must not import the Pi SDK`);
+    for (const [, specifier] of text.matchAll(/from\s+["'](\.\/[^"']+)["']/g)) visit(specifier.slice(2));
+  };
+  visit("runtime.mjs");
+  assert.ok(seen.has("context-policy.mjs"));
+  assert.equal(seen.has("context-compaction.mjs"), false);
+});
+
+test("a call that Pi rejected before execution does not hold its asynchronous batch open", async (t) => {
+  let runtime;
+  let valid;
+  const setupResult = await setup(t, { behavior: async (session, _input, signal) => {
+    const scheduler = runtime.getRecord("thread-1").active.asyncCoordinator;
+    scheduler.graceMs = 60_000;
+    const call = (id) => ({ type: "toolCall", id, name: "exec_command", arguments: {} });
+    // The runtime opens the batch when the assistant message ends...
+    session.emit({ type: "message_end", message: { role: "assistant", content: [call("valid-call"), call("invalid-call")], stopReason: "toolUse" } });
+    assert.deepEqual([...scheduler.batch.ids], ["valid-call", "invalid-call"]);
+    // ...and Pi reports the unrunnable call before any execute() of the batch.
+    session.emit({ type: "tool_execution_end", toolCallId: "invalid-call", toolName: "exec_command", result: { content: [], details: {} }, isError: true });
+    assert.deepEqual([...scheduler.batch.ids], ["valid-call"]);
+    valid = session.state.tools[0].execute("valid-call", { command: "valid" }, signal);
+    await valid;
+    session.emitAssistant("Handled both calls.");
+  } });
+  runtime = setupResult.runtime;
+  t.after(() => runtime.close());
+  await startThread(runtime, setupResult.workspace, { asyncTools: true });
+  await runtime.dispatch("turn/start", { threadId: "thread-1", turnId: "invalid-sibling", input: "neutral task" });
+  // A 60 s window would never elapse here: only the finished-batch rule can end this turn.
+  await waitFor(() => setupResult.events.some((event) => event.method === "turn/completed"), 1500);
+  const turn = setupResult.events.find((event) => event.method === "turn/completed").params.turn;
+  assert.equal(turn.status, "completed");
+  assert.equal((await valid).content[0].text, "host ok", "the real result is delivered directly");
+});
+
+test("a tool_execution_end for a call that runs never disturbs its batch", async (t) => {
+  let runtime;
+  const setupResult = await setup(t, { behavior: async (session, _input, signal) => {
+    const scheduler = runtime.getRecord("thread-1").active.asyncCoordinator;
+    scheduler.beginBatch(["only-call"]);
+    const output = await session.state.tools[0].execute("only-call", { command: "only" }, signal);
+    session.emit({ type: "tool_execution_end", toolCallId: "only-call", toolName: "exec_command", result: output, isError: false });
+    assert.deepEqual([...scheduler.batch.ids], ["only-call"]);
+    session.emitAssistant("Done.");
+  } });
+  runtime = setupResult.runtime;
+  t.after(() => runtime.close());
+  await startThread(runtime, setupResult.workspace, { asyncTools: true });
+  await runtime.dispatch("turn/start", { threadId: "thread-1", turnId: "normal-end", input: "neutral task" });
+  await waitFor(() => setupResult.events.some((event) => event.method === "turn/completed"));
+  assert.equal(setupResult.events.find((event) => event.method === "turn/completed").params.turn.status, "completed");
+});
+
+test("an entirely empty stop response fails but a blank final after real tool work remains reviewable", async (t) => {
+  for (const worked of [false, true]) {
+    const { runtime, workspace, events } = await setup(t, { behavior: async (session, _input, signal) => {
+      if (worked) await session.state.tools[0].execute("neutral-tool", { command: "check" }, signal);
+      session.emitAssistant("  ", { stopReason: "stop" });
+    } });
+    t.after(() => runtime.close());
+    await startThread(runtime, workspace);
+    await runtime.dispatch("turn/start", { threadId: "thread-1", turnId: "empty-stop", input: "neutral task" });
+    await waitFor(() => events.some((event) => event.method === "turn/completed"));
+    const terminal = events.find((event) => event.method === "turn/completed").params.turn;
+    assert.equal(terminal.status, worked ? "completed" : "failed");
+    if (!worked) assert.match(terminal.error.message, /without assistant text, tool work/);
+  }
+});
+
+test("a turn whose session produces no assistant message at all still reaches a terminal state", async (t) => {
+  const { runtime, workspace, events } = await setup(t, { behavior: async () => {} });
+  t.after(() => runtime.close());
+  await startThread(runtime, workspace);
+  await runtime.dispatch("turn/start", { threadId: "thread-1", turnId: "silent", input: "neutral task" });
+  await waitFor(() => events.some((event) => event.method === "turn/completed"));
+  const terminal = events.filter((event) => event.method === "turn/completed");
+  assert.equal(terminal.length, 1);
+  assert.equal(terminal[0].params.turn.status, "failed");
+  assert.equal(runtime.getRecord("thread-1").active, undefined);
+});
+
+test("a structured result without assistant text is not treated as an empty turn", async (t) => {
+  const { runtime, workspace, events } = await setup(t, { behavior: async (session, _input, signal) => {
+    await session.state.tools.find((tool) => tool.name === "submit_result").execute("submit", { decision: "accept" }, signal);
+    session.emitAssistant("", { stopReason: "toolUse" });
+  } });
+  t.after(() => runtime.close());
+  await startThread(runtime, workspace);
+  await runtime.dispatch("turn/start", { threadId: "thread-1", turnId: "structured", input: "neutral task",
+    outputSchema: { type: "object", properties: { decision: { type: "string" } }, required: ["decision"] } });
+  await waitFor(() => events.some((event) => event.method === "turn/completed"));
+  const terminal = events.find((event) => event.method === "turn/completed").params.turn;
+  assert.equal(terminal.status, "completed");
+  assert.deepEqual(terminal.structuredResult, { decision: "accept" });
+});
+
+test("compaction accounting settles once before terminal publication including incomplete usage", async (t) => {
+  let release, drainStarted = false;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const { runtime, workspace, events } = await setup(t, { behavior: async (session) => {
+    session.flushContextCompactionNotifications = async () => {
+      drainStarted = true;
+      await gate;
+      await session.options.onContextCompaction({ status: "failed", usageIncomplete: true,
+        model: "gpt-test", provider: "openai-codex", usage: [{ input: 101, output: 7 }] });
+    };
+    session.emitAssistant("Completed neutral work.", { usage: { input: 23, output: 5 } });
+  } });
+  t.after(async () => { release(); await runtime.close(); });
+  await startThread(runtime, workspace);
+  await runtime.dispatch("turn/start", { threadId: "thread-1", turnId: "accounting", input: "neutral task" });
+  await waitFor(() => drainStarted);
+  assert.equal(events.some((event) => event.method === "turn/completed"), false);
+  release();
+  await waitFor(() => events.some((event) => event.method === "turn/completed"));
+  const turn = events.find((event) => event.method === "turn/completed").params.turn;
+  assert.equal(turn.usage.input, 124);
+  assert.equal(turn.usage.output, 12);
+  assert.equal(turn.usage.responses.length, 2);
+  assert.equal(turn.usageIncomplete, true);
+  assert.equal(events.filter((event) => event.method === "thread/contextCompaction").length, 1);
+  const read = await runtime.dispatch("thread/read", { threadId: "thread-1" });
+  assert.equal(read.thread.turns[0].usageIncomplete, true, "the persisted turn keeps the incomplete-usage flag");
+});
+
+test("a failed accounting drain fails a completed turn but never hides an earlier failure", async (t) => {
+  for (const providerError of [false, true]) {
+    const { runtime, workspace, events } = await setup(t, { behavior: async (session) => {
+      session.flushContextCompactionNotifications = async () => { throw new Error("Simulated bounded accounting drain failure"); };
+      if (providerError) session.emitAssistant("", { stopReason: "error", errorMessage: "Synthetic provider failure" });
+      else session.emitAssistant("Neutral work.", { usage: { input: 3, output: 1 } });
+    } });
+    t.after(() => runtime.close());
+    await startThread(runtime, workspace);
+    await runtime.dispatch("turn/start", { threadId: "thread-1", turnId: "drain-failure", input: "neutral task" });
+    await waitFor(() => events.some((event) => event.method === "turn/completed"));
+    const turn = events.find((event) => event.method === "turn/completed").params.turn;
+    assert.equal(turn.status, "failed");
+    assert.equal(turn.usageIncomplete, true);
+    assert.match(turn.error.message, providerError ? /Synthetic provider failure/ : /accounting could not be persisted/);
+  }
+});
+
+for (const failDrain of [false, true]) {
+  test(`interrupt waits for the shared accounting drain${failDrain ? " and preserves incomplete accounting on failure" : " before terminal usage"}`, async (t) => {
+    let release, drainStarted = false, drains = 0;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const { runtime, workspace, events } = await setup(t, { behavior: async (session) => {
+      session.flushContextCompactionNotifications = async () => {
+        drains++; drainStarted = true;
+        await gate;
+        if (failDrain) throw new Error("Simulated bounded accounting drain failure");
+        await session.options.onContextCompaction({ status: "completed", model: "gpt-test", provider: "openai-codex",
+          usage: [{ input: 101, output: 7 }] });
+      };
+      session.emitAssistant("Neutral work.", { usage: { input: 23, output: 5 } });
+    } });
+    t.after(async () => { release(); await runtime.close(); });
+    await startThread(runtime, workspace);
+    await runtime.dispatch("turn/start", { threadId: "thread-1", turnId: "interrupt-drain", input: "neutral task" });
+    await waitFor(() => drainStarted);
+    const interrupted = runtime.dispatch("turn/interrupt", { threadId: "thread-1", turnId: "interrupt-drain" });
+    await Promise.resolve(); await Promise.resolve();
+    assert.equal(events.some((event) => event.method === "turn/completed"), false);
+    assert.ok(runtime.getRecord("thread-1").active);
+    release();
+    await interrupted;
+    await waitFor(() => events.some((event) => event.method === "turn/completed"));
+    const terminals = events.filter((event) => event.method === "turn/completed");
+    assert.equal(terminals.length, 1);
+    assert.equal(terminals[0].params.turn.status, "interrupted");
+    assert.equal(drains, 1);
+    assert.equal(terminals[0].params.turn.usage.input, failDrain ? 23 : 124);
+    assert.equal(terminals[0].params.turn.usage.output, failDrain ? 5 : 12);
+    assert.equal(terminals[0].params.turn.usageIncomplete, failDrain ? true : undefined);
+  });
+}
+
 test("model catalog exposes provider identity, effort support, and auth state", async (t) => {
   const { runtime, workspace } = await setup(t);
   const result = await runtime.dispatch("model/list", {});

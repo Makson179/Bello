@@ -11,6 +11,7 @@ imports delay that lookup until a call and avoid import-time cycles.
 from __future__ import annotations
 
 from pathlib import Path
+import math
 from typing import Any
 
 from supervisor.config_editor_types import (
@@ -252,6 +253,15 @@ def _commit_inline_edit(
             return config, _editor.replace(state, edit_error="enter 0 or a positive integer, or Unlimited")
         updated = _editor._replace_config_field(config, parameter.key, value)
         return updated, _editor.advance_after_selection(state, len(parameters))
+    if state.edit_kind == "retain_percent":
+        try:
+            percent = float(raw)
+        except ValueError:
+            percent = float("nan")
+        if not math.isfinite(percent) or not 0 < percent <= 50:
+            return config, _editor.replace(state, edit_error="enter a finite percentage greater than 0 and at most 50")
+        updated = _editor._replace_config_field(config, parameter.key, percent)
+        return updated, _editor.advance_after_selection(state, len(parameters))
     return config, _editor.cancel_inline_edit(state)
 
 
@@ -293,6 +303,9 @@ def _replace_config_field(
         return _editor.replace(config, log_distiller=_editor.replace(config.log_distiller, enabled=bool(value)))
     if field == "distiller_model_path":
         return _editor.replace(config, log_distiller=_editor.replace(config.log_distiller, model_path=value))
+    if field in {"no_need_for_context_enabled", "no_need_for_context_threshold_tokens", "no_need_for_context_retain_percent"}:
+        setting = field.removeprefix("no_need_for_context_")
+        return _editor.replace(config, no_need_for_context=_editor.replace(config.no_need_for_context, **{setting: value}))
     multi_agent_parts = _editor._multi_agent_editor_field_parts(field)
     if multi_agent_parts is not None:
         config_field, setting_field = multi_agent_parts

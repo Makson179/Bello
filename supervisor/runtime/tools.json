@@ -1,7 +1,7 @@
 [
   {
     "name": "exec_command",
-    "description": "Execute a shell command in the assigned isolated workspace. Long commands return a sessionId for poll_command or stop_command. timeout is the total execution deadline in seconds (default 120); yield_time_ms controls only the initial wait (default 10000). No interactive stdin or PTY. Use require_escalated only when this exact command needs access outside the sandbox; Bello must approve it before execution.",
+    "description": "Execute a shell command in the assigned isolated workspace. Omit cwd to use the assigned workspace; a task/source file's location is not necessarily your writable workspace. Each call starts independently: cd and environment changes do not carry into later calls. Long commands return a sessionId for poll_command or stop_command; poll only that returned ID. timeout is the total execution deadline in seconds (default 120); yield_time_ms controls only the initial wait (default 10000). No interactive stdin or PTY. Use require_escalated only when this exact command needs access outside the sandbox; Bello must approve it before execution. Approval does not change later calls, file-tool scope, or cwd path checks.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -9,7 +9,8 @@
           "type": "string"
         },
         "cwd": {
-          "type": "string"
+          "type": "string",
+          "description": "Existing directory in the assigned filesystem scope. Relative values resolve from the assigned workspace, not a previous command's cwd. Omit for the workspace root. No ~ or environment-variable expansion. Escalation does not permit an otherwise out-of-scope cwd."
         },
         "timeout": {
           "type": "number",
@@ -34,11 +35,11 @@
   },
   {
     "name": "poll_command",
-    "description": "Read new output and status from this turn's managed command session without starting another command.",
+    "description": "Read new output and status from this turn's managed command session without starting another command. Use only the exact sessionId returned by exec_command in this turn; never invent an ID or use a PID, callId, or session ID from another tool. A denied or completed command without a sessionId cannot be polled.",
     "parameters": {
       "type": "object",
       "properties": {
-        "session_id": {"type": "string"},
+        "session_id": {"type": "string", "description": "Copy the sessionId returned by exec_command in this turn verbatim."},
         "yield_time_ms": {"type": "integer", "minimum": 0, "maximum": 30000},
         "max_output_tokens": {"type": "integer", "minimum": 0, "description": "Approximate returned-text budget; default and host ceiling 10000 tokens."}
       },
@@ -48,10 +49,10 @@
   },
   {
     "name": "stop_command",
-    "description": "Stop this turn's managed command session and wait for its sandbox cleanup.",
+    "description": "Stop this turn's managed command session and wait for its sandbox cleanup. Use only the exact sessionId returned by exec_command in this turn; never invent an ID or use a PID or callId.",
     "parameters": {
       "type": "object",
-      "properties": {"session_id": {"type": "string"}},
+      "properties": {"session_id": {"type": "string", "description": "Copy the sessionId returned by exec_command in this turn verbatim."}},
       "required": ["session_id"],
       "additionalProperties": false
     }
@@ -61,19 +62,20 @@
     "description": "Read a PNG, JPEG, GIF, or WebP image from the assigned workspace for visual inspection.",
     "parameters": {
       "type": "object",
-      "properties": {"path": {"type": "string"}},
+      "properties": {"path": {"type": "string", "description": "Absolute path or path relative to the assigned workspace, not the last exec_command cwd. No ~ or environment-variable expansion."}},
       "required": ["path"],
       "additionalProperties": false
     }
   },
   {
     "name": "read_file",
-    "description": "Read a UTF-8 file; line numbers are one-based. Use offset and limit for longer files.",
+    "description": "Read an existing UTF-8 file; line numbers are one-based. Use offset and limit for longer files. File paths resolve from the assigned workspace, not the task/source file location or last command's cwd. File tools have no cwd argument, and command escalation does not expand their scope. A denied or failed command may not have created its intended output; verify completion before reading it.",
     "parameters": {
       "type": "object",
       "properties": {
         "path": {
-          "type": "string"
+          "type": "string",
+          "description": "Absolute path or path relative to the assigned workspace, not the last exec_command cwd. No ~ or environment-variable expansion."
         },
         "offset": {
           "type": "integer",
@@ -92,12 +94,13 @@
   },
   {
     "name": "write_file",
-    "description": "Create or replace a UTF-8 file in the assigned workspace.",
+    "description": "Create or replace a UTF-8 file in the assigned workspace. Prefer workspace-relative paths for generated files. A readable task/source file's location is not necessarily writable. File tools have no cwd argument, and command escalation does not expand their scope.",
     "parameters": {
       "type": "object",
       "properties": {
         "path": {
-          "type": "string"
+          "type": "string",
+          "description": "Absolute path or path relative to the assigned workspace, not the last exec_command cwd. No ~ or environment-variable expansion."
         },
         "content": {
           "type": "string"
@@ -112,12 +115,13 @@
   },
   {
     "name": "edit_file",
-    "description": "Replace an exact text occurrence. Fails if the old text is absent or ambiguous.",
+    "description": "Replace an exact text occurrence in a file in the assigned workspace. Fails if the old text is absent or ambiguous. File tools have no cwd argument, and command escalation does not expand their scope.",
     "parameters": {
       "type": "object",
       "properties": {
         "path": {
-          "type": "string"
+          "type": "string",
+          "description": "Absolute path or path relative to the assigned workspace, not the last exec_command cwd. No ~ or environment-variable expansion."
         },
         "old_text": {
           "type": "string"
@@ -144,7 +148,8 @@
       "type": "object",
       "properties": {
         "path": {
-          "type": "string"
+          "type": "string",
+          "description": "Absolute path or path relative to the assigned workspace, not the last exec_command cwd. No ~ or environment-variable expansion. Use . for the workspace root."
         }
       },
       "required": [
@@ -163,7 +168,8 @@
           "type": "string"
         },
         "path": {
-          "type": "string"
+          "type": "string",
+          "description": "Absolute path or path relative to the assigned workspace, not the last exec_command cwd. No ~ or environment-variable expansion. Use . for the workspace root."
         }
       },
       "required": [

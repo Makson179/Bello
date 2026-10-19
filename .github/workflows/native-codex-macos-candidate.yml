@@ -168,7 +168,7 @@ jobs:
         run: python -m pip install -e '.[log-distiller,test]'
       - name: Validate separate macOS build and qualifier contracts
         run: python -m pytest -q tests/test_build_native_codex_macos_candidate.py tests/test_verify_native_codex_macos_candidate.py tests/test_native_codex_macos_candidate_workflow.py --junitxml=native-candidate-tests.xml
-      - name: Prove selection9 async14 history1 and CPU inference4 plus bypass2
+      - name: Prove selection9 async15 history1 and CPU inference4 plus bypass2
         run: python scripts/verify_native_codex_macos_candidate.py --candidate native-candidate --target darwin-arm64 --output-dir candidate-proof --modernbert
       - name: Package only the qualified exact candidate with all installable hashes
         run: python scripts/release_native_codex_candidate.py package --target darwin-arm64 --candidate native-candidate --qualification candidate-proof --output "$RUNNER_TEMP/bello-0161-macos-release"

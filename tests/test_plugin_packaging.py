@@ -32,7 +32,10 @@ def test_codex_and_claude_manifests_share_one_versioned_skill() -> None:
 
     assert codex["name"] == claude["name"] == "bello"
     assert codex["version"] == claude["version"]
-    assert codex["version"] == "0.7.2"
+    # Both manifests track the package they ship with, whatever the release number is.
+    import tomllib
+    package = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+    assert codex["version"] == package
     assert codex["skills"] == claude["skills"] == "./skills/"
     assert (PLUGIN / "skills" / "bello-delegate" / "SKILL.md").is_file()
     assert SCRIPT.is_file()

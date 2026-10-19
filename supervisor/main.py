@@ -16,6 +16,7 @@ from supervisor.controller import BelloController
 from supervisor.project_config import (
     INTELLIGENCE_CHOICES,
     LogDistillerConfig,
+    NoNeedForContextConfig,
     ProjectConfig,
     ProjectConfigError,
     intelligence_choices_for_model,
@@ -142,15 +143,52 @@ class BelloClickGroup(click.Group):
     help="Delete everything except the selected task, optional plan, and protected paths before starting.",
 )
 @click.option(
+    "--goal/--no-goal",
+    default=None,
+    help=(
+        "Keep working toward the original task until its completion review accepts it. While on, runtime "
+        "supervision and completion review are mandatory (--no-runtime and --completion-review false are "
+        "ignored) and completion returns are unlimited. Smart Execution, the revision coder, context "
+        "compaction and the log distiller keep their own settings."
+    ),
+)
+@click.option(
     "--runtime/--no-runtime",
     "runtime_enabled",
     default=None,
-    help="Enable or disable runtime supervision for this run.",
+    help="Enable or disable runtime supervision for this run (mandatory while --goal is on).",
 )
 @click.option(
     "--async-tools/--no-async-tools",
     default=None,
-    help="Enable event-driven tool execution for this run (default: off).",
+    help="Enable or disable Smart Execution (event-driven tool execution) for this run (default: on).",
+)
+@click.option(
+    "--no-need-for-context/--no-no-need-for-context",
+    "no_need_for_context_enabled",
+    default=None,
+    help=(
+        "Enable No Need For Context: past a token threshold, replace older middle context with a plain-text "
+        "summary for coder, completion, adversary and their descendants, on Pi, Claude subscription and "
+        "native Codex (default: off; runtime excluded)."
+    ),
+)
+@click.option(
+    "--context-threshold-tokens",
+    "no_need_for_context_threshold_tokens",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Positive input-token threshold at which No Need For Context summarizes (default: 249000).",
+)
+@click.option(
+    "--context-retain-percent",
+    "no_need_for_context_retain_percent",
+    type=click.FloatRange(min=0, max=50, min_open=True),
+    default=None,
+    help=(
+        "Soft recent-context target as a percentage of the threshold, greater than 0 and at most 50 "
+        "(default: 10); whole turns and tool-call groups can exceed it."
+    ),
 )
 @click.option(
     "--log-distiller/--no-log-distiller",
@@ -172,7 +210,8 @@ class BelloClickGroup(click.Group):
     type=click.BOOL,
     metavar="[true|false]",
     help=(
-        "Run the completion review before finishing. Independent of runtime supervision and adversary."
+        "Run the completion review before finishing. Independent of runtime supervision and adversary; "
+        "always on while --goal is on."
     ),
 )
 @click.option(
@@ -226,8 +265,12 @@ def cli(
     start_over: bool | None,
     protected_paths: tuple[Path, ...],
     clean: bool | None,
+    goal: bool | None,
     runtime_enabled: bool | None,
     async_tools: bool | None,
+    no_need_for_context_enabled: bool | None,
+    no_need_for_context_threshold_tokens: int | None,
+    no_need_for_context_retain_percent: float | None,
     log_distiller_enabled: bool | None,
     distiller_model_path: Path | None,
     completion_review: bool | None,
@@ -285,14 +328,20 @@ def cli(
             start_over=start_over,
             protected_paths=protected_paths,
             clean=clean,
+            goal=goal,
             runtime_enabled=runtime_enabled,
             async_tools=async_tools,
+            no_need_for_context_enabled=no_need_for_context_enabled,
+            no_need_for_context_threshold_tokens=no_need_for_context_threshold_tokens,
+            no_need_for_context_retain_percent=no_need_for_context_retain_percent,
             log_distiller_enabled=log_distiller_enabled,
             distiller_model_path=distiller_model_path,
             completion_review=completion_review,
             adversary=adversary,
             adversary_runs=adversary_runs,
         )
+        for notice in run_settings.goal_notices:
+            click.echo(notice, err=True)
         _run_async_cleanly(_run_bello(run_settings))
     except ProjectConfigError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -649,22 +698,34 @@ def config_command() -> None:
     # Each change was saved when it was made; say whether anything changed.
     heading = "Saved Bello config" if config != before else "Bello config unchanged"
     click.echo(f"{heading}: {project_config_path(Path.cwd())}")
+    click.echo(f"goal: {str(config.goal).lower()}")
     click.echo(f"coder-mod: {config.coder_mod}")
     click.echo(f"coder-intelligence: {config.coder_intelligence}")
     click.echo(f"revision-coder: {'on' if config.revision_coder_enabled else 'off'}")
     if config.revision_coder_enabled:
         click.echo(f"revision-coder-mod: {config.revision_coder_mod}")
         click.echo(f"revision-coder-intelligence: {config.revision_coder_intelligence}")
-    click.echo(f"runtime: {str(config.runtime_enabled).lower()}")
+    # While Goal is on, runtime supervision and completion review are mandatory.
+    required = " (required by goal)" if config.goal else ""
+    click.echo(f"runtime: {str(config.effective_runtime_enabled).lower()}{required if not config.runtime_enabled else ''}")
     click.echo(f"async-tools: {str(config.async_tools).lower()}")
-    if config.runtime_enabled:
+    click.echo(f"no-need-for-context: {str(config.no_need_for_context.enabled).lower()}")
+    if config.no_need_for_context.enabled:
+        click.echo(f"context-threshold-tokens: {config.no_need_for_context.threshold_tokens}")
+        click.echo(f"context-retain-percent: {config.no_need_for_context.retain_percent}")
+    if config.effective_runtime_enabled:
         click.echo(f"runtime-mod: {config.runtime_mod}")
         click.echo(f"runtime-intelligence: {config.runtime_intelligence}")
         click.echo(f"cheap-runtime: {str(config.effective_cheap_runtime).lower()}")
-    click.echo(f"completion-review: {str(config.completion_review).lower()}")
-    if config.completion_review:
+    click.echo(
+        f"completion-review: {str(config.effective_completion_review).lower()}"
+        f"{required if not config.completion_review else ''}"
+    )
+    if config.effective_completion_review:
         click.echo(f"completion-mod: {config.completion_mod}")
         click.echo(f"completion-intelligence: {config.completion_intelligence}")
+        if config.goal:
+            click.echo("completion-returns: unlimited (goal)")
     click.echo(f"adversary: {str(config.adversary).lower()}")
     if config.adversary:
         click.echo(f"adversary-mod: {config.adversary_mod}")
@@ -800,8 +861,11 @@ async def _run_bello(settings: RunSettings) -> int:
         overwrite_state=settings.start_over,
         declared_grading_roots=settings.protected_paths,
         clean_workspace=settings.clean,
-        runtime_enabled=settings.runtime_enabled,
+        goal=settings.goal,
+        # Goal is passed separately and forces runtime on inside the controller.
+        runtime_enabled=settings.runtime_enabled if settings.runtime_choice is None else settings.runtime_choice,
         async_tools=settings.async_tools,
+        no_need_for_context=settings.no_need_for_context,
         log_distiller=settings.log_distiller,
         adversary_enabled=settings.adversary,
         adversary_runs=settings.adversary_runs,
@@ -835,10 +899,16 @@ class RunSettings:
     completion_review: bool
     adversary: bool
     adversary_runs: int
+    goal: bool = False
     runtime_enabled: bool = True
-    async_tools: bool = False
+    # Runtime switch before Goal forces supervision on (None: same as runtime_enabled).
+    runtime_choice: bool | None = None
+    async_tools: bool = True
+    no_need_for_context: NoNeedForContextConfig = field(default_factory=NoNeedForContextConfig)
     log_distiller: LogDistillerConfig = field(default_factory=LogDistillerConfig)
     recovery_enabled: bool = True
+    # Messages for explicit choices that Goal overrides (shown once at startup).
+    goal_notices: tuple[str, ...] = ()
 
 
 def _resolve_run_settings(
@@ -860,8 +930,12 @@ def _resolve_run_settings(
     start_over: bool | None = None,
     protected_paths: tuple[Path, ...] = (),
     clean: bool | None = None,
+    goal: bool | None = None,
     runtime_enabled: bool | None = None,
     async_tools: bool | None = None,
+    no_need_for_context_enabled: bool | None = None,
+    no_need_for_context_threshold_tokens: int | None = None,
+    no_need_for_context_retain_percent: float | None = None,
     log_distiller_enabled: bool | None = None,
     distiller_model_path: Path | None = None,
     completion_review: bool | None = None,
@@ -889,8 +963,26 @@ def _resolve_run_settings(
     selected_runtime_intelligence = runtime_intelligence or project_config.runtime_intelligence
     selected_completion_intelligence = completion_intelligence or project_config.completion_intelligence
     selected_adversary_intelligence = adversary_intelligence or project_config.adversary_intelligence
+    selected_goal = project_config.goal if goal is None else goal
     selected_runtime_enabled = project_config.runtime_enabled if runtime_enabled is None else runtime_enabled
+    # The run's own switch. The controller applies Goal itself and records this
+    # choice, so a Goal run never rewrites the saved runtime preference.
+    runtime_choice = selected_runtime_enabled
     selected_completion_review = project_config.completion_review if completion_review is None else completion_review
+    goal_notices: list[str] = []
+    if selected_goal:
+        # Goal makes runtime supervision and completion review mandatory. Smart Execution is
+        # deliberately not touched: it keeps its own default and any explicit choice.
+        if not selected_runtime_enabled:
+            goal_notices.append(
+                "Goal mode requires runtime supervision; "
+                + ("ignoring --no-runtime." if runtime_enabled is False
+                   else "the saved runtime=false is overridden for this run.")
+            )
+        if completion_review is False:
+            goal_notices.append("Goal mode requires completion review; ignoring --completion-review false.")
+        selected_runtime_enabled = True
+        selected_completion_review = True
     selected_adversary = (
         adversary if adversary is not None
         else (adversary_runs > 0 if adversary_runs is not None else project_config.adversary)
@@ -899,6 +991,15 @@ def _resolve_run_settings(
         project_config.log_distiller,
         enabled=project_config.log_distiller.enabled if log_distiller_enabled is None else log_distiller_enabled,
         model_path=project_config.log_distiller.model_path if distiller_model_path is None else str(distiller_model_path),
+    )
+    selected_context = replace(
+        project_config.no_need_for_context,
+        enabled=(project_config.no_need_for_context.enabled if no_need_for_context_enabled is None
+                 else no_need_for_context_enabled),
+        threshold_tokens=(project_config.no_need_for_context.threshold_tokens
+                          if no_need_for_context_threshold_tokens is None else no_need_for_context_threshold_tokens),
+        retain_percent=(project_config.no_need_for_context.retain_percent
+                        if no_need_for_context_retain_percent is None else no_need_for_context_retain_percent),
     )
     _validate_model_intelligence("coder", selected_coder_model, selected_coder_intelligence)
     if project_config.revision_coder_enabled and (selected_completion_review or selected_adversary):
@@ -930,8 +1031,12 @@ def _resolve_run_settings(
         start_over=project_config.start_over if start_over is None else start_over,
         protected_paths=selected_protected_paths,
         clean=project_config.clean if clean is None else clean,
+        goal=selected_goal,
+        goal_notices=tuple(goal_notices),
         runtime_enabled=selected_runtime_enabled,
+        runtime_choice=runtime_choice,
         async_tools=project_config.async_tools if async_tools is None else async_tools,
+        no_need_for_context=selected_context,
         log_distiller=selected_distiller,
         completion_review=selected_completion_review,
         # An explicit --adversary wins; otherwise an explicit --adversary-runs implies on/off (0 = off).

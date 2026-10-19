@@ -1,6 +1,6 @@
 # Current Bello configuration schema
 
-This reference targets Bello 0.7.2's user-facing `ProjectConfig`. The persistent file is `.supervisor/config.json`, but it also contains runtime state after a run starts. Never replace that file directly or feed it directly to the advisor validator; first extract the project settings with `scripts/inspect_config.py`.
+This reference targets Bello 0.8.0's user-facing `ProjectConfig`. The persistent file is `.supervisor/config.json`, but it also contains runtime state after a run starts. Never replace that file directly or feed it directly to the advisor validator; first extract the project settings with `scripts/inspect_config.py`.
 
 New configurations default the five parent roles to `openai-codex/gpt-6-astra` at `xhigh` (stored using the compatible bare `gpt-6-astra` alias). Existing partial configuration files retain their previous `gpt-5.6-sol` fallback, and explicit selections are preserved. Default children and cheap runtime triage retain `gpt-5.6-luna`; do not infer availability of newer Sol/Luna ids from their announcement. Recommendations use the current catalog and the role-fit guidance in `MODEL_ECONOMICS.md`. The complete shape below illustrates independently selectable fields, not a universal recommendation or the new-project defaults.
 
@@ -12,6 +12,7 @@ The inspector deliberately preserves valid dormant values such as saved review b
 {
   "review_limit_format": "explicit",
   "task": "TASK.md",
+  "goal": false,
   "coder_mod": "openai-codex/gpt-5.6-luna",
   "revision_coder_enabled": false,
   "revision_coder_mod": "openai-codex/gpt-5.6-luna",
@@ -25,7 +26,12 @@ The inspector deliberately preserves valid dormant values such as saved review b
   "adversary_intelligence": "xhigh",
   "speed": "usual",
   "runtime_enabled": true,
-  "async_tools": false,
+  "async_tools": true,
+  "no_need_for_context": {
+    "enabled": false,
+    "threshold_tokens": 249000,
+    "retain_percent": 10
+  },
   "windows_native_root_read": false,
   "cheap_runtime": true,
   "log_distiller": {
@@ -81,7 +87,7 @@ The inspector deliberately preserves valid dormant values such as saved review b
 
 Always include `"review_limit_format": "explicit"`. Without it, older zero-budget semantics are migrated to `"unlimited"`.
 
-Complete recommendations include the shown root fields and both `log_distiller` fields. For compatibility, the validator also accepts older recommendations without `async_tools` and `windows_native_root_read`; both default to false and, when present, must be Booleans. Sparse saved configs remain supported: missing `runtime_enabled` defaults to true; missing `log_distiller` or its fields defaults to `{"enabled": false, "model_path": null}`. Completion and adversary retain their own switches; neither is inferred from runtime or distiller.
+Complete recommendations include the shown root fields and both `log_distiller` fields. For compatibility, the validator also accepts older recommendations without `goal`, `async_tools` and `windows_native_root_read`; `goal` and `windows_native_root_read` default to false, `async_tools` defaults to true (Smart Execution is on for a config that does not name it; a saved explicit false is kept), and each, when present, must be a Boolean. Sparse saved configs remain supported: missing `runtime_enabled` defaults to true; missing `log_distiller` or its fields defaults to `{"enabled": false, "model_path": null}`. Completion and adversary retain their own switches; neither is inferred from runtime or distiller.
 
 ## Providers, models, and effort
 
@@ -116,7 +122,11 @@ The plan must be a regular `.md` file inside the project root, distinct from the
 
 ## Runtime and log-distiller switches
 
-`async_tools` (Smart Execution) defaults off and is independent of runtime, reviews, and distillation. It enables event-driven execution of independent tools for coder/reviewer threads and their children; it does not change models, billing routes, sandbox authority, or runtime's bounded wakeups. Choose it before starting a fresh run. Native Codex requires an explicitly compatible `bello_async_tools` build; do not treat an older selection-only helper as sufficient or silently substitute an engine.
+`goal` (Boolean, default false) is an opt-in that keeps the run working toward the original task until its completion review accepts it. While it is true, runtime supervision and completion review are mandatory (a saved `runtime_enabled: false` or `completion_review: false` is ignored for the run, so a Goal recommendation must set both to true) and completion-review returns are unlimited both before and after any adversary pass; the configured adversary pass count and prompt are unchanged. The completion reviewer returns work only for a concrete unmet requirement of the original task, and the coder is told to keep a `GOAL_MAP.md` of approaches tried, their results and untried ideas. Goal never changes `async_tools`, the revision coder, `no_need_for_context` or the log distiller. Do not recommend it unless the user asks for open-ended persistence toward the task's objectives; preserve an existing value during application.
+
+`async_tools` (Smart Execution) defaults on for new configurations, so a config that does not name it runs with it on; a saved explicit `false` is preserved, and `--async-tools/--no-async-tools` overrides it for one run. It is independent of runtime, reviews, goal, and distillation. It enables event-driven execution of independent tools for coder/reviewer threads and their children; it does not change models, billing routes, sandbox authority, or runtime's bounded wakeups. Choose it before starting a fresh run. Native Codex requires an explicitly compatible `bello_async_tools` build; do not treat an older selection-only helper as sufficient or silently substitute an engine.
+
+`no_need_for_context` (No Need For Context) is an optional object with `enabled` (Boolean, default false), `threshold_tokens` (positive integer, default 249000), and `retain_percent` (finite number greater than 0 and at most 50, default 10). It works with the Pi, Claude Code subscription (Agent SDK) and native Codex engines. When a coder, revision coder, completion or adversary thread (or a descendant; never runtime) reaches the input-token threshold, the older middle of its history is replaced by a plain-text summary, while the original task and instructions and the most recent whole turns, including complete tool-call and tool-result groups, are kept; `threshold_tokens * retain_percent / 100` tokens is a soft target for that recent tail, and complete turns can exceed it. The configured threshold is honored exactly, never automatically lowered for model capacity or an SDK compaction trigger: choose a threshold and model that fit, because an impossible setting or a hard input-budget overflow fails explicitly with output and safety headroom preserved. An unusable summary (empty, refusal-only, truncated, too long, or not smaller than what it replaces) is rejected and the original history is kept. It adds no sandbox, approval or escalation rules: permissions are exactly those of a run without it. Choose it before a fresh run. Native Codex requires a compatible build. Older recommendations may omit this object.
 
 `windows_native_root_read` defaults off. It is an explicit Windows native-Codex opt-in to read the workspace's drive/share root while writes stay scoped and known private controller/Codex homes remain denied. Enable it only with the user's explicit consent to that broader read scope; never infer consent from a request to make Windows work. Other platforms and engines ignore it. Changing saved-thread consent requires a fresh run. Preserve an existing setting during application unless changing it was authorized.
 
@@ -221,8 +231,8 @@ The validator uses that default triage route. If an existing `BELLO_RUNTIME_TRIA
 
 ## Current application limitation
 
-The current run CLI exposes initial-coder, runtime, completion, and adversary models and efforts; `--runtime/--no-runtime`; `--async-tools/--no-async-tools`; review/adversary toggles; `--log-distiller/--no-log-distiller` and `--distiller-model PATH`; adversary count; speed; task; an optional private `--plan PATH`; start-over; clean; and protected paths. These one-run flags override the corresponding saved values without rewriting the project config. `--plan` has no persistent config counterpart and applies only to that run.
+The current run CLI exposes initial-coder, runtime, completion, and adversary models and efforts; `--goal/--no-goal`; `--runtime/--no-runtime` (ignored while goal is on); `--async-tools/--no-async-tools`; `--no-need-for-context/--no-no-need-for-context` with `--context-threshold-tokens` and `--context-retain-percent`; review/adversary toggles; `--log-distiller/--no-log-distiller` and `--distiller-model PATH`; adversary count; speed; task; an optional private `--plan PATH`; start-over; clean; and protected paths. These one-run flags override the corresponding saved values for that run. A started run records the switches it actually used (runtime, Smart Execution, Goal, context compaction, log distiller) in `.supervisor/config.json`, which `bello` reads as the saved configuration next time; change them back with `bello config` or an explicit flag. `--plan` has no persistent config counterpart and applies only to that run.
 
 It does not expose Windows native root-read, revision-coder enablement/model/effort, cheap runtime, completion-return budgets, or any of the three multi-agent policy objects as one-run flags. Those fields require the saved `bello config` interface. A one-run initial-coder override does not implicitly rewrite the persisted revision-coder profile.
 
-The 0.7.2 `bello-delegate` helper starts the installed Bello with the already selected saved configuration and explicitly approved task/plan paths. It does not select models or apply configuration itself. Finish the authorized configuration step before delegating the launch; do not silently drop settings to fit an older plugin.
+The 0.8.0 `bello-delegate` helper starts the installed Bello with the already selected saved configuration and explicitly approved task/plan paths. It does not select models or apply configuration itself. Finish the authorized configuration step before delegating the launch; do not silently drop settings to fit an older plugin.

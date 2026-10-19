@@ -132,7 +132,7 @@ def test_candidate_preparation_with_real_git_preserves_patch_and_external_depend
                     '\n[[package]]\nname = "external"\nversion = "0.0.0"\nsource = "registry+pinned"\n',
                     encoding="utf-8", newline="\n")
     (source / "file.txt").write_bytes(b"before\n\ncontext\n")
-    for name, markers in candidate.ROOT_ROUNDTRIP_SOURCE_MARKERS.items():
+    for name, markers in {**candidate.ROOT_ROUNDTRIP_SOURCE_MARKERS, **candidate.CONTEXT_SOURCE_MARKERS}.items():
         target = source / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("\n".join(markers) + "\n", encoding="utf-8", newline="\n")
@@ -186,3 +186,34 @@ def test_candidate_source_requires_root_normalizer_strict_guard_and_rust_tests(t
     path.write_text(path.read_text().replace(marker, "removed"), encoding="utf-8", newline="\n")
     with pytest.raises(ValueError, match="source contract is incomplete"):
         candidate.verify_root_roundtrip_source(tmp_path)
+
+
+@pytest.mark.parametrize("missing", [
+    (name, marker) for name, markers in candidate.CONTEXT_SOURCE_MARKERS.items()
+    for marker in markers
+])
+def test_candidate_context_source_requires_opt_in_routing_and_snapshot_guard(tmp_path, missing):
+    for name, markers in candidate.CONTEXT_SOURCE_MARKERS.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(markers) + "\n", encoding="utf-8", newline="\n")
+    candidate.verify_context_source(tmp_path)
+    name, marker = missing
+    path = tmp_path / name
+    path.write_text(path.read_text().replace(marker, "removed"), encoding="utf-8", newline="\n")
+    with pytest.raises(ValueError, match="context source contract is incomplete"):
+        candidate.verify_context_source(tmp_path)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation requires Windows privileges")
+def test_candidate_context_source_rejects_linked_source(tmp_path):
+    for name, markers in candidate.CONTEXT_SOURCE_MARKERS.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(markers) + "\n", encoding="utf-8", newline="\n")
+    path = tmp_path / "codex-rs/core/src/bello_compact.rs"
+    target = tmp_path / "external-context.rs"
+    path.rename(target)
+    path.symlink_to(target)
+    with pytest.raises(ValueError, match="regular file"):
+        candidate.verify_context_source(tmp_path)

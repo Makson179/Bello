@@ -45,10 +45,13 @@ def _path_key(value: str | Path, workspace: Path | None) -> str:
     return os.path.normpath(path)
 
 
-def _document_path(value: str, task_path: Path | None, workspace: Path | None) -> bool:
+def _document_path(value: str, task_path: Path | None, workspace: Path | None,
+                   goal_map_path: Path | None = None) -> bool:
     if not value or "\n" in value or "\x00" in value:
         return False
     if task_path is not None and _path_key(value, workspace) == _path_key(task_path, workspace):
+        return True
+    if goal_map_path is not None and _path_key(value, workspace) == _path_key(goal_map_path, workspace):
         return True
     path = PurePosixPath(value.replace("\\", "/").casefold())
     return path.stem in _DOCUMENT_NAMES and path.suffix in _DOCUMENT_SUFFIXES
@@ -255,21 +258,26 @@ def _shell_read(source: str, important: Callable[[str], bool], depth: int = 0) -
 def preserve_tool_output(
     name: str, args: dict[str, Any], *, command: str | None = None,
     task_path: Path | None = None, workspace: Path | None = None,
+    goal_map_path: Path | None = None,
 ) -> bool:
     """Preserve selected critical replies without changing capture/output budgets.
 
     ``command`` is the original exec request for a subsequent poll/stop. The
-    configured task is compared by exact path, never just its arbitrary basename.
+    configured task and the Goal-mode map are compared by exact path, never just
+    their arbitrary basenames. The goal map is output-selection metadata only: it
+    grants no access and the file need not exist.
     """
     if task_path is not None:
         task_path = Path(_path_key(task_path, workspace))
+    if goal_map_path is not None:
+        goal_map_path = Path(_path_key(goal_map_path, workspace))
     if name in {"exec_command", "poll_command", "stop_command"}:
         source = command if command is not None else args.get("command")
         cwd = args.get("cwd")
         command_root = Path(_path_key(cwd, workspace)) if isinstance(cwd, str) else workspace
-        important = lambda value: _document_path(value, task_path, command_root)
+        important = lambda value: _document_path(value, task_path, command_root, goal_map_path)
         return isinstance(source, str) and _shell_read(source, important)
     if name not in {"read_file", "search"}:
         return False
     path = args.get("path")
-    return isinstance(path, str) and _document_path(path, task_path, workspace)
+    return isinstance(path, str) and _document_path(path, task_path, workspace, goal_map_path)

@@ -18,21 +18,44 @@ _PLAN_GUIDANCE_TEMPLATE = (
     "implementation reveals new facts or nuances. Do not copy or summarize the plan into workspace "
     "files, Bello runtime state, or your final message."
 )
+# Goal mode only. The file is the coder's own optional working memory: there is no parser, score
+# gate or controller-side memory behind it, and the file need not exist.
+GOAL_MAP_FILENAME = "GOAL_MAP.md"
+GOAL_CODER_GUIDANCE = (
+    f"Goal mode: maintain a concise {GOAL_MAP_FILENAME} in the workspace root with the approaches you "
+    "tried, what each one observed (results and where the evidence is), and promising untried ideas. "
+    "Consult it before choosing an approach and after any loss of context. Repeat an approach that "
+    "failed only when something relevant has changed, and record what changed. Update it after each "
+    "meaningful experiment."
+)
+GOAL_COMPLETION_GUIDANCE = (
+    "Goal mode: verify the task's original objectives against current evidence. Return the work only "
+    "for a concrete unmet requirement, for example a measured 65/100 where the task requires 70/100; "
+    "apply the same rule to non-numeric requirements. When the stated objectives and constraints are "
+    "met, accept. Do not invent requirements, raise the targets, or block on optional polish. Tie "
+    "every return to the unmet requirement and its evidence."
+)
 
 
-def build_coder_prompt(task_path: Path, *, plan_path: Path | None = None) -> str:
-    return _build_coder_prompt("coder_initial", task_path=task_path, plan_path=plan_path)
+def with_goal_guidance(prompt: str, *, goal: bool = False) -> str:
+    """Prefix the brief Goal coder guidance; the prompt is unchanged unless Goal is on."""
+    return f"{GOAL_CODER_GUIDANCE}\n\n{prompt}" if goal else prompt
 
 
-def build_restart_prompt(task_path: Path, *, plan_path: Path | None = None) -> str:
-    return _build_coder_prompt("coder_restart", task_path=task_path, plan_path=plan_path)
+def build_coder_prompt(task_path: Path, *, plan_path: Path | None = None, goal: bool = False) -> str:
+    return _build_coder_prompt("coder_initial", task_path=task_path, plan_path=plan_path, goal=goal)
 
 
-def build_revision_prompt(task_path: Path, reviewer_feedback: str) -> str:
-    return (
+def build_restart_prompt(task_path: Path, *, plan_path: Path | None = None, goal: bool = False) -> str:
+    return _build_coder_prompt("coder_restart", task_path=task_path, plan_path=plan_path, goal=goal)
+
+
+def build_revision_prompt(task_path: Path, reviewer_feedback: str, *, goal: bool = False) -> str:
+    return with_goal_guidance(
         _template("coder_revision")
         .replace("{task_path}", str(task_path.resolve()))
-        .replace("{reviewer_feedback}", reviewer_feedback)
+        .replace("{reviewer_feedback}", reviewer_feedback),
+        goal=goal,
     )
 
 
@@ -41,6 +64,7 @@ def _build_coder_prompt(
     *,
     task_path: Path,
     plan_path: Path | None,
+    goal: bool = False,
 ) -> str:
     template = _template(template_name)
     plan_guidance = _plan_guidance(plan_path)
@@ -51,7 +75,7 @@ def _build_coder_prompt(
         # silently dropping the plan. Prepending keeps their completion marker
         # and any other terminal instruction at the end of the custom prompt.
         template = f"{plan_guidance.lstrip()}\n\n{template}"
-    return template.replace("{task_path}", str(task_path.resolve()))
+    return with_goal_guidance(template.replace("{task_path}", str(task_path.resolve())), goal=goal)
 
 
 def _plan_guidance(plan_path: Path | None) -> str:
@@ -93,6 +117,7 @@ def build_completion_review_prompt(
     packet: SupervisorWakePacket,
     *,
     selective_context: dict[str, Any] | None = None,
+    goal: bool = False,
 ) -> str:
     payload = dict(selective_context) if selective_context is not None else packet.model_dump(
         mode="json",
@@ -113,6 +138,9 @@ def build_completion_review_prompt(
         "instructions": [_stateless_supervisor_section_text(name) for name in section_names],
         "prompt_sections": section_names,
     }
+    if goal:
+        result["instructions"].append(GOAL_COMPLETION_GUIDANCE)
+        result["prompt_sections"].append("goal")
     if "task_contents" in payload:
         result["task_contents"] = payload.pop("task_contents")
     result.update(payload)

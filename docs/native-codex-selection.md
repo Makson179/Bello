@@ -27,8 +27,9 @@ grants only on that checksum-verified file. Cache directories, manifests and
 other bundled files still require private ACLs; write/delete grants are rejected.
 
 The first download finishes before app-server starts, outside model-RPC timeouts.
-Codex runs without distiller use the ordinary executable. Claude/Pi-only runs do
-not download this helper. Unsupported platforms require an explicit compatible
+Codex runs with neither the distiller nor Smart Execution use the ordinary
+executable; Smart Execution, on by default for new configurations, uses the
+published async-capable helper. Claude/Pi-only runs do not download this helper. Unsupported platforms require an explicit compatible
 build; Bello does not silently turn distillation off or change the provider.
 
 ## Select an installed build
@@ -132,7 +133,7 @@ The source patch is [native-codex-selection.patch](../scripts/native-codex-selec
 It targets official `rust-v0.155.1`, revision
 `be2951ea34f0d295ed0becf97079f92fa5f6950e`, not an arbitrary current checkout.
 It includes the optional command/poll focus field and local selection hook,
-opt-in Smart Execution scheduling, and related tests. Native permissions,
+Smart Execution scheduling (enabled per run by Bello), and related tests. Native permissions,
 policy hooks, model routing and existing output metadata are preserved; neither
 feature disables sandboxing. These source-build instructions describe the new
 candidate, not the older published selection-only downloads listed above.

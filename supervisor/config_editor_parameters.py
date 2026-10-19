@@ -18,6 +18,8 @@ from supervisor.project_config import (
     ProjectConfig,
 )
 
+GOAL_UNLIMITED_VALUE = "Unlimited (goal)"
+GOAL_FORCED_VALUE = "true (goal)"
 MODEL_FAMILY_ASTRA_LABEL = "GPT-6 Astra"
 
 
@@ -129,6 +131,9 @@ def _parameter_defs(
 ) -> tuple[EditorParameter, ...]:
     from supervisor import config_editor as _editor
 
+    # Goal makes runtime supervision and completion review mandatory, whatever was saved.
+    runtime_enabled = config.effective_runtime_enabled
+    completion_review = config.effective_completion_review
     coder_parameters = _editor._role_parameters(
         "coder",
         "coder_mod",
@@ -180,7 +185,7 @@ def _parameter_defs(
         config.runtime_intelligence,
         models,
         catalog,
-    ) if config.runtime_enabled else ()
+    ) if runtime_enabled else ()
     completion_parameters = (
         _editor._role_parameters(
             "completion",
@@ -191,7 +196,7 @@ def _parameter_defs(
             models,
             catalog,
         )
-        if config.completion_review
+        if completion_review
         else ()
     )
     completion_multi_agent_parameters = (
@@ -203,7 +208,7 @@ def _parameter_defs(
             label_prefix="completion-",
             catalog=catalog,
         )
-        if config.completion_review
+        if completion_review
         else ()
     )
     adversary_enabled = config.adversary and config.adversary_runs > 0
@@ -252,7 +257,7 @@ def _parameter_defs(
             ),
         )
     ]
-    if config.completion_review:
+    if completion_review:
         before_adversary_help = (
             "Maximum completion-review rounds that may return work before Bello forces the first adversary. "
             "An earlier accept starts the adversary immediately. 0 skips these rounds; Unlimited removes the cap."
@@ -267,10 +272,13 @@ def _parameter_defs(
             _editor.EditorParameter(
                 "completion_returns_before_adversary",
                 "max-reviews-before-adversary" if adversary_enabled else "max-reviews",
-                _editor.format_review_limit(config.completion_returns_before_adversary),
+                GOAL_UNLIMITED_VALUE if config.goal else _editor.format_review_limit(config.completion_returns_before_adversary),
                 (),
-                edit_kind="review_limit",
-                help_text=before_adversary_help,
+                edit_kind=None if config.goal else "review_limit",
+                help_text=(
+                    "Goal keeps completion returns unlimited until the review accepts the work. Turn goal off to "
+                    "use the saved finite limit."
+                ) if config.goal else before_adversary_help,
             )
         )
     if adversary_enabled:
@@ -284,15 +292,18 @@ def _parameter_defs(
                 help_text="Maximum adversary passes in one run. 0 disables adversary passes.",
             )
         )
-        if config.completion_review:
+        if completion_review:
             review_parameters.append(
                 _editor.EditorParameter(
                     "completion_returns_after_adversary",
                     "max-reviews-after-adversary",
-                    _editor.format_review_limit(config.completion_returns_after_adversary),
+                    GOAL_UNLIMITED_VALUE if config.goal else _editor.format_review_limit(config.completion_returns_after_adversary),
                     (),
-                    edit_kind="review_limit",
+                    edit_kind=None if config.goal else "review_limit",
                     help_text=(
+                        "Goal keeps completion returns unlimited after every adversary pass. Turn goal off to use "
+                        "the saved finite limit."
+                    ) if config.goal else (
                         "Maximum additional completion-review rounds after each adversary pass. 0 schedules none; "
                         "Unlimited removes the cap. A candidate adversary finding is still adjudicated once before "
                         "Bello accepts it or returns a real defect to the coder."
@@ -309,6 +320,16 @@ def _parameter_defs(
             edit_kind="optional_text",
             help_text="Default task file for this folder. A --task CLI argument overrides it for one run.",
         ),
+        _editor.EditorParameter(
+            "goal",
+            "goal",
+            _editor._format_bool(config.goal),
+            (_editor.EditorOption("true", "goal", True), _editor.EditorOption("false", "goal", False)),
+            help_text=("Keep working toward the original task until the completion review accepts it. Runtime "
+                       "supervision and completion review become mandatory and completion returns unlimited. "
+                       "Smart Execution, the revision coder, context compaction and the log distiller keep "
+                       "their own settings. Off by default."),
+        ),
         *coder_parameters,
         revision_coder_toggle,
         *revision_coder_parameters,
@@ -318,10 +339,33 @@ def _parameter_defs(
             "async-tools",
             _editor._format_bool(config.async_tools),
             (_editor.EditorOption("true", "async_tools", True), _editor.EditorOption("false", "async_tools", False)),
-            help_text=("Deliver completed tool results automatically and run independent tool calls concurrently. "
-                       "Applies to coder, reviewers, and their subagents. Off preserves the existing execution loop. "
-                       "Choose before starting a run; independent of runtime supervision and log distillation."),
+            help_text=("Smart Execution: deliver completed tool results automatically and run independent tool "
+                       "calls concurrently. Applies to coder, reviewers, and their subagents. On by default for "
+                       "new configurations; off preserves the existing execution loop. Choose before starting a "
+                       "run; independent of runtime supervision, goal and log distillation."),
         ),
+        _editor.EditorParameter(
+            "no_need_for_context_enabled",
+            "no-need-for-context",
+            _editor._format_bool(config.no_need_for_context.enabled),
+            (_editor.EditorOption("true", "no_need_for_context_enabled", True),
+             _editor.EditorOption("false", "no_need_for_context_enabled", False)),
+            help_text=("No Need For Context: summarize the older middle at a token threshold; keep original task, "
+                       "instructions and recent whole turns. Works with Pi, Claude subscription and native Codex "
+                       "models. Applies to coder, completion, adversary and their descendants; runtime is excluded. "
+                       "Off by default. Choose before starting a fresh run."),
+        ),
+        *((_editor.EditorParameter(
+            "no_need_for_context_threshold_tokens", "context-threshold-tokens",
+            str(config.no_need_for_context.threshold_tokens), (), edit_kind="positive_int",
+            help_text="Positive input-token threshold for compaction. The backend also checks the model's context limit.",
+        ), _editor.EditorParameter(
+            "no_need_for_context_retain_percent", "context-retain-percent",
+            str(config.no_need_for_context.retain_percent), (), edit_kind="retain_percent",
+            help_text=("Recent-tail target as a percentage of the token threshold, greater than 0 and at most 50. "
+                       "The original task and instructions are retained separately. "
+                       "Whole turns and tool pairs may make the recent tail larger than this target."),
+        )) if config.no_need_for_context.enabled else ()),
         _editor.EditorParameter(
             "windows_native_root_read",
             "Windows native root read",
@@ -335,10 +379,16 @@ def _parameter_defs(
         _editor.EditorParameter(
             "runtime_enabled",
             "runtime",
-            _editor._format_bool(config.runtime_enabled),
-            (_editor.EditorOption("true", "runtime_enabled", True), _editor.EditorOption("false", "runtime_enabled", False)),
-            help_text=("Run runtime supervision and its optional cheap triage. Off reduces safety: network is enabled "
-                       "inside the filesystem sandbox, with no runtime review or outside-sandbox escalation."),
+            GOAL_FORCED_VALUE if config.goal else _editor._format_bool(config.runtime_enabled),
+            () if config.goal else (
+                _editor.EditorOption("true", "runtime_enabled", True), _editor.EditorOption("false", "runtime_enabled", False)
+            ),
+            help_text=(
+                "Runtime supervision is always on in goal mode, whatever was saved here. Turn goal off to change it."
+            ) if config.goal else (
+                "Run runtime supervision and its optional cheap triage. Off reduces safety: network is enabled "
+                "inside the filesystem sandbox, with no runtime review or outside-sandbox escalation."
+            ),
         ),
         *runtime_parameters,
         *completion_parameters,
@@ -367,7 +417,7 @@ def _parameter_defs(
                 "approvals, and mandatory checks bypass it. If that route is unavailable, the run uses the full "
                 "runtime supervisor for every check. false always uses the full runtime supervisor."
             ),
-        ),) if config.runtime_enabled else ()),
+        ),) if runtime_enabled else ()),
         _editor.EditorParameter(
             "start_over",
             "start-over",
@@ -381,12 +431,15 @@ def _parameter_defs(
         _editor.EditorParameter(
             "completion_review",
             "completion-review",
-            _editor._format_bool(config.completion_review),
-            (
+            GOAL_FORCED_VALUE if config.goal else _editor._format_bool(config.completion_review),
+            () if config.goal else (
                 _editor.EditorOption("true", "completion_review", True),
                 _editor.EditorOption("false", "completion_review", False),
             ),
             help_text=(
+                "Completion review is always on in goal mode and returns work only for concrete unmet task "
+                "requirements. Turn goal off to change it."
+            ) if config.goal else (
                 "true sends validated coder readiness to an independent read-only reviewer. false skips the final "
                 "review. Adversary remains independently configurable."
             ),
@@ -670,6 +723,8 @@ def _option_matches_current(config: ProjectConfig, parameter: EditorParameter, o
         return False
     if option.field == "log_distiller_enabled":
         return config.log_distiller.enabled == option.value
+    if option.field == "no_need_for_context_enabled":
+        return config.no_need_for_context.enabled == option.value
     multi_agent_parts = _editor._multi_agent_editor_field_parts(option.field)
     if multi_agent_parts is not None:
         config_field, setting_field = multi_agent_parts

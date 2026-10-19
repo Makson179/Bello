@@ -82,7 +82,8 @@ def test_config_editor_render_marks_active_row() -> None:
 
 
 def test_config_editor_render_marks_collapsed_expandable_fields() -> None:
-    output = _render(height=14)
+    # Keep the coder row in view alongside the task and goal rows.
+    output = _render(height=16)
 
     assert any("││   ▸ ◇  coder-mod" in line for line in output.splitlines())
     assert any("││  ─" in line for line in output.splitlines())

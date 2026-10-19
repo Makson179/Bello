@@ -45,6 +45,66 @@ def test_ordinary_user_text_is_not_counted_as_a_late_tool_result():
     assert proof.delivered(value, "ASYNC_SLOW_DONE") == 0
 
 
+@pytest.mark.parametrize("invalid", [None, "intermediate_wake", "missing_sibling", "failed_sibling",
+                                    "duplicate_resolution", "already_delivered"])
+def test_completion_batching_requires_one_continuation_with_every_successful_sibling(invalid):
+    completed = {"input": [
+        {"type": "function_call_output", "call_id": f"cluster-{index}",
+         "output": "Process exited with code 0\nOutput:\n" + marker}
+        for index, marker in enumerate(("ASYNC_FAST_DONE", "ASYNC_MIDDLE_DONE", "ASYNC_SLOW_DONE"))
+    ]}
+    values = [{"input": []}, completed]
+    if invalid == "intermediate_wake":
+        values.insert(1, {"input": completed["input"][:1]})
+    elif invalid == "missing_sibling":
+        completed["input"].pop(1)
+    elif invalid == "failed_sibling":
+        completed["input"][1]["output"] = completed["input"][1]["output"].replace("code 0", "code 1")
+    elif invalid == "duplicate_resolution":
+        completed["input"].append({"type": "function_call_output", "call_id": "cluster-1", "output": "pending"})
+    elif invalid == "already_delivered":
+        values[0]["input"] = completed["input"][:1]
+    assert proof.completion_batching_proof(values) is (invalid is None)
+
+
+def test_completion_batching_rejects_changed_first_request_prefix():
+    prefix = {"type": "message", "role": "user", "content": [
+        {"type": "input_text", "text": "Run the original synthetic fixture."}]}
+    outputs = [
+        {"type": "function_call_output", "call_id": f"cluster-{index}",
+         "output": "Process exited with code 0\nOutput:\n" + marker}
+        for index, marker in enumerate(("ASYNC_FAST_DONE", "ASYNC_MIDDLE_DONE", "ASYNC_SLOW_DONE"))
+    ]
+    values = [{"input": [prefix]}, {"input": [prefix, *outputs]}]
+    assert proof.completion_batching_proof(values)
+    values[1]["input"][0] = {**prefix, "content": [
+        {"type": "input_text", "text": "Rewritten original request."}]}
+    assert not proof.completion_batching_proof(values)
+
+
+@pytest.mark.parametrize("platform", ["nt", "posix"])
+def test_completion_batching_fixture_starts_three_long_calls_in_one_response(platform, monkeypatch):
+    monkeypatch.setattr(proof, "os", SimpleNamespace(name=platform))
+    provider = proof.ScriptedProvider(enabled=True, code=False, completion_batching=True)
+    provider.requests.append({})
+    events = [json.loads(line[6:]) for line in provider.response({}).decode().splitlines()
+              if line.startswith("data: ")]
+    calls = [event["item"] for event in events if event["type"] == "response.output_item.done"]
+    assert [call["call_id"] for call in calls] == ["cluster-0", "cluster-1", "cluster-2"]
+    assert {call["name"] for call in calls} == {"exec_command"}
+    commands = [json.loads(call["arguments"]) for call in calls]
+    assert all(command["yield_time_ms"] == 1 for command in commands)
+    seconds = []
+    for command, marker in zip(commands, ("ASYNC_FAST_DONE", "ASYNC_MIDDLE_DONE", "ASYNC_SLOW_DONE"), strict=True):
+        assert marker in command["cmd"]
+        if platform == "nt":
+            seconds.append(int(command["cmd"].split("Start-Sleep -Milliseconds ")[1].split(";")[0]) / 1000)
+        else:
+            seconds.append(float(command["cmd"].split("sleep ")[1].split(";")[0]))
+    assert min(seconds) > 1
+    assert 0 < max(seconds) - min(seconds) < 1
+
+
 def test_windows_off_polling_fits_the_longer_fixture_under_request_cap(monkeypatch):
     monkeypatch.setattr(proof, "os", SimpleNamespace(name="nt"))
     for code in (False, True):
@@ -73,11 +133,14 @@ async def test_cold_concurrency_repetitions_preserve_failed_attempts(tmp_path, m
     monkeypatch.setattr(proof, "verify_case", fake_case)
     monkeypatch.setattr(proof, "verify_selection_case", fake_selection)
     report = await proof.verify(tmp_path / "codex", tmp_path / "proof", concurrency_repeats=3)
-    assert len(report["results"]) == 14
+    assert len(report["results"]) == 15
     assert report["passed"] is False
     assert len({path for path, _ in seen}) == len(seen)
     assert (tmp_path / "proof/code_interrupt", {
         "enabled": True, "code": True, "signal": "interrupt",
+    }) in seen
+    assert (tmp_path / "proof/completion_batching", {
+        "enabled": True, "code": False, "completion_batching": True,
     }) in seen
     extra = [(path.name, options) for path, options in seen if "repeat" in path.name]
     assert extra == [
