@@ -380,6 +380,8 @@ async def verify_case(binary, output, *, enabled=True, failure=None, pending=Fal
 
 
 async def verify(binary, output, *, cases=None):
+    from scripts.verify_native_codex_candidate import sha256
+    binary_hash = sha256(binary)
     output.mkdir(parents=True, exist_ok=False)
     definitions = {"on": {}, "off": {"enabled": False}, "empty": {"failure": "empty"},
                    "truncated": {"failure": "truncated"}, "refused": {"failure": "refused"},
@@ -391,8 +393,10 @@ async def verify(binary, output, *, cases=None):
         result = await verify_case(binary, output / name, **definitions[name])
         results.append(result)
         print(json.dumps(result), flush=True)
+    unchanged = sha256(binary) == binary_hash
     report = {"schema": "bello.native-context-smoke.v1", "paid_model_calls": 0,
-              "passed": bool(results) and all(item["passed"] for item in results), "results": results}
+              "binary_sha256": binary_hash, "binary_unchanged": unchanged,
+              "passed": bool(results) and unchanged and all(item["passed"] for item in results), "results": results}
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     return report
 

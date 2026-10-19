@@ -47,6 +47,7 @@ def test_installed_receipt_paths_leave_room_for_the_private_selector_socket():
     assert {path.strip() for path in paths if path.strip().startswith(prefix)} == {
         prefix + 'installed-proof.json', prefix + 'worker/report.json',
         prefix + 'worker/*/report.json', prefix + 'worker/*/*/result.json',
+        prefix + 'worker/context/*/receipt.json',
     }
     assert 'installed-release-proof' not in TEXT
 
@@ -126,7 +127,8 @@ def test_installed_selector_real_posix_socket_boundary(case, monkeypatch):
 
 def test_release_gate_is_readonly_and_serial_per_branch():
     triggers = _block(TEXT, 'on')
-    assert _field(_block(triggers, 'push'), 'branches') == "['codex/072-recovery-validation']"
+    # Retained historical evidence cannot run automatically or qualify 0.8.0.
+    assert set(re.findall(r'^  ([a-z_]+):', triggers, re.M)) == {'workflow_dispatch'}
     assert re.search(r'^  workflow_dispatch:\s*$', triggers, re.M)
     assert _field(_block(TEXT, 'permissions'), 'contents') == 'read'
     assert _field(_block(TEXT, 'permissions'), 'actions') == 'read'
@@ -192,21 +194,13 @@ def test_both_windows_python_extremes_and_linux_are_real_install_gates():
 def test_published_download_gate_has_no_local_archive_substitution_or_publication():
     text = (ROOT / '.github/workflows/native-codex-release-download.yml').read_text()
     triggers = _block(text, 'on')
-    assert set(re.findall(r'^  ([a-z_]+):', triggers, re.M)) == {'push', 'workflow_dispatch'}
-    push = _block(triggers, 'push')
-    assert _field(push, 'branches') == "['codex/072-recovery-validation']"
-    assert re.findall(r"^\s*- '([^']+)'$", _block(push, 'paths'), re.M) == [
-        'supervisor/runtime/native_codex_install.py',
-        '.github/workflows/native-codex-release-download.yml',
-        'scripts/release_native_codex_candidate.py',
-        'tests/test_native_codex_install.py',
-        'tests/test_release_native_codex_candidate.py',
-        'tests/test_native_codex_release_workflow.py',
-        'tests/test_native_codex_download_transport.py',
-    ]
+    # Dispatch only after qualified helper publication and exact pin promotion.
+    # It remains available on the candidate branch but never auto-tests old pins.
+    assert set(re.findall(r'^  ([a-z_]+):', triggers, re.M)) == {'workflow_dispatch'}
     assert _field(_block(text, 'permissions'), 'contents') == 'read'
     assert _field(_block(text, 'concurrency'), 'cancel-in-progress') == 'false'
     job = _block(_block(text, 'jobs'), 'published-install')
+    assert _field(job, 'if') is None
     matrix = _block(_block(job, 'strategy'), 'matrix')
     assert re.findall(r'os: ([\w.-]+)', matrix) == ['ubuntu-22.04', 'macos-15', 'windows-2022', 'windows-2025']
     assert re.findall(r"python: '([\d.]+)'", matrix) == ['3.11', '3.13', '3.11', '3.14']
@@ -231,6 +225,7 @@ def test_published_download_gate_has_no_local_archive_substitution_or_publicatio
     assert {path.strip() for path in paths if path.strip()} == {
         prefix + 'installed-proof.json', prefix + 'worker/report.json',
         prefix + 'worker/*/report.json', prefix + 'worker/*/*/result.json',
+        prefix + 'worker/context/*/receipt.json',
     }
     for step in steps:
         if _action(step) == 'actions/checkout':

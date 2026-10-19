@@ -18,6 +18,7 @@ from typing import Any, Iterator
 from packaging.version import InvalidVersion, Version
 import pytest
 
+from supervisor.appserver import AppServerError
 from supervisor.controller import BelloController
 from supervisor.project_config import ProjectConfig
 from supervisor.runtime.client import RuntimeClient
@@ -1000,10 +1001,24 @@ async def test_real_pi_offline_coder_completion_adversary_pipeline(
     client.server_request_handler = controller._on_server_request
     client.transport_error_handler = controller._on_transport_error
 
+    # This fixture starts early to inject its isolated real worker. Apply the
+    # same effective policy as normal controller startup before it is frozen.
+    assert config.async_tools is True
+    client.configure_run(
+        runtime_enabled=controller._runtime_enabled(),
+        async_tools=controller._async_tools_enabled(),
+        no_need_for_context=controller._no_need_for_context_config(),
+        windows_native_root_read=controller._windows_native_root_read_enabled(),
+        log_distiller=controller._log_distiller_config(),
+    )
     await client.start()
     transport: WorkerTransport | None = None
     inserted = False
     try:
+        assert client.async_tools is True
+        with pytest.raises(AppServerError, match="run policy changes require stopping the runtime first"):
+            client.configure_run(async_tools=False)
+        assert client.async_tools is True
         with _local_provider(
             _pytest_command(windows_python),
             expected_reasoning_effort="high" if reasoning else None,

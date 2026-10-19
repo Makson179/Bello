@@ -130,6 +130,8 @@ USEFUL_PLAIN_TEXTS = {
     "headingless-paragraphs": ("The task is the ORB-4127 cache TTL change.\n\nWork so far: the parser was "
                                "rewritten; `pytest -q` passes.\n\nRemaining: document the new option."),
     "brace-first": "{ttl_seconds} must stay a template variable; the config loader now validates it.",
+    "standalone-blocker": "I cannot run the integration test because the database is unavailable.",
+    "apology-with-blocker": "I'm sorry, the integration test could not run because the database is unavailable.",
 }
 
 

@@ -36,8 +36,8 @@ needs both sandbox helper executables. Retain upstream licenses and notices.
 
 Before selecting a candidate with the explicit host binary override, validate
 its capabilities and exact executable hash, and run the selection, asynchronous
-execution, cancellation, and history proofs against that **same** binary. Native
-proofs use a synthetic local provider; they are not live model quality tests.
+execution, cancellation, history, and context proofs against that **same** binary.
+Native proofs use a synthetic local provider; they are not live model quality tests.
 macOS results do not qualify Windows ACLs or Linux sandboxing. Do not feed a
 0.161.0 candidate into the older 0.155.1 packaging/receipt helpers or overwrite
 the working global Codex/Bello installation. New published URLs or download pins
@@ -46,7 +46,7 @@ must only be added after real platform artifacts and their proofs exist.
 ## Candidate-only build and qualification
 
 The separate `native-codex-candidate.yml` workflow is limited to
-`codex/072-recovery-validation`. The build helper preserves a strict
+`codex/080-production-ready`. The build helper preserves a strict
 `native-build-receipt.json` with the exact target, source/toolchain recipe,
 normalized lockfile, licenses and every executable hash. Its `proof_status`
 remains `not-run`: reusable compiled binaries are not a passing qualification.
@@ -81,8 +81,9 @@ Use `--target windows-x64` on Windows. The supplied executable must report exact
 change download pins. It checks the full build receipt before and after each
 proof, binds proof-script hashes, and requires nine selection cases, fifteen
 async cases (including three cold concurrency attempts and per-batch completion
-batching), persistent history, the bundled Linux sandbox where applicable, and six
-CPU ModernBERT cases (four inference runs and two protected-input bypass controls).
+batching), persistent history, all eight context-compaction cases, the bundled
+Linux sandbox where applicable, and six CPU ModernBERT cases (four inference runs
+and two protected-input bypass controls).
 ModernBERT uses the public pinned bundle with authentication disabled; only that
 download may contact an external model repository. Provider proofs use synthetic
 loopback requests, empty homes, no account credentials, and rejecting proxies.
@@ -132,13 +133,24 @@ patch; it cannot prove that context lines match upstream, which `prepare` does w
 <binary> --output-dir <fresh-directory>` replays a synthetic loopback proof: compaction on
 and off, empty, truncated, refused, over-maximum and legacy-envelope summaries, and a
 pending Smart Execution call that survives a summary. It reports hashes and counts only.
+All eight cases are mandatory in the Linux, Windows and macOS candidate qualification
+and installed-cache suites. The validator requires every case's fifteen checks, its
+cold-resume result, and its individual `context/<case>/receipt.json` to agree with the
+aggregate report. Qualification binds those receipts and the proof scripts by SHA256
+to the unchanged executable; the release provenance includes the exact context report
+and case-receipt hash inventory. A standalone capability advertisement is not proof.
 
 ## Release archive and installed-cache gates
 
-The release preparation path is separate from candidate compilation.
-`native-codex-release-qualification.yml` binds Linux and Windows artifact IDs to
-the exact successful source run before downloading them. The versioned release
-packager verifies the complete build, aggregate guardian receipt, worker receipt,
+The current prepublication flow stays within `native-codex-candidate.yml` for
+Linux and Windows and `native-codex-macos-candidate.yml` for macOS. Each proof job
+qualifies its same-run build artifact, packages that exact candidate, and
+cold-installs the resulting archive. The retained receipts bind the source commit,
+workflow run and attempt, executable, qualification, archive and installed proof.
+These workflows do not publish assets or change download pins.
+`native-codex-release-qualification.yml` is retained only for manual historical
+artifact replay, not this current release path. The versioned release packager
+verifies the complete build, aggregate guardian receipt, worker receipt,
 proof-source hashes and individual case results before creating the installer's
 strict file inventory. It does not modify the compiled executable bytes or reuse
 the older packaging helpers under a different version constant.
@@ -151,13 +163,14 @@ continuation on macOS therefore remains fail-closed.
 
 All release targets must then cold-install their archive through Bello's real
 private-cache installer and repeat selection, async/cancellation, persistent
-history and six CPU ModernBERT cases (four inference runs and two protected-input
-bypass controls), plus the bundled sandbox on Linux. Local
-archive transfer is substituted only during this prepublication gate; no mock
+history, all eight context-compaction cases, and six CPU ModernBERT cases (four
+inference runs and two protected-input bypass controls), plus the bundled sandbox
+on Linux. Local archive transfer is substituted only during this prepublication gate; no mock
 native executable or provider credential is used. A separate postpublication
 gate must download the pinned archive through the normal HTTPS downloader and
-verify unchanged cache reuse. That manual gate expects the full fifteen-case proof,
-including completion batching, which the earlier `smart-execution-v1` archives predate;
+verify unchanged cache reuse. That manual gate expects the full fifteen-case async
+proof, including completion batching, and all eight context-compaction cases, which
+the earlier `smart-execution-v1` archives do not qualify for;
 run it only after the rebuilt archives are pinned. Passing source or candidate tests
 alone does not mean these archive and HTTPS gates have passed.
 
@@ -168,8 +181,11 @@ Context (the last also needs the rebuilt helper described above); ordinary Codex
 execution without those features continues to use the user's host Codex. No global
 Codex installation is replaced by this release path.
 
-The pin-promotion commit starts the separate production-HTTPS qualification on
-Linux, macOS Apple Silicon and both Windows/Python variants. Published URLs and
+After separately authorized helper publication and the exact installer pin update,
+manually dispatch `native-codex-release-download.yml` on the candidate branch for
+production-HTTPS qualification on Linux, macOS Apple Silicon and both
+Windows/Python variants. It has no push trigger; a pin-promotion commit does not
+start it automatically. Published URLs and
 pins are not evidence that this gate passed: release approval requires successful
 receipts on the exact final source. Both Windows variants must select the same
 archive and manifest hashes. No stable Bello release or HTTPS success is claimed

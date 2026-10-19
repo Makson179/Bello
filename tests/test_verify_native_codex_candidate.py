@@ -23,6 +23,17 @@ def case(name):
 
 def result(name, binary):
     base = {"passed": True, "paid_model_calls": 0}
+    if name == "context":
+        rows = []
+        for label in sorted(proof.CONTEXT_CASES):
+            failure = label if label in {"empty", "truncated", "refused", "oversized"} else None
+            rows.append({"case": label, **base, "checks": {key: True for key in proof.CONTEXT_CHECKS},
+                "provider_errors": 0, "blocked_external_requests": 0, "failure": None, "resumed": True,
+                "regular_requests": 9, "summary_requests": 0 if label == "off" else 2,
+                "enabled": label != "off", "pending_async": label == "pending", "legacy_envelope": label == "legacy",
+                "summary_failure": failure, "turn_status": "failed" if failure else "completed"})
+        return {**base, "schema": "bello.native-context-smoke.v1", "binary_sha256": proof.sha256(binary),
+                "binary_unchanged": True, "results": rows}
     if name == "selection":
         return {**base, "schema": "bello.native-selection-provider-proof.v1", "binary_sha256": proof.sha256(binary),
                 "cases": [case(name) for name in sorted(proof.SELECTION_CASES)]}
@@ -78,6 +89,10 @@ def harness(tmp_path, monkeypatch):
         if name == "history":
             (output / "case").mkdir()
             proof.write_report(output / "case/result.json", case("persistent_direct"))
+        if name == "context":
+            for row in report["results"]:
+                (output / row["case"]).mkdir()
+                proof.write_report(output / row["case"] / "receipt.json", row)
         return report
     monkeypatch.setattr(proof, "require_platform", lambda _: None)
     monkeypatch.setattr(proof, "verify_build", verify)
@@ -94,7 +109,9 @@ async def test_exact_candidate_all_requested_proofs_and_receipts(harness, tmp_pa
     before = dict(os.environ)
     report = await proof.qualify(harness.candidate, target, tmp_path / "proof", modernbert=modernbert)
     assert report["passed"] and report["candidate_unchanged"]
-    assert harness.calls == ["selection", "async", "history"] + (["sandbox"] if target == "linux-x64" else []) + (["modernbert"] if modernbert else [])
+    assert harness.calls == ["selection", "async", "history", "context"] + (["sandbox"] if target == "linux-x64" else []) + (["modernbert"] if modernbert else [])
+    assert report["proofs"]["context"]["cases"] == 8
+    assert len(report["proofs"]["context"]["case_results"]) == 8
     assert report["proofs"]["async"]["cases"] == 15
     assert report["proofs"]["selection"]["cases"] == 9
     assert os.environ == before

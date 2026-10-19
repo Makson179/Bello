@@ -37,7 +37,7 @@ def proof_inputs() -> dict:
 
 
 def names(modernbert: bool) -> set[str]:
-    return {"selection", "async", "history"} | ({"modernbert"} if modernbert else set())
+    return {"selection", "async", "history", "context"} | ({"modernbert"} if modernbert else set())
 
 
 def fresh_output(candidate: Path, output: Path) -> tuple[Path, Path]:
@@ -81,7 +81,7 @@ async def qualify(candidate: Path, target: str, output: Path, *, modernbert: boo
         report.update(build_receipt_sha256=receipt_hash, build_identity=before["identity"],
                       candidate_files=before["files"], proof_inputs=scripts,
                       binary_sha256=common.sha256(binary))
-        ordered = ["selection", "async", "history"] + (["modernbert"] if modernbert else [])
+        ordered = ["selection", "async", "history", "context"] + (["modernbert"] if modernbert else [])
         with common.isolated_environment(output):
             report["phase"] = "native_version"
             report["native_version"] = common.native_version(binary)

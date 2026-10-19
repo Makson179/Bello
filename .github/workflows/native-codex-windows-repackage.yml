@@ -10,7 +10,8 @@ permissions:
 
 jobs:
   repackage:
-    if: ${{ github.repository == 'Makson179/Bello' && github.event_name == 'workflow_dispatch' }}
+    # Historical 0.155.1 repackaging of one preserved build: never for the 0.8.0 candidate branch.
+    if: ${{ github.repository == 'Makson179/Bello' && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/codex/080-production-ready' }}
     # Match the preserved candidate's successful selection/async qualification.
     runs-on: windows-2025
     timeout-minutes: 25

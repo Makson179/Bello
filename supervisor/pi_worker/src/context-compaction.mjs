@@ -232,6 +232,42 @@ export function planContextCompaction(context, policy, pendingCallIds = []) {
   };
 }
 
+// Content checks, not a required format: inspect every substantive statement so
+// an opening blocker cannot discard a useful handoff, nor can markup hide a
+// refusal-only answer. Quoted/code text is historical data, not a refusal.
+function handoffContent(summary) {
+  const empty = /^(?:none|n\/a|na|nothing|not applicable|nothing to report|none yet|none so far|nothing yet|nothing so far)$/i;
+  const label = /^(?:handoff(?: summary)?|summary|goals?|objectives?|tasks?|constraints?|requirements?|progress|status|current state|completed work|decisions?|next(?: steps?| actions?)?|remaining(?: work| tasks)?|to ?do|critical data|references?|facts|details)$/i;
+  // Inability to run/read task resources is itself useful handoff evidence.
+  // Match refusing this response, not every first-person task blocker.
+  const bareApology = /^(?:(?:unfortunately|regrettably),?\s+)?(?:(?:i[' ]?m|i am)\s+(?:(?:so|very|really|truly)\s+)?sorry|sorry|(?:my\s+)?apologies|i apologi[sz]e)$/i;
+  const refusal = /(?:\bi(?:\s+|')(?:cannot|can't|can not|won't|will not|am unable|m unable|am not able|m not able|must decline|decline|refuse|am not going|m not going)\s*(?:$|(?:to\s+)?(?:summari[sz]e\b|help\b|assist\b|comply\b|(?:provide|produce|write|generate|create)\s+(?:(?:a|the|this|that)\s+)?(?:summary|handoff|answer|response)\b|(?:do|provide)\s+(?:this|that)(?:\s+(?:request|task))?$|(?:follow|continue)(?:\s+(?:this|that|the)\s+(?:task|request|instructions?))?$))|\bunable to (?:summari[sz]e|comply)\b)/i;
+  let statements = 0, refusals = 0, inFence = false;
+  for (const raw of summary.split(/\r?\n/)) {
+    let line = raw.trim();
+    if (/^(?:`{3,}|~{3,})/.test(line)) { inFence = !inFence; continue; }
+    const quoted = inFence || line.startsWith(">");
+    if (quoted) line = line.replace(/^>\s?/, "");
+    else {
+      const decorated = /^#{1,6}(?:\s|$)/.test(line) || /^(\*\*|__|\*|_).+\1\s*:?$/.test(line);
+      line = line.replace(/^#{1,6}(?:\s+|$)/, "").replace(/\s+#+$/, "")
+        .replace(/^(?:[-*+•]\s+|\d{1,3}[.)]\s+)/, "").replace(/^[*_]+|[*_]+$/g, "").trim();
+      if ((decorated || line.endsWith(":")) && label.test(line.replace(/:$/, "").trim())) continue;
+    }
+    for (let statement of line.split(/[.!?;。！？](?:\s+|$)/u)) {
+      statement = statement.trim();
+      if (!quoted) statement = statement.replace(/^[\p{L}][\p{L} '&/()-]{0,60}:\s*/u, "");
+      const normalized = statement.replace(/[\s.*_`>#-]+$/g, "").trim();
+      if (!/[\p{L}\p{N}]/u.test(normalized) || empty.test(normalized)) continue;
+      statements++;
+      const unquoted = statement.replace(/"[^"\n]*"|“[^”\n]*”|«[^»\n]*»|‘[^’\n]*’|`[^`\n]*`/g, " ")
+        .replace(/[’ʼ＇]/g, "'").trim().replace(/[.!?]+$/, "").trim();
+      if (!quoted && (bareApology.test(unquoted) || refusal.test(unquoted))) refusals++;
+    }
+  }
+  return statements > 0 && statements !== refusals;
+}
+
 // A summary is ordinary plain text: no envelope, heading or JSON is required.
 // A legacy <bello_context_summary> envelope is still accepted and unwrapped.
 // The durable marker is added by Bello, so a model can never forge or omit it.
@@ -242,10 +278,8 @@ function summaryText(response) {
   let summary = response.content?.filter((block) => block.type === "text").map((block) => block.text).join("\n").trim() ?? "";
   if (summary.startsWith(SUMMARY_OPEN)) summary = summary.slice(SUMMARY_OPEN.length).trim();
   if (summary.endsWith(SUMMARY_CLOSE)) summary = summary.slice(0, -SUMMARY_CLOSE.length).trim();
-  if (!summary || /^(?:I(?:['’]m| am)? sorry|I (?:cannot|can['’]t|won['’]t|am unable to)|Unable to (?:summarize|comply))/i.test(summary)) {
-    throw new Error("Summary response was empty or refused");
-  }
   if (summary.length > CONTEXT_SUMMARY_MAX_CHARS) throw new Error("Summary response exceeds the character limit");
+  if (!handoffContent(summary)) throw new Error("Summary response was content-free or refusal-only");
   return `${SUMMARY_OPEN}\n${summary}\n${SUMMARY_CLOSE}`;
 }
 

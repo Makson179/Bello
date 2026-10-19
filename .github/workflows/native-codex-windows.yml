@@ -1,11 +1,14 @@
 name: Native Codex Windows proof
 
+# Historical 0.155.1 selection recipe; it is not 0.8.0 candidate qualification.
+# The unpublished 0.8.0 candidate branch is excluded from the branch glob below,
+# and both jobs also refuse a manual dispatch from it.
 on:
   workflow_dispatch:
   push:
     # Readiness tests the already published, pinned helper in its ModernBERT
     # workflow. A new branch cannot reuse another branch's native build cache.
-    branches: [mystery, 'codex/**', '!codex/release-0.6.0-readiness', '!codex/072-recovery-validation']
+    branches: [mystery, 'codex/**', '!codex/release-0.6.0-readiness', '!codex/080-production-ready']
     paths:
       - '.github/workflows/native-codex-windows*.yml'
       - 'scripts/native-codex-selection.patch'
@@ -42,11 +45,11 @@ concurrency:
 
 jobs:
   native-build:
-    if: github.ref != 'refs/heads/codex/072-recovery-validation'
+    if: github.ref != 'refs/heads/codex/080-production-ready'
     uses: ./.github/workflows/native-codex-windows-build.yml
 
   native-proof:
-    if: github.ref != 'refs/heads/codex/072-recovery-validation'
+    if: github.ref != 'refs/heads/codex/080-production-ready'
     needs: native-build
     runs-on: windows-2025
     timeout-minutes: 40

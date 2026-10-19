@@ -1,9 +1,12 @@
 name: Native Codex Linux proof
 
+# Historical 0.155.1 selection recipe; it is not 0.8.0 candidate qualification.
+# The unpublished 0.8.0 candidate branch is excluded from the branch glob below,
+# and both jobs also refuse a manual dispatch from it.
 on:
   workflow_dispatch:
   push:
-    branches: [mystery, 'codex/**', '!codex/072-recovery-validation']
+    branches: [mystery, 'codex/**', '!codex/080-production-ready']
     paths:
       - '.github/workflows/native-codex-linux*.yml'
       - 'scripts/*native_codex_linux.py'
@@ -29,11 +32,11 @@ concurrency:
 
 jobs:
   native-build:
-    if: github.ref != 'refs/heads/codex/072-recovery-validation'
+    if: github.ref != 'refs/heads/codex/080-production-ready'
     uses: ./.github/workflows/native-codex-linux-build.yml
 
   native-proof:
-    if: github.ref != 'refs/heads/codex/072-recovery-validation'
+    if: github.ref != 'refs/heads/codex/080-production-ready'
     needs: native-build
     runs-on: ubuntu-22.04
     timeout-minutes: 30

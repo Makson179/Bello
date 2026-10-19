@@ -26,6 +26,9 @@ concurrency:
 
 jobs:
   real-model:
+    # Published-pin diagnostic (its optional live path reads a repository secret):
+    # refused on the unpublished 0.8.0 candidate branch.
+    if: github.ref != 'refs/heads/codex/080-production-ready'
     runs-on: windows-2025
     timeout-minutes: 40
     defaults:

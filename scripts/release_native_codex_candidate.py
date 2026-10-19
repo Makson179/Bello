@@ -222,10 +222,12 @@ def _guardian(value: dict, target: str) -> None:
 
 
 def proof_names(target: str) -> set[str]:
-    return {"selection", "async", "history", "modernbert"} | ({"sandbox"} if target == "linux-x64" else set())
+    return {"selection", "async", "history", "context", "modernbert"} | ({"sandbox"} if target == "linux-x64" else set())
 
 
 def _case_paths(name: str, common) -> set[str]:
+    if name == "context":
+        return {f"{case}/receipt.json" for case in common.CONTEXT_CASES}
     cases = {"selection": common.SELECTION_CASES, "modernbert": common.MODERNBERT_CASES,
              "async": {"async_and_selection_direct", "async_and_selection_code"},
              "history": {"case"}, "sandbox": set()}[name]
@@ -239,8 +241,8 @@ def _case_hashes(directory: Path, name: str, common) -> dict[str, str]:
         # No proof directory alias may hide or substitute a saved result.
         for child in directories:
             regular(Path(parent) / child, directory=True)
-        if "result.json" in files:
-            found.add((Path(parent) / "result.json").relative_to(directory).as_posix())
+        for filename in {"result.json", "receipt.json"} & set(files):
+            found.add((Path(parent) / filename).relative_to(directory).as_posix())
     if found != expected:
         raise ValueError("Proof case-file inventory is incomplete or unexpected")
     return {name: sha256(_file(directory, name)) for name in sorted(expected)}
@@ -252,7 +254,7 @@ def validate_suite(proofs: dict, root: Path, binary: Path, target: str) -> dict[
     if not isinstance(proofs, dict) or set(proofs) != expected:
         raise ValueError("Every release proof, including real CPU ModernBERT, is required")
     counts = {"selection": len(common.SELECTION_CASES), "async": len(common.ASYNC_CASES),
-              "history": 1, "modernbert": len(common.MODERNBERT_CASES), "sandbox": 1}
+              "history": 1, "context": len(common.CONTEXT_CASES), "modernbert": len(common.MODERNBERT_CASES), "sandbox": 1}
     hashes = {}
     for name in sorted(expected):
         saved = proofs[name]
@@ -402,7 +404,7 @@ def verify_artifact(target: str, artifact: Path) -> tuple[dict, Path]:
             or not 0 < archive.stat().st_size <= MAX_ARCHIVE or checks.get("archive_sha256") != sha256(archive)
             or checks.get("packaging_inputs") != packaging_inputs(target)):
         raise ValueError("Artifact identity, source, or archive checksum mismatch")
-    build, proof, _ = _modules(target)
+    build, proof, common = _modules(target)
     manifest, info = None, None
     hashes, total = {}, 0
     with tarfile.open(archive, "r:gz") as stream:
@@ -438,6 +440,15 @@ def verify_artifact(target: str, artifact: Path) -> tuple[dict, Path]:
             or any(not re.fullmatch(r"[0-9a-f]{64}", str(provenance.get(name, "")))
                    for name in ("build_receipt_sha256", "qualification_sha256", "worker_sha256"))):
         raise ValueError("Release provenance lacks exact build and qualification hashes")
+    expected_proof_files = {
+        f"{name}/{path}" for name in proof_names(target)
+        for path in {"report.json", *_case_paths(name, common)}
+    }
+    proof_files = provenance.get("proof_files")
+    if (not isinstance(proof_files, dict) or set(proof_files) != expected_proof_files
+            or any(type(digest) is not str or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                   for digest in proof_files.values())):
+        raise ValueError("Release proof-file inventory is incomplete, unexpected, or malformed")
     if (manifest != expected_manifest or checks.get("files") != files
             or checks.get("build_identity") != build.identity(target)
             or info.get("native_build_identity") != checks.get("build_identity")

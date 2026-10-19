@@ -2,7 +2,7 @@ name: Release package validation
 
 on:
   push:
-    branches: [codex/072-recovery-validation]
+    branches: [codex/080-production-ready]
   pull_request:
     branches: [main]
   workflow_dispatch:

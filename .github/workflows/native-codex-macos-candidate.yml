@@ -2,7 +2,7 @@ name: Native Codex 0.161 macOS arm64 candidate
 
 on:
   push:
-    branches: ['codex/072-recovery-validation']
+    branches: ['codex/080-production-ready']
   workflow_dispatch:
 
 permissions:
@@ -12,11 +12,14 @@ concurrency:
   group: native-codex-macos-candidate-0161-${{ github.ref }}
   cancel-in-progress: false
 
-# Separate recipe: the already-qualified Linux/Windows cache identity is untouched.
+# Separate recipe: the Linux/Windows cache identities are untouched.
 # No publishing or credentials; Mac cleanup proves normal completion/groups only.
+# The proof job uses only the candidate its build job verified against this
+# commit's recipe (fresh or exact-cache hit), with this run/attempt's artifact
+# name, never another run/artifact ID. Editing this file changes build identity.
 jobs:
   macos-build:
-    if: github.ref == 'refs/heads/codex/072-recovery-validation'
+    if: github.ref == 'refs/heads/codex/080-production-ready'
     runs-on: macos-15
     timeout-minutes: 240
     outputs:
@@ -34,6 +37,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Require the exact pushed commit
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
       - name: Require native ARM64 Darwin
         run: test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64
       - uses: actions/setup-python@v5
@@ -110,6 +115,10 @@ jobs:
         if: steps.candidate.outputs.cache-hit != 'true'
         working-directory: native-source/codex-rs
         run: cargo test --locked --release --target aarch64-apple-darwin -p codex-protocol --lib bello_permission_path_roundtrip
+      - name: Test native NNC Smart Execution and selection regressions before snapshot
+        if: steps.candidate.outputs.cache-hit != 'true'
+        working-directory: native-source/codex-rs
+        run: cargo test --locked --release --target aarch64-apple-darwin -p codex-core --lib -j 3 -- bello native_async native_selection native_steer_generation
       - name: Preserve successful recompilable Cargo state
         if: steps.candidate.outputs.cache-hit != 'true' && steps.cargo_cache.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -142,10 +151,10 @@ jobs:
           retention-days: 14
 
   macos-proof:
-    if: github.ref == 'refs/heads/codex/072-recovery-validation'
+    if: github.ref == 'refs/heads/codex/080-production-ready'
     needs: macos-build
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 120
     defaults:
       run:
         shell: bash
@@ -153,6 +162,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Require the exact pushed commit
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
       - name: Require native ARM64 Darwin
         run: test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64
       - uses: actions/setup-python@v5
@@ -166,21 +177,181 @@ jobs:
         run: python scripts/build_native_codex_macos_candidate.py verify-build --target darwin-arm64 --candidate native-candidate --restore-executable-modes
       - name: Install CPU inference and local proof dependencies
         run: python -m pip install -e '.[log-distiller,test]'
-      - name: Validate separate macOS build and qualifier contracts
-        run: python -m pytest -q tests/test_build_native_codex_macos_candidate.py tests/test_verify_native_codex_macos_candidate.py tests/test_native_codex_macos_candidate_workflow.py --junitxml=native-candidate-tests.xml
-      - name: Prove selection9 async15 history1 and CPU inference4 plus bypass2
+      - name: Validate separate macOS build, qualifier, packaging and branch routing contracts
+        run: python -m pytest -q tests/test_build_native_codex_macos_candidate.py tests/test_verify_native_codex_macos_candidate.py tests/test_verify_native_codex_context.py tests/test_native_context_release_binding.py tests/test_release_native_codex_candidate.py tests/test_native_codex_macos_candidate_workflow.py tests/test_native_codex_release_workflow.py tests/test_github_branch_workflow.py --junitxml=native-candidate-tests.xml
+      - name: Prove selection9 async15 history1 context8 and CPU inference4 plus bypass2
         run: python scripts/verify_native_codex_macos_candidate.py --candidate native-candidate --target darwin-arm64 --output-dir candidate-proof --modernbert
       - name: Package only the qualified exact candidate with all installable hashes
-        run: python scripts/release_native_codex_candidate.py package --target darwin-arm64 --candidate native-candidate --qualification candidate-proof --output "$RUNNER_TEMP/bello-0161-macos-release"
+        run: python scripts/release_native_codex_candidate.py package --target darwin-arm64 --candidate native-candidate --qualification candidate-proof --output "$RUNNER_TEMP/native-release"
       - name: Prove the real fresh-cache installer and installed native CPU pipeline
-        run: python scripts/release_native_codex_candidate.py install-local --target darwin-arm64 --artifact "$RUNNER_TEMP/bello-0161-macos-release" --runtime-root "$RUNNER_TEMP/bello-0161-installed-runtime" --output "$RUNNER_TEMP/bello-0161-macos-installed-proof" --modernbert
+        run: python scripts/release_native_codex_candidate.py install-local --target darwin-arm64 --artifact "$RUNNER_TEMP/native-release" --runtime-root "$RUNNER_TEMP/bello-0161-release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --output "$RUNNER_TEMP/release-receipts/installed" --modernbert
+      - name: Bind commit, binary, qualification, archive and installed proof together
+        shell: python
+        env:
+          BELLO_TARGET: darwin-arm64
+          BELLO_CANDIDATE_ARTIFACT: ${{ needs.macos-build.outputs.artifact-name }}
+          BELLO_RELEASE_DIR: ${{ runner.temp }}/native-release
+          BELLO_INSTALLED_DIR: ${{ runner.temp }}/release-receipts/installed
+          BELLO_BINDING_FILE: ${{ runner.temp }}/release-receipts/source-binding.json
+        run: |
+          import hashlib
+          import json
+          import os
+          import platform
+          import re
+          from pathlib import Path
+
+
+          def reject(reason):
+              raise SystemExit("Exact source binding rejected: " + reason)
+
+
+          def require(condition, reason):
+              if not condition:
+                  reject(reason)
+
+
+          def digest(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+          def load(path):
+              value = json.loads(Path(path).read_text(encoding="utf-8"))
+              require(isinstance(value, dict), "evidence must be a JSON object")
+              return value
+
+
+          def is_digest(value):
+              return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+          def proof_cases(report):
+              proofs = report.get("proofs")
+              require(isinstance(proofs, dict) and proofs, "the proof inventory is missing")
+              counts = {}
+              for name, item in proofs.items():
+                  require(isinstance(item, dict) and item.get("passed") is True
+                          and type(item.get("cases")) is int and item["cases"] > 0
+                          and is_digest(item.get("sha256")), "a proof did not pass with counted cases")
+                  counts[name] = item["cases"]
+              return counts
+
+
+          target = os.environ["BELLO_TARGET"]
+          executable = "bin/codex.exe" if target == "windows-x64" else "bin/codex"
+          source = os.environ["GITHUB_SHA"]
+          run_id = os.environ["GITHUB_RUN_ID"]
+          require(re.fullmatch(r"[0-9a-f]{40}", source) is not None, "the pushed commit is not a full SHA")
+          require(re.fullmatch(r"[0-9]+", run_id) is not None, "the workflow run is not numeric")
+          artifact = os.environ["BELLO_CANDIDATE_ARTIFACT"]
+          attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+          require(re.fullmatch(r"[1-9][0-9]*", attempt) is not None, "the workflow attempt is not numeric")
+          require(artifact == f"native-codex-candidate-0161-{target}-{source}-{run_id}-{attempt}",
+                  "the candidate artifact was not produced for this commit and run")
+
+          candidate, proof = Path("native-candidate"), Path("candidate-proof")
+          release, installed = Path(os.environ["BELLO_RELEASE_DIR"]), Path(os.environ["BELLO_INSTALLED_DIR"])
+          binding = Path(os.environ["BELLO_BINDING_FILE"])
+
+          receipt_path = candidate / "native-build-receipt.json"
+          receipt = load(receipt_path)
+          files, identity = receipt.get("files"), receipt.get("identity")
+          require(isinstance(files, dict) and isinstance(identity, dict) and is_digest(identity.get("build_key")),
+                  "the candidate receipt lacks its file inventory or build identity")
+          binary = files.get(executable)
+          require(is_digest(binary) and digest(candidate / executable) == binary,
+                  "the candidate executable differs from its build receipt")
+          receipt_sha256 = digest(receipt_path)
+
+          aggregate_path, worker_path = proof / "qualification.json", proof / "worker" / "qualification.json"
+          aggregate, worker = load(aggregate_path), load(worker_path)
+          for report in (aggregate, worker):
+              require(report.get("passed") is True and report.get("published") is False
+                      and report.get("target") == target and report.get("binary_sha256") == binary
+                      and report.get("build_receipt_sha256") == receipt_sha256
+                      and report.get("build_identity") == identity and report.get("candidate_files") == files,
+                      "the qualification is not bound to this candidate")
+          require(aggregate.get("worker_report_sha256") == digest(worker_path),
+                  "the aggregate qualification names a different worker report")
+
+          checks = load(release / "checksums.json")
+          archive_name = checks.get("archive")
+          require(isinstance(archive_name, str) and Path(archive_name).name == archive_name,
+                  "the package names no single archive file")
+          archive_sha256 = digest(release / archive_name)
+          manifest_sha256 = checks.get("manifest_sha256")
+          require(checks.get("published") is False and checks.get("target") == target
+                  and checks.get("archive_sha256") == archive_sha256 and is_digest(manifest_sha256)
+                  and checks.get("build_receipt_sha256") == receipt_sha256
+                  and checks.get("qualification_sha256") == digest(aggregate_path)
+                  and checks.get("build_identity") == identity
+                  and isinstance(checks.get("files"), dict) and checks["files"].get(executable) == binary,
+                  "the package is not bound to this candidate and qualification")
+
+          installed_path, installed_worker_path = installed / "installed-proof.json", installed / "worker" / "report.json"
+          final, final_worker = load(installed_path), load(installed_worker_path)
+          for report in (final, final_worker):
+              require(report.get("passed") is True and report.get("published") is False
+                      and report.get("target") == target and report.get("archive_sha256") == archive_sha256
+                      and report.get("manifest_sha256") == manifest_sha256,
+                      "the installed proof did not use this archive")
+          cache = final_worker.get("cache_files")
+          require(final.get("worker_report_sha256") == digest(installed_worker_path)
+                  and final_worker.get("binary_sha256") == binary
+                  and final_worker.get("distribution_source") == "local-archive"
+                  and isinstance(cache, dict) and isinstance(cache.get(executable), dict)
+                  and cache[executable].get("sha256") == binary,
+                  "the installed executable is not the candidate executable")
+
+          qualified, repeated = proof_cases(aggregate), proof_cases(final)
+          require(qualified == repeated, "the installed proofs differ from the qualification")
+          required = {"selection": 9, "async": 15, "history": 1, "context": 8, "modernbert": 6}
+          if target == "linux-x64":
+              required["sandbox"] = 1
+          require(qualified == required,
+                  "the full proof set including the eight context cases is required")
+
+          record = {
+              "schema": "bello.native-ci-source-binding.v1",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "ref": os.environ["GITHUB_REF"],
+              "source_sha": source,
+              "workflow_ref": os.environ.get("GITHUB_WORKFLOW_REF", ""),
+              "run_id": int(run_id),
+              "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "job": os.environ["GITHUB_JOB"],
+              "runner_os": os.environ["RUNNER_OS"],
+              "runner_image": os.environ.get("ImageVersion", ""),
+              "python": platform.python_version(),
+              "target": target,
+              "candidate_artifact": artifact,
+              "build_key": identity["build_key"],
+              "build_receipt_sha256": receipt_sha256,
+              "binary_sha256": binary,
+              "qualification_sha256": digest(aggregate_path),
+              "worker_qualification_sha256": digest(worker_path),
+              "archive": archive_name,
+              "archive_sha256": archive_sha256,
+              "manifest_sha256": manifest_sha256,
+              "installed_proof_sha256": digest(installed_path),
+              "installed_worker_report_sha256": digest(installed_worker_path),
+              "proof_cases": qualified,
+              "published": False,
+          }
+          binding.parent.mkdir(parents=True, exist_ok=True)
+          with binding.open("x", encoding="utf-8", newline="\n") as stream:
+              stream.write(json.dumps(record, indent=2, sort_keys=True) + "\n")
+          print(json.dumps({"bound": True, "source_sha": source, "target": target,
+                            "binary_sha256": binary, "archive_sha256": archive_sha256}))
       - name: Preserve qualified archive and its checksums without publishing
         uses: actions/upload-artifact@v4
         with:
           name: native-codex-release-0161-darwin-arm64-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/bello-0161-macos-release/bello-native-codex-0.161.0-aarch64-apple-darwin.tar.gz
-            ${{ runner.temp }}/bello-0161-macos-release/checksums.json
+            ${{ runner.temp }}/native-release/*.tar.gz
+            ${{ runner.temp }}/native-release/checksums.json
+            ${{ runner.temp }}/native-release/bundle/selection-manifest.json
+            ${{ runner.temp }}/native-release/bundle/BUILD-INFO
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
@@ -197,9 +368,20 @@ jobs:
             candidate-proof/worker/qualification.json
             candidate-proof/worker/*/report.json
             candidate-proof/worker/*/*/result.json
-            ${{ runner.temp }}/bello-0161-macos-installed-proof/installed-proof.json
-            ${{ runner.temp }}/bello-0161-macos-installed-proof/worker/report.json
-            ${{ runner.temp }}/bello-0161-macos-installed-proof/worker/*/report.json
-            ${{ runner.temp }}/bello-0161-macos-installed-proof/worker/*/*/result.json
+            candidate-proof/worker/context/*/receipt.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Preserve bounded installed-proof receipts and the source binding even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-codex-installed-proof-0161-darwin-arm64-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/release-receipts/source-binding.json
+            ${{ runner.temp }}/release-receipts/installed/installed-proof.json
+            ${{ runner.temp }}/release-receipts/installed/worker/report.json
+            ${{ runner.temp }}/release-receipts/installed/worker/*/report.json
+            ${{ runner.temp }}/release-receipts/installed/worker/*/*/result.json
+            ${{ runner.temp }}/release-receipts/installed/worker/context/*/receipt.json
           if-no-files-found: warn
           retention-days: 14

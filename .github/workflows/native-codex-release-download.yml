@@ -1,19 +1,14 @@
 name: Published Native Codex 0.161 release qualification
 
-# Push qualification starts only after the separately published native assets
-# and their verified immutable hashes have been promoted into the installer.
-# This workflow never builds or publishes an artifact.
+# POST-PUBLICATION gate, started by hand only. It downloads the archives that the
+# installer pins name through the normal HTTPS downloader and repeats every proof.
+# It therefore qualifies the pinned helper, never an unpublished candidate: until
+# the rebuilt archives are published and the pins promoted, the pins still name the
+# previous helper and a green run would say nothing about 0.8.0. There is no push
+# trigger. Dispatch on the candidate branch only after the separately authorized
+# helper publication and exact installer pin update. This workflow never builds,
+# packages or publishes an artifact; a local-archive proof cannot replace it.
 on:
-  push:
-    branches: ['codex/072-recovery-validation']
-    paths:
-      - 'supervisor/runtime/native_codex_install.py'
-      - '.github/workflows/native-codex-release-download.yml'
-      - 'scripts/release_native_codex_candidate.py'
-      - 'tests/test_native_codex_install.py'
-      - 'tests/test_release_native_codex_candidate.py'
-      - 'tests/test_native_codex_release_workflow.py'
-      - 'tests/test_native_codex_download_transport.py'
   workflow_dispatch:
 
 permissions:
@@ -84,5 +79,6 @@ jobs:
             ${{ runner.temp }}/published-release-proof/worker/report.json
             ${{ runner.temp }}/published-release-proof/worker/*/report.json
             ${{ runner.temp }}/published-release-proof/worker/*/*/result.json
+            ${{ runner.temp }}/published-release-proof/worker/context/*/receipt.json
           if-no-files-found: warn
           retention-days: 14

@@ -154,6 +154,7 @@ async def test_report_retains_a_failed_case_without_raw_transcripts(tmp_path, mo
 
     monkeypatch.setattr(proof, "verify_case", fake_case)
     output = tmp_path / "report"
+    (tmp_path / "codex").write_bytes(b"synthetic-binary-no-execution")
     result = await proof.verify(tmp_path / "codex", output)
     assert not result["passed"]
     assert [item["case"] for item in result["results"]] == [

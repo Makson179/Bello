@@ -470,15 +470,20 @@ _LEADING_EMPHASIS = re.compile(r"(\*\*|__)(.+?)\1")
 _SENTENCE_BREAK = re.compile(r"(?<=[.!?;\u3002\uff01\uff1f])\s+")
 # Reported speech or data: double, typographic and guillemet quotes, code spans.
 _QUOTED = re.compile('"[^"\\n]*"|\u201c[^\u201d\\n]*\u201d|\u00ab[^\u00bb\\n]*\u00bb|\u2018[^\u2019\\n]*\u2019|`[^`\\n]*`')
-# First-person refusal or apology: a statement opening with one, or containing
-# a first-person refusal clause. Applied only to unquoted text, and a reply is
-# rejected only when EVERY substantive statement is one (refusal-only output).
-_REFUSAL_OPENING = re.compile(
+# Refusal of this response, not inability to perform a task action: a concrete
+# run/read/access blocker is useful handoff evidence even as a single sentence.
+# Applied only to unquoted text; every substantive statement must be a refusal.
+_BARE_APOLOGY = re.compile(
     r"(?:(?:unfortunately|regrettably),?\s+)?"
-    r"(?:(?:i'?m|i\s+am)\s+(?:(?:so|very|really|truly)\s+)?sorry|sorry|(?:my\s+)?apologies|i\s+apologi[sz]e)\b")
+    r"(?:(?:i'?m|i\s+am)\s+(?:(?:so|very|really|truly)\s+)?sorry|sorry|(?:my\s+)?apologies|i\s+apologi[sz]e)$")
 _REFUSAL_CLAUSE = re.compile(
-    r"\bi(?:\s+|')(?:cannot|can't|can\s+not|won't|will\s+not|am\s+unable|m\s+unable|am\s+not\s+able"
-    r"|m\s+not\s+able|must\s+decline|decline\s+to|refuse|am\s+not\s+going\s+to|m\s+not\s+going\s+to)\b")
+    r"(?:\bi(?:\s+|')(?:cannot|can't|can\s+not|won't|will\s+not|am\s+unable|m\s+unable|am\s+not\s+able"
+    r"|m\s+not\s+able|must\s+decline|decline|refuse|am\s+not\s+going|m\s+not\s+going)\s*"
+    r"(?:$|(?:to\s+)?(?:summari[sz]e\b|help\b|assist\b|comply\b"
+    r"|(?:provide|produce|write|generate|create)\s+(?:(?:a|the|this|that)\s+)?(?:summary|handoff|answer|response)\b"
+    r"|(?:do|provide)\s+(?:this|that)(?:\s+(?:request|task))?$"
+    r"|(?:follow|continue)(?:\s+(?:this|that|the)\s+(?:task|request|instructions?))?$))"
+    r"|\bunable to (?:summari[sz]e|comply)\b)")
 # The legacy envelope Bello used to request: {"status":"complete","summary":"..."}.
 # Recovery applies only to an object that opens exactly like this; the summary
 # then ends at the leftmost unescaped quote followed by nothing but a valid
@@ -738,15 +743,15 @@ def _substantive(text: str) -> bool:
 
 
 def _refusal_statement(text: str) -> bool:
-    """A first-person refusal or apology, judged on the statement's unquoted text.
+    """Refusing this response or a bare apology, not a concrete task blocker.
 
     Quoted spans are reported speech or data (a handoff may quote an earlier
     refusal as a fact), so they are removed first and never count.
     """
-    unquoted = _QUOTED.sub(" ", text).translate(_APOSTROPHES).lower().strip()
+    unquoted = _QUOTED.sub(" ", text).translate(_APOSTROPHES).lower().strip().rstrip(".!?").strip()
     if not any(char.isalnum() for char in unquoted):
         return False
-    return _REFUSAL_OPENING.match(unquoted) is not None or _REFUSAL_CLAUSE.search(unquoted) is not None
+    return _BARE_APOLOGY.fullmatch(unquoted) is not None or _REFUSAL_CLAUSE.search(unquoted) is not None
 
 
 def handoff_content(text: str) -> tuple[int, int]:
@@ -804,7 +809,7 @@ def _check_handoff_content(text: str) -> None:
     This is deliberately not a format gate: headings, labels, section counts,
     JSON and wording are never required. Content is rejected only when nothing
     but markup or empty markers remains, or when EVERY substantive statement is
-    a first-person refusal or apology (refusal-only output, even when padded
+    a response refusal or bare apology (refusal-only output, even when padded
     with headings). A useful handoff that quotes or describes a refusal is kept.
     """
     statements, refusals = handoff_content(text)

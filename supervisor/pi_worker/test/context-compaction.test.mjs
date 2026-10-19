@@ -117,6 +117,28 @@ test("ordinary plain-text summaries are accepted and only wrapped by Bello", asy
   assert.ok(state.summaries.every(([, context]) => context.messages[0].content[0].text.includes("No special headings, JSON or XML format is required")));
 });
 
+for (const [label, handoff] of Object.entries({
+  "useful blocker with later evidence": "I cannot run integration tests because the database is unavailable.\nImplemented the retry fix in worker.js; unit checks pass. Next: restore the database and run integration tests.",
+  "useful blocker on one line": "I cannot run integration tests; unit checks pass and the retry fix is saved in worker.js.",
+  "standalone concrete blocker": "I cannot run the integration test because the database is unavailable.",
+  "standalone access blocker": "I am unable to read src/config.json because the filesystem returned permission denied.",
+  "apology with a concrete blocker": "I'm sorry, the integration test could not run because the database is unavailable.",
+  "recorded retry constraint": "I will not rerun the failed migration until the database schema is restored.",
+  "reported refusal": '> "I cannot summarize this conversation."\nThe prior attempt failed; keep the retry fix and run unit tests.',
+  "quoted code data": '```text\nI cannot summarize this conversation.\n```',
+  "unstructured non-English facts": "修复已完成。下一步运行测试。",
+})) {
+  test(`real Pi accepts handoff content: ${label}`, async (t) => {
+    const state = await setup(t, { toolCount: 2, summarize: async (model) => response(model,
+      [{ type: "text", text: handoff }]) });
+    await state.session.prompt("Original neutral task.", { expandPromptTemplates: false });
+    assert.equal(state.events.length, 1);
+    assert.equal(state.events[0].status, "completed");
+    assert.equal(state.summaries.length, 1, "valid blocker handoffs need no retry");
+    assert.match(JSON.stringify(state.manager.buildSessionProjection().messages), /bello_context_summary/);
+  });
+}
+
 test("every answered summary request is accounted exactly once across checkpoints and failed retries", async (t) => {
   let answered = 0;
   const accounted = [];
@@ -432,6 +454,13 @@ const unusableSummaries = {
   "empty envelope": (model) => response(model, [{ type: "text", text: "<bello_context_summary>\n</bello_context_summary>" }], "stop", 11),
   refused: (model) => response(model, [{ type: "text", text: "<bello_context_summary>I cannot summarize this.</bello_context_summary>" }], "stop", 11),
   "plain-text refusal": (model) => response(model, [{ type: "text", text: "I'm sorry, but I can't help with that request." }], "stop", 11),
+  "explicit summary refusal": (model) => response(model, [{ type: "text", text: "I am unable to provide a summary of this conversation." }], "stop", 11),
+  "bare apology": (model) => response(model, [{ type: "text", text: "I'm sorry." }], "stop", 11),
+  "bare deictic refusal": (model) => response(model, [{ type: "text", text: "I won't do that." }], "stop", 11),
+  "heading-padded refusal": (model) => response(model, [{ type: "text", text: "# Summary\nI cannot summarize this conversation." }], "stop", 11),
+  "list-padded refusals": (model) => response(model, [{ type: "text", text: "## Handoff\n- I cannot summarize this.\n- I'm sorry, but I am unable to comply." }], "stop", 11),
+  "markup-only": (model) => response(model, [{ type: "text", text: "###\n---\n```\n```" }], "stop", 11),
+  "empty template": (model) => response(model, [{ type: "text", text: "# Summary\n## Progress\nNone.\n## Next steps\nN/A" }], "stop", 11),
   "refusal block": (model) => response(model, [{ type: "refusal", refusal: "Declined." }], "stop", 11),
   truncated: (model) => response(model, [{ type: "text", text: "<bello_context_summary>cut short" }], "length", 11),
   "token-limit stop": (model) => response(model, [{ type: "text", text: "A complete-looking summary." }], "max_tokens", 11),

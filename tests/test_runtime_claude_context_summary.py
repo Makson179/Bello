@@ -161,6 +161,10 @@ JSON_HOSTILE = (
     ("Task: ship it\nStatus: parser fixed\nRemaining work: run the suite", None, "plain_text"),
     ("# Handoff\n### 1. Goals\nship it\n### 2. Current state\nparser fixed\n### 3. Next steps (in order)\nrun",
      None, "plain_text"),
+    ("I cannot run the integration test because the database is unavailable.", None, "plain_text"),
+    ("I am unable to read src/config.json because the filesystem returned permission denied.", None, "plain_text"),
+    ("I'm sorry, the integration test could not run because the database is unavailable.", None, "plain_text"),
+    ("I will not rerun the failed migration until the database schema is restored.", None, "plain_text"),
 ])
 def test_plain_text_handoff_is_accepted_as_written(raw, expected, form):
     message = result(raw)
@@ -205,6 +209,9 @@ REFUSAL_PADDED_WITH_HEADINGS = (
     ("I'm sorry, but I can't summarize this conversation.", "refused", {"contentRefusal": True}),
     ("Sorry, I cannot help with that.", "refused", {"contentRefusal": True}),
     ("I\u2019m sorry, but I can\u2019t summarize this conversation.", "refused", {"contentRefusal": True}),
+    ("I am unable to provide a summary of this conversation.", "refused", {"contentRefusal": True}),
+    ("I'm sorry.", "refused", {"contentRefusal": True}),
+    ("I won't do that.", "refused", {"contentRefusal": True}),
     # Refusal-only output is rejected even when padded with any headings.
     (REFUSAL_PADDED_WITH_HEADINGS, "refused", {"contentRefusal": True}),
     ("# Handoff summary\n**Status:** I'm unable to summarize this history.\n- I will not continue the task.",

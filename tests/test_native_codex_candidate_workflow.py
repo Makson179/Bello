@@ -10,8 +10,9 @@ from tests.test_native_codex_windows_workflow import _action, _block, _field, _m
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BRANCH = "codex/072-recovery-validation"
+BRANCH = "codex/080-production-ready"
 REF = f"refs/heads/{BRANCH}"
+STALE_BRANCH = "codex/072-recovery-validation"
 WORKFLOW = ROOT / ".github/workflows/native-codex-candidate.yml"
 UPSTREAM = "979011409de0a60b52f179721948e65531d26144"
 
@@ -38,6 +39,9 @@ def test_exact_branch_push_and_guarded_dispatch_never_publish(workflow):
     assert re.search(r"^  workflow_dispatch:\s*$", triggers, re.M)
     assert not re.search(r"\b(paths|paths-ignore|pull_request|workflow_call):", triggers)
     assert _field(_block(workflow, "permissions"), "contents") == "read"
+    # Same-run artifacts only: nothing reads other runs' artifact metadata.
+    assert re.findall(r"^\s+([a-z-]+):", _block(workflow, "permissions"), re.M) == ["contents"]
+    assert STALE_BRANCH not in workflow and "recovery-validation" not in workflow
     assert _field(_block(workflow, "concurrency"), "cancel-in-progress") == "false"
     jobs = _jobs(workflow)
     assert set(jobs) == {"linux-build", "windows-build", "linux-proof", "windows-proof"}
@@ -56,10 +60,15 @@ def test_requested_branch_keeps_general_gates_and_excludes_only_legacy_native_pr
         workflow = (ROOT / ".github/workflows" / filename).read_text(encoding="utf-8")
         push = _block(_block(workflow, "on"), "push")
         assert BRANCH in _branches(push), filename
+        assert STALE_BRANCH not in workflow, filename
         assert "paths:" not in push and "paths-ignore:" not in push
+        triggers = _block(workflow, "on")
+        assert re.search(r"^  workflow_dispatch:\s*$", triggers, re.M), filename
+        assert re.search(r"^  pull_request:\s*$", triggers, re.M), filename
     for platform in ("linux", "windows"):
         workflow = (ROOT / f".github/workflows/native-codex-{platform}.yml").read_text(encoding="utf-8")
         branches = _branches(_block(_block(workflow, "on"), "push"))
+        assert STALE_BRANCH not in branches and f"!{STALE_BRANCH}" not in branches
         assert branches[:2] == ["mystery", "codex/**"]
         assert branches[-1] == f"!{BRANCH}"
         expected = {f"!{BRANCH}"}
@@ -70,6 +79,16 @@ def test_requested_branch_keeps_general_gates_and_excludes_only_legacy_native_pr
         assert _field(jobs["native-build"], "if") == f"github.ref != '{REF}'"
         assert _field(jobs["native-proof"], "if") == f"github.ref != '{REF}'"
         assert _field(jobs["native-build"], "uses") == f"./.github/workflows/native-codex-{platform}-build.yml"
+
+
+def test_general_pi_tests_use_installed_python_for_real_schema_validation():
+    workflow = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+    for name in ("linux", "native-platforms"):
+        steps = _steps(_jobs(workflow)[name])
+        python = next(step for step in steps if _action(step) == "actions/setup-python")
+        assert _field(python, "id") == "python"
+        worker = next(step for step in steps if _field(step, "name") == "Run Pi worker tests")
+        assert _field(_block(worker, "env"), "BELLO_TEST_PYTHON") == "${{ steps.python.outputs.python-path }}"
 
 
 @pytest.mark.parametrize("platform,runner,target", [
@@ -151,9 +170,10 @@ def test_real_path_and_permission_uri_rust_tests_gate_every_new_candidate_snapsh
     steps = _steps(_jobs(workflow)[f"{platform}-build"])
     commands = [_field(step, "run") or "" for step in steps]
     indices = [i for i, command in enumerate(commands) if "cargo test" in command]
-    assert len(indices) == 2
+    assert len(indices) == 3
     packages = ["codex-utils-path-uri --lib",
-                "codex-protocol --lib bello_permission_path_roundtrip"]
+                "codex-protocol --lib bello_permission_path_roundtrip",
+                "codex-core --lib -j 3 -- bello native_async native_selection native_steer_generation"]
     snapshot = next(i for i, command in enumerate(commands) if " snapshot-build " in command)
     prepare = next(i for i, command in enumerate(commands) if " prepare " in command)
     for test_index, package in zip(indices, packages, strict=True):
@@ -214,14 +234,19 @@ def test_proof_verifies_before_execution_runs_real_cpu_models_and_retains_only_b
         if _action(step) == "actions/checkout":
             assert _field(_block(step, "with"), "repository") is None
     uploads = [step for step in steps if _action(step) == "actions/upload-artifact"]
-    assert len(uploads) == 1 and _field(uploads[0], "if") == "always()"
-    settings = _block(uploads[0], "with")
+    # Qualified archive (only after every gate), then the two bounded-receipt
+    # uploads that survive failure. The archive is never an installer pin.
+    assert [_field(step, "if") for step in uploads] == [None, "always()", "always()"]
+    receipts = uploads[1]
+    assert "-proof-" in _field(_block(receipts, "with"), "name")
+    assert "installed" not in _field(_block(receipts, "with"), "name")
+    settings = _block(receipts, "with")
     assert _field(settings, "overwrite") is None
     paths = _field(settings, "path").splitlines()
     assert set(paths) == {"native-candidate/native-build-receipt.json", "native-candidate/BUILD-INFO",
         "native-candidate-tests.xml", "candidate-proof/qualification.json",
         "candidate-proof/worker/qualification.json", "candidate-proof/worker/*/report.json",
-        "candidate-proof/worker/*/*/result.json"}
+        "candidate-proof/worker/*/*/result.json", "candidate-proof/worker/context/*/receipt.json"}
     assert all("**" not in path for path in paths)
     if platform == "windows":
         assert "matrix.os" in _field(settings, "name") and "matrix.python" in _field(settings, "name")

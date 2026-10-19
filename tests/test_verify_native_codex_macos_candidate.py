@@ -38,6 +38,10 @@ def harness(tmp_path, monkeypatch):
         if name == "history":
             (output / "case").mkdir()
             proof.common.write_report(output / "case/result.json", case("persistent_direct"))
+        if name == "context":
+            for row in report["results"]:
+                (output / row["case"]).mkdir()
+                proof.common.write_report(output / row["case"] / "receipt.json", row)
         return report
     monkeypatch.setattr(proof.build, "require_platform", lambda *args: None)
     monkeypatch.setattr(proof.build, "verify_build", verify)
@@ -60,7 +64,9 @@ async def test_complete_worker_is_not_a_guardian_or_full_tree_claim(harness, tmp
     assert report["proofs"]["history"]["cases"] == 1
     if modernbert:
         assert report["proofs"]["modernbert"]["cases"] == 6
-    assert harness.calls == ["selection", "async", "history"] + (["modernbert"] if modernbert else [])
+    assert harness.calls == ["selection", "async", "history", "context"] + (["modernbert"] if modernbert else [])
+    assert report["proofs"]["context"]["cases"] == 8
+    assert len(report["proofs"]["context"]["case_results"]) == 8
     assert dict(os.environ) == before and "secret-do-not-forward" not in json.dumps(report)
 
 
