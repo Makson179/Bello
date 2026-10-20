@@ -1,20 +1,21 @@
 name: Published Native Codex 0.161 release qualification
 
-# Push qualification starts only after the separately published native assets
-# and their verified immutable hashes have been promoted into the installer.
-# This workflow never builds or publishes an artifact.
+# POST-PUBLICATION gate, started by hand only. It downloads the archives that the
+# installer pins name through the normal HTTPS downloader and repeats every proof.
+# It therefore qualifies the pinned helper, never an unpublished candidate: until
+# the rebuilt archives are published and the pins promoted, the pins still name the
+# previous helper and a green run would say nothing about 0.8.0. There is no push
+# trigger. Dispatch on the candidate branch only after the separately authorized
+# helper publication, exact installer pin update and audited release ledger.
+# It builds a Bello wheel after native qualification, but never rebuilds the Codex
+# helper or publishes anything; a local-archive proof cannot replace HTTPS proof.
 on:
-  push:
-    branches: ['codex/072-recovery-validation']
-    paths:
-      - 'supervisor/runtime/native_codex_install.py'
-      - '.github/workflows/native-codex-release-download.yml'
-      - 'scripts/release_native_codex_candidate.py'
-      - 'tests/test_native_codex_install.py'
-      - 'tests/test_release_native_codex_candidate.py'
-      - 'tests/test_native_codex_release_workflow.py'
-      - 'tests/test_native_codex_download_transport.py'
   workflow_dispatch:
+    inputs:
+      helper_release_ledger:
+        description: 'Repository-relative audited public helper ledger, populated from qualified published assets'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -62,7 +63,7 @@ jobs:
           fi
           python -m pip install -e '.[log-distiller,test]'
       - name: Test published release verifier contracts
-        run: python -m pytest -q tests/test_release_native_codex_candidate.py tests/test_native_codex_release_workflow.py tests/test_native_codex_install.py tests/test_native_codex_download_transport.py
+        run: python -m pytest -q tests/test_release_native_codex_candidate.py tests/test_native_codex_release_workflow.py tests/test_native_codex_install.py tests/test_native_codex_download_transport.py tests/test_installed_wheel_default_smoke.py
       - name: Cold production HTTPS install and full actual installed native qualification
         run: |
           if [[ "$RUNNER_OS" == 'Windows' ]]; then
@@ -74,6 +75,72 @@ jobs:
             --target ${{ matrix.target }} \
             --runtime-root "$runtime_parent/bello-0161-published-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
             --output "$RUNNER_TEMP/published-release-proof" --modernbert
+      - uses: dtolnay/rust-toolchain@1.98.1
+        if: runner.os == 'Windows'
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build exact post-pin wheel and verify its isolated default HTTPS helper
+        env:
+          HELPER_RELEASE_LEDGER: ${{ inputs.helper_release_ledger }}
+          PRODUCT_SOURCE_SHA: ${{ github.sha }}
+          NATIVE_TARGET: ${{ matrix.target }}
+        run: |
+          python -m pip install build
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import shutil
+          import subprocess
+          import sys
+
+          root = Path.cwd().resolve()
+          source_sha = os.environ["PRODUCT_SOURCE_SHA"]
+          if subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() != source_sha:
+              raise SystemExit("Wheel checkout differs from the workflow SHA")
+          subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], check=True)
+          relative = PurePosixPath(os.environ["HELPER_RELEASE_LEDGER"])
+          if relative.is_absolute() or not relative.parts or ".." in relative.parts or "\\" in str(relative):
+              raise SystemExit("Helper ledger must be a repository-relative path")
+          ledger = root.joinpath(*relative.parts)
+          if not ledger.is_file() or any(path.is_symlink() for path in (ledger, *ledger.parents)) or not ledger.resolve().is_relative_to(root):
+              raise SystemExit("Helper ledger must be an ordinary file in the checked-out source")
+          subprocess.run(["git", "ls-files", "--error-unmatch", "--", str(relative)], check=True, stdout=subprocess.DEVNULL)
+          build = Path(os.environ["RUNNER_TEMP"]) / "installed-wheel-build"
+          build.mkdir(exist_ok=False)
+          subprocess.run([sys.executable, "-m", "build", "--wheel", "--outdir", str(build)], check=True)
+          wheels = list(build.glob("*.whl"))
+          expected_tag = "-py3-none-win_amd64.whl" if os.name == "nt" else "-py3-none-any.whl"
+          if len(wheels) != 1 or not wheels[0].name.endswith(expected_tag):
+              raise SystemExit("Expected one wheel for the actual platform")
+          subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], check=True)
+          wheel = wheels[0]
+          runtime_parent = Path(os.environ["LOCALAPPDATA"] if os.name == "nt" else os.environ["RUNNER_TEMP"])
+          suffix = os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+          output = runtime_parent / ("bello-wheel-default-" + suffix)
+          bounded = Path(os.environ["RUNNER_TEMP"]) / "installed-wheel-proof"
+          bounded.mkdir(exist_ok=False)
+          identity = {"source_sha": source_sha, "target": os.environ["NATIVE_TARGET"],
+                      "wheel": wheel.name, "wheel_sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+                      "helper_release_ledger_sha256": hashlib.sha256(ledger.read_bytes()).hexdigest()}
+          (bounded / "wheel.json").write_text(json.dumps(identity, indent=2) + "\n", encoding="utf-8")
+          try:
+              subprocess.run([sys.executable, "-I", "-B", str(root / "scripts/installed_wheel_default_smoke/prepare.py"),
+                  "--wheel", str(wheel), "--helper-ledger", str(ledger), "--target", os.environ["NATIVE_TARGET"],
+                  "--source-sha", source_sha, "--published-proof", str(Path(os.environ["RUNNER_TEMP"]) / "published-release-proof"),
+                  "--published-runtime-root", str(runtime_parent / ("bello-0161-published-" + suffix)),
+                  "--output", str(output)], check=True)
+              prepared = json.loads((output / "preparation.json").read_text(encoding="utf-8"))
+              if prepared.get("passed") is not True:
+                  raise SystemExit("Isolated wheel preparation failed")
+              subprocess.run(prepared["driver_command"], cwd=output / "work", check=True)
+          finally:
+              for source, name in ((output / "preparation.json", "preparation.json"),
+                                   (output / "delivery-proof/RESULT.json", "RESULT.json")):
+                  if source.is_file():
+                      shutil.copyfile(source, bounded / name)
+          PY
       - name: Preserve bounded public receipts even on failure
         if: always()
         uses: actions/upload-artifact@v4
@@ -84,5 +151,17 @@ jobs:
             ${{ runner.temp }}/published-release-proof/worker/report.json
             ${{ runner.temp }}/published-release-proof/worker/*/report.json
             ${{ runner.temp }}/published-release-proof/worker/*/*/result.json
+            ${{ runner.temp }}/published-release-proof/worker/context/*/receipt.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Preserve bounded installed-wheel default-delivery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-codex-0161-wheel-default-${{ matrix.os }}-py${{ matrix.python }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/installed-wheel-proof/wheel.json
+            ${{ runner.temp }}/installed-wheel-proof/preparation.json
+            ${{ runner.temp }}/installed-wheel-proof/RESULT.json
           if-no-files-found: warn
           retention-days: 14

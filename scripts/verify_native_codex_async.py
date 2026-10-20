@@ -23,7 +23,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts.verify_native_codex_selection import (
-    CASES, LIMIT, NativeSession, decode_body, isolated_environment, provision_windows_sandbox,
+    CASES, LIMIT, NativeSession, WindowsSetupFailure, decode_body, isolated_environment, provision_windows_sandbox,
     run_case as verify_selection_case,
     windows_permission_params, windows_shell,
 )
@@ -147,12 +147,24 @@ def unique_tool_resolutions(request):
     return len(ids) == len(set(ids))
 
 
+def completion_batching_proof(requests):
+    """Long sibling calls must arrive together without an intermediate inference."""
+    markers = ("ASYNC_FAST_DONE", "ASYNC_MIDDLE_DONE", "ASYNC_SLOW_DONE")
+    return (len(requests) == 2
+            and requests[1].get("input", [])[:len(requests[0].get("input", []))] == requests[0].get("input", [])
+            and all(delivered(requests[0], marker) == 0 for marker in markers)
+            and all(delivered(requests[1], marker) == 1 for marker in markers)
+            and all(unique_tool_resolutions(request) for request in requests))
+
+
 class ScriptedProvider:
-    def __init__(self, *, enabled, code, child_wait=False, interrupt_probe=False, workspace=None):
+    def __init__(self, *, enabled, code, child_wait=False, interrupt_probe=False, workspace=None,
+                 completion_batching=False):
         self.enabled, self.code = enabled, code
         self.child_wait = child_wait
         self.interrupt_probe = interrupt_probe
         self.workspace = workspace
+        self.completion_batching = completion_batching
         self.slow_seconds = 12 if os.name == "nt" else 2.5
         if interrupt_probe and os.name != "nt":
             self.slow_seconds = 5
@@ -210,6 +222,17 @@ class ScriptedProvider:
         followup = self.interrupt_followup(request) if self.interrupt_probe else None
         if followup is not None:
             items = followup
+        elif number == 1 and self.completion_batching:
+            items = []
+            for index, marker in enumerate(("ASYNC_FAST_DONE", "ASYNC_MIDDLE_DONE", "ASYNC_SLOW_DONE")):
+                seconds = self.slow_seconds + index * 0.2
+                command = f"sleep {seconds}; printf {marker}"
+                shell = {}
+                if os.name == "nt":
+                    command = f"Start-Sleep -Milliseconds {round(seconds * 1000)}; [Console]::Out.Write('{marker}')"
+                    shell = {"shell": windows_shell()}
+                items.append(tool(f"cluster-{index}", "exec_command", {
+                    "cmd": command, "yield_time_ms": 1, "max_output_tokens": 200, "login": False, **shell}))
         elif number == 1:
             command = f"sleep {self.slow_seconds}; printf ASYNC_SLOW_DONE"
             fast_command = "printf ASYNC_FAST_DONE"
@@ -328,13 +351,15 @@ class ChildWaitSession(NativeSession):
         await super().close(output)
 
 
-async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, signal=None, child_wait=False):
+async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, signal=None, child_wait=False,
+                      completion_batching=False):
     output.mkdir(parents=True, exist_ok=False)
     home, workspace = output / "empty-home", output / "work"
     home.mkdir()
     workspace.mkdir()
     provider = ScriptedProvider(enabled=enabled, code=code, child_wait=child_wait,
-                                interrupt_probe=signal == "interrupt", workspace=workspace)
+                                interrupt_probe=signal == "interrupt", workspace=workspace,
+                                completion_batching=completion_batching)
     server = ThreadingHTTPServer(("127.0.0.1", 0), provider.handler())
     server.daemon_threads = True
     worker = threading.Thread(target=server.serve_forever, daemon=True)
@@ -349,6 +374,7 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
         'request_max_retries = 0\nstream_max_retries = 0\n')
     session = ChildWaitSession(binary, home, isolated_environment(home, binary, port, {}), wait_seconds=provider.slow_seconds)
     failure = None
+    setup_failure = None
     interrupted = False
     interrupted_command_started = False
     requests_at_interrupt = None
@@ -433,6 +459,8 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
             await session.complete(reply["thread"]["id"], timeout=60)
     except Exception as error:
         failure = type(error).__name__ + ": " + str(error)
+        if isinstance(error, WindowsSetupFailure):
+            setup_failure = error.diagnostic
     finally:
         await session.close(output)
         await asyncio.to_thread(server.shutdown)
@@ -443,7 +471,7 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
     terminal = bool(provider.requests and delivered(provider.requests[-1], "ASYNC_SLOW_DONE") == 1)
     fast_delivered = code or bool(provider.requests and delivered(provider.requests[-1], "ASYNC_FAST_DONE") == 1)
     unique_resolutions = all(unique_tool_resolutions(request) for request in provider.requests)
-    expected_requests = 2 if code else 3
+    expected_requests = 2 if code or completion_batching else 3
     prefix_stable = all(right.get("input", [])[:len(left.get("input", []))] == left.get("input", [])
                         for left, right in zip(provider.requests[1:], provider.requests[2:]))
     if signal == "interrupt":
@@ -481,6 +509,8 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
                   and resumed_same_thread and resume_output_delivered and sibling_scope_preserved)
     elif enabled:
         passed &= no_polls and prefix_stable
+        if completion_batching:
+            passed &= completion_batching_proof(provider.requests)
         if signal == "steer":
             passed &= steer_wakeup_proof(provider.requests, provider.times, provider.slow_seconds)
         else:
@@ -492,7 +522,8 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
         passed &= not no_polls
     return {"case": output.name, "enabled": enabled, "code_mode": code, "signal": signal,
             "interrupted": interrupted, "child_wait": child_wait,
-            "passed": bool(passed), "failure": failure,
+            "completion_batching": completion_batching,
+            "passed": bool(passed), "failure": failure, "windows_setup_failure": setup_failure,
             "provider_errors": provider.errors, "provider_requests": len(provider.requests),
             "rejected_network_requests": provider.rejected, "external_proxy_requests_forwarded": 0,
             "tools": provider.tools, "prefix_stable": prefix_stable, "terminal_output_delivered": terminal,
@@ -529,6 +560,10 @@ async def verify(binary, output, *, concurrency_repeats=1):
     result = await verify_case(binary, output / "child_wait", enabled=True, code=False, child_wait=True)
     results.append(result)
     print(json.dumps({"case": "child_wait", **result}), flush=True)
+    result = await verify_case(binary, output / "completion_batching", enabled=True, code=False,
+                               completion_batching=True)
+    results.append(result)
+    print(json.dumps({"case": "completion_batching", **result}), flush=True)
     for case in (item for item in CASES if item.name in {"direct_on", "code_on"}):
         name = "async_and_selection_" + case.mode
         result = {**await verify_selection_case(binary, case, output / name, async_tools=True),

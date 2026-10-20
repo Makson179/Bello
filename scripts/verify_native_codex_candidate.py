@@ -30,14 +30,21 @@ SCHEMA = "bello.native-codex-candidate-qualification.v1"
 SELECTION_CASES = {"direct_off", "direct_on", "code_off", "code_on", "poll_off", "poll_on",
                    "missing_focus", "task_protected", "help_protected"}
 ASYNC_CASES = {"direct_off", "direct_on", "code_off", "code_on", "steer", "interrupt",
-               "code_interrupt", "child_wait", "async_and_selection_direct", "async_and_selection_code",
+               "code_interrupt", "child_wait", "async_and_selection_direct", "async_and_selection_code", "completion_batching",
                "direct_on_repeat_2", "steer_repeat_2", "direct_on_repeat_3", "steer_repeat_3"}
 MODERNBERT_CASES = {"short_cold", "short_warm", "long_cold", "long_warm", "task_protected", "help_protected"}
+CONTEXT_CASES = {"on", "off", "empty", "truncated", "refused", "oversized", "legacy", "pending"}
+CONTEXT_CHECKS = {"outcome", "prefix_unchanged", "same_model_settings", "summary_tools_disabled",
+    "summary_request_is_plain_text", "summary_prompt_names_character_target", "call_result_pairs_intact",
+    "append_only_between_compactions", "one_current_summary", "latest_correction_preserved",
+    "whole_oversized_latest_round_retained", "retained_native_blocks_unchanged", "commands_executed_once",
+    "raw_history_archived_privately", "pending_tool_survives_summary"}
 PROOF_INPUTS = (
     "scripts/verify_native_codex_candidate.py", "scripts/build_native_codex_candidate.py",
     "scripts/prepare_native_codex_candidate.py", "scripts/prepare_native_codex_windows.py",
     "scripts/native-codex-0.161.0.patch", "scripts/verify_native_codex_selection.py",
     "scripts/verify_native_codex_async.py", "scripts/verify_native_codex_history.py",
+    "scripts/verify_native_codex_context.py",
     "scripts/verify_windows_modernbert.py", "scripts/verify_windows_modernbert_live.py",
     "scripts/build_native_codex_linux.py", "supervisor/runtime/codex_distiller.py",
     "supervisor/runtime/distiller.py", "supervisor/runtime/distiller_worker.py",
@@ -81,7 +88,7 @@ def proof_inputs() -> dict[str, str]:
 
 def case_results(output: Path) -> dict[str, str]:
     return {str(path.relative_to(output)).replace(os.sep, "/"): sha256(path)
-            for path in sorted(output.rglob("result.json"))}
+            for path in sorted([*output.rglob("result.json"), *output.rglob("receipt.json")])}
 
 
 def native_version(binary: Path) -> dict:
@@ -157,7 +164,7 @@ def validate_cases(report: dict, field: str, expected: set[str]) -> None:
 def validate_proof(name: str, report: dict, output: Path, binary: Path, target: str) -> None:
     schemas = {"selection": "bello.native-selection-provider-proof.v1",
         "async": "bello.native-async-smoke.v1", "history": "bello.native-persistent-history-smoke.v1",
-        "modernbert": "bello.candidate-real-modernbert-proof.v1"}
+        "modernbert": "bello.candidate-real-modernbert-proof.v1", "context": "bello.native-context-smoke.v1"}
     if name == "sandbox":
         from scripts.build_native_codex_linux import validate_sandbox_proof
         validate_sandbox_proof(report, binary)
@@ -175,6 +182,38 @@ def validate_proof(name: str, report: dict, output: Path, binary: Path, target: 
         validate_cases(report, "results", ASYNC_CASES)
         if report.get("on_off_native_instructions_identical") is not True:
             raise ValueError("Native instruction preservation was not proven")
+    elif name == "context":
+        if (report.get("passed") is not True or not _zero(report.get("paid_model_calls"))
+                or report.get("binary_sha256") != sha256(binary)
+                or report.get("binary_unchanged") is not True):
+            raise ValueError("Context proof is not bound to the unchanged candidate binary")
+        rows = report.get("results")
+        if (not isinstance(rows, list) or len(rows) != len(CONTEXT_CASES)
+                or any(not isinstance(row, dict) for row in rows)
+                or {row.get("case") for row in rows} != CONTEXT_CASES):
+            raise ValueError("Context proof requires all eight distinct cases")
+        for row in rows:
+            label = row["case"]
+            failure = label if label in {"empty", "truncated", "refused", "oversized"} else None
+            checks = row.get("checks")
+            if (row.get("passed") is not True or not isinstance(checks, dict)
+                    or set(checks) != CONTEXT_CHECKS or any(value is not True for value in checks.values())
+                    or row.get("failure") is not None or row.get("resumed") is not True
+                    or any(not _zero(row.get(key)) for key in ("provider_errors", "blocked_external_requests", "paid_model_calls"))
+                    or type(row.get("regular_requests")) is not int or row["regular_requests"] <= 0
+                    or type(row.get("summary_requests")) is not int or row["summary_requests"] < 0
+                    or row.get("enabled") is not (label != "off")
+                    or row.get("pending_async") is not (label == "pending")
+                    or row.get("legacy_envelope") is not (label == "legacy")
+                    or row.get("summary_failure") != failure
+                    or row.get("turn_status") != ("failed" if failure else "completed")):
+                raise ValueError("Context case lacks complete safe execution evidence")
+            count = row["summary_requests"]
+            if ((label == "off" and count != 0) or (failure and count != 2)
+                    or (label != "off" and not failure and count < 2)):
+                raise ValueError("Context case did not exercise the expected repeated compression or rollback")
+            if read_report(output / label / "receipt.json") != row:
+                raise ValueError("Context case receipt differs from its aggregate")
     elif name == "history":
         if (report.get("passed") is not True or not _zero(report.get("paid_model_calls"))
                 or report.get("provider_passed") is not True or report.get("exact_selected_history_match") is not True
@@ -246,6 +285,9 @@ async def run_proof(name: str, binary: Path, output: Path) -> dict:
         from scripts.verify_native_codex_history import verify
         output.mkdir(parents=True, exist_ok=False)
         return await verify(binary, output)
+    if name == "context":
+        from scripts.verify_native_codex_context import verify
+        return await verify(binary, output)
     if name == "sandbox":
         from scripts.build_native_codex_linux import sandbox_proof
         return sandbox_proof(binary, output)
@@ -273,7 +315,7 @@ async def qualify(candidate: Path, target: str, output: Path, *, modernbert: boo
         binary = candidate / "bin" / ("codex.exe" if target == "windows-x64" else "codex")
         report.update(build_receipt_sha256=receipt_hash, build_identity=before["identity"],
                       candidate_files=before["files"], proof_inputs=scripts, binary_sha256=sha256(binary))
-        names = ["selection", "async", "history"] + (["sandbox"] if target == "linux-x64" else [])
+        names = ["selection", "async", "history", "context"] + (["sandbox"] if target == "linux-x64" else [])
         if modernbert:
             names.append("modernbert")
         with isolated_environment(output):
@@ -400,7 +442,7 @@ def guarded_qualification(candidate: Path, target: str, output: Path, *, modernb
                 or child.get("proof_inputs") != proof_inputs()
                 or child.get("build_receipt_sha256") != sha256(candidate / "native-build-receipt.json")):
             raise ValueError("Worker proof and guardian finalization must both pass unchanged")
-        expected = {"selection", "async", "history"} | ({"sandbox"} if target == "linux-x64" else set()) | ({"modernbert"} if modernbert else set())
+        expected = {"selection", "async", "history", "context"} | ({"sandbox"} if target == "linux-x64" else set()) | ({"modernbert"} if modernbert else set())
         if set(child.get("proofs", {})) != expected or child.get("native_version", {}).get("version") != "0.161.0":
             raise ValueError("Worker did not prove the full requested candidate suite")
         binary = candidate / "bin" / ("codex.exe" if target == "windows-x64" else "codex")

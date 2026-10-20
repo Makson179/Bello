@@ -34,24 +34,24 @@ class NativeBundle:
 BUNDLES: dict[tuple[str, str], NativeBundle] = {
     ("Linux", "x86_64"): NativeBundle(
         url=("https://github.com/Makson179/Bello/releases/download/"
-             "native-codex-0.161.0-smart-execution-v1/"
+             "native-codex-0.161.0-nnc-se-20261019/"
              "bello-native-codex-0.161.0-x86_64-unknown-linux-gnu.tar.gz"),
-        archive_sha256="1a7bceded0ba7e8134f55a5af048dae387b82e14946d0b87faefda2ce1c41865",
-        manifest_sha256="f6f0c751e01493869f87a5330b3e5818f342491691e3d1d166d338f652e1bf6a",
+        archive_sha256="dace587b72401effc572d5702d670da95fee08f79f808c5ae01e02a6032e513a",
+        manifest_sha256="73bb2613cd29a2a799713c7098c8a28fd2923fe3f705a50faf56389329ddd77b",
     ),
     ("Darwin", "arm64"): NativeBundle(
         url=("https://github.com/Makson179/Bello/releases/download/"
-             "native-codex-0.161.0-smart-execution-v1/"
+             "native-codex-0.161.0-nnc-se-20261019/"
              "bello-native-codex-0.161.0-aarch64-apple-darwin.tar.gz"),
-        archive_sha256="f68975458df96607eb26935d0703e5b788d2b59b70434ea65b4b1180170f1ea8",
-        manifest_sha256="fb8f3f30eedbc5789d7f308ca1dbc8e4dec0503b74f531bf200339024f9ad345",
+        archive_sha256="111cfe5cd8ccb7451bc439d0e61f1c0b47ab9ecbec955c0207c23eef401ecc85",
+        manifest_sha256="91d82250f699f7483f9c91b0a4d661ef544f5e23851bddf8f336a9227ae9aae6",
     ),
     ("Windows", "x86_64"): NativeBundle(
         url=("https://github.com/Makson179/Bello/releases/download/"
-             "native-codex-0.161.0-smart-execution-v1/"
+             "native-codex-0.161.0-nnc-se-20261019/"
              "bello-native-codex-0.161.0-x86_64-pc-windows-msvc.tar.gz"),
-        archive_sha256="57042f61b748ee5c8623692d75d216c63758fbc57143c5a49f9e910537bdce14",
-        manifest_sha256="a606bec1ac967a81b1b614acb9cea0db7a7a0458ff4168c6b9f210e2b193bf4e",
+        archive_sha256="135f8e721f5393ecafa0a4febd28659c0e8f2ceb5649a1028351c28b87cc2f12",
+        manifest_sha256="22e290e3adbe4b5be631885427b443c101109809daabf9859987911821cbdc36",
     ),
 }
 # Keep capability-specific pins separate: the published selection-v1 binaries do
@@ -62,24 +62,24 @@ BUNDLES: dict[tuple[str, str], NativeBundle] = {
 ASYNC_BUNDLES: dict[tuple[str, str], NativeBundle] = {
     ("Linux", "x86_64"): NativeBundle(
         url=("https://github.com/Makson179/Bello/releases/download/"
-             "native-codex-0.161.0-smart-execution-v1/"
+             "native-codex-0.161.0-nnc-se-20261019/"
              "bello-native-codex-0.161.0-x86_64-unknown-linux-gnu.tar.gz"),
-        archive_sha256="1a7bceded0ba7e8134f55a5af048dae387b82e14946d0b87faefda2ce1c41865",
-        manifest_sha256="f6f0c751e01493869f87a5330b3e5818f342491691e3d1d166d338f652e1bf6a",
+        archive_sha256="dace587b72401effc572d5702d670da95fee08f79f808c5ae01e02a6032e513a",
+        manifest_sha256="73bb2613cd29a2a799713c7098c8a28fd2923fe3f705a50faf56389329ddd77b",
     ),
     ("Darwin", "arm64"): NativeBundle(
         url=("https://github.com/Makson179/Bello/releases/download/"
-             "native-codex-0.161.0-smart-execution-v1/"
+             "native-codex-0.161.0-nnc-se-20261019/"
              "bello-native-codex-0.161.0-aarch64-apple-darwin.tar.gz"),
-        archive_sha256="f68975458df96607eb26935d0703e5b788d2b59b70434ea65b4b1180170f1ea8",
-        manifest_sha256="fb8f3f30eedbc5789d7f308ca1dbc8e4dec0503b74f531bf200339024f9ad345",
+        archive_sha256="111cfe5cd8ccb7451bc439d0e61f1c0b47ab9ecbec955c0207c23eef401ecc85",
+        manifest_sha256="91d82250f699f7483f9c91b0a4d661ef544f5e23851bddf8f336a9227ae9aae6",
     ),
     ("Windows", "x86_64"): NativeBundle(
         url=("https://github.com/Makson179/Bello/releases/download/"
-             "native-codex-0.161.0-smart-execution-v1/"
+             "native-codex-0.161.0-nnc-se-20261019/"
              "bello-native-codex-0.161.0-x86_64-pc-windows-msvc.tar.gz"),
-        archive_sha256="57042f61b748ee5c8623692d75d216c63758fbc57143c5a49f9e910537bdce14",
-        manifest_sha256="a606bec1ac967a81b1b614acb9cea0db7a7a0458ff4168c6b9f210e2b193bf4e",
+        archive_sha256="135f8e721f5393ecafa0a4febd28659c0e8f2ceb5649a1028351c28b87cc2f12",
+        manifest_sha256="22e290e3adbe4b5be631885427b443c101109809daabf9859987911821cbdc36",
     ),
 }
 _MAX_DOWNLOAD = 1024 * 1024 * 1024

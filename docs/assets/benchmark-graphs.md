@@ -18,6 +18,16 @@
   <img src="./readme-smart-execution.png" alt="Smart Execution: API-equivalent cost falls 30.19% on Sonnet 5 and 31.61% on Astra; solution time falls 50.00% and 15.06%; mean scores decrease by 3.68% and 0.74%." width="100%">
 </picture>
 
+## No Need For Context
+
+<picture>
+  <img src="./nnc-astra-xhigh-solar.png" alt="Astra XHigh Solar: mean observed passed-test fraction, historical API-equivalent cost and solver time, three attempts per setup; partial evaluation included." width="100%">
+</picture>
+
+[Measurements and settings](./nnc-astra-xhigh-solar.json). The test metric is
+observed passed tests divided by the expected suite size, including partial
+evaluation; it is not a three-run official completed-evaluation score.
+
 ## Budget C+A
 
 <picture>
@@ -39,9 +49,10 @@
 <details>
 <summary>Sources, design references, and regeneration</summary>
 
-The README uses six supplied PNG redesigns, unchanged, on all screen sizes.
+The README uses seven supplied PNG figures, unchanged, on all screen sizes.
 Their mapping is: eee1 → model comparison, eee2 → Smart Execution, eee3 →
 Efficient Budget, eee4 → Sol Ultra C+A, eee5 → Runtime-only, eee6 → distiller.
+The additional NNC figure is `nnc-astra-xhigh-solar.png`.
 
 The original SVG figures and their generator are retained as source references.
 The regeneration command below rebuilds those SVGs, not the supplied PNGs:

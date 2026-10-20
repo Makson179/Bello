@@ -1,0 +1,35 @@
+{
+  "benchmark": "Solar",
+  "model": "gpt-6-astra",
+  "effort": "xhigh",
+  "attempts_per_setup": 3,
+  "test_fraction_definition": "Observed passed tests divided by 1978 expected tests; includes partial evaluation and is not an official completed-evaluation three-run score.",
+  "raw_observed_passed": [1170, 1133, 1191],
+  "nnc_observed_passed": [1126, 1047, 1148],
+  "expected_tests_per_attempt": 1978,
+  "raw_mean_observed_pass_percent": 58.88102460397708,
+  "nnc_mean_observed_pass_percent": 55.96562184024267,
+  "raw_api_equivalent_usd": [10.082028, 9.382652, 8.64932],
+  "nnc_api_equivalent_usd": [8.573554, 7.722036, 8.085996],
+  "raw_mean_api_equivalent_usd": 9.371333333333334,
+  "nnc_mean_api_equivalent_usd": 8.127195333333333,
+  "raw_mean_solver_seconds": 1880.0571507946652,
+  "nnc_mean_solver_seconds": 1665.1137850669995,
+  "nnc_settings": {
+    "threshold_tokens": 75000,
+    "retain_percent": 13.333333333333334,
+    "soft_recent_tail_tokens": 10000,
+    "other_bello_features": "off"
+  },
+  "historical_api_equivalent_rates_per_million": {
+    "uncached_input": 10,
+    "cached_input": 1,
+    "cache_write_input": 12.5,
+    "output": 50
+  },
+  "cost_scope": "Observed completed-response usage; summaries included once. Historical API equivalent, not subscription charges, current pricing or server costs.",
+  "time_scope": "Solver container time only; excludes setup, evaluation and waiting.",
+  "comparison_scope": "Historical pilot using different runtime builds; not a controlled same-build A/B experiment.",
+  "source_report_sha256": "5c2e30c04d321d1b29f126cc6032c16b65d13040044723444a1a8e2e7f11094d",
+  "chart_sha256": "5dbb0fddb633b7eafa34276b0fd7154d1a34551f6d8825844fbeca4de4678821"
+}

@@ -13,6 +13,8 @@ permissions:
 
 jobs:
   windows-history:
+    # Published-pin diagnostic: refused on the unpublished 0.8.0 candidate branch.
+    if: github.ref != 'refs/heads/codex/080-production-ready'
     runs-on: windows-2025
     timeout-minutes: 15
     defaults:

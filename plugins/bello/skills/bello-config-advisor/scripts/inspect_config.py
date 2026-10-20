@@ -7,6 +7,7 @@ import argparse
 import copy
 import ctypes
 import json
+import math
 import os
 import re
 import shutil
@@ -19,7 +20,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from inspect_models import qualified_model
 
-TARGET_VERSION = "0.7.2"
+TARGET_VERSION = "0.8.0"
 ACTIVE_STATUSES = {"starting", "running", "paused", "restarting"}
 TERMINAL_STATUSES = {"complete", "escalated", "stuck", "provider_failure", "exited"}
 LEGACY_MODELS = {"gpt-6-astra", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.5"}
@@ -175,10 +176,18 @@ def _normalize(payload: dict[str, Any], *, config_exists: bool) -> dict[str, Any
         {"enabled": raw_distiller.get("enabled", False), "model_path": raw_distiller.get("model_path")}
         if isinstance(raw_distiller, dict) else copy.deepcopy(raw_distiller)
     )
+    raw_context = payload.get("no_need_for_context", {})
+    no_need_for_context = (
+        {"enabled": raw_context.get("enabled", False),
+         "threshold_tokens": raw_context.get("threshold_tokens", 200000),
+         "retain_percent": raw_context.get("retain_percent", 10)}
+        if isinstance(raw_context, dict) else copy.deepcopy(raw_context)
+    )
 
     return {
         "review_limit_format": "explicit",
         "task": _optional_nonempty_string(_first(payload, ("task", "task_path"), None, skip_none=True)),
+        "goal": payload.get("goal", False),
         "coder_mod": coder_model,
         "revision_coder_enabled": payload.get("revision_coder_enabled", False),
         "revision_coder_mod": revision_coder_model,
@@ -198,7 +207,9 @@ def _normalize(payload: dict[str, Any], *, config_exists: bool) -> dict[str, Any
         ),
         "speed": speed,
         "runtime_enabled": payload.get("runtime_enabled", True),
-        "async_tools": payload.get("async_tools", False),
+        # Smart Execution defaults on for configs without the key; an explicit false is kept.
+        "async_tools": payload.get("async_tools", True),
+        "no_need_for_context": no_need_for_context,
         "windows_native_root_read": payload.get("windows_native_root_read", False),
         "cheap_runtime": _first(payload, ("cheap_runtime", "cheap_runtime_enabled"), True),
         "log_distiller": log_distiller,
@@ -303,6 +314,7 @@ def _source_config_errors(payload: dict[str, Any], current: dict[str, Any], *, c
     if payload.get("speed") is None and "fast" in payload and not isinstance(payload["fast"], bool):
         errors.append("fast must be boolean")
     for field in (
+        "goal",
         "revision_coder_enabled",
         "runtime_enabled",
         "async_tools",
@@ -316,6 +328,18 @@ def _source_config_errors(payload: dict[str, Any], current: dict[str, Any], *, c
         if not isinstance(current[field], bool):
             errors.append(f"{field} must be boolean")
     distiller = current["log_distiller"]
+    context = current["no_need_for_context"]
+    raw_context = payload.get("no_need_for_context", {})
+    if not isinstance(raw_context, dict) or set(raw_context) - {"enabled", "threshold_tokens", "retain_percent"}:
+        errors.append("no_need_for_context must contain only enabled, threshold_tokens and retain_percent")
+    if isinstance(context, dict):
+        if type(context["enabled"]) is not bool:
+            errors.append("no_need_for_context.enabled must be boolean")
+        if not _is_int(context["threshold_tokens"]) or context["threshold_tokens"] <= 0:
+            errors.append("no_need_for_context.threshold_tokens must be a positive integer")
+        percent = context["retain_percent"]
+        if type(percent) not in (int, float) or not 0 < percent <= 50 or not math.isfinite(percent):
+            errors.append("no_need_for_context.retain_percent must be a finite number greater than 0 and at most 50")
     raw_distiller = payload.get("log_distiller", {})
     if not isinstance(raw_distiller, dict) or set(raw_distiller) - {"enabled", "model_path"}:
         errors.append("log_distiller must contain only enabled and model_path")

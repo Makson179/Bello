@@ -1,8 +1,8 @@
-name: Native Codex 0.161 release archive qualification
+name: Historical Native Codex 0.161 archive qualification
 
+# Historical artifact replay only. Current candidate qualification, packaging,
+# and local installation run together in the candidate workflows instead.
 on:
-  push:
-    branches: ['codex/072-recovery-validation']
   workflow_dispatch:
 
 permissions:
@@ -169,5 +169,6 @@ jobs:
             ${{ runner.temp }}/release-receipts/installed/worker/report.json
             ${{ runner.temp }}/release-receipts/installed/worker/*/report.json
             ${{ runner.temp }}/release-receipts/installed/worker/*/*/result.json
+            ${{ runner.temp }}/release-receipts/installed/worker/context/*/receipt.json
           if-no-files-found: warn
           retention-days: 14

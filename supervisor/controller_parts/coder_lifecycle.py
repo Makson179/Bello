@@ -70,6 +70,7 @@ class CoderLifecyclePort(CoordinatorPort):
         '_discard_uncommitted_revision_thread',
         '_fast_mode',
         '_finalizing',
+        '_goal_enabled',
         '_handle_active_coder_guard',
         '_handle_coder_turn_completed',
         '_handle_no_marker_idle',
@@ -769,7 +770,13 @@ class CoderLifecycle:
         if active_turn_id:
             self.ports._clear_persisted_coder_turn(cfg.coder_thread_id, active_turn_id)
         if start_continuation:
-            await coder.start_turn(compat.TRANSPORT_RECOVERY_CODER_PROMPT)
+            await coder.start_turn(self._transport_recovery_prompt())
+
+    def _transport_recovery_prompt(self) -> str:
+        # Goal mode repeats the brief coder guidance; otherwise the prompt is unchanged.
+        return compat.with_goal_guidance(
+            compat.TRANSPORT_RECOVERY_CODER_PROMPT, goal=self.ports._goal_enabled(),
+        )
 
     async def _start_fallback_recovery_coder(
         self,
@@ -789,6 +796,7 @@ class CoderLifecycle:
             multi_agent=self.ports._multi_agent_config(),
             plan_path=self.ports._active_coder_plan_path(),
             readonly_roots=previous.readonly_roots,
+            goal=self.ports._goal_enabled(),
         )
         self.state.coder = replacement
         new_thread_id = await replacement.start_thread()
@@ -801,7 +809,7 @@ class CoderLifecycle:
             }
         )
         if start_continuation:
-            await replacement.start_turn(compat.TRANSPORT_RECOVERY_CODER_PROMPT)
+            await replacement.start_turn(self._transport_recovery_prompt())
 
     async def fail_provider(self, message: str) -> None:
         if not self.ports.running and self.ports.store.get_bello_config().status == compat.BelloStatus.PROVIDER_FAILURE:
@@ -1080,6 +1088,7 @@ class CoderLifecycle:
             multi_agent=self.ports._multi_agent_config(),
             plan_path=self.ports._active_coder_plan_path(),
             readonly_roots=self.ports._active_dependency_roots(),
+            goal=self.ports._goal_enabled(),
         )
         await self.state.coder.start_thread()
         if (
@@ -1240,6 +1249,7 @@ class CoderLifecycle:
             multi_agent=self.ports._multi_agent_config(),
             plan_path=None,
             readonly_roots=self.ports._active_dependency_roots(),
+            goal=self.ports._goal_enabled(),
         )
         try:
             new_thread_id = await revision_coder.start_thread(persist_state=False)

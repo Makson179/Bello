@@ -69,6 +69,7 @@ class RuntimeReviewPort(CoordinatorPort):
         '_finalize_bounded_completion',
         '_finalizing',
         '_fresh_adversary_report',
+        '_goal_enabled',
         '_handle_completion_review_timeout_failure',
         '_handle_no_marker_idle',
         '_handle_supervisor_no_message_failure',
@@ -420,10 +421,15 @@ class RuntimeReview:
 
     def _update_relevant_edit_state(self, changed_files: list[compat.ChangedFile]) -> None:
         task_contents = self.ports._canonical_task_text()
+        # Goal mode's GOAL_MAP.md is the coder's own working memory, not a deliverable: updating it
+        # after the last passing validation must not make that validation stale.
+        goal_map = "GOAL_MAP.md" if self.ports._goal_enabled() else None
         relevant_sequences = [
             changed.sequence
             for changed in changed_files
-            if changed.sequence is not None and compat._is_relevant_changed_path(changed.path, task_contents=task_contents)
+            if changed.sequence is not None
+            and changed.path.replace("\\", "/").removeprefix("./") != goal_map
+            and compat._is_relevant_changed_path(changed.path, task_contents=task_contents)
         ]
         if not relevant_sequences:
             return

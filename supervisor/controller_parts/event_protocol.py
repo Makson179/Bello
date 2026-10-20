@@ -1,6 +1,8 @@
 """Controller event protocol; compatibility exports live in controller."""
 from __future__ import annotations
 
+import re
+
 from . import compat
 from .defaults import SUBAGENT_TEXT_LIMIT
 
@@ -78,7 +80,69 @@ def _format_allowed_subagent_profiles(multi_agent: compat.Any) -> str:
     )
 
 
+# Context checkpoint receipts keep only closed labels, counts and flags. Engine
+# text (messages, prompts, summaries, provider errors) is never journalled here.
+_CONTEXT_EVENTS = frozenset({"thread/contextCompacted", "thread/contextCompactionFailed"})
+_CONTEXT_INTS = frozenset({
+    "generation", "retainedRounds", "previousTokens", "projectedTokens", "configuredThresholdTokens",
+    "effectiveThresholdTokens", "consecutiveFailures", "retryAtTokens", "priorFailedCheckpoints",
+    "summarizedRounds", "freshTokens", "summaryChars", "summaryTimeoutSeconds", "summaryMaxOutputTokens",
+})
+_CONTEXT_BOOLS = frozenset({"thresholdRetriesExhausted", "originalContextContinues"})
+_CONTEXT_LABELS = frozenset({"trigger", "stage", "category", "summaryFormat", "historyRepresentation"})
+# Per-attempt diagnostics: where an attempt ended (phase, first-message and
+# response latency), how much it produced (blocks, characters, output tokens),
+# which CLI continuation stopped it, and for a rejected answer the location and
+# reason of the format failure. Counts, closed labels and model ids only.
+_ATTEMPT_INTS = frozenset({
+    "attempt", "numTurns", "apiErrorStatus", "resultChars", "responses", "assistantMessages",
+    "injectedInputs", "durationMs", "firstMessageMs", "responseMs", "inputTokensEstimate", "textBlocks",
+    "textChars", "thinkingBlocks", "outputTokens", "formatErrorAt", "formatErrorAtPercent", "summaryChars",
+    # Input admission (tokens): measured baseline, reported capacity, and the
+    # baseline + estimate + output cap + margin that had to fit.
+    "contextBaselineTokens", "contextCapacityTokens", "admissionRequiredTokens",
+})
+_ATTEMPT_BOOLS = frozenset({"retryNote", "usageReported", "cleanupError", "stopIncomplete", "structuredOutput",
+                            "resultMismatch", "syntheticMessage", "contentRefusal"})
+_ATTEMPT_LABELS = frozenset({
+    "outcome", "summaryFormat", "stopReason", "resultSubtype", "terminalReason", "assistantError", "errorType",
+    "phase", "model", "continuation", "formatError", "completionEvidence",
+})
+_CONTEXT_LABEL = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]{0,63}")
+_MAX_CONTEXT_ATTEMPTS = 4
+
+
+def _snake_case(name: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+
+def _bounded_fields(source: dict[str, compat.Any], ints: frozenset[str], bools: frozenset[str],
+                    labels: frozenset[str]) -> dict[str, compat.Any]:
+    result: dict[str, compat.Any] = {}
+    for key, value in source.items():
+        if key in ints and type(value) is int and 0 <= value <= 10**12:
+            result[_snake_case(key)] = value
+        elif key in bools and type(value) is bool:
+            result[_snake_case(key)] = value
+        elif key in labels and isinstance(value, str) and _CONTEXT_LABEL.fullmatch(value):
+            result[_snake_case(key)] = value
+    return result
+
+
+def _bounded_context_event_payload(params: dict[str, compat.Any]) -> dict[str, compat.Any]:
+    payload = _bounded_fields(params, _CONTEXT_INTS, _CONTEXT_BOOLS, _CONTEXT_LABELS)
+    attempts = params.get("attempts")
+    if isinstance(attempts, list):
+        payload["attempts"] = [
+            _bounded_fields(attempt, _ATTEMPT_INTS, _ATTEMPT_BOOLS, _ATTEMPT_LABELS)
+            for attempt in attempts[:_MAX_CONTEXT_ATTEMPTS] if isinstance(attempt, dict)
+        ]
+    return payload
+
+
 def _bounded_subagent_event_payload(method: str, params: dict[str, compat.Any]) -> dict[str, compat.Any]:
+    if method in _CONTEXT_EVENTS:
+        return _bounded_context_event_payload(params)
     if method == "thread/started":
         thread = params.get("thread")
         if not isinstance(thread, dict) or not isinstance(thread.get("parentThreadId"), str):

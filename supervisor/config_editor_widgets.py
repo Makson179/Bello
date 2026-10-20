@@ -548,6 +548,7 @@ def _parameter_icon(parameter_key: str, theme: Theme) -> str:
     if _editor._ascii_symbols(theme):
         return {
             "task": "T",
+            "goal": "G",
             "coder_mod": "C",
             "coder_mod_variant": "V",
             "revision_coder_enabled": "R",
@@ -580,6 +581,7 @@ def _parameter_icon(parameter_key: str, theme: Theme) -> str:
         }.get(parameter_key, "-")
     return {
         "task": "☑",
+        "goal": "◎",
         "coder_mod": "◇",
         "coder_mod_variant": "◇",
         "revision_coder_enabled": "↪",

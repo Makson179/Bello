@@ -51,9 +51,10 @@ def policy():
 
 
 def config():
-    result = dict(review_limit_format="explicit", task="TASK.md", speed="usual",
+    result = dict(review_limit_format="explicit", task="TASK.md", goal=False, speed="usual",
                   revision_coder_enabled=False, runtime_enabled=True, cheap_runtime=False,
                   async_tools=False, windows_native_root_read=False,
+                  no_need_for_context={"enabled": False, "threshold_tokens": 249000, "retain_percent": 10},
                   log_distiller={"enabled": False, "model_path": None}, start_over=False,
                   completion_review=True, adversary=True, max_adversary_runs=1,
                   max_completion_returns_before_adversary=1,
@@ -135,14 +136,127 @@ class CatalogTests(unittest.TestCase):
 
 
 class AdvisorValidationTests(unittest.TestCase):
-    def test_old_complete_recommendations_keep_false_opt_in_defaults(self):
+    def test_context_opt_in_roundtrip_and_strict_validation(self):
+        candidate = config()
+        candidate["no_need_for_context"] = {"enabled": True, "threshold_tokens": 100000, "retain_percent": 12.5}
+        self.assertEqual(validate(candidate), [])
+        current = INSPECTOR._normalize(candidate, config_exists=True)
+        self.assertEqual(current["no_need_for_context"], candidate["no_need_for_context"])
+        for field, invalid in (("enabled", 1), ("threshold_tokens", True), ("threshold_tokens", 0),
+                               ("retain_percent", True), ("retain_percent", 0), ("retain_percent", 51),
+                               ("retain_percent", float("nan"))):
+            bad = copy.deepcopy(candidate)
+            bad["no_need_for_context"][field] = invalid
+            self.assertTrue(any("no_need_for_context" in error for error in validate(bad)))
+            current = INSPECTOR._normalize(bad, config_exists=True)
+            self.assertTrue(any("no_need_for_context" in error for error in
+                                INSPECTOR._source_config_errors(bad, current, config_exists=True)))
+
+    def test_old_complete_recommendations_keep_documented_opt_in_defaults(self):
         candidate = config()
         candidate.pop("async_tools")
         candidate.pop("windows_native_root_read")
+        candidate.pop("no_need_for_context")
+        candidate.pop("goal")
         self.assertEqual(validate(candidate), [])
         current = INSPECTOR._normalize(candidate, config_exists=True)
-        self.assertIs(current["async_tools"], False)
+        # Smart Execution is on when the key is absent, like ProjectConfig; Goal and root-read stay off.
+        self.assertIs(current["async_tools"], True)
+        self.assertIs(current["goal"], False)
         self.assertIs(current["windows_native_root_read"], False)
+        self.assertEqual(current["no_need_for_context"], {"enabled": False, "threshold_tokens": 200000, "retain_percent": 10})
+
+    def test_context_sparse_defaults_and_explicit_legacy_threshold_match_project_config(self):
+        from supervisor.project_config import _config_from_payload
+        for threshold in (None, 249000):
+            for enabled in (False, True):
+                with self.subTest(threshold=threshold, enabled=enabled):
+                    candidate = config()
+                    candidate["no_need_for_context"] = {"enabled": enabled}
+                    if threshold is not None:
+                        candidate["no_need_for_context"]["threshold_tokens"] = threshold
+                    self.assertEqual(validate(candidate), [])
+                    expected = {"enabled": enabled, "threshold_tokens": threshold or 200000, "retain_percent": 10}
+                    self.assertEqual(INSPECTOR._normalize(candidate, config_exists=True)["no_need_for_context"], expected)
+                    self.assertEqual(_config_from_payload(candidate, path=Path("synthetic.json")).no_need_for_context.to_json_data(), expected)
+
+    def test_explicit_saved_async_off_is_preserved_and_defaults_match_project_config(self):
+        from supervisor.project_config import _config_from_payload
+        for saved, expected in ((False, False), (True, True)):
+            candidate = config()
+            candidate["async_tools"] = saved
+            self.assertEqual(validate(candidate), [])
+            self.assertIs(INSPECTOR._normalize(candidate, config_exists=True)["async_tools"], expected)
+            self.assertIs(_config_from_payload(candidate, path=Path("synthetic.json")).async_tools, expected)
+        absent = config()
+        absent.pop("async_tools")
+        self.assertIs(_config_from_payload(absent, path=Path("synthetic.json")).async_tools, True)
+        self.assertIs(INSPECTOR._normalize({}, config_exists=False)["async_tools"], True)
+        self.assertIs(INSPECTOR._normalize({}, config_exists=True)["async_tools"], True)
+
+    def test_goal_is_a_strict_optional_boolean_that_roundtrips_and_leaves_async_alone(self):
+        from supervisor.project_config import _config_from_payload
+        for goal in (False, True):
+            candidate = config()
+            candidate.update(goal=goal, async_tools=False)
+            if goal:
+                candidate.update(max_completion_returns_before_adversary="unlimited",
+                                 max_completion_returns_after_adversary="unlimited", completion_review=True)
+            self.assertEqual(validate(candidate), [])
+            current = INSPECTOR._normalize(candidate, config_exists=True)
+            self.assertIs(current["goal"], goal)
+            self.assertIs(current["async_tools"], False)
+            self.assertIs(_config_from_payload(candidate, path=Path("synthetic.json")).goal, goal)
+        for value in (0, 1, "true", None, [], {}):
+            candidate = config()
+            candidate["goal"] = value
+            self.assertIn("goal: expected boolean", validate(candidate))
+            current = INSPECTOR._normalize(candidate, config_exists=True)
+            self.assertIn("goal must be boolean", INSPECTOR._source_config_errors(
+                candidate, current, config_exists=True))
+
+    def test_goal_recommendation_must_keep_runtime_and_completion_on_and_allows_unlimited(self):
+        message = "goal: requires runtime_enabled=true and completion_review=true"
+        candidate = config()
+        candidate.update(goal=True, runtime_enabled=False, completion_review=False,
+                         max_completion_returns_before_adversary=0, max_completion_returns_after_adversary=0)
+        self.assertIn(message, validate(candidate))
+        # Either mandatory switch alone being false is enough to reject.
+        for runtime, review in ((False, True), (True, False)):
+            single = config()
+            single.update(goal=True, runtime_enabled=runtime, completion_review=review, adversary=True,
+                          max_completion_returns_before_adversary="unlimited",
+                          max_completion_returns_after_adversary="unlimited")
+            self.assertIn(message, validate(single))
+        candidate.update(runtime_enabled=True, completion_review=True,
+                         max_completion_returns_before_adversary="unlimited",
+                         max_completion_returns_after_adversary="unlimited")
+        self.assertEqual(validate(candidate), [])
+        # Unlimited remains a cost-sensitive choice outside Goal.
+        candidate["goal"] = False
+        self.assertTrue(any("unlimited is not allowed" in error for error in validate(candidate)))
+        self.assertEqual(validate(candidate, allow_unlimited=True), [])
+
+    def test_goal_recommendation_spells_out_unlimited_returns(self):
+        candidate = config()
+        candidate.update(goal=True, adversary=True, max_adversary_runs=2)
+        for before, after, expected in (
+            (1, 0, ["goal: requires max_completion_returns_before_adversary='unlimited'",
+                    "goal: requires max_completion_returns_after_adversary='unlimited' while adversary=true"]),
+            ("unlimited", 1, ["goal: requires max_completion_returns_after_adversary='unlimited' while adversary=true"]),
+            (3, "unlimited", ["goal: requires max_completion_returns_before_adversary='unlimited'"]),
+            ("unlimited", "unlimited", []),
+        ):
+            candidate.update(max_completion_returns_before_adversary=before,
+                             max_completion_returns_after_adversary=after)
+            self.assertEqual(validate(candidate), expected)
+        # Without an adversary only the pre-adversary limit applies; post-adversary stays canonical zero.
+        candidate.update(adversary=False, max_adversary_runs=0, max_completion_returns_before_adversary="unlimited",
+                         max_completion_returns_after_adversary=0)
+        self.assertEqual(validate(candidate), [])
+        candidate["max_completion_returns_before_adversary"] = 1
+        self.assertEqual(validate(candidate),
+                         ["goal: requires max_completion_returns_before_adversary='unlimited'"])
 
     def test_new_opt_ins_are_strict_independent_booleans(self):
         for async_tools, root_read in itertools.product((False, True), repeat=2):
@@ -591,12 +705,13 @@ class ConfigInspectionTests(unittest.TestCase):
             "max_completion_returns_before_adversary": 0, "max_completion_returns_after_adversary": 0}),
             ("unlimited", "unlimited"))
 
-    def test_version_target_recognizes_072_development(self):
-        for value in ("0.7.2", "0.7.2.dev0", "0.7.2.dev12"):
+    def test_version_target_recognizes_080_development(self):
+        self.assertEqual(INSPECTOR.TARGET_VERSION, "0.8.0")
+        for value in ("0.8.0", "0.8.0.dev0", "0.8.0.dev12"):
             self.assertEqual(INSPECTOR._version_compatibility(value), "verified")
-        self.assertEqual(INSPECTOR._version_compatibility("0.5.2"), "update_required")
-        self.assertEqual(INSPECTOR._version_compatibility("0.7.0"), "update_required")
-        self.assertEqual(INSPECTOR._version_compatibility("0.7.1"), "update_required")
+        # The 0.8 schema adds `goal` and defaults Smart Execution on: older installs need an update.
+        for value in ("0.5.2", "0.7.0", "0.7.1", "0.7.2"):
+            self.assertEqual(INSPECTOR._version_compatibility(value), "update_required")
         self.assertEqual(INSPECTOR._version_compatibility("garbage"), "unverified")
 
     def test_live_process_guard_and_state_are_preserved_read_only(self):

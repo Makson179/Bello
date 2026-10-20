@@ -138,10 +138,33 @@ async def drain(backend):
 async def test_async_tools_rejects_stock_native_before_creating_thread(tmp_path):
     backend, _, clients = make_backend(tmp_path)
     try:
-        with pytest.raises(AppServerError, match="requires a native Codex build"):
+        with pytest.raises(AppServerError, match="requires a native Codex build") as first:
             await backend.request("thread/start", thread_params(tmp_path, asyncTools=True))
         assert not any(method == "thread/start" for method, _ in clients[0].calls)
         assert clients[0].options["command"][1] == "app-server"
+        # The cached capability result fails closed with the same actionable text.
+        with pytest.raises(AppServerError, match="requires a native Codex build") as cached:
+            await backend.request("thread/start", thread_params(tmp_path, host="again", asyncTools=True))
+        assert str(cached.value) == str(first.value)
+        assert not any(method == "thread/start" for method, _ in clients[0].calls)
+    finally:
+        await backend.stop()
+
+
+async def test_missing_smart_execution_capability_explains_default_on_and_opt_out(tmp_path):
+    backend, _, clients = make_backend(tmp_path)
+    try:
+        with pytest.raises(AppServerError) as raised:
+            await backend.request("thread/start", thread_params(tmp_path, asyncTools=True))
+        message = str(raised.value)
+        assert "Smart Execution" in message and "on by default for new configurations" in message
+        assert "--no-async-tools" in message and "async_tools to false" in message
+        assert "bello config" in message and "BELLO_CODEX_BINARY" in message
+        assert "no engine or API fallback was used" in message
+        # Opting out keeps the stock helper usable: nothing was started silently.
+        await backend.request("thread/start", thread_params(tmp_path, host="off", asyncTools=False))
+        native = [params for method, params in clients[0].calls if method == "thread/start"]
+        assert len(native) == 1 and "features.bello_async_tools" not in native[0]["config"]
     finally:
         await backend.stop()
 
@@ -945,7 +968,8 @@ async def test_native_distiller_feature_and_scope_are_coder_only(tmp_path, monke
     from supervisor.runtime import codex_distiller
     bridge = type("Bridge", (), {"environment": {"BELLO_SELECTOR_SOCKET": "/private/socket"},
         "thread_config": {"features.bello_native_selection": True}, "start": AsyncMock(), "close": AsyncMock(),
-        "register_scope": lambda self, root, task=None: self.scopes.append((root, task)), "scopes": []})()
+        "register_scope": lambda self, root, task=None, goal_map_path=None: self.scopes.append((root, task, goal_map_path)),
+        "scopes": []})()
     monkeypatch.setattr(codex_distiller, "validate_native_selection", AsyncMock(return_value={}))
     monkeypatch.setattr(codex_distiller, "CodexDistillerBridge", lambda *a, **k: bridge)
     backend, _, clients = make_backend(tmp_path, distiller=object())
@@ -955,7 +979,7 @@ async def test_native_distiller_feature_and_scope_are_coder_only(tmp_path, monke
         native = [p for m, p in clients[0].calls if m == "thread/start"]
         assert native[0]["config"]["features.bello_native_selection"] is True
         assert native[1]["config"]["features.bello_native_selection"] is False
-        assert bridge.scopes == [(tmp_path, tmp_path / "TASK.md")]
+        assert bridge.scopes == [(tmp_path, tmp_path / "TASK.md", None)]
         assert clients[0].options["environment_overrides"]["BELLO_SELECTOR_SOCKET"] == "/private/socket"
     finally:
         await backend.stop()

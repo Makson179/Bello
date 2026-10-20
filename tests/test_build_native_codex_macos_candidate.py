@@ -57,6 +57,13 @@ def test_capture_exact_inventory_and_no_install_or_publication_claim(captured, r
     assert "selection-manifest.json" not in receipt["files"]
 
 
+def test_shared_prepared_source_includes_both_source_contracts(prepared_source):
+    # macOS imports the same synthetic source fixture as Linux/Windows. Keep
+    # it complete without weakening capture's exact provenance/tamper checks.
+    prepare.verify_root_roundtrip_source(prepared_source)
+    prepare.verify_context_source(prepared_source)
+
+
 @pytest.mark.parametrize("name", [*build.EXECUTABLES, *sorted(build.METADATA)])
 def test_every_distributed_byte_is_bound(captured, recipe, name):
     with (captured / name).open("ab") as stream:

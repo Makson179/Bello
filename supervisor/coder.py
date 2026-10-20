@@ -13,6 +13,7 @@ from supervisor.appserver import (
     text_input,
 )
 from supervisor.prompts import build_coder_prompt, build_restart_prompt, build_revision_prompt
+from supervisor.prompts.supervisor import GOAL_MAP_FILENAME
 from supervisor.project_config import MultiAgentConfig
 from supervisor.runtime.models import NO_EFFORT, engine_effort
 from supervisor.state import StateStore
@@ -285,6 +286,8 @@ class CoderSession:
     plan_path: Path | None = None
     readonly_roots: tuple[Path, ...] = ()
     cleanup_rpc_timeout_seconds: float = CODER_INTERRUPT_RPC_TIMEOUT_SECONDS
+    # Goal mode: the coder is told to keep GOAL_MAP.md and its reads bypass log-distiller shortening.
+    goal: bool = False
     _task_read_path: Path = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -301,9 +304,17 @@ class CoderSession:
         """The canonical task authority fixed before the model starts."""
         return self._task_read_path
 
+    def _goal_params(self, params: dict[str, Any]) -> dict[str, Any]:
+        if self.goal:
+            # Output-selection metadata for the log distiller, like runtimeTaskPath:
+            # it grants no filesystem access and the optional file need not exist.
+            # The directory is resolved like the thread's cwd; the file itself is never followed.
+            params["runtimeGoalMapPath"] = str(self.project_root.resolve() / GOAL_MAP_FILENAME)
+        return params
+
     async def start_thread(self, *, persist_state: bool = True) -> str:
         response = await self.client.thread_start(
-            coder_thread_params(
+            self._goal_params(coder_thread_params(
                 self.project_root,
                 task_path=self._task_read_path,
                 readonly_roots=self.readonly_roots,
@@ -311,7 +322,7 @@ class CoderSession:
                 fast=self.fast,
                 intelligence=self.intelligence,
                 multi_agent=self.multi_agent,
-            ),
+            )),
             timeout=APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
         )
         thread = response.get("thread", {})
@@ -327,7 +338,7 @@ class CoderSession:
         if not self.thread_id:
             raise RuntimeError("cannot resume coder thread without a thread id")
         response = await self.client.thread_resume(
-            coder_thread_resume_params(
+            self._goal_params(coder_thread_resume_params(
                 self.thread_id,
                 self.project_root,
                 task_path=self._task_read_path,
@@ -336,7 +347,7 @@ class CoderSession:
                 fast=self.fast,
                 intelligence=self.intelligence,
                 multi_agent=self.multi_agent,
-            ),
+            )),
             timeout=APP_SERVER_CONTROL_RPC_TIMEOUT_SECONDS,
         )
         thread = response.get("thread", {})
@@ -346,24 +357,24 @@ class CoderSession:
 
     async def start_initial_turn(self) -> str:
         return await self.start_turn(
-            build_coder_prompt(self._task_read_path, plan_path=self.plan_path)
+            build_coder_prompt(self._task_read_path, plan_path=self.plan_path, goal=self.goal)
         )
 
     async def start_restart_turn(self) -> str:
         return await self.start_turn(
-            build_restart_prompt(self._task_read_path, plan_path=self.plan_path)
+            build_restart_prompt(self._task_read_path, plan_path=self.plan_path, goal=self.goal)
         )
 
     async def start_revision_turn(self, reviewer_feedback: str, *, persist_state: bool = True) -> str:
         return await self.start_turn(
-            build_revision_prompt(self._task_read_path, reviewer_feedback),
+            build_revision_prompt(self._task_read_path, reviewer_feedback, goal=self.goal),
             persist_state=persist_state,
         )
 
     async def start_turn(self, message: str, *, persist_state: bool = True) -> str:
         thread_id = self.thread_id or await self.start_thread(persist_state=persist_state)
         response = await self.client.turn_start(
-            coder_turn_params(
+            self._goal_params(coder_turn_params(
                 thread_id,
                 message,
                 self.project_root,
@@ -372,7 +383,7 @@ class CoderSession:
                 model=self.model,
                 fast=self.fast,
                 intelligence=self.intelligence,
-            ),
+            )),
             timeout=self.coder_rpc_timeout_seconds,
         )
         turn = response.get("turn", {})

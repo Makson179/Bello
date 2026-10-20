@@ -112,6 +112,56 @@ async def test_escalation_needs_exact_approval_and_does_not_change_later_scope(h
 
 
 @pytest.mark.asyncio
+async def test_approval_denial_explains_no_session_or_output_without_executing(host):
+    result = await call(host, arguments={"command": "denied-command > reply.json",
+                                        "sandbox_permissions": "require_escalated"})
+    assert result["isError"]
+    text = result["content"][0]["text"]
+    assert text.startswith("Bello denied this action. No command was executed.")
+    assert "created no command session or output files" in text
+    assert "Do not poll it" in text
+    assert "Do not retry unchanged or reroute outputs to bypass the denial" in text
+    assert "sessionId" not in result["details"]
+    assert not host[4]
+    assert not (host[1] / "reply.json").exists()
+    assert len(host[3]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["read_file", "write_file", "exec_command"])
+async def test_outside_scope_error_identifies_workspace_and_remediation_without_rejected_path(host, name):
+    outside = host[1].parent / "original-project" / "generated.txt"
+    args = ({"command": "approved-command", "cwd": str(outside.parent),
+             "sandbox_permissions": "require_escalated"} if name == "exec_command" else
+            {"path": str(outside), **({"content": "neutral"} if name == "write_file" else {})})
+    result = await call(host, name, args)
+    text = result["content"][0]["text"]
+    assert result["isError"]
+    assert f"Assigned workspace: {host[1].resolve()}" in text
+    assert "workspace-relative path" in text
+    assert "task/source file's location is not necessarily writable" in text
+    assert "Command escalation does not change file-tool scope or cwd path checks" in text
+    assert "original-project" not in text
+    assert not host[3]  # Even explicit escalation cannot skip the cwd path check.
+    assert not host[4]
+
+
+@pytest.mark.parametrize("options", [{"async_tools": True}, {"runtime_enabled": False},
+                                     {"async_tools": True, "runtime_enabled": False}])
+def test_replaced_exec_descriptions_keep_the_cwd_contract(options):
+    from supervisor.runtime.tools import tool_definitions
+
+    base = next(tool for tool in tool_definitions() if tool["name"] == "exec_command")
+    command = next(tool for tool in tool_definitions(**options) if tool["name"] == "exec_command")
+    assert "Omit cwd to use the assigned workspace" in base["description"]
+    assert command["description"] != base["description"]
+    assert "Omit cwd to use the assigned workspace" in command["description"]
+    assert "cd and environment changes do not carry into later calls" in command["description"]
+    assert "Command escalation does not change file-tool scope or cwd path checks." in command["description"]
+    assert command["parameters"]["properties"]["cwd"]["description"].startswith("Existing directory")
+
+
+@pytest.mark.asyncio
 async def test_scope_is_rechecked_after_an_approval(host):
     async def approve(*_args):
         host[2].clear()

@@ -12,7 +12,7 @@ from typing import Any, Literal
 EditorAction = Literal["add_protected_path"]
 
 
-InlineEditKind = Literal["optional_text", "non_negative_int", "positive_int", "protected_path_entry", "review_limit"]
+InlineEditKind = Literal["optional_text", "non_negative_int", "positive_int", "protected_path_entry", "review_limit", "retain_percent"]
 
 
 StyledFragment = tuple[str, str]

@@ -26,6 +26,9 @@ from supervisor.supervisor_agent import _agent_message_text_from_turns, _parse_j
 # Default cheap-triage model: the efficient GPT-5.6 variant for frequent,
 # narrow runtime routing decisions.
 DEFAULT_TRIAGE_MODEL = MODEL_GPT_5_6_LUNA
+# Use this model's advertised default, not an unrelated native user profile
+# (which may request an unsupported effort such as ultra).
+DEFAULT_TRIAGE_EFFORT = "medium"
 
 RUNTIME_TRIAGE_MODEL_ENV = "BELLO_RUNTIME_TRIAGE_MODEL"
 RUNTIME_TRIAGE_TIMEOUT_ENV = "BELLO_RUNTIME_TRIAGE_TIMEOUT"
@@ -390,6 +393,9 @@ class CheapRuntimeReviewer:
         self.client = client
         self.workspace = workspace.resolve()
         self.model = model
+        self.effort = (DEFAULT_TRIAGE_EFFORT
+                       if model in {DEFAULT_TRIAGE_MODEL, f"openai-codex/{DEFAULT_TRIAGE_MODEL}"}
+                       else None)
         self.timeout_seconds = timeout_seconds
 
     async def review(self, packet: SupervisorWakePacket) -> CheapRuntimeDecision:
@@ -419,6 +425,7 @@ class CheapRuntimeReviewer:
                         "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
                         "outputSchema": openai_strict_json_schema_for_cheap_runtime_decision(),
                         "model": self.model,
+                        **({"effort": self.effort} if self.effort is not None else {}),
                     },
                     timeout=self.timeout_seconds,
                 ),
@@ -480,6 +487,7 @@ class CheapRuntimeReviewer:
             "experimentalRawEvents": False,
             "persistExtendedHistory": False,
             "model": self.model,
+            **({"effort": self.effort} if self.effort is not None else {}),
             "config": {"agents": {"enabled": False}},
         }
 

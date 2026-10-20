@@ -17,7 +17,7 @@ def jobs():
 def test_release_validation_triggers_are_explicit_and_never_publish():
     workflow, mapping = jobs()
     triggers = _block(workflow, "on")
-    assert _field(_block(triggers, "push"), "branches") == "[codex/072-recovery-validation]"
+    assert _field(_block(triggers, "push"), "branches") == "[codex/080-production-ready]"
     assert _field(_block(triggers, "pull_request"), "branches") == "[main]"
     assert "workflow_dispatch:" in triggers and "release:" not in triggers
     assert _field(_block(workflow, "permissions"), "contents") == "read"

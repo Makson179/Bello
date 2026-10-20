@@ -289,26 +289,55 @@ completion review, adversary and the distiller default to off. Turning completio
 review off preserves the adversary setting. A revision coder can handle feedback
 when either completion review or adversary is enabled.
 
-The persisted fields are `runtime_enabled`, `completion_review`, `adversary` and
-the nested `log_distiller` object:
+[Smart Execution](async-tools.md) is on by default for new configurations.
+[No Need For Context](no-need-for-context.md) is off by default; it summarizes
+older agent context while keeping the original task and a recent tail, and never
+applies to the runtime supervisor.
+
+**Goal** (`goal`, off by default) keeps a run working toward the original task.
+While it is on, runtime supervision and completion review are on regardless of
+their saved values, and completion returns are unlimited both before and after
+the optional adversary; the adversary's instructions and pass count are
+unchanged. The reviewer is told to check the original objectives and return work
+only for a concrete unmet requirement (for example 65/100 where 70/100 is
+required), not for new requirements or polish. Bello adds no score parser or
+automatic gate. The coder is asked to keep a short `GOAL_MAP.md` of approaches
+tried, observed results and evidence, and untried ideas, and to repeat a failed
+approach only after a recorded relevant change; reads of that file bypass
+log-distiller shortening like the task file. Smart Execution, the revision coder,
+No Need For Context and the distiller keep their own switches. Unlimited returns
+do not guarantee success; interruption and failure handling still apply.
+
+The persisted fields include:
 
 ```json
 {
+  "goal": false,
   "runtime_enabled": true,
   "completion_review": false,
   "adversary": true,
+  "async_tools": true,
+  "no_need_for_context": {"enabled": false, "threshold_tokens": 200000, "retain_percent": 10},
   "log_distiller": {"enabled": false, "model_path": null}
 }
 ```
 
-Run overrides do not change the saved project configuration:
+Run flags select settings for a run:
 
 ```sh
+bello --goal
 bello --no-runtime --completion-review false --adversary
-bello --runtime --log-distiller
+bello --runtime --log-distiller --no-async-tools
 bello --log-distiller --distiller-model /absolute/path/local-bundle
 bello --no-log-distiller
 ```
+
+Review and model flags apply to one run. The switch flags (`--goal`,
+`--runtime`, `--async-tools`, `--no-need-for-context` with its threshold options,
+and `--log-distiller`) are also recorded in `.supervisor/config.json`, because
+recovery resumes a run with the switches it started with; later runs use them
+until changed. Goal keeps the saved runtime choice, so turning Goal off restores
+it.
 
 With runtime supervision off, cheap runtime triage is effectively off too, and
 the editor hides the runtime model, effort and cheap-triage rows. This mode

@@ -33,6 +33,9 @@ def case(name):
 
 def proof_report(name, binary):
     base = {"passed": True, "paid_model_calls": 0}
+    if name == "context":
+        from tests.test_verify_native_codex_candidate import result
+        return result(name, binary)
     if name == "selection":
         return {**base, "schema": "bello.native-selection-provider-proof.v1", "binary_sha256": release.sha256(binary),
                 "cases": [case(value) for value in sorted(common.SELECTION_CASES)]}
@@ -62,6 +65,9 @@ def write_proof(name, binary, output):
     if name in {"selection", "modernbert"}:
         for row in value["cases"]:
             put(output / row["case"] / "result.json", row)
+    elif name == "context":
+        for row in value["results"]:
+            put(output / row["case"] / "receipt.json", row)
     elif name == "history":
         put(output / "case/result.json", case("persistent_direct"))
     elif name == "async":
@@ -165,6 +171,22 @@ def test_complete_bound_qualification_and_exact_deterministic_installer_archive(
     assert before == {name: release.sha256(f.candidate / name) for name in before}
 
 
+@pytest.mark.parametrize("target", release.TARGETS)
+@pytest.mark.parametrize("count", [14, 15])
+def test_legacy_async_report_without_completion_batching_never_qualifies(fixture, target, count):
+    f = fixture(target)
+    path = f.qualification / "worker/async/report.json"
+    report = release.read_json(path)
+    assert len(report["results"]) == 15
+    report["results"] = [row for row in report["results"] if row["case"] != "completion_batching"]
+    assert len(report["results"]) == 14
+    put(path, report)
+    f.worker["proofs"]["async"]["cases"] = count
+    refresh(f, "async")
+    with pytest.raises(ValueError):
+        release.validate_qualification(f.target, f.candidate, f.qualification)
+
+
 @pytest.mark.parametrize("field,value", [("passed", False), ("phase", "partial"), ("target", "other"),
     ("published", True), ("candidate_unchanged", False), ("modernbert_requested", False),
     ("paid_model_calls", 1), ("paid_model_calls", False), ("external_provider_requests_forwarded", 1),
@@ -208,7 +230,7 @@ def test_all_saved_case_hashes_counts_and_semantics_required(fixture, change):
     f = fixture()
     if change == "missing-proof": del f.worker["proofs"]["modernbert"]
     elif change == "extra-proof": f.worker["proofs"]["unknown"] = {"report": "unknown/report.json"}
-    elif change == "wrong-count": f.worker["proofs"]["async"]["cases"] = 13
+    elif change == "wrong-count": f.worker["proofs"]["async"]["cases"] = 14
     elif change == "report-path": f.worker["proofs"]["selection"]["report"] = "../selection/report.json"
     elif change == "report-bytes":
         path = f.qualification / "worker/selection/report.json"
@@ -337,6 +359,55 @@ def test_archive_entry_inventory_and_metadata_fail_closed_even_with_rebound_oute
     checks.update(archive_sha256=release.sha256(archive), archive_size=archive.stat().st_size)
     put(archive.parent / "checksums.json", checks)
     with pytest.raises(ValueError): release.verify_artifact(f.target, archive.parent)
+
+
+@pytest.mark.parametrize("target", release.TARGETS)
+@pytest.mark.parametrize("change", ["missing-context", "missing-inventory", "missing-case", "extra-case",
+                                    "invalid-sha256", "non-string-sha256", "boolean-sha256"])
+def test_artifact_requires_exact_proof_inventory_even_with_rebound_hashes(fixture, target, change):
+    f = fixture(target)
+    archive = release.package(f.target, f.candidate, f.qualification, f.base / "package")
+    release.verify_artifact(f.target, archive.parent)
+    with tarfile.open(archive, "r:gz") as stream:
+        entries = [(deepcopy(member), stream.extractfile(member).read()) for member in stream]
+    values = {member.name: data for member, data in entries}
+    info = json.loads(values["BUILD-INFO"])
+    inventory = info["release_provenance"]["proof_files"]
+    assert {name for name in inventory if name.startswith("context/")} == {
+        "context/report.json", *(f"context/{case}/receipt.json" for case in common.CONTEXT_CASES)
+    }
+    if change == "missing-context":
+        info["release_provenance"]["proof_files"] = {
+            name: digest for name, digest in inventory.items() if not name.startswith("context/")
+        }
+    elif change == "missing-inventory":
+        del info["release_provenance"]["proof_files"]
+    elif change == "missing-case":
+        del inventory["context/pending/receipt.json"]
+    elif change == "extra-case":
+        inventory["context/unrequested/receipt.json"] = "a" * 64
+    else:
+        inventory["context/pending/receipt.json"] = {
+            "invalid-sha256": "g" * 64, "non-string-sha256": 1, "boolean-sha256": True,
+        }[change]
+    values["BUILD-INFO"] = (json.dumps(info, sort_keys=True, indent=2) + "\n").encode()
+    info_hash = hashlib.sha256(values["BUILD-INFO"]).hexdigest()
+    manifest = json.loads(values["selection-manifest.json"])
+    manifest["files"]["BUILD-INFO"] = info_hash
+    values["selection-manifest.json"] = (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode()
+    with tarfile.open(archive, "w:gz", format=tarfile.USTAR_FORMAT) as stream:
+        for member, _old_data in entries:
+            data = values[member.name]
+            member.size = len(data)
+            stream.addfile(member, io.BytesIO(data))
+    checks_path = archive.parent / "checksums.json"
+    checks = release.read_json(checks_path)
+    checks["files"]["BUILD-INFO"] = info_hash
+    checks.update(archive_sha256=release.sha256(archive), archive_size=archive.stat().st_size,
+                  manifest_sha256=hashlib.sha256(values["selection-manifest.json"]).hexdigest())
+    put(checks_path, checks)
+    with pytest.raises(ValueError, match="proof-file inventory"):
+        release.verify_artifact(f.target, archive.parent)
 
 
 def test_installer_code_identity_excludes_only_pin_values(tmp_path, monkeypatch):
@@ -525,7 +596,8 @@ def test_installed_real_unpack_cache_and_proof_orchestration(fixture, monkeypatc
     assert report["distribution_source"] == ("production-https" if published else "local-archive")
     if published:
         assert downloads == [True] and installer._download is mock_production_transfer
-    assert set(report["proofs"]) == {"selection", "async", "history", "modernbert"}
+    assert set(report["proofs"]) == {"selection", "async", "history", "context", "modernbert"}
+    assert report["proofs"]["context"]["cases"] == 8
     assert os.environ == environment and "unit-secret" not in json.dumps(report)
     assert Path(report["installed_directory"]).name == release.sha256(archive)
 

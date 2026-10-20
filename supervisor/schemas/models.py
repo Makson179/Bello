@@ -7,7 +7,7 @@ from copy import deepcopy
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from supervisor.markdown_fences import advance_markdown_fence
 from supervisor.review_limits import (
@@ -194,7 +194,26 @@ class BelloConfig(BaseModel):
     max_adversary_runs: int = 1
     completion_review_enabled: bool = True
     runtime_enabled: bool = True
-    async_tools: bool = False
+    # Opt-in Goal mode (see ProjectConfig.goal). Runtime supervision and completion
+    # review are mandatory while it is on; nothing else is implied.
+    goal: bool = Field(default=False, strict=True)
+    # Smart Execution defaults on; a saved explicit false is preserved.
+    async_tools: bool = True
+    no_need_for_context: dict[str, Any] = Field(
+        default_factory=lambda: {"enabled": False, "threshold_tokens": 200000, "retain_percent": 10}
+    )
+
+    @field_validator("no_need_for_context", mode="before")
+    @classmethod
+    def validate_no_need_for_context(cls, value: Any) -> dict[str, Any]:
+        from supervisor.project_config import NoNeedForContextConfig, ProjectConfigError
+        if not isinstance(value, dict) or set(value) - {"enabled", "threshold_tokens", "retain_percent"}:
+            raise ValueError("no_need_for_context must contain only enabled, threshold_tokens and retain_percent")
+        try:
+            return NoNeedForContextConfig(**value).to_json_data()
+        except ProjectConfigError as exc:
+            raise ValueError(str(exc)) from exc
+
     windows_native_root_read: bool = Field(default=False, strict=True)
     cheap_runtime: bool = True
     log_distiller: dict[str, Any] = Field(default_factory=lambda: {"enabled": False, "model_path": None})

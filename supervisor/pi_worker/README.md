@@ -20,6 +20,16 @@ reported for that provider response plus provider/model/API provenance. The turn
 ledger exposes their arithmetic sum and retains the individual response records;
 missing provider fields are not estimated.
 
+A thread started with `asyncTools` runs a batch of independent tool calls
+concurrently and delivers late results once per batch (see
+`docs/async-tools.md`). With `noNeedForContext` enabled, the worker summarizes
+the older middle of a session at a turn boundary: the summary is plain text with
+one 500-second deadline, about 16,000 characters are requested and anything over
+48,000 is rejected. Instructions, the first request, recent whole tool groups and
+system entries appended on resume are never edited (see
+`docs/no-need-for-context.md`). A turn that stops at the output limit or ends
+without any output completes as failed.
+
 Run with Node.js 22.19 or newer:
 
 ```sh

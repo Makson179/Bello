@@ -73,7 +73,176 @@ test("real pinned Pi loop waits for late results without polling and preserves s
   assert.equal(scheduler.pending, false);
 });
 
-for (const stopReason of ["error", "aborted"]) {
+test("real pinned Pi loop groups clustered late siblings into one model request", async (t) => {
+  const layout = temporaryLayout(t);
+  const modelRuntime = await realPiSdk.createModelRuntime({ agentDir: layout.agentDir, allowModelNetwork: false });
+  const model = modelRuntime.getModel("openai-codex", "gpt-5.6-sol");
+  assert.ok(model);
+  modelRuntime.hasConfiguredAuth = () => true;
+  const scheduler = new AsyncToolCoordinator();
+  const finish = {};
+  const gates = Object.fromEntries(["a", "b", "c"].map((id) => [id, new Promise((resolve) => { finish[id] = resolve; })]));
+  let afterTurns = 0;
+  let session;
+  session = await realPiSdk.createSession({
+    cwd: layout.workspace, agentDir: layout.agentDir, modelRuntime, model,
+    thinkingLevel: "high", sessionManager: SessionManager.inMemory(layout.workspace),
+    customTools: [{ ...TEST_TOOL, label: "Command", executionMode: "parallel", execute: (id, args, signal) => scheduler.execute(id, "exec_command", async () => {
+      if (gates[args.command]) await gates[args.command];
+      if (args.command === "b") throw new Error("b failed offline");
+      return { content: [{ type: "text", text: `${args.command} finished` }], details: {} };
+    }, signal) }],
+    activeToolNames: [TEST_TOOL.name], requestOptions: { current: {} },
+    asyncAfterTurn: async (turn) => {
+      afterTurns++;
+      const results = await scheduler.ready({ wait: !turn.message.content.some((block) => block.type === "toolCall") });
+      if (results.length) await session.sendCustomMessage(lateToolMessage(results), { deliverAs: "steer" });
+    },
+  });
+  t.after(async () => {
+    for (const resolve of Object.values(finish)) resolve();
+    await scheduler.cancel();
+    session.dispose();
+  });
+  session.agent.getApiKey = async () => "offline-test-key";
+  session.subscribe((event) => {
+    if (event.type === "message_end" && event.message.role === "assistant") {
+      scheduler.beginBatch(event.message.content.filter((block) => block.type === "toolCall").map((block) => block.id));
+    }
+  });
+  const requests = [];
+  session.agent.streamFunction = (_model, context) => {
+    requests.push(JSON.parse(JSON.stringify(context.messages)));
+    const message = {
+      role: "assistant",
+      content: requests.length === 1
+        ? ["fast", "a", "b", "c"].map((id) => ({ type: "toolCall", id, name: "exec_command", arguments: { command: id } }))
+        : [{ type: "text", text: "Checked the available results." }],
+      api: model.api, provider: model.provider, model: model.id,
+      stopReason: requests.length === 1 ? "toolUse" : "stop", timestamp: Date.now(),
+      usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    };
+    return { async *[Symbol.asyncIterator]() { yield { type: "done", reason: message.stopReason, message }; }, result: async () => message };
+  };
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 10_000 });
+  t.mock.method(performance, "now", () => Date.now());
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+  const drainUntil = async (condition) => {
+    for (let attempt = 0; attempt < 200 && !condition(); attempt++) {
+      t.mock.timers.tick(0);
+      await flush();
+    }
+    assert.ok(condition(), "the offline Pi loop reached its expected state");
+  };
+  const tick = async (milliseconds) => { t.mock.timers.tick(milliseconds); await flush(); };
+  const running = session.prompt("Run four independent commands and inspect their results", { expandPromptTemplates: false });
+  await drainUntil(() => scheduler.jobs.get("fast")?.done);
+  assert.equal(requests.length, 1);
+  await tick(1000);
+  await drainUntil(() => afterTurns === 2);
+  assert.equal(requests.length, 2);
+  const sentPrefix = JSON.parse(JSON.stringify(requests[1]));
+  await tick(60_000);
+  assert.equal(requests.length, 2, "no result means no periodic model wake");
+  finish.a();
+  await drainUntil(() => scheduler.jobs.get("a").done);
+  await tick(700);
+  finish.b();
+  await drainUntil(() => scheduler.jobs.get("b").done);
+  await tick(300);
+  assert.equal(requests.length, 2, "the old completion timer cannot split siblings across requests");
+  await tick(699);
+  assert.equal(requests.length, 2);
+  await tick(1);
+  await drainUntil(() => afterTurns === 3);
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[2].slice(0, sentPrefix.length), sentPrefix);
+  const grouped = requests[2].slice(sentPrefix.length).filter((message) => JSON.stringify(message).includes("Completed tool call"));
+  assert.equal(grouped.length, 1);
+  assert.match(JSON.stringify(grouped[0]), /a finished/);
+  assert.match(JSON.stringify(grouped[0]), /b failed offline/);
+  await tick(60_000);
+  assert.equal(requests.length, 3, "consumed results cannot cause another model wake");
+  finish.c();
+  await running;
+  assert.equal(requests.length, 4, "the final sibling releases immediately");
+  assert.deepEqual(requests[3].slice(0, requests[2].length), requests[2]);
+  assert.equal(scheduler.pending, false);
+});
+
+// Pi finishes an invalid call (here: missing required arguments) with an immediate
+// error result and never invokes execute() for it. The runtime reports that through
+// tool_execution_end; the batch must then count as finished without a window.
+for (const wired of [true, false]) {
+  test(`real pinned Pi loop ${wired ? "releases" : "keeps waiting for"} a batch whose other call was rejected before execution`, async (t) => {
+    const layout = temporaryLayout(t);
+    const modelRuntime = await realPiSdk.createModelRuntime({ agentDir: layout.agentDir, allowModelNetwork: false });
+    const model = modelRuntime.getModel("openai-codex", "gpt-5.6-sol");
+    assert.ok(model);
+    modelRuntime.hasConfiguredAuth = () => true;
+    const scheduler = new AsyncToolCoordinator();
+    let session;
+    session = await realPiSdk.createSession({
+      cwd: layout.workspace, agentDir: layout.agentDir, modelRuntime, model,
+      thinkingLevel: "high", sessionManager: SessionManager.inMemory(layout.workspace),
+      customTools: [{ ...TEST_TOOL, label: "Command", executionMode: "parallel", execute: (id, args, signal) => scheduler.execute(id, "exec_command", async () => ({
+        content: [{ type: "text", text: `${args.command} finished` }], details: {},
+      }), signal) }],
+      activeToolNames: [TEST_TOOL.name], requestOptions: { current: {} },
+      asyncAfterTurn: async (turn) => {
+        const results = await scheduler.ready({ wait: !turn.message.content.some((block) => block.type === "toolCall") });
+        if (results.length) await session.sendCustomMessage(lateToolMessage(results), { deliverAs: "steer" });
+      },
+    });
+    t.after(async () => { await scheduler.cancel(); session.dispose(); });
+    session.agent.getApiKey = async () => "offline-test-key";
+    session.subscribe((event) => {
+      if (event.type === "message_end" && event.message.role === "assistant") {
+        scheduler.beginBatch(event.message.content.filter((block) => block.type === "toolCall").map((block) => block.id));
+      }
+      if (wired && event.type === "tool_execution_end") scheduler.skip(event.toolCallId);
+    });
+    const requests = [];
+    session.agent.streamFunction = (_model, context) => {
+      requests.push(JSON.parse(JSON.stringify(context.messages)));
+      const message = {
+        role: "assistant",
+        content: requests.length === 1
+          ? [{ type: "toolCall", id: "valid-call", name: "exec_command", arguments: { command: "valid" } },
+            { type: "toolCall", id: "invalid-call", name: "exec_command", arguments: {} }]
+          : [{ type: "text", text: "Checked the valid command." }],
+        api: model.api, provider: model.provider, model: model.id,
+        stopReason: requests.length === 1 ? "toolUse" : "stop", timestamp: Date.now(),
+        usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      };
+      return { async *[Symbol.asyncIterator]() { yield { type: "done", reason: message.stopReason, message }; }, result: async () => message };
+    };
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 10_000 });
+    t.mock.method(performance, "now", () => Date.now());
+    const flush = () => new Promise((resolve) => setImmediate(resolve));
+    const drainUntil = async (condition, attempts = 100) => {
+      for (let attempt = 0; attempt < attempts && !condition(); attempt++) { t.mock.timers.tick(0); await flush(); }
+      return condition();
+    };
+    const running = session.prompt("Run one valid and one invalid command", { expandPromptTemplates: false });
+    assert.equal(await drainUntil(() => scheduler.jobs.get("valid-call")?.done), true);
+    if (wired) {
+      assert.equal(await drainUntil(() => requests.length === 2), true, "no collection window is paid for a call that can never finish");
+    } else {
+      assert.equal(await drainUntil(() => requests.length === 2, 30), false, "without the notice the batch is held open");
+      t.mock.timers.tick(1000);
+      assert.equal(await drainUntil(() => requests.length === 2), true);
+    }
+    await running;
+    const toolResults = requests[1].filter((message) => message.role === "toolResult");
+    assert.deepEqual(toolResults.map((message) => [message.toolCallId, message.isError]), [["valid-call", false], ["invalid-call", true]]);
+    assert.match(JSON.stringify(toolResults[0]), /valid finished/, "the real result is delivered directly, not as a placeholder");
+    assert.equal(requests.length, 2);
+    assert.equal(scheduler.pending, false);
+  });
+}
+
+for (const stopReason of ["error", "aborted", "length"]) {
   test(`Pi 1.0 finishTurn does not await late tools after a terminal ${stopReason}`, async (t) => {
     const layout = temporaryLayout(t);
     const modelRuntime = await realPiSdk.createModelRuntime({ agentDir: layout.agentDir, allowModelNetwork: false });
@@ -104,7 +273,9 @@ for (const stopReason of ["error", "aborted"]) {
     await session.prompt("Offline terminal response", { expandPromptTemplates: false });
     assert.equal(requests, 1, "a terminal result must not be replayed");
     assert.equal(afterTurns, 0);
-    assert.equal(session.agent.state.messages.at(-1).stopReason, stopReason);
+    // Pi may drop a recoverable output-limit attempt from its own projection, but
+    // never turns it into another request or a wait for tool output.
+    if (stopReason !== "length") assert.equal(session.agent.state.messages.at(-1).stopReason, stopReason);
     assert.equal(session.agent.state.isStreaming, false);
   });
 }

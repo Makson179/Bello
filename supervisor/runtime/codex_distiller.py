@@ -144,21 +144,22 @@ class CodexDistillerBridge:
     removes all BELLO_SELECTOR_* values from tool subprocess environments.
 
     Protocol v1 has no thread/cwd fields. Register each exact coder workspace/task
-    before start/resume/revision; only their protected reads bypass selection.
-    A missing focus and worker failures retain native output and are counted, not
-    reported as successful compression. Receipts contain no log/focus contents.
+    (and, in Goal mode, its GOAL_MAP.md) before start/resume/revision; only their
+    protected reads bypass selection. A missing focus and worker failures retain
+    native output and are counted, not reported as successful compression. Receipts
+    contain no log/focus contents.
     """
 
     def __init__(self, distiller: LogDistiller, state_dir: Path,
                  workspace: Path | None = None, task_path: Path | None = None,
-                 *, transport: str | None = None):
+                 *, transport: str | None = None, goal_map_path: Path | None = None):
         self._transport = transport or ("tcp" if os.name == "nt" else "unix")
         if self._transport not in {"tcp", "unix"}:
             raise ValueError("Unknown native distiller transport")
         self.distiller = distiller
         self.state_dir = Path(state_dir)
         self.metrics: Counter = Counter()
-        self._scopes: set[tuple[Path, Path | None]] = set()
+        self._scopes: set[tuple[Path, Path | None, Path | None]] = set()
         self._directory: tempfile.TemporaryDirectory | None = None
         self._socket_path: Path | None = None
         self._server: asyncio.AbstractServer | None = None
@@ -167,14 +168,20 @@ class CodexDistillerBridge:
         self._handlers: set[asyncio.Task] = set()
         self._closed = False
         if workspace is not None:
-            self.register_scope(workspace, task_path)
+            self.register_scope(workspace, task_path, goal_map_path=goal_map_path)
 
-    def register_scope(self, workspace: Path, task_path: Path | None = None) -> None:
+    def register_scope(self, workspace: Path, task_path: Path | None = None,
+                       *, goal_map_path: Path | None = None) -> None:
         root = Path(workspace).absolute()
         task = Path(task_path) if task_path is not None else None
         if task is not None and not task.is_absolute():
             task = root / task
-        self._scopes.add((root, task))
+        # Output-selection metadata only (like the task): no access is granted and
+        # the optional Goal map need not exist.
+        goal_map = Path(goal_map_path) if goal_map_path is not None else None
+        if goal_map is not None and not goal_map.is_absolute():
+            goal_map = root / goal_map
+        self._scopes.add((root, task, goal_map))
 
     @property
     def environment(self) -> dict[str, str]:
@@ -240,8 +247,9 @@ class CodexDistillerBridge:
         elif before > MAX_INPUT_BYTES:
             outcome, selected = "oversized", original
         elif preserve_tool_output("exec_command", {"command": command}) or any(
-            preserve_tool_output("exec_command", {"command": command}, task_path=task, workspace=root)
-            for root, task in self._scopes
+            preserve_tool_output("exec_command", {"command": command}, task_path=task,
+                                 goal_map_path=goal_map, workspace=root)
+            for root, task, goal_map in self._scopes
         ):
             outcome, selected = "protected", original
         elif not focus.strip() or len(focus) > 120 or not command.strip():

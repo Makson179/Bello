@@ -321,6 +321,29 @@ async def terminate_windows_setup(process, env: dict[str, str]) -> None:
             await asyncio.wait_for(process.wait(), 5)
 
 
+def _windows_setup_stream_diagnostic(data: bytes) -> dict[str, Any]:
+    sample = data[:_DIAGNOSTIC_SCAN_LIMIT].decode("utf-8", errors="replace")
+    details = _diagnostic_text(sample)
+    details.update({"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                    "scan_truncated": len(data) > _DIAGNOSTIC_SCAN_LIMIT})
+    # Native errors may render a code as a colon-prefixed message or a
+    # structured JSON value. Retain only the known enum, never its text.
+    details["setup_error_codes"] = sorted(
+        code for code in _DIAGNOSTIC_SETUP_CODES
+        if re.search(r"\b" + code + r"\b", sample))
+    return details
+
+
+class WindowsSetupFailure(RuntimeError):
+    """Failed proof setup with bounded, text-free diagnostics for public receipts."""
+
+    def __init__(self, exit_code: int, stdout: bytes, stderr: bytes):
+        super().__init__(f"Native Windows sandbox setup failed with exit code {exit_code}")
+        self.diagnostic = {"schema": "bello.windows-setup-failure.v1", "exit_code": exit_code}
+        for name, data in (("stdout", stdout), ("stderr", stderr)):
+            self.diagnostic[name] = _windows_setup_stream_diagnostic(data)
+
+
 async def provision_windows_sandbox(binary: Path, home: Path, env: dict[str, str], output: Path) -> None:
     # CI only, on its disposable elevated runner. No automatic UAC or inherited
     # account credentials. The setup state stays outside uploaded diagnostics.
@@ -342,10 +365,17 @@ async def provision_windows_sandbox(binary: Path, home: Path, env: dict[str, str
         if isinstance(error, TimeoutError):
             raise RuntimeError("Native Windows sandbox setup timed out") from error
         raise
+    failure = None
+    if process.returncode != 0:
+        failure = WindowsSetupFailure(process.returncode, stdout, stderr)
+        # Preserve the fixed-schema diagnostic independently of each caller's
+        # exception/report handling, before writing any private raw logs.
+        (output / "windows-setup-failure.json").write_text(
+            json.dumps(failure.diagnostic, indent=2) + "\n", encoding="utf-8")
     (output / "windows-setup-stdout.txt").write_bytes(stdout)
     (output / "windows-setup-stderr.txt").write_bytes(stderr)
-    if process.returncode != 0:
-        raise RuntimeError(f"Native Windows sandbox setup failed with exit code {process.returncode}")
+    if failure is not None:
+        raise failure
 
 
 def isolated_environment(home: Path, binary: Path, port: int,
@@ -674,6 +704,7 @@ _DIAGNOSTIC_FAILURE_MARKERS = {
     "permission_denied": r"\b(?:PermissionDenied|AccessDenied|access is denied|access denied|permission denied)\b",
     "job_object_failure_marker": r"AssignProcessToJobObject|PROC_THREAD_ATTRIBUTE_JOB_LIST|\bjob object\b",
     "runner_pipe_failure": r"runner pipe closed before spawn_ready|wait for runner spawn_ready|timed out after [0-9]{1,10}ms connecting runner pipe-(?:in|out)",
+    "setup_helper_exited": r"\bsetup helper exited with status Some\(-?[0-9]{1,10}\)",
 }
 
 
@@ -697,7 +728,12 @@ def _diagnostic_text(text: str) -> dict[str, Any]:
     header = re.split(r"\r?\nOutput:\r?\n", sample, maxsplit=1)[0]
     codes = re.findall(r"\b(?:os error|Windows error|WinError|errno|error code)\s*[:=(\[]*\s*(-?[0-9]{1,10})\b", header, re.I)
     codes += re.findall(r"\bCreateProcess(?:WithLogonW|AsUserW) failed:\s*(-?[0-9]{1,10})\b", header)
+    # Pinned Windows account provisioning preserves NetUserAdd/NetUserSetInfo
+    # statuses as a pair. Keep the numbers, never the intervening account name.
+    for pair in re.findall(r"\bfailed to create/update user[^\r\n]{0,512}, code ([0-9]{1,10})/([0-9]{1,10})\b", header):
+        codes.extend(pair)
     exits = re.findall(r"(?m)^Process exited with code (-?[0-9]{1,10})\r?$", header)
+    exits += re.findall(r"\bsetup helper exited with status Some\((-?[0-9]{1,10})\)", header)
     bounded = lambda values: sorted({int(v) for v in values if -(2 ** 31) <= int(v) < 2 ** 32})[:8]
     return {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
             "scanned_characters": len(sample), "scan_truncated": len(text) > len(sample),
@@ -825,6 +861,7 @@ async def run_case(binary: Path, case: Case, output: Path, *, selector=None,
         'request_max_retries = 0\nstream_max_retries = 0\n')
     session = NativeSession(binary, home, isolated_environment(home, binary, port, bridge.environment))
     failure = None
+    setup_failure = None
     windows_acls = None
     try:
         if os.name == "nt":
@@ -850,6 +887,8 @@ async def run_case(binary: Path, case: Case, output: Path, *, selector=None,
         await session.complete(thread_id, timeout=turn_timeout)
     except Exception as exc:
         failure = type(exc).__name__ + ": " + str(exc)
+        if isinstance(exc, WindowsSetupFailure):
+            setup_failure = exc.diagnostic
     finally:
         await session.close(output)
         if os.name == "nt" and windows_acls is not None:
@@ -881,7 +920,8 @@ async def run_case(binary: Path, case: Case, output: Path, *, selector=None,
     # rejects and records these; a blocked attempt is not an external request
     # succeeding, and is not evidence of output selection failing.
     result = {"case": case.name, "passed": not failure and exact and focus_ok and not provider.errors and windows_isolated is not False,
-        "error": failure, "exact_model_visible_output": exact, "focus_and_command_correct": focus_ok,
+        "error": failure, "windows_setup_failure": setup_failure,
+        "exact_model_visible_output": exact, "focus_and_command_correct": focus_ok,
         "provider_requests": len(provider.requests), "selector_calls": len(selections),
         "bridge_outcomes": dict(bridge.metrics), "rejected_network_requests": provider.rejected,
         "provider_errors": provider.errors, "external_proxy_requests_forwarded": 0,

@@ -27,8 +27,9 @@ grants only on that checksum-verified file. Cache directories, manifests and
 other bundled files still require private ACLs; write/delete grants are rejected.
 
 The first download finishes before app-server starts, outside model-RPC timeouts.
-Codex runs without distiller use the ordinary executable. Claude/Pi-only runs do
-not download this helper. Unsupported platforms require an explicit compatible
+Codex runs without the distiller, Smart Execution or No Need For Context use the ordinary
+executable; Smart Execution, on by default for new configurations, uses the
+published async-capable helper. Claude/Pi-only runs do not download this helper. Unsupported platforms require an explicit compatible
 build; Bello does not silently turn distillation off or change the provider.
 
 ## Select an installed build
@@ -65,7 +66,16 @@ point it at a build whose source and tests you have verified. Stock Codex, a sta
 manifest, and the older 135-second build fail with an actionable error before a
 distilled coder turn starts. D-off does not read this manifest or run these checks.
 
-The automatically downloaded Linux x86-64 Codex 0.153.4 executable has SHA-256
+The current managed helper is the published
+`native-codex-0.161.0-nnc-se-20261019` release. Its exact download pins, payload
+hashes and qualification provenance are in the
+[qualified release ledger](../scripts/native-codex-0.161.0-qualified-release.json);
+see the [0.161.0 build and qualification guide](native-codex-candidate.md) for the
+current recipe and the separate postpublication delivery checks.
+
+The following hashes and proof links describe historical 0.153.4 selection-only
+archives, not the current automatic-download pins. The historical Linux x86-64
+Codex 0.153.4 executable has SHA-256
 `852bc3d5ead7d624b7a248e9e5b738d3cd1e2ebbcbd050a1a21b115a3767c2b4`.
 The bridge uses Unix sockets on Unix platforms. Automatic native selection is
 available for Linux x86-64 (glibc 2.35+), macOS Apple Silicon (arm64), and Windows x86-64; the archives contain
@@ -82,7 +92,7 @@ passed all nine cases before and after installation, plus post-run cache reuse.
 This is not a universal prebuilt package: Linux ARM64/musl, Windows ARM64, and macOS Intel are not
 included in the automatic-download table.
 
-### Windows build and verification
+### Historical Windows build and verification
 
 The `Native Codex Windows proof` workflow has separate build and proof jobs on
 Windows Server 2025. The reusable build workflow saves a **CI-only, unverified
@@ -126,16 +136,17 @@ log/configuration file, and removed from tool subprocess environments even when
 a shell policy requests full environment inheritance. A failed handshake retains
 the original native output; it never counts as successful compression.
 
-## Build from source
+## Historical 0.155.1 build recipe
 
 The source patch is [native-codex-selection.patch](../scripts/native-codex-selection.patch).
 It targets official `rust-v0.155.1`, revision
 `be2951ea34f0d295ed0becf97079f92fa5f6950e`, not an arbitrary current checkout.
 It includes the optional command/poll focus field and local selection hook,
-opt-in Smart Execution scheduling, and related tests. Native permissions,
+Smart Execution scheduling (enabled per run by Bello), and related tests. Native permissions,
 policy hooks, model routing and existing output metadata are preserved; neither
-feature disables sandboxing. These source-build instructions describe the new
-candidate, not the older published selection-only downloads listed above.
+feature disables sandboxing. These source-build instructions preserve the historical
+0.155.1 candidate, not the current managed helper or the older selection-only downloads
+listed above. For the current recipe, use the [0.161.0 guide](native-codex-candidate.md).
 
 Use a separate build directory, with no user account credentials mounted. Install
 the upstream Rust/Cargo build prerequisites first. The validated build used
@@ -205,7 +216,7 @@ For macOS arm64, `scripts/verify_native_codex_selection.py` exercises nine
 offline provider-boundary cases: direct command, code-mode and polling with
 selection on/off, missing focus, a custom task file, and CLI help. It uses
 synthetic logs and a local provider, with no account credentials or paid model
-calls. All nine cases pass for the macOS executable pinned above. The helper's
+calls. All nine cases passed for the historical macOS executable recorded above. The helper's
 transport checks are separate from the learned selector's quality evaluation.
 
 The [official app-server protocol](https://learn.chatgpt.com/docs/app-server#protocol)

@@ -3,7 +3,7 @@ name: Windows restricted sandbox
 on:
   workflow_dispatch:
   push:
-    branches: [main, codex/0.6.0-multi-provider, mystery, codex/072-recovery-validation]
+    branches: [main, codex/0.6.0-multi-provider, mystery, codex/080-production-ready]
   pull_request:
 
 permissions:

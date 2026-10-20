@@ -10,7 +10,8 @@ permissions:
 
 jobs:
   repackage:
-    if: ${{ github.repository == 'Makson179/Bello' && github.event_name == 'workflow_dispatch' }}
+    # Historical 0.155.1 repackaging of one preserved build: never for the 0.8.0 candidate branch.
+    if: ${{ github.repository == 'Makson179/Bello' && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/codex/080-production-ready' }}
     # Match the preserved candidate's successful selection/async qualification.
     runs-on: windows-2025
     timeout-minutes: 25
@@ -41,7 +42,7 @@ jobs:
         run: python -B scripts/repackage_native_codex_windows_candidate.py download --historical ../provenance --output ../repackage-inputs
       - name: Verify and package using the original native build identity
         run: python -B scripts/repackage_native_codex_windows_candidate.py package --historical ../provenance --inputs ../repackage-inputs --output ../native-repackaged
-      - name: Fresh final-code install, nine selection cases and fourteen async cases
+      - name: Fresh final-code install, nine selection cases and fifteen async cases
         run: |
           $runtimeRoot = Join-Path $env:LOCALAPPDATA "bello-native-repackage-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           # Native provisioning intentionally rejects ParentDir, even in absolute paths.

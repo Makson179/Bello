@@ -56,7 +56,8 @@ from supervisor.health import (
 from supervisor.immutable_reads import _literal_parts
 from supervisor.filesystem_safety import is_link_or_reparse, is_windows_platform
 from supervisor.executables import ExecutableResolutionError, require_trusted_executable
-from supervisor.project_config import DEFAULT_MODEL, LogDistillerConfig, MultiAgentConfig, ProjectConfig
+from supervisor.project_config import DEFAULT_MODEL, LogDistillerConfig, MultiAgentConfig, NoNeedForContextConfig, ProjectConfig
+from supervisor.prompts.supervisor import with_goal_guidance
 from supervisor.policy import (
     _executable_basename,
     command_is_windows_shell_wrapper,
@@ -703,8 +704,11 @@ class BelloController:
     _fast_mode = service_method('settings', Settings._fast_mode)
     _cheap_runtime_enabled = service_method('settings', Settings._cheap_runtime_enabled)
     _runtime_enabled = service_method('settings', Settings._runtime_enabled)
+    _runtime_choice = service_method('settings', Settings._runtime_choice)
     _post_coder_review_enabled = service_method('settings', Settings._post_coder_review_enabled)
     _async_tools_enabled = service_method('settings', Settings._async_tools_enabled)
+    _goal_enabled = service_method('settings', Settings._goal_enabled)
+    _no_need_for_context_config = service_method('settings', Settings._no_need_for_context_config)
     _log_distiller_config = service_method('settings', Settings._log_distiller_config)
     _windows_native_root_read_enabled = service_method('settings', Settings._windows_native_root_read_enabled)
     _effective_completion_review = service_method('settings', Settings._effective_completion_review)
@@ -935,7 +939,9 @@ class BelloController:
         completion_review: bool | None = None,
         runtime_enabled: bool | None = None,
         async_tools: bool | None = None,
+        no_need_for_context: NoNeedForContextConfig | None = None,
         log_distiller: LogDistillerConfig | None = None,
+        goal: bool | None = None,
         declared_grading_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
         project_config: ProjectConfig | None = None,
         recovery_enabled: bool = True,
@@ -990,7 +996,11 @@ class BelloController:
         self.completion_review = completion_review
         self.runtime_enabled = runtime_enabled
         self.async_tools = async_tools
+        self.no_need_for_context = no_need_for_context
         self.log_distiller = log_distiller
+        # Goal override for this run (None = the saved project/run config decides). While
+        # Goal is on, runtime supervision and completion review are mandatory.
+        self.goal = goal
         self.project_config = project_config
         self.event_queue: asyncio.Queue[ControllerEvent] = asyncio.Queue()
         self.client = client or RuntimeClient(
@@ -1105,6 +1115,7 @@ class BelloController:
                 configure_run(
                     runtime_enabled=self._runtime_enabled(),
                     async_tools=self._async_tools_enabled(),
+                    no_need_for_context=self._no_need_for_context_config(),
                     windows_native_root_read=self._windows_native_root_read_enabled(),
                     log_distiller=self._log_distiller_config(),
                 )
@@ -1151,6 +1162,7 @@ class BelloController:
                     thread_id,
                     role="completion_review",
                 ),
+                goal=self._goal_enabled(),
             ) if self._effective_completion_review() else None
             self.adv_report_controller = StatelessSupervisorAgent(
                 self.client,
@@ -1184,6 +1196,7 @@ class BelloController:
                 multi_agent=self._multi_agent_config(),
                 plan_path=self._active_coder_plan_path(),
                 readonly_roots=self._active_dependency_roots(),
+                goal=self._goal_enabled(),
             )
             if self._durable_run is not None and self._durable_run.restored:
                 await resume_coder(self)
@@ -1292,8 +1305,11 @@ class BelloController:
             max_completion_returns_after_adversary=project_config.completion_returns_after_adversary,
             completion_review_enabled=project_config.completion_review,
             cheap_runtime=self._runtime_enabled() and project_config.cheap_runtime,
-            runtime_enabled=self._runtime_enabled(),
+            # Goal forces runtime on at every point of use; keep the saved choice.
+            runtime_enabled=self._runtime_choice(),
+            goal=self._goal_enabled(),
             async_tools=self._async_tools_enabled(),
+            no_need_for_context=self._no_need_for_context_config().to_json_data(),
             windows_native_root_read=self._windows_native_root_read_enabled(),
             log_distiller=self._log_distiller_config().to_json_data(),
             multi_agent=project_config.multi_agent.to_json_data(),
@@ -1421,8 +1437,11 @@ class BelloController:
                     "max_completion_returns_after_adversary": project_config.completion_returns_after_adversary,
                     "completion_review_enabled": project_config.completion_review,
                     "cheap_runtime": self._runtime_enabled() and project_config.cheap_runtime,
-                    "runtime_enabled": self._runtime_enabled(),
+                    # Goal forces runtime on at every point of use; keep the saved choice.
+                    "runtime_enabled": self._runtime_choice(),
+                    "goal": self._goal_enabled(),
                     "async_tools": self._async_tools_enabled(),
+                    "no_need_for_context": self._no_need_for_context_config().to_json_data(),
                     "windows_native_root_read": self._windows_native_root_read_enabled(),
                     "log_distiller": self._log_distiller_config().to_json_data(),
                     "multi_agent": project_config.multi_agent.to_json_data(),
@@ -1838,6 +1857,10 @@ class BelloController:
             seen_completions.append(completion_key)
             turn = params.get("turn", {})
             if isinstance(turn, dict) and turn.get("status") == "failed":
+                # A failed provider turn is terminal too. Clear its owned turn before
+                # finalization so a stale active ID cannot survive an empty or
+                # length-limited answer after a completion return.
+                self._clear_persisted_coder_turn(thread_id, turn_id)
                 detail = bounded_provider_error({"error": turn.get("error")}).get("error", {})
                 await self.fail_provider(f"coder execution failed: {detail or 'provider returned a failed turn'}")
                 return

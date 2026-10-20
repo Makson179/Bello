@@ -59,15 +59,16 @@ def test_review_temp_environment_linux_and_mac(monkeypatch, tmp_path):
     temp = root / ".cache" / "review"
     temp.mkdir(parents=True)
     policy = SandboxPolicy(root, temp_root=temp)
+    monkeypatch.setenv("CLAUDE_CODE_TMPDIR", "/outside/host-controlled-temp")
     monkeypatch.setattr(sandbox, "_linux_launcher", lambda: Path("/usr/bin/bwrap"))
     invocation = sandbox._linux_invocation(policy, root, ("/usr/bin/true",))
     pairs = _argument_pairs(invocation.argv, "--setenv")
-    for key in ("TMPDIR", "TMP", "TEMP"):
+    for key in ("TMPDIR", "TMP", "TEMP", "CLAUDE_CODE_TMPDIR"):
         assert (key, str(temp.resolve())) in pairs
     monkeypatch.setattr(sandbox, "_trusted_launcher", lambda path, label: path)
     monkeypatch.setattr(sandbox, "_mac_profile", lambda *args: ("profile", ()))
     mac = sandbox._mac_invocation(policy, root, ("/usr/bin/true",), tmp_path)
-    for key in ("TMPDIR", "TMP", "TEMP"):
+    for key in ("TMPDIR", "TMP", "TEMP", "CLAUDE_CODE_TMPDIR"):
         assert mac.env[key] == str(temp.resolve())
 
 
@@ -234,6 +235,7 @@ def test_macos_invocation_scrubs_host_environment(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv("DYLD_INSERT_LIBRARIES", "/tmp/evil.dylib")
     monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid")
+    monkeypatch.setenv("CLAUDE_CODE_TMPDIR", "/outside/host-controlled-temp")
 
     invocation = sandbox._mac_invocation(
         SandboxPolicy(tmp_path, mode="read-only"), tmp_path, ("/bin/sh", "-c", "true"), scratch
@@ -244,6 +246,7 @@ def test_macos_invocation_scrubs_host_environment(monkeypatch: pytest.MonkeyPatc
     assert invocation.env is not None
     assert invocation.env["HOME"] == str(scratch / "home")
     assert invocation.env["TMPDIR"] == str(scratch / "tmp")
+    assert invocation.env["CLAUDE_CODE_TMPDIR"] == str(scratch / "tmp")
     assert not ({"OPENAI_API_KEY", "DYLD_INSERT_LIBRARIES", "SSH_AUTH_SOCK", "HTTP_PROXY"}
                 & invocation.env.keys())
 
@@ -442,6 +445,7 @@ def test_linux_invocation_has_fail_closed_namespace_and_mount_contract(
     dependency = tmp_path / "dependency"
     root.mkdir()
     dependency.mkdir()
+    monkeypatch.setenv("CLAUDE_CODE_TMPDIR", "/outside/host-controlled-temp")
     monkeypatch.setattr(sandbox, "_linux_launcher", lambda: Path("/usr/bin/bwrap"))
     monkeypatch.setattr(
         sandbox,
@@ -471,8 +475,10 @@ def test_linux_invocation_has_fail_closed_namespace_and_mount_contract(
     assert "/home" not in {source for source, _ in _argument_pairs(argv, "--ro-bind")}
     assert argv[-4:] == ("--", "/bin/sh", "-c", "printf ok")
     assert invocation.env is not None
+    assert invocation.env["CLAUDE_CODE_TMPDIR"] == "/tmp"
+    assert ("CLAUDE_CODE_TMPDIR", "/tmp") in _argument_pairs(argv, "--setenv")
     assert invocation.env.keys() == {
-        "HOME", "LANG", "LC_ALL", "PATH", "TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME",
+        "HOME", "LANG", "LC_ALL", "PATH", "TMPDIR", "CLAUDE_CODE_TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME",
         "XDG_DATA_HOME", "XDG_RUNTIME_DIR",
     }
 

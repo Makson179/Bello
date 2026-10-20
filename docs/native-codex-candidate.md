@@ -5,7 +5,7 @@ targets upstream commit `979011409de0a60b52f179721948e65531d26144`
 (`rust-v0.161.0`). The managed selection and Smart Execution pins now select the
 same published 0.161.0 archive for each supported platform: Linux x64, Windows
 x64 and macOS Apple Silicon. The native assets use the GitHub-only release
-`native-codex-0.161.0-smart-execution-v1`, separate from Bello package publication.
+`native-codex-0.161.0-nnc-se-20261019`, separate from Bello package publication.
 The existing `native-codex-selection.patch` and 0.155.1 build workflows are retained
 as historical recipes, not relabelled as 0.161.0 builds.
 
@@ -36,8 +36,8 @@ needs both sandbox helper executables. Retain upstream licenses and notices.
 
 Before selecting a candidate with the explicit host binary override, validate
 its capabilities and exact executable hash, and run the selection, asynchronous
-execution, cancellation, and history proofs against that **same** binary. Native
-proofs use a synthetic local provider; they are not live model quality tests.
+execution, cancellation, history, and context proofs against that **same** binary.
+Native proofs use a synthetic local provider; they are not live model quality tests.
 macOS results do not qualify Windows ACLs or Linux sandboxing. Do not feed a
 0.161.0 candidate into the older 0.155.1 packaging/receipt helpers or overwrite
 the working global Codex/Bello installation. New published URLs or download pins
@@ -46,7 +46,7 @@ must only be added after real platform artifacts and their proofs exist.
 ## Candidate-only build and qualification
 
 The separate `native-codex-candidate.yml` workflow is limited to
-`codex/072-recovery-validation`. The build helper preserves a strict
+`codex/080-production-ready`. The build helper preserves a strict
 `native-build-receipt.json` with the exact target, source/toolchain recipe,
 normalized lockfile, licenses and every executable hash. Its `proof_status`
 remains `not-run`: reusable compiled binaries are not a passing qualification.
@@ -79,10 +79,11 @@ python scripts/verify_native_codex_candidate.py --candidate native-candidate \
 Use `--target windows-x64` on Windows. The supplied executable must report exactly
 `codex-cli 0.161.0`. The wrapper does not use the published native installer or
 change download pins. It checks the full build receipt before and after each
-proof, binds proof-script hashes, and requires nine selection cases, fourteen
-async cases including three cold concurrency attempts, persistent history, the
-bundled Linux sandbox where applicable, and six CPU ModernBERT cases (four
-inference runs and two protected-input bypass controls).
+proof, binds proof-script hashes, and requires nine selection cases, fifteen
+async cases (including three cold concurrency attempts and per-batch completion
+batching), persistent history, all eight context-compaction cases, the bundled
+Linux sandbox where applicable, and six CPU ModernBERT cases (four inference runs
+and two protected-input bypass controls).
 ModernBERT uses the public pinned bundle with authentication disabled; only that
 download may contact an external model repository. Provider proofs use synthetic
 loopback requests, empty homes, no account credentials, and rejecting proxies.
@@ -98,12 +99,61 @@ not sufficient. Do not upload the guardian control directory or model/home
 caches. Local mocked wrapper tests prove validation behavior, not native-platform
 execution, learned-model performance, or release readiness.
 
+## Context compaction capability (No Need For Context)
+
+The patch also adds the opt-in `bello_context_compaction` feature, off by default.
+When Bello's native backend enables it, the middle of the conversation is replaced
+by a **plain-text** summary: one request without tools that asks for at most about
+16,000 characters, with a single 500-second wall-clock deadline covering the attempt
+and its one retry. A summary over 48,000 characters is rejected, never truncated.
+Empty, refused, unfinished, tool-calling, over-long and non-reducing summaries are
+rejected and the original history stays in place. The configured threshold is
+checked against the model's usable context minus the summary output reserve and a
+safety margin; an incompatible threshold fails explicitly and is never lowered.
+The checkpoint is committed together with its companion records, an unresolved
+storage commit blocks further inference until a cold resume, and a history whose
+own estimate is far below the threshold is not summarized again just because the
+restored usage figure predates the checkpoint. No sandbox, readable-root, network or
+approval setting depends on this feature.
+
+The pinned `native-codex-0.161.0-nnc-se-20261019` helper includes this capability.
+Its archives passed platform qualification and the local-archive installed-cache
+suites described below, including all eight context-compaction cases. The
+[qualified release ledger](../scripts/native-codex-0.161.0-qualified-release.json)
+binds the exact archives and their qualification provenance. Bello still checks for
+`bello_context_compaction` before any thread or turn and fails closed with a clear
+message if it is absent; it does not fall back to another engine or change the global
+Codex. The patch itself can be checked without a Rust toolchain:
+
+```sh
+python scripts/verify_native_codex_patch_structure.py
+python scripts/prepare_native_codex_candidate.py identity
+```
+
+The first command validates every hunk count, file header and offset of the hand-edited
+patch; it cannot prove that context lines match upstream, which `prepare` does with
+`git apply`. Against a built candidate, `scripts/verify_native_codex_context.py --codex
+<binary> --output-dir <fresh-directory>` replays a synthetic loopback proof: compaction on
+and off, empty, truncated, refused, over-maximum and legacy-envelope summaries, and a
+pending Smart Execution call that survives a summary. It reports hashes and counts only.
+All eight cases are mandatory in the Linux, Windows and macOS candidate qualification
+and installed-cache suites. The validator requires every case's fifteen checks, its
+cold-resume result, and its individual `context/<case>/receipt.json` to agree with the
+aggregate report. Qualification binds those receipts and the proof scripts by SHA256
+to the unchanged executable; the release provenance includes the exact context report
+and case-receipt hash inventory. A standalone capability advertisement is not proof.
+
 ## Release archive and installed-cache gates
 
-The release preparation path is separate from candidate compilation.
-`native-codex-release-qualification.yml` binds Linux and Windows artifact IDs to
-the exact successful source run before downloading them. The versioned release
-packager verifies the complete build, aggregate guardian receipt, worker receipt,
+The current prepublication flow stays within `native-codex-candidate.yml` for
+Linux and Windows and `native-codex-macos-candidate.yml` for macOS. Each proof job
+qualifies its same-run build artifact, packages that exact candidate, and
+cold-installs the resulting archive. The retained receipts bind the source commit,
+workflow run and attempt, executable, qualification, archive and installed proof.
+These workflows do not publish assets or change download pins.
+`native-codex-release-qualification.yml` is retained only for manual historical
+artifact replay, not this current release path. The versioned release packager
+verifies the complete build, aggregate guardian receipt, worker receipt,
 proof-source hashes and individual case results before creating the installer's
 strict file inventory. It does not modify the compiled executable bytes or reuse
 the older packaging helpers under a different version constant.
@@ -116,22 +166,29 @@ continuation on macOS therefore remains fail-closed.
 
 All release targets must then cold-install their archive through Bello's real
 private-cache installer and repeat selection, async/cancellation, persistent
-history and six CPU ModernBERT cases (four inference runs and two protected-input
-bypass controls), plus the bundled sandbox on Linux. Local
-archive transfer is substituted only during this prepublication gate; no mock
+history, all eight context-compaction cases, and six CPU ModernBERT cases (four
+inference runs and two protected-input bypass controls), plus the bundled sandbox
+on Linux. Local archive transfer is substituted only during this prepublication gate; no mock
 native executable or provider credential is used. A separate postpublication
 gate must download the pinned archive through the normal HTTPS downloader and
-verify unchanged cache reuse. Passing source or candidate tests alone does not
-mean these archive and HTTPS gates have passed.
+verify unchanged cache reuse. That manual gate expects the full fifteen-case async
+proof, including completion batching, and all eight context-compaction cases, which
+the earlier `smart-execution-v1` archives do not qualify for;
+run it against the currently pinned release. Passing source or candidate tests
+alone does not mean these archive and HTTPS gates have passed.
 
 Archive checksums must exist before setting public download pins. Native helper
 assets are published separately from the Bello package release. The managed
-helper is selected for native Smart Execution or log distillation; ordinary
-Codex execution without those features continues to use the user's host Codex.
-No global Codex installation is replaced by this release path.
+helper is selected for native Smart Execution, log distillation or No Need For
+Context; ordinary Codex
+execution without those features continues to use the user's host Codex. No global
+Codex installation is replaced by this release path.
 
-The pin-promotion commit starts the separate production-HTTPS qualification on
-Linux, macOS Apple Silicon and both Windows/Python variants. Published URLs and
+After separately authorized helper publication and the exact installer pin update,
+manually dispatch `native-codex-release-download.yml` on the candidate branch for
+production-HTTPS qualification on Linux, macOS Apple Silicon and both
+Windows/Python variants. It has no push trigger; a pin-promotion commit does not
+start it automatically. Published URLs and
 pins are not evidence that this gate passed: release approval requires successful
 receipts on the exact final source. Both Windows variants must select the same
 archive and manifest hashes. No stable Bello release or HTTPS success is claimed

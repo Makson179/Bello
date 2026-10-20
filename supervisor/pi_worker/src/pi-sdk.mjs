@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { installOpenRouterBackpressure } from "./openrouter-backpressure.mjs";
 import { createCatalogRuntime } from "./catalog.mjs";
 import { enforceExecutionBillingRoute } from "./billing-route.mjs";
+import { assertContextFits, contextBudget, contextCompactionExtension, CONTEXT_COMPACTION_STATE_TYPE, installContextTransactionGuard, normalizeContextPolicy } from "./context-compaction.mjs";
 
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import {
@@ -100,11 +101,29 @@ export const realPiSdk = {
     systemPrompt,
     requestOptions,
     asyncAfterTurn,
+    noNeedForContext,
+    pendingCallIds,
+    onContextCompaction,
   }) {
+    const contextPolicy = normalizeContextPolicy(noNeedForContext);
+    const budget = contextPolicy.enabled ? contextBudget(contextPolicy, model) : undefined;
+    const contextTransactions = budget ? installContextTransactionGuard(sessionManager) : undefined;
+    // Compaction notifications (committed checkpoints and interrupted summaries)
+    // run strictly in order. The worker drains the chain before it publishes a
+    // terminal turn, so late usage accounting cannot race the final state.
+    let compactionNotifications = Promise.resolve();
+    let compactionNotificationFailure;
+    const notifyCompaction = (data) => {
+      compactionNotifications = compactionNotifications.then(() => onContextCompaction?.(data)).catch((error) => {
+        compactionNotificationFailure ??= error;
+      });
+      return compactionNotifications;
+    };
     const settingsManager = SettingsManager.inMemory({
       defaultTools: [],
       steeringMode: "one-at-a-time",
       followUpMode: "one-at-a-time",
+      ...(contextPolicy.enabled ? { compaction: { enabled: false } } : {}),
     });
     const appendSystemPrompt = typeof developerInstructions === "string" && developerInstructions.trim()
       ? [developerInstructions]
@@ -118,7 +137,10 @@ export const realPiSdk = {
       noPromptTemplates: true,
       noThemes: true,
       noContextFiles: true,
-      extensionFactories: [providerPayloadExtension(requestOptions)],
+      extensionFactories: [providerPayloadExtension(requestOptions), contextCompactionExtension({
+        policy: contextPolicy, modelRuntime, requestOptions, transformPayload: transformProviderPayload,
+        pendingCallIds, onInterruptedSummary: notifyCompaction,
+      })],
       // Pi discovers project/agent SYSTEM.md only when this option is
       // nullish. An explicit empty source prevents those reads while retaining
       // Pi's generic base prompt when Bello supplies no custom system prompt.
@@ -143,16 +165,54 @@ export const realPiSdk = {
       throw new Error(`Pi unexpectedly selected a fallback model: ${modelFallbackMessage}`);
     }
     installOpenRouterBackpressure(session.agent);
+    if (budget) {
+      const previousTransform = session.agent.transformContext;
+      session.agent.transformContext = async (messages, signal) => {
+        if (signal?.aborted) throw new DOMException("Context request aborted", "AbortError");
+        contextTransactions.assertHealthy();
+        const transformed = previousTransform ? await previousTransform(messages, signal) : messages;
+        if (signal?.aborted) throw new DOMException("Context request aborted", "AbortError");
+        assertContextFits(transformed, budget, session.systemPrompt, session.agent.state.tools);
+        return transformed;
+      };
+      session.subscribe((event) => {
+        if (event.type === "entry_appended" && event.entry.type === "custom"
+            && event.entry.customType === CONTEXT_COMPACTION_STATE_TYPE) {
+          // entry_appended is emitted after the SDK commits every draft and
+          // refreshes the live projection. Only a durable committed (or
+          // rolled-back) checkpoint is reported here; telemetry cannot roll
+          // back a commit.
+          void notifyCompaction(event.entry.data);
+        }
+      });
+    }
+    // Resolves when every queued notification has settled, or rejects after a
+    // bounded wait. A callback failure is reported once, to the drain that
+    // observes it, so one failed turn does not poison every later turn.
+    session.flushContextCompactionNotifications = async () => {
+      let timer;
+      try {
+        await Promise.race([compactionNotifications, new Promise((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("Context compaction accounting did not settle within 5 seconds")), 5000);
+        })]);
+      } finally {
+        clearTimeout(timer);
+      }
+      const failure = compactionNotificationFailure;
+      compactionNotificationFailure = undefined;
+      if (failure) throw failure;
+    };
     session.setActiveToolsByName(activeToolNames);
     if (asyncAfterTurn) {
       // Pi 1.0 uses finishTurn decisions in place of shouldStopAfterTurn.
-      // Preserve the session's own hook and its end/continue decision. Error
-      // and abort turns are terminal and must never wait for more tool output.
+      // Preserve the session's own hook and its end/continue decision. Error,
+      // abort and output-limit turns are terminal and must never wait for more
+      // tool output.
       const previousFinish = session.agent.finishTurn;
       session.agent.finishTurn = async (turn, signal) => {
         const decision = await previousFinish?.call(session.agent, turn, signal);
         if (decision?.action === "end" || signal?.aborted
-            || ["error", "aborted"].includes(turn.message.stopReason)) return decision;
+            || ["error", "aborted", "length"].includes(turn.message.stopReason)) return decision;
         await asyncAfterTurn(turn, signal);
         return decision;
       };

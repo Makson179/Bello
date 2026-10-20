@@ -28,7 +28,7 @@ from email.parser import BytesParser
 from zipfile import ZipFile
 
 
-VERSION = "0.7.2"
+VERSION = "0.8.0"
 PROBE_MODULES = (
     "supervisor", "supervisor.main", "supervisor.controller", "supervisor.project_config",
     "supervisor.prompts.supervisor", "supervisor.runtime.client", "supervisor.runtime.codex",

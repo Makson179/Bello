@@ -10,7 +10,7 @@ name: Claude Code on native Windows
 on:
   workflow_dispatch:
   push:
-    branches: [main, codex/windows-claude-config-071, codex/072-recovery-validation]
+    branches: [main, codex/windows-claude-config-071, codex/080-production-ready]
   pull_request:
 
 permissions:

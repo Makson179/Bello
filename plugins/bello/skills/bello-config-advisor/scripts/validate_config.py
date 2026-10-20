@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
@@ -48,8 +49,11 @@ REQUIRED_KEYS = {
     "adversary_multi_agent",
 }
 # Older complete recommendations omit these opt-ins. Match ProjectConfig's
-# false defaults without accepting arbitrary new keys or coercing strings.
-OPTIONAL_BOOLEAN_KEYS = {"async_tools", "windows_native_root_read"}
+# defaults (async_tools=true, windows_native_root_read=false, goal=false) without
+# accepting arbitrary new keys or coercing strings.
+OPTIONAL_BOOLEAN_KEYS = {"async_tools", "windows_native_root_read", "goal"}
+OPTIONAL_BOOLEAN_DEFAULTS = {"async_tools": True, "windows_native_root_read": False, "goal": False}
+OPTIONAL_OBJECT_KEYS = {"no_need_for_context"}
 
 
 def _is_int(value: Any, *, minimum: int = 0) -> bool:
@@ -246,14 +250,25 @@ def validate(
     except ValueError as exc:
         return [f"catalog: {exc}; supply a current catalog from inspect_models.py"]
     missing = REQUIRED_KEYS - config.keys()
-    extra = config.keys() - REQUIRED_KEYS - OPTIONAL_BOOLEAN_KEYS
+    extra = config.keys() - REQUIRED_KEYS - OPTIONAL_BOOLEAN_KEYS - OPTIONAL_OBJECT_KEYS
     if missing:
         errors.append(f"root: missing keys {sorted(missing)}")
     if extra:
         errors.append(f"root: unknown keys {sorted(extra)}")
     for field in sorted(OPTIONAL_BOOLEAN_KEYS):
-        if type(config.get(field, False)) is not bool:
+        if type(config.get(field, OPTIONAL_BOOLEAN_DEFAULTS[field])) is not bool:
             errors.append(f"{field}: expected boolean")
+    context = config.get("no_need_for_context", {})
+    if not isinstance(context, dict) or set(context) - {"enabled", "threshold_tokens", "retain_percent"}:
+        errors.append("no_need_for_context: expected only enabled, threshold_tokens and retain_percent")
+    else:
+        if type(context.get("enabled", False)) is not bool:
+            errors.append("no_need_for_context.enabled: expected boolean")
+        if not _is_int(context.get("threshold_tokens", 200000), minimum=1):
+            errors.append("no_need_for_context.threshold_tokens: expected a positive integer")
+        percent = context.get("retain_percent", 10)
+        if type(percent) not in (int, float) or not 0 < percent <= 50 or not math.isfinite(percent):
+            errors.append("no_need_for_context.retain_percent: expected a finite number greater than 0 and at most 50")
 
     if config.get("review_limit_format") != "explicit":
         errors.append("review_limit_format: must be 'explicit'")
@@ -265,6 +280,10 @@ def validate(
         errors.append(f"task: expected the resolved input task {expected_task!r}")
     runtime = config.get("runtime_enabled") is True
     review = config.get("completion_review") is True
+    goal = config.get("goal", False) is True
+    if goal and not (runtime and review):
+        # Goal makes both mandatory; a recommendation must say so explicitly.
+        errors.append("goal: requires runtime_enabled=true and completion_review=true")
     adversary_enabled = config.get("adversary") is True
     active_roles = {"coder"}
     if runtime:
@@ -310,7 +329,8 @@ def validate(
         "max_completion_returns_before_adversary",
         "max_completion_returns_after_adversary",
     ):
-        _validate_review_limit(config.get(field), field, errors, allow_unlimited=allow_unlimited)
+        # Goal makes completion returns unlimited by definition.
+        _validate_review_limit(config.get(field), field, errors, allow_unlimited=allow_unlimited or goal)
 
     completion = config.get("completion_review")
     adversary = config.get("adversary")
@@ -330,6 +350,14 @@ def validate(
             errors.append("review pipeline: adversary=false requires adversary runs and post-adversary returns=0")
         if completion is True and before == 0:
             errors.append("review pipeline: completion review has no scheduled return budget")
+
+    if goal:
+        # Goal runs unlimited completion returns; keep the recommendation self-describing so a reader
+        # (or a Bello version that predates Goal) never sees a finite cap that would not apply.
+        if before != "unlimited":
+            errors.append("goal: requires max_completion_returns_before_adversary='unlimited'")
+        if adversary is True and after != "unlimited":
+            errors.append("goal: requires max_completion_returns_after_adversary='unlimited' while adversary=true")
 
     protected = config.get("protected_path")
     if not isinstance(protected, list) or any(not isinstance(item, str) or not item.strip() for item in protected):
