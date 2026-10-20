@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+from importlib import metadata
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,52 @@ def _load_launcher():
     return module
 
 
+def _bello_package_version(root: Path) -> str:
+    pyproject = root / "pyproject.toml"
+    if pyproject.is_file():
+        import tomllib
+
+        return tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+    # The standalone marketplace installs its pinned upstream Bello for tests;
+    # it does not carry a duplicate package definition of its own.
+    return metadata.version("Bello")
+
+
+def test_package_version_prefers_source_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "Bello"\nversion = "9.8.7"\n', encoding="utf-8",
+    )
+    monkeypatch.setattr(metadata, "version", lambda name: pytest.fail("source version ignored"))
+
+    assert _bello_package_version(tmp_path) == "9.8.7"
+
+
+def test_marketplace_version_queries_installed_bello_distribution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed_version = Mock(return_value="9.8.7")
+    monkeypatch.setattr(metadata, "version", installed_version)
+
+    assert not (tmp_path / "pyproject.toml").exists()
+    assert _bello_package_version(tmp_path) == "9.8.7"
+    installed_version.assert_called_once_with("Bello")
+
+
+def test_marketplace_version_does_not_hide_missing_bello(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing_distribution(name: str) -> str:
+        assert name == "Bello"
+        raise metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(metadata, "version", missing_distribution)
+
+    with pytest.raises(metadata.PackageNotFoundError, match="Bello"):
+        _bello_package_version(tmp_path)
+
+
 def test_codex_and_claude_manifests_share_one_versioned_skill() -> None:
     codex = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
     claude = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
@@ -33,9 +80,7 @@ def test_codex_and_claude_manifests_share_one_versioned_skill() -> None:
     assert codex["name"] == claude["name"] == "bello"
     assert codex["version"] == claude["version"]
     # Both manifests track the package they ship with, whatever the release number is.
-    import tomllib
-    package = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
-    assert codex["version"] == package
+    assert codex["version"] == _bello_package_version(ROOT)
     assert codex["skills"] == claude["skills"] == "./skills/"
     assert (PLUGIN / "skills" / "bello-delegate" / "SKILL.md").is_file()
     assert SCRIPT.is_file()
