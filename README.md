@@ -157,6 +157,25 @@ block on polish. The coder keeps a short `GOAL_MAP.md` of what it tried, what
 happened and what is left to try. Goal is off by default; see
 [docs/runtime.md](./docs/runtime.md#independent-run-controls).
 
+### No Need For Context (NNC)
+
+NNC compresses older conversation history into a summary while preserving the
+original task, instructions, and a recent tail of complete interactions. The
+compression threshold and retained-tail size are configurable.
+
+This lets agents continue long-running tasks without carrying the entire
+conversation into every subsequent request. NNC is off by default; when enabled,
+the default threshold is 200,000 tokens with a soft recent-tail target of 20,000.
+See [configuration and backend details](./docs/no-need-for-context.md).
+
+<picture>
+  <img src="./docs/assets/nnc-astra-xhigh-solar.png" alt="Astra XHigh on Solar, three attempts per setup. Raw versus NNC: observed passed-test fraction 58.88% versus 55.97%, API-equivalent cost $9.37 versus $8.13, solver time 31:20 versus 27:45. Partial evaluation included in observed pass fraction." width="100%">
+</picture>
+
+Mean observed test-pass fraction (partial evaluation included), historical
+API-equivalent cost, and solver time; three attempts per setup.
+[Measurements and settings.](./docs/assets/nnc-astra-xhigh-solar.json)
+
 ## Results
 
 Scores are ProgramBench completion scores unless a task has its own evaluator.
