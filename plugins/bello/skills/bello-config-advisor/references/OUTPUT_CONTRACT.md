@@ -13,6 +13,7 @@ I recommend this Bello setup for `TASK.md`:
 - Execution mode: normal speed.
 - Smart Execution: on.
 - Goal: off.
+- NNC: off.
 - Runtime supervision: GPT-5.6 Sol at medium effort, with cheap runtime triage enabled.
 - Log distiller: off.
 - Completion review: GPT-5.6 Sol at high effort may return work to the coder once.
@@ -35,6 +36,7 @@ This is a shape example, not a preset. Populate it from the selected setup and o
 - If runtime is off, omit its dormant profile and state briefly that live supervision/triage is off with reduced protection; network remains inside the filesystem sandbox and outside-sandbox grants are unavailable. Do not imply C/A are disabled or equivalent live protection remains.
 - State whether Goal is on or off (it is off unless the user asked for it). When on, say that runtime supervision and completion review are mandatory and that completion returns are unlimited, before and after any adversary pass, until the reviewer accepts; the review schedule below then lists the adversary passes only.
 - State whether Smart Execution is on or off. For a Windows native setup, state root-read permission when relevant; enabling it needs explicit consent to broad reads and does not grant broad writes. Do not imply advice itself changed permissions.
+- State whether No Need For Context (NNC) is on or off. When on, give the compression threshold in tokens, the retained-tail percentage, and its derived soft token target; whole turns can make the actual tail larger. When off, omit dormant threshold/tail settings. Do not imply Goal or Smart Execution automatically enables NNC.
 - For log distiller, say off, on with Bello's default model (downloaded once at first use), or identify the selected local override. Omit implementation and timeout details; do not imply a provider subscription, guaranteed savings, or that advice has already downloaded weights.
 - Describe the review schedule as maximum allowed returns and adversary passes. For an adversarial schedule, state separately how many completion returns are allowed before the first adversary, how many adversary passes may run, and how many completion returns are allowed after each adversary pass. Make clear that a reviewer may accept earlier when that distinction matters.
 - Adversary reports use the completion profile if completion is enabled, otherwise the adversary profile. Mention a report-processing profile only when it adds a role not already clear from the setup; do not add a redundant line for A-only or imply a hidden completion role.
