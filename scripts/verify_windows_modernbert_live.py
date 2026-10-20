@@ -291,6 +291,8 @@ async def live_turn(binary: Path, bundle: Path, home: Path, work: Path, private_
     except Exception as exc:
         # RPC/auth errors can contain sensitive provider details. Export type only.
         result["error_type"] = type(exc).__name__
+        if isinstance(exc, native.WindowsSetupFailure):
+            result["windows_setup_failure"] = exc.diagnostic
     finally:
         if session is not None:
             await session.close(private_logs)
@@ -385,6 +387,11 @@ def main() -> int:
         result["auth_removed"] = not os.path.lexists(home)
         result["passed"] = result["passed"] and result["auth_removed"]
         if output.is_dir():
+            if result.get("windows_setup_failure") is not None:
+                # The private auth/log home has been removed above. Copy only
+                # the helper's already text-free diagnostic to the public root.
+                (output / "windows-setup-failure.json").write_text(
+                    json.dumps(result["windows_setup_failure"], indent=2) + "\n", encoding="utf-8")
             (output / "report.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(result), flush=True)
     return 0 if result["passed"] else 1

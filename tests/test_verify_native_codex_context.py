@@ -3,10 +3,43 @@ import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from scripts import verify_native_codex_context as proof
+
+
+@pytest.mark.asyncio
+async def test_context_setup_failure_is_in_existing_uploaded_receipt_and_report(tmp_path, monkeypatch):
+    failure = proof.WindowsSetupFailure(
+        1, b"", b"setup_transaction_lock_failed: os error 5 private-fixture-token")
+    server = SimpleNamespace(server_port=1234, serve_forever=Mock(), shutdown=Mock(), server_close=Mock())
+    worker = SimpleNamespace(start=Mock(), join=Mock())
+    session = SimpleNamespace(start=AsyncMock(), close=AsyncMock())
+    monkeypatch.setattr(proof, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(proof, "ThreadingHTTPServer", Mock(return_value=server))
+    monkeypatch.setattr(proof, "threading", SimpleNamespace(Thread=Mock(return_value=worker), Event=proof.threading.Event))
+    monkeypatch.setattr(proof, "ReceiptSession", Mock(return_value=session))
+    provision = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(proof, "provision_windows_sandbox", provision)
+    binary = tmp_path / "not-executed.exe"
+    binary.write_bytes(b"fixture identity only")
+    output = tmp_path / "context"
+
+    report = await proof.verify(binary, output, cases=["empty"])
+
+    result = report["results"][0]
+    assert report["passed"] is False and result["passed"] is False
+    assert result["failure"] == {"stage": "startup", "type": "WindowsSetupFailure"}
+    assert result["regular_requests"] == result["summary_requests"] == 0
+    assert result["windows_setup_failure"] == failure.diagnostic
+    assert json.loads((output / "empty/receipt.json").read_text())["windows_setup_failure"] == failure.diagnostic
+    assert json.loads((output / "report.json").read_text())["results"][0]["windows_setup_failure"] == failure.diagnostic
+    assert "private-fixture-token" not in json.dumps(report)
+    session.start.assert_not_awaited()
+    session.close.assert_awaited_once()
+    provision.assert_awaited_once()
 
 
 def message(text):

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import os
+import sys
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -13,6 +15,66 @@ from scripts import verify_windows_modernbert as smoke
 class CharacterTokenizer:
     def __call__(self, text, **kwargs):
         return {"input_ids": list(text.encode("utf-8"))}
+
+
+@pytest.mark.asyncio
+async def test_live_setup_failure_is_reported_before_any_provider_or_model_call(tmp_path, monkeypatch):
+    from scripts import verify_windows_modernbert_live as live
+    failure = live.native.WindowsSetupFailure(
+        1, b"", b"helper_firewall_rule_verify_failed: os error 5 private-fixture-token")
+    tokenizer = SimpleNamespace(from_pretrained=Mock(return_value=object()))
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoTokenizer=tokenizer))
+    selector = SimpleNamespace(close=AsyncMock(), worker_failure_types=[])
+    bridge = SimpleNamespace(start=AsyncMock(), close=AsyncMock(), environment={})
+    session = SimpleNamespace(start=AsyncMock(), close=AsyncMock())
+    monkeypatch.setattr(live, "ObservedDistiller", Mock(return_value=selector))
+    monkeypatch.setattr(live, "CodexDistillerBridge", Mock(return_value=bridge))
+    monkeypatch.setattr(live.native, "NativeSession", Mock(return_value=session))
+    monkeypatch.setattr(live.native, "isolated_environment", lambda *_args: {"PATH": "fixture"})
+    monkeypatch.setattr(live, "_private_directory", lambda *_args, **_kwargs: None)
+    provision = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(live.native, "provision_windows_sandbox", provision)
+
+    result = await live.live_turn(tmp_path / "codex.exe", tmp_path / "bundle", tmp_path / "home",
+                                  tmp_path / "work", tmp_path / "private-logs")
+
+    assert result["passed"] is False and result["paid_turns_started"] == 0
+    assert result["phase"] == "bootstrap" and result["error_type"] == "WindowsSetupFailure"
+    assert result["windows_setup_failure"] == failure.diagnostic
+    assert "private-fixture-token" not in json.dumps(result)
+    session.start.assert_not_awaited()
+    session.close.assert_awaited_once()
+    provision.assert_awaited_once()
+    bridge.close.assert_awaited_once()
+    selector.close.assert_awaited_once()
+
+
+def test_live_setup_diagnostic_survives_into_existing_public_report(tmp_path, monkeypatch):
+    from scripts import verify_windows_modernbert_live as live
+    diagnostic = live.native.WindowsSetupFailure(
+        1, b"", b"helper_user_create_or_update_failed: os error 5 private-fixture-token").diagnostic
+    output, runtime, home = tmp_path / "output", tmp_path / "runtime", tmp_path / "auth-fixture"
+    monkeypatch.setattr(sys, "argv", ["proof", "--runtime-root", str(runtime),
+                                     "--auth-home", str(home), "--output-dir", str(output)])
+    # A synthetic dictionary, not the process environment or any real login.
+    monkeypatch.setattr(live, "os", SimpleNamespace(name="nt", path=os.path,
+        environ={live.SECRET_ENV: '{"fixture":"not-a-credential"}'}))
+    monkeypatch.setattr(live, "_private_directory", lambda path, parents=False: path.mkdir(parents=parents))
+    monkeypatch.setattr(live, "ensure_native_selection", lambda: ([str(tmp_path / "not-executed.exe")], {}))
+    monkeypatch.setattr(live, "validate_native_selection", AsyncMock())
+    monkeypatch.setattr(live, "ensure_default_bundle", lambda: tmp_path / "not-loaded")
+    monkeypatch.setattr(live, "live_turn", AsyncMock(return_value={
+        "passed": False, "paid_turns_started": 0, "error_type": "WindowsSetupFailure",
+        "windows_setup_failure": diagnostic}))
+    monkeypatch.setattr(live, "remove_path_tree", lambda _path: None)
+
+    assert live.main() == 1
+
+    report = json.loads((output / "report.json").read_text())
+    assert report["passed"] is False and report["paid_turns_started"] == 0
+    assert report["windows_setup_failure"] == diagnostic
+    assert json.loads((output / "windows-setup-failure.json").read_text()) == diagnostic
+    assert "private-fixture-token" not in json.dumps(report)
 
 
 def test_synthetic_short_and_long_sizes_are_mechanical_and_below_native_budget():

@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts.verify_native_codex_async import ScriptedProvider, delivered, tool, unique_tool_resolutions
-from scripts.verify_native_codex_selection import NativeSession, isolated_environment, provision_windows_sandbox, windows_permission_params, windows_shell
+from scripts.verify_native_codex_selection import NativeSession, WindowsSetupFailure, isolated_environment, provision_windows_sandbox, windows_permission_params, windows_shell
 
 INITIAL = "Run only the synthetic context fixture; preserve this exact initial requirement."
 CORRECTION = "Latest user correction: preserve RELEASE_83 and never publish anything."
@@ -312,6 +312,7 @@ async def verify_case(binary, output, *, enabled=True, failure=None, pending=Fal
     env = isolated_environment(home, binary, server.server_port, {})
     session = ReceiptSession(binary, home, env)
     stage, error, status, resumed = "startup", None, None, False
+    setup_failure = None
     params = {"model": "gpt-5.5", "modelProvider": "bello_fixture", "cwd": str(workspace),
         "sandbox": "workspace-write", "approvalPolicy": "never", "ephemeral": False,
         "config": {"features.bello_context_compaction": enabled, "features.bello_async_tools": pending,
@@ -356,6 +357,8 @@ async def verify_case(binary, output, *, enabled=True, failure=None, pending=Fal
         resumed = await session.terminal(thread_id) == "completed"
     except Exception as exc:
         error = {"stage": stage, "type": type(exc).__name__}
+        if isinstance(exc, WindowsSetupFailure):
+            setup_failure = exc.diagnostic
     finally:
         provider.allow_second.set()
         await session.close(output)
@@ -369,7 +372,8 @@ async def verify_case(binary, output, *, enabled=True, failure=None, pending=Fal
     result = {"case": output.name, "passed": error is None and not provider.errors and not provider.rejected and all(checks.values()),
         "enabled": enabled, "summary_failure": failure, "pending_async": pending,
         "legacy_envelope": legacy_envelope, "checks": checks,
-        "failure": error, "regular_requests": len(provider.regular), "summary_requests": len(provider.summaries),
+        "failure": error, "windows_setup_failure": setup_failure,
+        "regular_requests": len(provider.regular), "summary_requests": len(provider.summaries),
         "turn_status": status, "resumed": resumed,
         "retained_source_rounds": sorted(source_markers(provider.regular[-1])) if provider.regular else [],
         "provider_errors": len(provider.errors), "blocked_external_requests": len(provider.rejected),

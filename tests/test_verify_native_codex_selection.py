@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import gzip
 import importlib.util
 import json
@@ -576,9 +577,99 @@ async def test_windows_setup_failure_keeps_only_bounded_diagnostic_fields(tmp_pa
     assert "private-fixture" not in serialized
     assert "unknown_setup_identifier" not in serialized
     assert len(serialized) < 4096
+    assert json.loads((tmp_path / "windows-setup-failure.json").read_text()) == diagnostic
     spawn.assert_awaited_once()
     process.communicate.assert_awaited_once()
     assert (tmp_path / "windows-setup-stderr.txt").read_bytes() == stderr
+
+
+async def test_windows_setup_sidecar_survives_private_log_write_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("USERNAME", "fixture-runner")
+    process = SimpleNamespace(returncode=1, communicate=AsyncMock(return_value=(
+        b"", b"helper_user_create_or_update_failed: os error 5 private-fixture-token")))
+    monkeypatch.setattr(proof.asyncio, "create_subprocess_exec", AsyncMock(return_value=process))
+    original_write = Path.write_bytes
+
+    def fail_private_log(path, data):
+        if path.name == "windows-setup-stdout.txt":
+            raise OSError("synthetic private log failure")
+        return original_write(path, data)
+
+    monkeypatch.setattr(Path, "write_bytes", fail_private_log)
+    with pytest.raises(OSError, match="synthetic private log failure"):
+        await proof.provision_windows_sandbox(tmp_path / "codex.exe", tmp_path, {}, tmp_path)
+    serialized = (tmp_path / "windows-setup-failure.json").read_text()
+    assert json.loads(serialized)["stderr"]["setup_error_codes"] == ["helper_user_create_or_update_failed"]
+    assert "private-fixture-token" not in serialized
+
+
+async def test_selection_setup_failure_is_in_existing_uploaded_result(tmp_path, monkeypatch):
+    from supervisor.runtime import codex_distiller
+    failure = proof.WindowsSetupFailure(
+        1, b"", b"helper_firewall_policy_access_failed: os error 5 private-fixture-token")
+    bridge = SimpleNamespace(start=AsyncMock(), close=AsyncMock(), environment={}, metrics={})
+    server = SimpleNamespace(server_port=1234, serve_forever=Mock(), shutdown=Mock(), server_close=Mock())
+    worker = SimpleNamespace(start=Mock(), join=Mock())
+    session = SimpleNamespace(env={}, start=AsyncMock(), close=AsyncMock())
+    monkeypatch.setattr(proof, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(codex_distiller, "CodexDistillerBridge", Mock(return_value=bridge))
+    monkeypatch.setattr(proof, "ThreadingHTTPServer", Mock(return_value=server))
+    monkeypatch.setattr(proof, "threading", SimpleNamespace(Thread=Mock(return_value=worker)))
+    monkeypatch.setattr(proof, "NativeSession", Mock(return_value=session))
+    monkeypatch.setattr(proof, "isolated_environment", lambda *_args: {})
+    monkeypatch.setattr(proof, "create_windows_private_canary", lambda *_args: "fixture-hash")
+    monkeypatch.setattr(proof, "windows_root_read_fixture", lambda *_args: "")
+    monkeypatch.setattr(proof, "windows_filesystem_probe", lambda *_args: "")
+    monkeypatch.setattr(proof, "windows_fixture_acls", lambda *_args: {})
+    monkeypatch.setattr(proof, "windows_filesystem_result", lambda *_args, **_kwargs: {
+        "windows_filesystem_sandbox_enforced": False})
+    monkeypatch.setattr(proof, "windows_root_read_result", lambda *_args: {
+        "windows_private_and_metadata_enforced": False})
+    monkeypatch.setattr(proof, "invocation", lambda *_args, **_kwargs: ("exec_command", "fixture"))
+    provision = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(proof, "provision_windows_sandbox", provision)
+    output = tmp_path / "selection"
+
+    result = await proof.run_case(tmp_path / "codex.exe", proof.Case("direct_on"), output)
+
+    assert result["passed"] is False and result["provider_requests"] == 0
+    assert result["windows_setup_failure"] == failure.diagnostic
+    assert json.loads((output / "result.json").read_text())["windows_setup_failure"] == failure.diagnostic
+    assert "private-fixture-token" not in json.dumps(result)
+    session.start.assert_not_awaited()
+    session.close.assert_awaited_once()
+    provision.assert_awaited_once()
+
+
+def test_every_direct_windows_setup_consumer_has_failure_receipt_regression():
+    root = Path(__file__).resolve().parents[1] / "scripts"
+    consumers = set()
+    for path in root.glob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and (
+                isinstance(node.func, ast.Name) and node.func.id == "provision_windows_sandbox"
+                or isinstance(node.func, ast.Attribute) and node.func.attr == "provision_windows_sandbox"
+            ):
+                consumers.add(path.name)
+    # Each has a fake failure test exercising its actual entry point, not just
+    # source text. A new consumer must add its receipt coverage deliberately.
+    assert consumers == {
+        "verify_native_codex_selection.py", "verify_native_codex_async.py",
+        "verify_native_codex_context.py", "verify_windows_modernbert_live.py",
+    }
+
+
+def test_windows_setup_diagnostic_preserves_native_account_status_pair_and_helper_exit():
+    raw = (b"helper_user_create_or_update_failed: failed to create/update user private-fixture-user, "
+           b"code 2245/2221\nsetup helper exited with status Some(1) private-fixture-token")
+    diagnostic = proof.WindowsSetupFailure(1, b"", raw).diagnostic
+    stderr = diagnostic["stderr"]
+    assert stderr["setup_error_codes"] == ["helper_user_create_or_update_failed"]
+    assert stderr["error_codes"] == [2221, 2245]
+    assert stderr["exit_codes"] == [1]
+    assert stderr["failure_markers"] == ["setup_helper_exited"]
+    assert "private-fixture" not in json.dumps(diagnostic)
 
 
 def test_windows_setup_diagnostic_bounds_scanning_and_preserves_original_byte_hash():
