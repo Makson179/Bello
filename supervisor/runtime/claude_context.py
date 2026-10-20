@@ -33,7 +33,7 @@ from typing import Any
 from supervisor.appserver import AppServerError
 
 
-DEFAULT_THRESHOLD = 249_000
+DEFAULT_THRESHOLD = 200_000
 DEFAULT_RETAIN_PERCENT = 10.0
 CONTINUE_PROMPT = (
     "Continue the active Bello request from the completed tool results. "

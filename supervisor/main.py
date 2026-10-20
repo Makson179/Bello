@@ -178,7 +178,7 @@ class BelloClickGroup(click.Group):
     "no_need_for_context_threshold_tokens",
     type=click.IntRange(min=1),
     default=None,
-    help="Positive input-token threshold at which No Need For Context summarizes (default: 249000).",
+    help="Positive input-token threshold at which No Need For Context summarizes (default: 200000).",
 )
 @click.option(
     "--context-retain-percent",

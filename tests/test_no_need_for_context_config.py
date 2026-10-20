@@ -48,7 +48,7 @@ def test_context_config_legacy_defaults_and_round_trip(tmp_path):
     path.parent.mkdir(parents=True)
     path.write_text("{}")
     old = load_project_config(tmp_path, create=False)
-    assert old.no_need_for_context == NoNeedForContextConfig(False, 249000, 10)
+    assert old.no_need_for_context == NoNeedForContextConfig(False, 200000, 10)
     config = replace(old, no_need_for_context=NoNeedForContextConfig(True, 100000, 12.5))
     save_project_config(tmp_path, config)
     assert load_project_config(tmp_path, create=False).no_need_for_context == config.no_need_for_context
@@ -59,6 +59,30 @@ def test_context_config_legacy_defaults_and_round_trip(tmp_path):
     assert config.no_need_for_context.to_backend_data() == {
         "enabled": True, "thresholdTokens": 100000, "retainPercent": 12.5,
     }
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_context_sparse_defaults_and_explicit_legacy_threshold_are_preserved(tmp_path, enabled):
+    from supervisor.runtime.claude_context import context_policy
+
+    path = project_config_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"no_need_for_context": {"enabled": enabled}}))
+    sparse = load_project_config(tmp_path, create=False)
+    assert sparse.no_need_for_context == NoNeedForContextConfig(enabled, 200000, 10)
+    assert context_policy({"enabled": enabled}) == sparse.no_need_for_context.to_backend_data()
+    assert BelloConfig(project_root=str(tmp_path), task_path="TASK.md", no_need_for_context={"enabled": enabled}).no_need_for_context == {
+        "enabled": enabled, "threshold_tokens": 200000, "retain_percent": 10}
+
+    explicit = {"enabled": enabled, "threshold_tokens": 249000, "retain_percent": 10}
+    path.write_text(json.dumps({"no_need_for_context": explicit}))
+    saved = load_project_config(tmp_path, create=False)
+    save_project_config(tmp_path, saved)
+    assert load_project_config(tmp_path, create=False).no_need_for_context.to_json_data() == explicit
+    assert StateStore(tmp_path).get_bello_config().no_need_for_context == explicit
+    assert _resolve_run_settings(project_config=saved).no_need_for_context.to_json_data() == explicit
+    assert context_policy(saved.no_need_for_context.to_backend_data()) == {
+        "enabled": enabled, "thresholdTokens": 249000, "retainPercent": 10}
 
 
 def test_context_run_override_preserves_saved_config():
@@ -138,9 +162,9 @@ def test_controller_reads_saved_context_and_explicit_override(tmp_path):
 
 
 def test_context_is_off_by_default_everywhere():
-    assert ProjectConfig().no_need_for_context == NoNeedForContextConfig(False, 249000, 10)
+    assert ProjectConfig().no_need_for_context == NoNeedForContextConfig(False, 200000, 10)
     assert BelloConfig(project_root="/project", task_path="TASK.md").no_need_for_context == {
-        "enabled": False, "threshold_tokens": 249000, "retain_percent": 10}
+        "enabled": False, "threshold_tokens": 200000, "retain_percent": 10}
     assert _resolve_run_settings(project_config=ProjectConfig()).no_need_for_context.enabled is False
 
 
@@ -162,6 +186,7 @@ def test_context_wording_is_engine_neutral_in_cli_and_editor():
         "no_need_for_context_enabled", "no_need_for_context_threshold_tokens", "no_need_for_context_retain_percent")]
     assert "Pi, Claude subscription and native Codex" in texts[0]
     assert "default: off" in texts[0] and "runtime excluded" in texts[0]
+    assert "default: 200000" in texts[1]
     assert "Soft" in texts[2] and "at most 50" in texts[2]
     parameters = {p.key: p for p in parameter_defs(ProjectConfig(no_need_for_context=NoNeedForContextConfig(True, 1000, 5)))}
     context_rows = [p for key, p in parameters.items() if key.startswith("no_need_for_context")]

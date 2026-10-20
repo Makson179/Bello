@@ -317,7 +317,7 @@ The persisted fields include:
   "completion_review": false,
   "adversary": true,
   "async_tools": true,
-  "no_need_for_context": {"enabled": false, "threshold_tokens": 249000, "retain_percent": 10},
+  "no_need_for_context": {"enabled": false, "threshold_tokens": 200000, "retain_percent": 10},
   "log_distiller": {"enabled": false, "model_path": null}
 }
 ```

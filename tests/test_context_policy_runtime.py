@@ -696,6 +696,23 @@ async def test_native_forwards_policy_through_start_and_resume(tmp_path, monkeyp
         await backend.stop()
 
 
+@pytest.mark.parametrize("threshold", [None, 249000])
+async def test_native_sparse_policy_default_and_explicit_legacy_threshold(tmp_path, monkeypatch, threshold):
+    backend, root, _, clients, _ = make_native(tmp_path, monkeypatch)
+    policy = {"enabled": True}
+    if threshold is not None:
+        policy["thresholdTokens"] = threshold
+    try:
+        await backend.request("thread/start", thread_params(root, noNeedForContext=policy))
+        await backend.request("thread/resume", {"threadId": "host-thread"})
+        for method, native in clients[0].calls:
+            if method in {"thread/start", "thread/resume"}:
+                assert native["config"]["model_auto_compact_token_limit"] == (threshold or 200000)
+                assert native["config"]["bello_context_retain_percent"] == 10
+    finally:
+        await backend.stop()
+
+
 async def test_native_on_policy_overrides_untrusted_context_config(tmp_path, monkeypatch):
     backend, root, _, clients, _ = make_native(tmp_path, monkeypatch)
     try:

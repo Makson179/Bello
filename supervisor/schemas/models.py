@@ -200,7 +200,7 @@ class BelloConfig(BaseModel):
     # Smart Execution defaults on; a saved explicit false is preserved.
     async_tools: bool = True
     no_need_for_context: dict[str, Any] = Field(
-        default_factory=lambda: {"enabled": False, "threshold_tokens": 249000, "retain_percent": 10}
+        default_factory=lambda: {"enabled": False, "threshold_tokens": 200000, "retain_percent": 10}
     )
 
     @field_validator("no_need_for_context", mode="before")

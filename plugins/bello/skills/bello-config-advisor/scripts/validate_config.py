@@ -264,7 +264,7 @@ def validate(
     else:
         if type(context.get("enabled", False)) is not bool:
             errors.append("no_need_for_context.enabled: expected boolean")
-        if not _is_int(context.get("threshold_tokens", 249000), minimum=1):
+        if not _is_int(context.get("threshold_tokens", 200000), minimum=1):
             errors.append("no_need_for_context.threshold_tokens: expected a positive integer")
         percent = context.get("retain_percent", 10)
         if type(percent) not in (int, float) or not 0 < percent <= 50 or not math.isfinite(percent):

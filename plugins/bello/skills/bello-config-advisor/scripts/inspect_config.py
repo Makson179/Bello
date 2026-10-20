@@ -179,7 +179,7 @@ def _normalize(payload: dict[str, Any], *, config_exists: bool) -> dict[str, Any
     raw_context = payload.get("no_need_for_context", {})
     no_need_for_context = (
         {"enabled": raw_context.get("enabled", False),
-         "threshold_tokens": raw_context.get("threshold_tokens", 249000),
+         "threshold_tokens": raw_context.get("threshold_tokens", 200000),
          "retain_percent": raw_context.get("retain_percent", 10)}
         if isinstance(raw_context, dict) else copy.deepcopy(raw_context)
     )

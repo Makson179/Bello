@@ -164,7 +164,21 @@ class AdvisorValidationTests(unittest.TestCase):
         self.assertIs(current["async_tools"], True)
         self.assertIs(current["goal"], False)
         self.assertIs(current["windows_native_root_read"], False)
-        self.assertEqual(current["no_need_for_context"], {"enabled": False, "threshold_tokens": 249000, "retain_percent": 10})
+        self.assertEqual(current["no_need_for_context"], {"enabled": False, "threshold_tokens": 200000, "retain_percent": 10})
+
+    def test_context_sparse_defaults_and_explicit_legacy_threshold_match_project_config(self):
+        from supervisor.project_config import _config_from_payload
+        for threshold in (None, 249000):
+            for enabled in (False, True):
+                with self.subTest(threshold=threshold, enabled=enabled):
+                    candidate = config()
+                    candidate["no_need_for_context"] = {"enabled": enabled}
+                    if threshold is not None:
+                        candidate["no_need_for_context"]["threshold_tokens"] = threshold
+                    self.assertEqual(validate(candidate), [])
+                    expected = {"enabled": enabled, "threshold_tokens": threshold or 200000, "retain_percent": 10}
+                    self.assertEqual(INSPECTOR._normalize(candidate, config_exists=True)["no_need_for_context"], expected)
+                    self.assertEqual(_config_from_payload(candidate, path=Path("synthetic.json")).no_need_for_context.to_json_data(), expected)
 
     def test_explicit_saved_async_off_is_preserved_and_defaults_match_project_config(self):
         from supervisor.project_config import _config_from_payload

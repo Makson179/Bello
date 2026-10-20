@@ -13,7 +13,7 @@ and recent-tail percentage. The saved configuration is:
 {
   "no_need_for_context": {
     "enabled": false,
-    "threshold_tokens": 249000,
+    "threshold_tokens": 200000,
     "retain_percent": 10
   }
 }
@@ -22,12 +22,13 @@ and recent-tail percentage. The saved configuration is:
 Run flags:
 
 ```sh
-bello --no-need-for-context --context-threshold-tokens 249000 --context-retain-percent 10
+bello --no-need-for-context --context-threshold-tokens 200000 --context-retain-percent 10
 bello --no-no-need-for-context
 ```
 
 The threshold must be a positive integer. The retention percentage must be a
-finite number greater than zero and at most 50.
+finite number greater than zero and at most 50. Existing explicitly saved thresholds
+remain unchanged; the default applies when the threshold is omitted.
 
 ## What it does
 
@@ -35,7 +36,7 @@ When a role's input context reaches the threshold, Bello replaces the older
 middle of that role's history with a summary written by the same model at the
 same reasoning effort, without tools. The original task, instructions and tool
 definitions stay in place. The most recent whole turns stay verbatim, targeting
-`threshold_tokens × retain_percent / 100` tokens (24,900 with the defaults).
+`threshold_tokens × retain_percent / 100` tokens (20,000 with the defaults).
 This tail target is soft: turns and tool calls with their results are never
 split, so the tail can be larger. The latest human correction also stays
 verbatim. Each role has its own history, threshold accounting and summary.
@@ -82,6 +83,6 @@ where the provider supports it, and later sections are rebuilt.
   x64 and macOS arm64. A helper without the capability still stops before the first
   model turn; Bello does not switch engines. The helper uses a
   4,000-token output reserve and a 4,096-token margin (the default threshold needs
-  at least 257,096 usable tokens). See the [qualification and delivery details](native-codex-candidate.md)
+  at least 208,096 usable tokens). See the [qualification and delivery details](native-codex-candidate.md)
   for the separate production-HTTPS and final installed-wheel checks; publication
   alone is not proof that those checks or live-model tests passed.

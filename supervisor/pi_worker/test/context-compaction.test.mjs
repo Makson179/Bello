@@ -698,7 +698,7 @@ test("older native image evidence reaches the summarizer as images rather than b
 
 test("an incompatible configured threshold fails explicitly instead of being lowered", async (t) => {
   await assert.rejects(setup(t, {
-    model: { contextWindow: 16000, maxTokens: 2000 }, policy: { enabled: true },
+    model: { contextWindow: 16000, maxTokens: 2000 }, policy: { enabled: true, thresholdTokens: 249000 },
   }), /Configured context threshold 249000 exceeds the model input capacity 9904/);
   assert.throws(() => contextBudget({ ...policy, thresholdTokens: 9905 }, { contextWindow: 16000, maxTokens: 2000 }),
     /Configured context threshold 9905 exceeds/);
@@ -1113,5 +1113,5 @@ test("worker persists context policy, forwards it and rejects resume drift befor
   await assert.rejects(runtime.dispatch("thread/resume", { threadId: "policy-thread", noNeedForContext: { ...policy, retainPercent: 20 } }), /cannot change noNeedForContext/);
   await assert.rejects(runtime.dispatch("thread/start", { ...params, threadId: "bad", noNeedForContext: { ...policy, retainPercent: 51 } }), /retainPercent/);
   assert.equal(runtime.threads.has("bad"), false);
-  assert.deepEqual(normalizeContextPolicy(undefined), { enabled: false, thresholdTokens: 249000, retainPercent: 10 });
+  assert.deepEqual(normalizeContextPolicy(undefined), { enabled: false, thresholdTokens: 200000, retainPercent: 10 });
 });

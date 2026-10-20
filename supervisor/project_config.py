@@ -126,7 +126,7 @@ class ProjectConfigError(RuntimeError):
 @dataclass(frozen=True)
 class NoNeedForContextConfig:
     enabled: bool = False
-    threshold_tokens: int = 249000
+    threshold_tokens: int = 200000
     retain_percent: float = 10
 
     def __post_init__(self) -> None:

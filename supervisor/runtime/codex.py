@@ -430,7 +430,7 @@ class CodexBackend:
             # Context compaction is a conversation-history policy only: it adds
             # no sandbox, readable-root, network or approval restriction.
             from supervisor.project_config import NoNeedForContextConfig
-            NoNeedForContextConfig(enabled=context_enabled, threshold_tokens=context_policy.get("thresholdTokens", 249000),
+            NoNeedForContextConfig(enabled=context_enabled, threshold_tokens=context_policy.get("thresholdTokens", 200000),
                                    retain_percent=context_policy.get("retainPercent", 10))
             if not self._context_compaction_verified:
                 raise AppServerError("native context compaction requested without verified capability")
@@ -484,7 +484,7 @@ class CodexBackend:
         if self._context_compaction_verified:
             config["features.bello_context_compaction"] = context_enabled
         if context_enabled:
-            config.update(model_auto_compact_token_limit=context_policy.get("thresholdTokens", 249000),
+            config.update(model_auto_compact_token_limit=context_policy.get("thresholdTokens", 200000),
                           model_auto_compact_token_limit_scope="total",
                           model_post_turn_compact_threshold_percent=0,
                           bello_context_retain_percent=context_policy.get("retainPercent", 10))
