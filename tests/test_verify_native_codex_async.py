@@ -3,9 +3,37 @@ import json
 import base64
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 import pytest
 
 from scripts import verify_native_codex_async as proof
+
+
+@pytest.mark.asyncio
+async def test_windows_setup_failure_is_reported_without_starting_native_session(tmp_path, monkeypatch):
+    failure = proof.WindowsSetupFailure(
+        1, b"", b"helper_firewall_policy_access_failed: os error 5 private-fixture-token")
+    server = SimpleNamespace(server_port=1234, serve_forever=Mock(), shutdown=Mock(), server_close=Mock())
+    worker = SimpleNamespace(start=Mock(), join=Mock())
+    session = SimpleNamespace(env={}, start=AsyncMock(), close=AsyncMock())
+    monkeypatch.setattr(proof, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(proof, "ThreadingHTTPServer", Mock(return_value=server))
+    monkeypatch.setattr(proof, "threading", SimpleNamespace(Thread=Mock(return_value=worker)))
+    monkeypatch.setattr(proof, "ChildWaitSession", Mock(return_value=session))
+    provision = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(proof, "provision_windows_sandbox", provision)
+
+    result = await proof.verify_case(tmp_path / "codex.exe", tmp_path / "child_wait",
+                                     enabled=True, code=False, child_wait=True)
+
+    assert result["passed"] is False
+    assert result["provider_requests"] == 0
+    assert result["windows_setup_failure"] == failure.diagnostic
+    assert result["windows_setup_failure"]["stderr"]["error_codes"] == [5]
+    assert "private-fixture-token" not in json.dumps(result)
+    session.start.assert_not_awaited()
+    session.close.assert_awaited_once()
+    provision.assert_awaited_once()
 
 
 def request(text, *, late=False):
@@ -121,10 +149,12 @@ def test_windows_off_polling_fits_the_longer_fixture_under_request_cap(monkeypat
 @pytest.mark.asyncio
 async def test_cold_concurrency_repetitions_preserve_failed_attempts(tmp_path, monkeypatch):
     seen = []
+    diagnostic = proof.WindowsSetupFailure(1, b"", b"setup_transaction_lock_failed: os error 5").diagnostic
 
     async def fake_case(binary, output, **kwargs):
         seen.append((output, kwargs))
         return {"case": output.name, "passed": output.name != "direct_on_repeat_2",
+                "windows_setup_failure": diagnostic if output.name == "direct_on_repeat_2" else None,
                 "native_instructions_sha256": "unchanged"}
 
     async def fake_selection(binary, case, output, **kwargs):
@@ -135,6 +165,9 @@ async def test_cold_concurrency_repetitions_preserve_failed_attempts(tmp_path, m
     report = await proof.verify(tmp_path / "codex", tmp_path / "proof", concurrency_repeats=3)
     assert len(report["results"]) == 15
     assert report["passed"] is False
+    saved = json.loads((tmp_path / "proof/report.json").read_text())
+    failed = next(row for row in saved["results"] if row.get("case") == "direct_on_repeat_2")
+    assert failed["windows_setup_failure"] == diagnostic
     assert len({path for path, _ in seen}) == len(seen)
     assert (tmp_path / "proof/code_interrupt", {
         "enabled": True, "code": True, "signal": "interrupt",

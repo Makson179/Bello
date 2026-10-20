@@ -546,6 +546,55 @@ async def test_windows_provisioning_uses_only_current_runner_and_no_selection_se
     assert (tmp_path / "windows-setup-stdout.txt").read_bytes() == b"ok"
 
 
+@pytest.mark.parametrize("setup_code", [
+    "setup_transaction_lock_failed", "helper_user_create_or_update_failed",
+    "helper_firewall_rule_verify_failed",
+])
+async def test_windows_setup_failure_keeps_only_bounded_diagnostic_fields(tmp_path, monkeypatch, setup_code):
+    monkeypatch.setenv("USERNAME", "fixture-runner")
+    stdout = b"unknown_setup_identifier: private-fixture-user"
+    stderr = json.dumps({"code": setup_code, "message":
+                         "os error 5; private-fixture-token; C:\\private-fixture-path"}).encode()
+    process = SimpleNamespace(returncode=1, communicate=AsyncMock(return_value=(stdout, stderr)))
+    spawn = AsyncMock(return_value=process)
+    monkeypatch.setattr(proof.asyncio, "create_subprocess_exec", spawn)
+
+    with pytest.raises(proof.WindowsSetupFailure) as caught:
+        await proof.provision_windows_sandbox(tmp_path / "codex.exe", tmp_path, {}, tmp_path)
+
+    diagnostic = caught.value.diagnostic
+    assert diagnostic["schema"] == "bello.windows-setup-failure.v1"
+    assert diagnostic["exit_code"] == 1
+    assert diagnostic["stderr"]["setup_error_codes"] == [setup_code]
+    assert diagnostic["stderr"]["error_codes"] == [5]
+    assert diagnostic["stdout"]["setup_error_codes"] == []
+    for name, data in (("stdout", stdout), ("stderr", stderr)):
+        assert diagnostic[name]["bytes"] == len(data)
+        assert diagnostic[name]["sha256"] == hashlib.sha256(data).hexdigest()
+        assert diagnostic[name]["scan_truncated"] is False
+    serialized = json.dumps(diagnostic) + str(caught.value)
+    assert "private-fixture" not in serialized
+    assert "unknown_setup_identifier" not in serialized
+    assert len(serialized) < 4096
+    spawn.assert_awaited_once()
+    process.communicate.assert_awaited_once()
+    assert (tmp_path / "windows-setup-stderr.txt").read_bytes() == stderr
+
+
+def test_windows_setup_diagnostic_bounds_scanning_and_preserves_original_byte_hash():
+    data = (b"setup_transaction_lock_failed: os error 5\n\xff" + b"x" * 9000
+            + b"\nhelper_firewall_rule_verify_failed: os error 87")
+    diagnostic = proof.WindowsSetupFailure(1, b"", data).diagnostic
+    stderr = diagnostic["stderr"]
+    assert stderr["setup_error_codes"] == ["setup_transaction_lock_failed"]
+    assert stderr["error_codes"] == [5]
+    assert stderr["scan_truncated"] is True
+    assert stderr["scanned_characters"] <= proof._DIAGNOSTIC_SCAN_LIMIT
+    assert stderr["bytes"] == len(data)
+    assert stderr["sha256"] == hashlib.sha256(data).hexdigest()
+    assert len(json.dumps(diagnostic)) < 4096
+
+
 async def test_windows_provisioning_refuses_an_unspecified_account(tmp_path, monkeypatch):
     monkeypatch.delenv("USERNAME", raising=False)
     spawn = AsyncMock()

@@ -23,7 +23,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts.verify_native_codex_selection import (
-    CASES, LIMIT, NativeSession, decode_body, isolated_environment, provision_windows_sandbox,
+    CASES, LIMIT, NativeSession, WindowsSetupFailure, decode_body, isolated_environment, provision_windows_sandbox,
     run_case as verify_selection_case,
     windows_permission_params, windows_shell,
 )
@@ -374,6 +374,7 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
         'request_max_retries = 0\nstream_max_retries = 0\n')
     session = ChildWaitSession(binary, home, isolated_environment(home, binary, port, {}), wait_seconds=provider.slow_seconds)
     failure = None
+    setup_failure = None
     interrupted = False
     interrupted_command_started = False
     requests_at_interrupt = None
@@ -458,6 +459,8 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
             await session.complete(reply["thread"]["id"], timeout=60)
     except Exception as error:
         failure = type(error).__name__ + ": " + str(error)
+        if isinstance(error, WindowsSetupFailure):
+            setup_failure = error.diagnostic
     finally:
         await session.close(output)
         await asyncio.to_thread(server.shutdown)
@@ -520,7 +523,7 @@ async def verify_case(binary: Path, output: Path, *, enabled: bool, code: bool, 
     return {"case": output.name, "enabled": enabled, "code_mode": code, "signal": signal,
             "interrupted": interrupted, "child_wait": child_wait,
             "completion_batching": completion_batching,
-            "passed": bool(passed), "failure": failure,
+            "passed": bool(passed), "failure": failure, "windows_setup_failure": setup_failure,
             "provider_errors": provider.errors, "provider_requests": len(provider.requests),
             "rejected_network_requests": provider.rejected, "external_proxy_requests_forwarded": 0,
             "tools": provider.tools, "prefix_stable": prefix_stable, "terminal_output_delivered": terminal,

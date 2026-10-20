@@ -321,6 +321,25 @@ async def terminate_windows_setup(process, env: dict[str, str]) -> None:
             await asyncio.wait_for(process.wait(), 5)
 
 
+class WindowsSetupFailure(RuntimeError):
+    """Failed proof setup with bounded, text-free diagnostics for public receipts."""
+
+    def __init__(self, exit_code: int, stdout: bytes, stderr: bytes):
+        super().__init__(f"Native Windows sandbox setup failed with exit code {exit_code}")
+        self.diagnostic = {"schema": "bello.windows-setup-failure.v1", "exit_code": exit_code}
+        for name, data in (("stdout", stdout), ("stderr", stderr)):
+            sample = data[:_DIAGNOSTIC_SCAN_LIMIT].decode("utf-8", errors="replace")
+            details = _diagnostic_text(sample)
+            details.update({"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                            "scan_truncated": len(data) > _DIAGNOSTIC_SCAN_LIMIT})
+            # Native errors may render a code as a colon-prefixed message or a
+            # structured JSON value. Retain only the known enum, never its text.
+            details["setup_error_codes"] = sorted(
+                code for code in _DIAGNOSTIC_SETUP_CODES
+                if re.search(r"\b" + code + r"\b", sample))
+            self.diagnostic[name] = details
+
+
 async def provision_windows_sandbox(binary: Path, home: Path, env: dict[str, str], output: Path) -> None:
     # CI only, on its disposable elevated runner. No automatic UAC or inherited
     # account credentials. The setup state stays outside uploaded diagnostics.
@@ -345,7 +364,7 @@ async def provision_windows_sandbox(binary: Path, home: Path, env: dict[str, str
     (output / "windows-setup-stdout.txt").write_bytes(stdout)
     (output / "windows-setup-stderr.txt").write_bytes(stderr)
     if process.returncode != 0:
-        raise RuntimeError(f"Native Windows sandbox setup failed with exit code {process.returncode}")
+        raise WindowsSetupFailure(process.returncode, stdout, stderr)
 
 
 def isolated_environment(home: Path, binary: Path, port: int,
@@ -825,6 +844,7 @@ async def run_case(binary: Path, case: Case, output: Path, *, selector=None,
         'request_max_retries = 0\nstream_max_retries = 0\n')
     session = NativeSession(binary, home, isolated_environment(home, binary, port, bridge.environment))
     failure = None
+    setup_failure = None
     windows_acls = None
     try:
         if os.name == "nt":
@@ -850,6 +870,8 @@ async def run_case(binary: Path, case: Case, output: Path, *, selector=None,
         await session.complete(thread_id, timeout=turn_timeout)
     except Exception as exc:
         failure = type(exc).__name__ + ": " + str(exc)
+        if isinstance(exc, WindowsSetupFailure):
+            setup_failure = exc.diagnostic
     finally:
         await session.close(output)
         if os.name == "nt" and windows_acls is not None:
@@ -881,7 +903,8 @@ async def run_case(binary: Path, case: Case, output: Path, *, selector=None,
     # rejects and records these; a blocked attempt is not an external request
     # succeeding, and is not evidence of output selection failing.
     result = {"case": case.name, "passed": not failure and exact and focus_ok and not provider.errors and windows_isolated is not False,
-        "error": failure, "exact_model_visible_output": exact, "focus_and_command_correct": focus_ok,
+        "error": failure, "windows_setup_failure": setup_failure,
+        "exact_model_visible_output": exact, "focus_and_command_correct": focus_ok,
         "provider_requests": len(provider.requests), "selector_calls": len(selections),
         "bridge_outcomes": dict(bridge.metrics), "rejected_network_requests": provider.rejected,
         "provider_errors": provider.errors, "external_proxy_requests_forwarded": 0,
