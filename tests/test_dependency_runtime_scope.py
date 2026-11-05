@@ -343,10 +343,6 @@ def _has_native_posix_backend() -> bool:
     )
 
 
-@pytest.mark.skipif(
-    not _has_native_posix_backend() and os.environ.get("BELLO_REQUIRE_NATIVE_SANDBOX") != "1",
-    reason="requires a native POSIX sandbox backend",
-)
 def _execute_only_oracle(tmp_path: Path) -> tuple[str, str]:
     """A standalone executable whose renamed copy prints the marker, and its arguments.
 
@@ -368,6 +364,10 @@ def _execute_only_oracle(tmp_path: Path) -> tuple[str, str]:
     pytest.skip("no standalone executable can serve as the execute-only oracle")
 
 
+@pytest.mark.skipif(
+    not _has_native_posix_backend() and os.environ.get("BELLO_REQUIRE_NATIVE_SANDBOX") != "1",
+    reason="requires a native POSIX sandbox backend",
+)
 async def test_real_coder_runtime_executes_dependencies_without_writes_or_private_reads(
     dependency_snapshot, tmp_path: Path, request: pytest.FixtureRequest,
 ) -> None:
