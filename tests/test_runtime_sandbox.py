@@ -247,8 +247,29 @@ def test_macos_invocation_scrubs_host_environment(monkeypatch: pytest.MonkeyPatc
     assert invocation.env["HOME"] == str(scratch / "home")
     assert invocation.env["TMPDIR"] == str(scratch / "tmp")
     assert invocation.env["CLAUDE_CODE_TMPDIR"] == str(scratch / "tmp")
+    assert invocation.env["GIT_CONFIG_NOSYSTEM"] == "1"
     assert not ({"OPENAI_API_KEY", "DYLD_INSERT_LIBRARIES", "SSH_AUTH_SOCK", "HTTP_PROXY"}
                 & invocation.env.keys())
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Seatbelt integration")
+async def test_git_works_inside_the_macos_sandbox(tmp_path: Path) -> None:
+    # Seatbelt reports EPERM for the unlisted /etc/gitconfig, which git treats
+    # as fatal: status and diff used to exit 128 for every sandboxed command.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    (root / "new.txt").write_text("x\n", encoding="utf-8")
+    runner = SandboxRunner(SandboxPolicy(root))
+    try:
+        result = await runner.run("git status --short && git diff --stat", root, 30)
+    except SandboxUnavailableError as exc:
+        if os.environ.get("BELLO_REQUIRE_NATIVE_SANDBOX") == "1":
+            raise
+        pytest.skip(str(exc))
+    assert result.exit_code == 0, result.output
+    assert "?? new.txt" in result.output
 
 
 def _make_executable(path: Path, body: str = "#!/bin/sh\nexit 0\n") -> Path:
