@@ -42,6 +42,7 @@ class SettingsPort(CoordinatorPort):
         '_completion_multi_agent_config',
         '_completion_supervisor_agent',
         '_configure_runtime_triage',
+        '_durable_run',
         '_effective_completion_review',
         '_effective_max_adversary_runs',
         '_enabled_subagent_models_for_preflight',
@@ -439,6 +440,24 @@ class Settings:
     def _adv_report_controller_agent(self) -> compat.StatelessSupervisorAgent | None:
         return getattr(self.ports, "adv_report_controller", None)
 
+    async def _verify_restored_engines(self) -> None:
+        """A restored run continues only with the exact launchers it recorded.
+
+        The checkpoint records every engine loaded so far, including ones a
+        fresh preflight loads only later (for example cheap triage). Initialize
+        each recorded launcher (a start, never a model turn or self-test) so
+        the comparison covers the exact recorded set, then require equality.
+        """
+        durable = getattr(self.ports, "_durable_run", None)
+        if durable is None:
+            return
+        load = getattr(self.ports.client, "_engine", None)
+        if callable(load):
+            for name in getattr(durable, "expected_engines", None) or {}:
+                if name != "client":
+                    await load(name)
+        durable.verify_engine_selection()
+
     async def preflight(self) -> None:
         if isinstance(self.ports.client, compat.RuntimeClient):
             await self.ports._runtime_preflight()
@@ -474,9 +493,7 @@ class Settings:
             )
         self.ports.tui.status("checking available models")
         models_response = await self.ports.client.model_list()
-        durable = getattr(self.ports, "_durable_run", None)
-        if durable is not None:
-            durable.verify_engine_selection()
+        await self._verify_restored_engines()
         self.ports._persist_model_config()
         await self.ports._ensure_selected_models_available(models_response)
         if self.ports.store.get_bello_config().status == compat.BelloStatus.PROVIDER_FAILURE:
@@ -535,9 +552,7 @@ class Settings:
                 self.ports.tui.status("checking the official Claude Code CLI (one-time verified download if needed)")
             await prepare_engines(self.ports.client.required_models)
         models = await self.ports.client.model_list()
-        durable = getattr(self.ports, "_durable_run", None)
-        if durable is not None:
-            durable.verify_engine_selection()
+        await self._verify_restored_engines()
         self.ports.store.update_bello_config(lambda cfg: cfg.model_copy(update={
             "runtime_name": "bello-codex/pi/claude-code", "runtime_protocol_version": 1,
         }))
