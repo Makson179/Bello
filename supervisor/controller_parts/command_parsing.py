@@ -9,6 +9,12 @@ from . import compat
 _RESTART_SHELL_NAMES = frozenset({"bash", "dash", "ksh", "sh", "zsh"})
 
 
+# A file-descriptor duplication such as `2>&1`, `>&2` or `1>&-` writes no file.
+# Only for test evidence, drop it before splitting, so that its `&` is not read
+# as a background operator; `&>file` and `>&file` (file writes) stay unsupported.
+_FD_DUPLICATION = re.compile(r"(?<![^\s;&|])\d*[<>]&(?:\d+|-)(?=$|[\s;&|])")
+
+
 _LITERAL_POWERSHELL_PYTHONPATH_PREFIX = re.compile(
     r"\A\s*\$env:PYTHONPATH\s*=\s*'(?:(?:'')|[^'\r\n])*'\s*;\s*(?P<command>[^\r\n]+?)\s*\Z",
     re.IGNORECASE,
@@ -889,7 +895,7 @@ def _posix_validation_command_segments(command: str) -> list[list[str]] | None:
     This is evidence classification, not a shell evaluator or execution gate.
     Unsupported syntax is not promoted to trusted test evidence.
     """
-    parts = compat._literal_parts(command)
+    parts = compat._literal_parts(_FD_DUPLICATION.sub(" ", command))
     if parts is None:
         return None
     segments: list[list[str]] = []

@@ -117,6 +117,54 @@ def test_compound_test_and_static_checks_remain_behavioral(
     assert store.get_bello_config().last_trusted_passing_behavioral_validation_sequence == 815
 
 
+_UNITTEST_PASS = "...\n" + "-" * 70 + "\nRan 3 tests in 0.000s\n\nOK\nexit=0\n"
+
+
+@pytest.mark.parametrize(
+    "command, stdout",
+    [
+        ("python3 -m unittest discover -s tests -t . 2>&1", _UNITTEST_PASS),
+        ("python3 -m unittest discover -s tests -t . 2>&1; echo exit=$?", _UNITTEST_PASS),
+        ("python3 -m unittest discover -s tests -t . > validation.log 2>&1; "
+         "echo exit=$? >> validation.log; cat validation.log", _UNITTEST_PASS),
+        ("cat stats.py; echo ---; python3 -m unittest discover -s tests -t . 2>&1 | tail -20", _UNITTEST_PASS),
+        ("pytest -q 2>&1|tail -5", "...\n3 passed in 0.01s\n"),
+    ],
+)
+def test_test_runs_with_descriptor_duplication_are_behavioral_evidence(
+    posix_command_semantics: None, command: str, stdout: str,
+) -> None:
+    # Coders append `2>&1` to most test commands. Its `&` used to read as a
+    # background operator, so passing runs were never recorded as evidence.
+    validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution", command=command, exit_code=0,
+            status="completed", summary="command completed",
+        ),
+        sequence=42, item={"stdout": stdout},
+    )
+    assert validation is not None
+    assert validation.type == "behavioral"
+    assert validation.trusted_validation_outcome == "passed"
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["python3 -m pytest -q &>out.log", "python3 -m pytest -q >&out.log", "python3 -m pytest -q & echo started"],
+)
+def test_file_writing_or_background_ampersands_stay_unsupported_evidence(
+    posix_command_semantics: None, command: str,
+) -> None:
+    validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution", command=command, exit_code=0,
+            status="completed", summary="command completed",
+        ),
+        sequence=1, item={"stdout": "3 passed in 0.01s"},
+    )
+    assert validation is None or validation.type != "behavioral"
+
+
 @pytest.mark.parametrize(
     "command",
     [
