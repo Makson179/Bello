@@ -162,7 +162,8 @@ class AdvisorValidationTests(unittest.TestCase):
                                ({"enabled": True, "threshold_tokens": 20000}, False),
                                ({"enabled": True, "threshold_tokens": 1000, "retain_tokens": 501}, False),
                                ({"enabled": True, "threshold_tokens": 1000, "retain_tokens": 500}, True),
-                               ({"enabled": True, "threshold_tokens": 20000, "retain_percent": 10}, True)):
+                               ({"enabled": True, "threshold_tokens": 20000, "retain_percent": 10}, True),
+                               ({"enabled": False, "threshold_tokens": 20000}, True)):
             with self.subTest(context=context):
                 candidate = config()
                 candidate["no_need_for_context"] = context

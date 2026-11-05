@@ -277,7 +277,8 @@ def validate(
             errors.append("no_need_for_context.retain_tokens: expected a positive integer")
         tail = context.get("retain_tokens", None if "retain_percent" in context else 24800)
         threshold = context.get("threshold_tokens", 244800)
-        if _is_int(tail, minimum=1) and _is_int(threshold, minimum=1) and tail * 2 > threshold:
+        if (context.get("enabled") is True and _is_int(tail, minimum=1) and _is_int(threshold, minimum=1)
+                and tail * 2 > threshold):
             errors.append("no_need_for_context.retain_tokens: expected at most half of threshold_tokens")
         if "retain_percent" in context:
             percent = context["retain_percent"]

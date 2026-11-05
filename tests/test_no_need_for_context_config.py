@@ -195,6 +195,24 @@ def test_context_absolute_tail_is_at_most_half_the_threshold():
     assert lowered == NoNeedForContextConfig(True, 20000, retain_tokens=4000)
 
 
+def test_a_disabled_context_policy_is_bounded_only_when_enabled(tmp_path):
+    # Saved settings stay loadable (and fixable) while the feature is off.
+    disabled = NoNeedForContextConfig(False, 20000)
+    assert disabled.retain_tokens == 24800
+    with pytest.raises(ProjectConfigError, match="at most half of threshold_tokens"):
+        replace(disabled, enabled=True)
+    save_project_config(tmp_path, ProjectConfig(no_need_for_context=disabled))
+    assert load_project_config(tmp_path).no_need_for_context == disabled
+    state = BelloConfig(project_root="/project", task_path="TASK.md", no_need_for_context=disabled.to_json_data())
+    assert state.no_need_for_context == disabled.to_json_data()
+    with pytest.raises(ProjectConfigError, match="at most half of threshold_tokens"):
+        _resolve_run_settings(project_config=ProjectConfig(no_need_for_context=disabled),
+                              no_need_for_context_enabled=True)
+    fixed = _resolve_run_settings(project_config=ProjectConfig(no_need_for_context=disabled),
+                                  no_need_for_context_enabled=True, no_need_for_context_retain_tokens=2000)
+    assert fixed.no_need_for_context == NoNeedForContextConfig(True, 20000, retain_tokens=2000)
+
+
 def test_context_cli_rejects_a_lowered_threshold_with_the_default_tail(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("supervisor.main._startup_update_gate", lambda: None)
@@ -219,6 +237,17 @@ def test_context_editor_keeps_the_absolute_tail_valid():
     switched, _, _ = select_current(percent, EditorState(parameter_index=index, expanded_index=index,
                                                         option_index=0))
     assert switched.no_need_for_context == NoNeedForContextConfig(True, 20000, retain_tokens=10000)
+    # Options that would make the settings invalid are refused with a notice.
+    tiny = ProjectConfig(no_need_for_context=NoNeedForContextConfig(True, 1, 10))
+    index = [p.key for p in parameter_defs(tiny)].index("no_need_for_context_retention_mode")
+    unchanged, state, _ = select_current(tiny, EditorState(parameter_index=index, expanded_index=index,
+                                                         option_index=0))
+    assert unchanged == tiny and "at most half of threshold_tokens" in state.notice
+    disabled = ProjectConfig(no_need_for_context=NoNeedForContextConfig(False, 20000))
+    index = [p.key for p in parameter_defs(disabled)].index("no_need_for_context_enabled")
+    unchanged, state, _ = select_current(disabled, EditorState(parameter_index=index, expanded_index=index,
+                                                             option_index=0))
+    assert unchanged == disabled and "at most half of threshold_tokens" in state.notice
 
 @pytest.mark.parametrize("context,option", [
     (NoNeedForContextConfig(True, 100000, 20), 1),

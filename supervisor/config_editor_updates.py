@@ -84,7 +84,11 @@ def select_current(
         updated = _editor._toggle_multi_agent_allowed(config, option.field, str(option.value))
         return updated, _editor._keep_parameter_expanded(state, parameter.key, updated, model_choices), None
     catalog = getattr(model_choices, "catalog", None)
-    updated = _editor._replace_config_field(config, option.field, option.value, catalog=catalog)
+    try:
+        updated = _editor._replace_config_field(config, option.field, option.value, catalog=catalog)
+    except ProjectConfigError as exc:
+        # An option that would make the saved settings invalid is not applied.
+        return config, _editor.replace(state, notice=str(exc)), None
     next_state = _editor._advance_after_parameter_change(state, parameters, updated, model_choices)
     notice = _editor._effort_change_notice(config, updated)
     return updated, _editor.replace(next_state, notice=notice) if notice else next_state, None
