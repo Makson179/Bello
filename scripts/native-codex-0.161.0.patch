@@ -2977,7 +2977,7 @@ diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/test
 index 4496c9b940d1278f9c70a2eba8d85ed2b1593ee6..60e8828ba9bf111c8dc0f532901783f1216acc0e 100644
 --- a/codex-rs/core/src/session/tests.rs
 +++ b/codex-rs/core/src/session/tests.rs
-@@ -5966,6 +5966,152 @@ async fn settings_checkpoint_waits_for_accepted_settings_persistence() {
+@@ -5966,6 +5966,160 @@ async fn settings_checkpoint_waits_for_accepted_settings_persistence() {
  }
  
  #[tokio::test]
@@ -3073,10 +3073,18 @@ index 4496c9b940d1278f9c70a2eba8d85ed2b1593ee6..60e8828ba9bf111c8dc0f532901783f1
 +        )
 +        .await
 +        .unwrap();
-+    assert_eq!(
-+        session.clone_history().await.annotated_items(),
-+        replacement.as_slice()
-+    );
++    // Installing the checkpoint stamps an id and its resume companions on the
++    // summary item; the payloads themselves are kept exactly.
++    let installed = session.clone_history().await.annotated_items().to_vec();
++    assert_eq!(installed.len(), replacement.len());
++    let (ResponseItem::Message { content, .. }, ResponseItem::Message { content: expected, .. }) =
++        (&installed[0].item, &replacement[0].item)
++    else {
++        panic!("the checkpoint summary is not a message");
++    };
++    assert_eq!(content, expected);
++    // Plain comparison: a pretty diff of this 2 MB fixture takes over an hour.
++    assert!(installed[1].item == replacement[1].item, "retained opaque reasoning changed");
 +}
 +
 +#[tokio::test]
@@ -3130,7 +3138,7 @@ index 4496c9b940d1278f9c70a2eba8d85ed2b1593ee6..60e8828ba9bf111c8dc0f532901783f1
  async fn mcp_attribution_checkpoints_cover_batch_prefixes_compaction_and_restore() {
      let (mut session, turn_context) = make_session_and_context().await;
      session.services.executed_tool_calls =
-@@ -12957,6 +13103,7 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
+@@ -12957,6 +13111,7 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
          internal_chat_message_metadata_passthrough: None,
      };
      let mut ctx = HandleOutputCtx {
