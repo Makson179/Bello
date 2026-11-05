@@ -2,7 +2,7 @@ name: Release package validation
 
 on:
   push:
-    branches: [codex/080-production-ready]
+    branches: [ci/0.8.1-rc]
   pull_request:
     branches: [main]
   workflow_dispatch:

@@ -10,7 +10,7 @@ permissions:
 jobs:
   published-async:
     # Published-pin diagnostic: refused on the unpublished 0.8.0 candidate branch.
-    if: github.ref != 'refs/heads/codex/080-production-ready'
+    if: github.ref != 'refs/heads/ci/0.8.1-rc'
     strategy:
       fail-fast: false
       matrix:

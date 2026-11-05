@@ -6,7 +6,7 @@ name: Native Codex Linux proof
 on:
   workflow_dispatch:
   push:
-    branches: [mystery, 'codex/**', '!codex/080-production-ready']
+    branches: [mystery, 'codex/**', '!ci/0.8.1-rc']
     paths:
       - '.github/workflows/native-codex-linux*.yml'
       - 'scripts/*native_codex_linux.py'
@@ -32,11 +32,11 @@ concurrency:
 
 jobs:
   native-build:
-    if: github.ref != 'refs/heads/codex/080-production-ready'
+    if: github.ref != 'refs/heads/ci/0.8.1-rc'
     uses: ./.github/workflows/native-codex-linux-build.yml
 
   native-proof:
-    if: github.ref != 'refs/heads/codex/080-production-ready'
+    if: github.ref != 'refs/heads/ci/0.8.1-rc'
     needs: native-build
     runs-on: ubuntu-22.04
     timeout-minutes: 30
