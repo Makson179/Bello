@@ -71,6 +71,26 @@ _PIPELINE_FAILURE_MARKERS = (
 )
 
 
+_PROVIDER_REJECTIONS = (
+    "the fake provider received anything other than its isolated dummy key",
+    "unexpected paid model route",
+    "unexpected provider path",
+    "non-reasoning fixture received reasoning_effort",
+    "reasoning fixture did not receive the configured exact effort",
+    "could not identify the real Bello role from the request",
+    "request did not retain the JSON prompt key",
+    "coder did not receive the implementation write result",
+    "coder did not receive the test write result",
+    "coder did not receive a passing pytest result",
+    "completion review did not receive the implementation",
+    "completion review did not receive the behavioral test",
+    "adversary did not receive the submitted implementation",
+    "adversary did not receive its passing probe result",
+    "adversary report controller did not receive the task",
+    "adversary report controller did not receive the raw report",
+)
+
+
 def _pipeline_diagnostic(controller, tui, provider, *, socket_diagnostic=None) -> str:
     """Bounded structural failure evidence; never echo arbitrary controller text."""
     try:
@@ -120,6 +140,12 @@ def _pipeline_diagnostic(controller, tui, provider, *, socket_diagnostic=None) -
         "finished_role_count": len(provider.finished_roles),
         "provider_request_count": len(provider.requests),
         "provider_error_count": len(provider.errors),
+        # The fake provider's own rejection reasons as fixed fixture clauses;
+        # anything else (possibly request content) is reported as "other".
+        "provider_rejections": [
+            next((known for known in _PROVIDER_REJECTIONS if str(error).startswith(known)), "other")
+            for error in list(provider.errors)[:8]
+        ],
         "requests_by_role": {role: min(1000000, max(0, provider.roles[role])) for role in _PIPELINE_ROLES},
     }
     if socket_diagnostic is not None:
@@ -159,6 +185,10 @@ def test_pipeline_diagnostic_reports_lock_failure_without_raw_private_content(tm
     assert result["reason"]["os_errors"] == ["[Errno 13]"]
     assert "failed to create coder workspace snapshot" in result["reason"]["markers"]
     assert result["socket_probe_exit_codes"] == {"host_control": 5}
+    assert result["provider_rejections"] == ["other"]
+    provider.errors = ["coder did not receive a passing pytest result"]
+    assert json.loads(_pipeline_diagnostic(controller, tui, provider))["provider_rejections"] == [
+        "coder did not receive a passing pytest result"]
 
 
 def test_pipeline_diagnostic_fallback_filters_tui_and_keeps_only_known_roles(tmp_path) -> None:
