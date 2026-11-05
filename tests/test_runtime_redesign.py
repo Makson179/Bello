@@ -333,7 +333,7 @@ async def test_periodic_review_still_respects_lifecycle(rig, blocker):
     c._maybe_schedule_goal_progress_review()
     assert c._supervisor_task is None and reviewer.runtime_packets == []
 
-async def test_goal_idle_nudges_without_completion_but_not_each_tick(rig):
+async def test_goal_idle_never_nudges_or_reviews_without_readiness(rig):
     c, _, reviewer, clock = rig
     c._generation_has_coder_turn = True
     await c._handle_no_marker_idle(subagents_refreshed=True)
@@ -342,11 +342,15 @@ async def test_goal_idle_nudges_without_completion_but_not_each_tick(rig):
     c.coder.steer_or_start.assert_not_awaited()
     clock[0] = 2400
     await c._handle_no_marker_idle(subagents_refreshed=True)
-    assert c.coder.steer_or_start.await_count == 1 and c._supervisor_task is None
-    assert reviewer.completion_packets == [] and c._no_marker_idle_since is None
+    assert c.coder.steer_or_start.await_count == 0 and c._supervisor_task is None
+    assert reviewer.completion_packets == [] and getattr(c, '_no_marker_idle_since', None) is None
     clock[0] = 2401
     await c._handle_no_marker_idle(subagents_refreshed=True)
-    assert c.coder.steer_or_start.await_count == 1
+    assert c.coder.steer_or_start.await_count == 0
+    clock[0] = 86400
+    await c._handle_controller_idle_guard()
+    c.coder.steer_or_start.assert_not_awaited()
+    assert reviewer.completion_packets == []
 
 @pytest.mark.parametrize("state", ["busy", "unknown"])
 async def test_goal_idle_does_not_nudge_unconfirmed_thread(rig, state):

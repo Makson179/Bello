@@ -318,20 +318,36 @@ async def test_controller_deprecation_during_probe_preserves_mature_idle_window(
 
 @pytest.mark.parametrize("result", [{"state": "unknown"}, None, {}, {"state": []}])
 async def test_unknown_probe_retries_next_guard_tick_without_another_40_minutes(idle_controller, result):
+    # Goal continues successful turns itself and never uses the idle window, so
+    # the retry contract belongs to the ordinary automatic completion review.
     controller, store, reviewer, clock = idle_controller
-    store.update_bello_config(lambda cfg: cfg.model_copy(update={"goal": True}))
     controller._deliver_coder_message = AsyncMock(return_value=(True, None))
     controller.client.read_execution_status.return_value = result
     await controller._handle_controller_idle_guard()
     controller._deliver_coder_message.assert_not_awaited()
+    assert controller._supervisor_task is None
     assert controller._no_marker_idle_since == 0.0
     assert controller.client.read_execution_status.await_count == 1
     clock[0] += 60
     controller.client.read_execution_status.return_value = {"state": "quiescent"}
     await controller._handle_controller_idle_guard()
-    controller._deliver_coder_message.assert_awaited_once()
     assert controller.client.read_execution_status.await_count == 2
-    assert reviewer.completion_packets == []
+    controller._deliver_coder_message.assert_not_awaited()
+    await controller._supervisor_task
+    assert len(reviewer.completion_packets) == 1
+
+
+async def test_goal_idle_guard_never_probes_or_reviews(idle_controller):
+    controller, store, reviewer, clock = idle_controller
+    store.update_bello_config(lambda cfg: cfg.model_copy(update={"goal": True}))
+    controller._deliver_coder_message = AsyncMock(return_value=(True, None))
+    controller.client.read_execution_status.return_value = {"state": "quiescent"}
+    for _ in range(3):
+        await controller._handle_controller_idle_guard()
+        clock[0] += 60
+    controller._deliver_coder_message.assert_not_awaited()
+    controller.client.read_execution_status.assert_not_awaited()
+    assert controller._supervisor_task is None and reviewer.completion_packets == []
 
 
 @pytest.mark.parametrize("activity", ["message", "turn", "approval", "native_tool"])

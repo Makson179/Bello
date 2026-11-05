@@ -28,6 +28,7 @@ class CompletionState:
     _no_marker_completion_review_key: str | None
     _no_marker_idle_since: float | None
     _no_marker_idle_identity: tuple[int, str | None, int] | None
+    _goal_auto_next_pending: tuple[int, str | None, int, object] | None
     _pending_adversary_report: compat.AdversaryReport | None
     _readiness_event_journal: compat.deque[compat._ReadinessJournalEvent]
     adv_report_controller: compat.StatelessSupervisorAgent | None
@@ -82,6 +83,7 @@ class CompletionPort(CoordinatorPort):
         '_goal_enabled',
         '_goal_adversary_after_returns',
         '_handle_no_marker_idle',
+        '_resume_goal_auto_next',
         '_mark_adversary_thread_done',
         '_mark_adversary_thread_started',
         '_no_message_backoff_seconds',
@@ -127,6 +129,8 @@ class CompletionPort(CoordinatorPort):
         'last_coder_message',
         'pending_approvals',
         'prior_interventions',
+        'running',
+        'paused',
         'restart',
         'store',
         'tui',
@@ -146,7 +150,13 @@ class Completion:
         self.state = CompletionState()
         self.ports = ports
 
-    async def _handle_coder_turn_completed(self, *, item_id: str | None) -> None:
+    async def _handle_coder_turn_completed(self, *, item_id: str | None, turn_status: str = "completed") -> None:
+        goal = self.ports._goal_enabled()
+        if goal and turn_status != "completed":
+            # Interruption is not successful work and never authorizes another
+            # turn (in particular while an explicit pause is being processed).
+            self.state._goal_auto_next_pending = None
+            return
         repaired_runtime_controls = self.ports._repair_snapshot_runtime_controls(source="coder_turn_completed")
         if await self.ports._escalate_runtime_integrity_issue(source="coder_turn_completed"):
             return
@@ -157,7 +167,13 @@ class Completion:
             )
             return
         message = self.ports.last_coder_message
+        if (goal and message is not None and compat._has_readiness_marker(message.text)
+                and self.state._last_completion_marker_sequence == message.sequence):
+            # An empty later turn must not resubmit or re-clarify an already
+            # handled readiness message left in the historical last-message slot.
+            message = None
         if message is not None and compat._has_readiness_marker(message.text):
+            self.state._goal_auto_next_pending = None
             if self.state._last_completion_marker_sequence != message.sequence:
                 await self.ports._refresh_coder_subagents()
                 active_subagents = self.ports._active_coder_subagents()
@@ -217,6 +233,12 @@ class Completion:
                 sequence=message.sequence,
             )
             return
+        if goal:
+            cfg = self.ports.store.get_bello_config()
+            coder = self.ports.coder
+            self.state._goal_auto_next_pending = (cfg.generation, cfg.coder_thread_id, id(coder), object())
+            await self.ports._resume_goal_auto_next()
+            return
         if not self.ports._runtime_enabled():
             await self.ports._handle_no_marker_idle()
             return
@@ -227,6 +249,49 @@ class Completion:
             await self.ports._handle_no_marker_idle()
             return
         self.ports._schedule_supervisor_check("Coder turn completed", triggering_item_id=item_id)
+
+    async def _resume_goal_auto_next(self) -> bool:
+        """Consume one successful-turn continuation under the delivery lock.
+
+        A runtime review can run independently. Its late message may already
+        have started a new coder turn; in that case this pending continuation is
+        satisfied, not delivered a second time. Approval/child blockers retain
+        the token for the next ordinary controller tick.
+        """
+        pending = getattr(self.state, "_goal_auto_next_pending", None)
+        if pending is None or not self.ports._goal_enabled():
+            return False
+        await self.ports._refresh_coder_subagents()
+
+        def claim() -> bool:
+            if getattr(self.state, "_goal_auto_next_pending", None) is not pending:
+                return False
+            cfg = self.ports.store.get_bello_config()
+            coder = self.ports.coder
+            current = (cfg.generation, cfg.coder_thread_id, id(coder))
+            if (not self.ports._coder_lifecycle_accepts_activity(cfg)
+                    or coder is None or current != pending[:3]):
+                self.state._goal_auto_next_pending = None
+                return False
+            if cfg.active_coder_turn_id or getattr(coder, "active_turn_id", None):
+                self.state._goal_auto_next_pending = None
+                return False
+            if (self.ports.pending_approvals or cfg.pending_server_request_ids
+                    or self.ports._active_coder_subagents()):
+                return False
+            # Claim before any start RPC. Failures are not automatically replayed.
+            self.state._goal_auto_next_pending = None
+            return True
+
+        delivered, _ = await self.ports._deliver_coder_message(
+            "Continue toward the original Goal. Check any pending work or external results "
+            "and choose your next step. Submit for review only when you actually judge the work ready.",
+            before_send=claim,
+        )
+        if delivered:
+            self.ports._append_event(compat.AppEventSource.SUPERVISOR,
+                "goal/auto_next", reason="successful coder turn continued without a readiness marker")
+        return delivered
 
     async def _continue_after_readiness_marker(
         self,
@@ -321,6 +386,8 @@ class Completion:
         return execution_queue_clear(queue)
 
     async def _handle_no_marker_idle(self, *, subagents_refreshed: bool = False) -> None:
+        if self.ports._goal_enabled():
+            return
         if not subagents_refreshed:
             await self.ports._refresh_coder_subagents()
         # Read the current lifecycle after the await, not a stale pre-refresh config.
@@ -339,25 +406,6 @@ class Completion:
         last_message_sequence = self.ports.last_coder_message.sequence if self.ports.last_coder_message is not None else None
         review_key = f"{cfg.generation}:{last_message_sequence}:{latest_validation_sequence}"
         if getattr(self.state, "_no_marker_completion_review_key", None) == review_key:
-            return
-        if self.ports._goal_enabled():
-            # An idle Goal turn is not a submission. This also covers detached
-            # external evaluation whose submit tool has already returned: ask
-            # the coder to inspect its pending work, not a final auditor to
-            # reject an unfinished result. Native busy/unknown is never nudged.
-            if (not self.ports._no_marker_idle_ready()
-                    or not await self.ports._confirm_coder_quiescent()
-                    or not self.ports._no_marker_idle_ready()):
-                return
-            delivered, _ = await self.ports._deliver_coder_message(
-                "Continue toward the original Goal. Check any pending work or external results "
-                "and choose your next step. This is an idle continuation, not a completion review "
-                "or a new task requirement. Submit for review only when you actually judge the work ready."
-            )
-            if delivered:
-                self.state._no_marker_completion_review_key = review_key
-                self.ports._append_event(compat.AppEventSource.SUPERVISOR,
-                    "goal/idle_continue", reason="confirmed quiescent Goal resumed without completion review")
             return
         if not self.ports._post_coder_review_enabled():
             self.state._no_marker_completion_review_key = review_key

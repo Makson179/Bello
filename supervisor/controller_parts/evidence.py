@@ -352,7 +352,8 @@ class Evidence:
                 self.ports._git_command_excluding_review_private_inputs(command)
             )
             if output is not None:
-                output = compat._filter_internal_git_output(
+                output = await compat.asyncio.to_thread(
+                    compat._filter_internal_git_output,
                     output,
                     command=command,
                     project_root=self.ports._active_workspace_root(),
@@ -387,7 +388,13 @@ class Evidence:
         if status_text is None and numstat_text is None:
             return self._cap_changed_files([])
         files: dict[str, compat.ChangedFile] = {}
-        for path, status in compat._git_status_entries_from_porcelain_v1_z(status_text or ""):
+        for index, (path, status) in enumerate(compat._git_status_entries_from_porcelain_v1_z(status_text or "")):
+            # Large untracked snapshot trees must not monopolise the same event
+            # loop that consumes provider control replies. Keep every existing
+            # path/privacy check; yield between bounded batches instead of
+            # dropping evidence or increasing provider timeouts.
+            if index % 32 == 0:
+                await compat.asyncio.sleep(0)
             if (
                 path
                 and not self.ports._is_review_private_path(path)
@@ -398,7 +405,9 @@ class Evidence:
                 )
             ):
                 files[path] = compat.ChangedFile(path=path, status=status)
-        for line in (numstat_text or "").splitlines():
+        for index, line in enumerate((numstat_text or "").splitlines()):
+            if index % 32 == 0:
+                await compat.asyncio.sleep(0)
             parts = line.split("\t")
             if len(parts) < 3:
                 continue
@@ -459,6 +468,9 @@ class Evidence:
         return output == "true"
 
     async def _git_output(self, command: list[str]) -> str | None:
+        spawn = None
+        proc = None
+        communication = None
         try:
             exec_command = list(command)
             env = None
@@ -479,19 +491,73 @@ class Evidence:
                 if git is None:
                     return None
                 exec_command[0] = git
-            proc = await create_subprocess_exec(
+            spawn = compat.asyncio.create_task(create_subprocess_exec(
                 *exec_command,
                 cwd=str(self.ports._active_workspace_root()),
                 env=env,
                 stdout=compat.asyncio.subprocess.PIPE,
                 stderr=compat.asyncio.subprocess.PIPE,
+            ))
+            proc = await compat.asyncio.shield(spawn)
+            communication = compat.asyncio.create_task(proc.communicate())
+            stdout, stderr = await compat.asyncio.wait_for(
+                compat.asyncio.shield(communication), timeout=5
             )
-            stdout, stderr = await compat.asyncio.wait_for(proc.communicate(), timeout=5)
             if proc.returncode != 0:
                 return None
             return stdout.decode("utf-8", errors="replace").strip()
         except Exception:
             return None
+        finally:
+            # A timed-out/cancelled inspection must not leave Git blocked on
+            # full pipes. Keep reading while terminating it, and reap it before
+            # returning. Shield creation too: cancellation can arrive after the
+            # OS child exists but before create_subprocess_exec returns it.
+            cancelled = False
+            if spawn is not None:
+                while not spawn.done():
+                    try:
+                        await compat.asyncio.shield(spawn)
+                    except compat.asyncio.CancelledError:
+                        cancelled = True
+                    except Exception:
+                        break
+                try:
+                    proc = spawn.result()
+                except compat.asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    pass
+            if proc is not None:
+                if proc.returncode is None:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                if communication is None:
+                    communication = compat.asyncio.create_task(proc.communicate())
+                while not communication.done():
+                    try:
+                        await compat.asyncio.shield(communication)
+                    except compat.asyncio.CancelledError:
+                        cancelled = True
+                    except Exception:
+                        break
+                try:
+                    communication.result()
+                except compat.asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    pass
+                reaped = compat.asyncio.create_task(proc.wait())
+                while not reaped.done():
+                    try:
+                        await compat.asyncio.shield(reaped)
+                    except compat.asyncio.CancelledError:
+                        cancelled = True
+                reaped.result()
+            if cancelled:
+                raise compat.asyncio.CancelledError
 
     async def patch_summary(self, limit: int = 4000) -> str | None:
         if not self.ports.use_git_diff:

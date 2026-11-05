@@ -23,6 +23,68 @@ AUTH = {
     # The backend must discard identity rather than persisting or returning it.
     "email": "private@example.test",
 }
+
+
+def test_failure_diagnostic_redacts_content_and_preserves_cause():
+    secret = "TOKEN-secret-prompt-reasoning-not-to-be-logged"
+    try:
+        try:
+            raise KeyError(secret)
+        except KeyError as cause:
+            raise RuntimeError(secret) from cause
+    except RuntimeError as error:
+        diagnostic = ClaudeBackend._failure_diagnostic(error)
+    encoded = json.dumps(diagnostic)
+    assert secret not in encoded
+    assert [n["type"] for n in diagnostic["exceptions"]] == ["RuntimeError", "KeyError"]
+    assert diagnostic["exceptions"][1]["relation"] == "cause"
+
+
+def test_failure_diagnostic_bounded_group_and_numeric_exit():
+    from claude_agent_sdk._errors import ProcessError
+    error = ExceptionGroup("private text", [ProcessError("secret", exit_code=1), *[ValueError("secret") for _ in range(20)]])
+    diagnostic = ClaudeBackend._failure_diagnostic(error)
+    assert len(diagnostic["exceptions"]) <= 8
+    assert diagnostic["exceptions"][1]["exit_code"] == 1
+    assert diagnostic["truncated"]
+    assert "secret" not in json.dumps(diagnostic)
+    assert "private text" not in json.dumps(diagnostic)
+
+
+def test_failure_diagnostic_unknown_exception_name_is_redacted():
+    error = type("SECRET_CLASS_NAME", (Exception,), {})("secret")
+    assert ClaudeBackend._failure_diagnostic(error)["exceptions"][0]["type"] == "OtherException"
+    assert ClaudeBackend._safe_failure(error) == "Claude Code turn failed before a result was received"
+
+
+@pytest.mark.asyncio
+async def test_receive_failure_diagnostic_is_durable_without_replay(tmp_path):
+    events = []
+    factory = FakeFactory(complete_after_queries=None)
+    class FailingClient(FakeClient):
+        async def receive_response(self):
+            raise RuntimeError("secret-error-body")
+            yield
+    factory.__class__ = type("FailingFactory", (FakeFactory,), {
+        "__call__": lambda self, options: _failure_client(self, options)
+    })
+    def _failure_client(factory, options):
+        client = FailingClient(factory, options)
+        factory.clients.append(client)
+        return client
+    runtime = backend(tmp_path, factory, events)
+    try:
+        await start_thread(runtime, tmp_path)
+        await runtime.request("turn/start", {"threadId": "thread-1", "turnId": "failed-turn", "input": [{"type": "text", "text": "work"}]})
+        await wait_completed(events)
+        completed = next(e["params"]["turn"] for e in events if e["method"] == "turn/completed")
+        assert completed["status"] == "failed"
+        assert completed["failureDiagnostic"]["exceptions"][0]["type"] == "RuntimeError"
+        persisted = (tmp_path / "claude-state" / "threads.json").read_text()
+        assert "failureDiagnostic" in persisted and "secret-error-body" not in persisted
+        assert len(factory.clients) == 1 and len(factory.clients[0].queries) == 1
+    finally:
+        await runtime.stop()
 MODELS = [
     {
         "value": "sonnet",

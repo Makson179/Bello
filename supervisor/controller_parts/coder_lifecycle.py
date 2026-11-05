@@ -74,6 +74,7 @@ class CoderLifecyclePort(CoordinatorPort):
         '_handle_active_coder_guard',
         '_handle_coder_turn_completed',
         '_handle_no_marker_idle',
+        '_resume_goal_auto_next',
         '_interrupt_stale_revision_turn',
         '_last_completion_marker_sequence',
         '_last_restart_budget_signature',
@@ -404,6 +405,13 @@ class CoderLifecycle:
             )
             return
         if getattr(coder, "active_turn_id", None):
+            self.ports._reset_no_marker_idle()
+            return
+        if self.ports._goal_enabled() and await self.ports._resume_goal_auto_next():
+            return
+        if self.ports._goal_enabled():
+            # Goal continuation follows completed turns immediately. Readiness,
+            # rather than elapsed idle time, is the completion-review trigger.
             self.ports._reset_no_marker_idle()
             return
         if getattr(self.ports, "pending_approvals", None):

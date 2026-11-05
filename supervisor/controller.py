@@ -797,6 +797,7 @@ class BelloController:
     _no_marker_completion_review_key = OwnedField('completion', '_no_marker_completion_review_key')
     _no_marker_idle_since = OwnedField('completion', '_no_marker_idle_since')
     _no_marker_idle_identity = OwnedField('completion', '_no_marker_idle_identity')
+    _goal_auto_next_pending = OwnedField('completion', '_goal_auto_next_pending')
     _pending_adversary_report = OwnedField('completion', '_pending_adversary_report')
     _readiness_event_journal = OwnedField('completion', '_readiness_event_journal')
     adv_report_controller = OwnedField('completion', 'adv_report_controller')
@@ -808,6 +809,7 @@ class BelloController:
     no_marker_idle_nudge_count = OwnedField('completion', 'no_marker_idle_nudge_count')
     provider_failure_recovery_counts = OwnedField('completion', 'provider_failure_recovery_counts')
     _handle_coder_turn_completed = service_method('completion', Completion._handle_coder_turn_completed)
+    _resume_goal_auto_next = service_method('completion', Completion._resume_goal_auto_next)
     _continue_after_readiness_marker = service_method('completion', Completion._continue_after_readiness_marker)
     _done_without_fresh_behavioral_validation = service_method('completion', Completion._done_without_fresh_behavioral_validation)
     _steer_for_marker = service_method('completion', Completion._steer_for_marker)
@@ -1896,7 +1898,8 @@ class BelloController:
             if self.coder and isinstance(turn_id, str):
                 self.coder.mark_turn_completed(turn_id)
             self._write_run_checkpoint("coder_turn_complete", state="stable")
-            await self._handle_coder_turn_completed(item_id=item_id)
+            await self._handle_coder_turn_completed(item_id=item_id,
+                turn_status=turn.get("status", "unknown") if isinstance(turn, dict) else "unknown")
             return
         if method in {"turn/completed", "thread/status/changed", "thread/closed"}:
             await self._resume_deferred_completion_if_quiescent()

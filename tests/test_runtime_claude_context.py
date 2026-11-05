@@ -71,6 +71,67 @@ async def context_thread(instance, tmp_path, policy=None):
     })
 
 
+@pytest.mark.parametrize("failures,expected_status,queries", [(1, "completed", 3), (2, "failed", 0)])
+async def test_context_usage_timeout_reconnect_is_bounded_no_query_replay(tmp_path, failures, expected_status, queries):
+    class ProbeClient(ContextClient):
+        async def get_context_usage(self):
+            self.factory.probes += 1
+            if self.factory.probes <= failures:
+                try:
+                    raise TimeoutError("private-timeout")
+                except TimeoutError as cause:
+                    raise Exception("Control request timeout: get_context_usage") from cause
+            return await super().get_context_usage()
+    class ProbeFactory(ContextFactory):
+        probes = 0
+        def __call__(self, options):
+            client = ProbeClient(self, options)
+            self.clients.append(client)
+            return client
+    factory = ProbeFactory()
+    events = []
+    instance = backend(tmp_path, factory, events)
+    try:
+        await context_thread(instance, tmp_path)
+        original = instance._record("thread-1")["claudeSessionId"]
+        await instance.request("turn/start", {"threadId":"thread-1", "turnId":"probe-test", "input":[{"type":"text", "text":"Continue work"}]})
+        done = await wait_completed(events)
+        assert done["params"]["turn"]["status"] == expected_status
+        assert factory.main_queries == queries
+        assert instance._record("thread-1")["contextUsageProbeRetries"] == 1
+        assert factory.clients[0].queries == []
+        assert factory.clients[0].disconnect_task is not None
+        assert factory.clients[0].options.session_id == factory.clients[1].options.session_id == original
+        if failures == 2:
+            assert factory.probes == 2 and len(factory.clients) == 2
+            assert instance._record("thread-1")["claudeSessionId"] == original
+            assert instance._record("thread-1")["contextState"]["generation"] == 0
+        assert "private-timeout" not in (instance.state_dir / "threads.json").read_text()
+    finally:
+        await instance.stop()
+
+
+async def test_context_usage_non_timeout_is_not_retried(tmp_path):
+    class RefusedClient(ContextClient):
+        async def get_context_usage(self):
+            raise ValueError("private-error")
+    class RefusedFactory(ContextFactory):
+        def __call__(self, options):
+            client = RefusedClient(self, options)
+            self.clients.append(client)
+            return client
+    factory = RefusedFactory();events=[];instance=backend(tmp_path,factory,events)
+    try:
+        await context_thread(instance,tmp_path)
+        await instance.request("turn/start", {"threadId":"thread-1", "turnId":"refused", "input":[{"type":"text", "text":"work"}]})
+        done=await wait_completed(events)
+        assert done["params"]["turn"]["status"]=="failed"
+        assert len(factory.clients)==1 and factory.main_queries==0
+        assert not instance._record("thread-1").get("contextUsageProbeRetries")
+    finally:
+        await instance.stop()
+
+
 async def test_rollover_preserves_logical_thread_and_exact_whole_round(tmp_path):
     factory = ContextFactory()
     events = []

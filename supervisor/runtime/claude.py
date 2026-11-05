@@ -785,6 +785,10 @@ class ClaudeBackend:
             raise
         except Exception as exc:
             if record.get("activeTurnId") == turn_id:
+                # Preserve bounded, content-free diagnostics before the public
+                # error is sanitized. Never persist exception text, args,
+                # subprocess stderr, frame locals, prompts or credentials.
+                self._turn(record, turn_id)["failureDiagnostic"] = self._failure_diagnostic(exc)
                 await self._complete_turn(record, turn_id, "failed", self._async_usage.get(async_key, {}), self._safe_failure(exc))
             return stop_owner
         finally:
@@ -870,12 +874,47 @@ class ClaudeBackend:
             self._persist()
         client = self._new_client(self._options(record, params))
         try:
-            await self._validate_context_connection(client, record, params)
-            self._check_context_cancel(command_task, record)
             state = record.get("contextState")
-            if state is None:
-                return client, None
-            usage = await client.get_context_usage()
+            # One shared retry budget for the complete PRE-QUERY preparation,
+            # not separate nested budgets for initialize and measurement.
+            # connect() sends no prompt; account/model/MCP validation is rerun.
+            # Never retry query(), tool execution or an ambiguous stream here.
+            for attempt in range(2):
+                phase = "connection_validation"
+                try:
+                    await self._validate_context_connection(client, record, params)
+                    self._check_context_cancel(command_task, record)
+                    if state is None:
+                        return client, None
+                    phase = "context_usage"
+                    usage = await client.get_context_usage()
+                    break
+                except Exception as exc:
+                    if not (isinstance(exc, TimeoutError) or isinstance(exc.__cause__, TimeoutError)):
+                        raise
+                    record["lastContextPreparationFailure"] = {
+                        "phase": phase, "attempt": attempt + 1,
+                        "diagnostic": self._failure_diagnostic(exc),
+                        "transport": self._control_channel_diagnostic(client),
+                    }
+                    record["contextPreparationFailures"] = [
+                        *record.get("contextPreparationFailures", [])[-3:],
+                        record["lastContextPreparationFailure"],
+                    ]
+                    self._persist()
+                    if attempt:
+                        raise
+                    self._check_context_cancel(command_task, record)
+                    # Close in the owning task. A cleanup failure must prevent
+                    # a second connection, not leave two live CLI owners.
+                    await client.disconnect()
+                    self._check_context_cancel(command_task, record)
+                    record["contextPreparationRetries"] = record.get("contextPreparationRetries", 0) + 1
+                    if phase == "context_usage":
+                        record["contextUsageProbeRetries"] = record.get("contextUsageProbeRetries", 0) + 1
+                        record["lastContextUsageProbeFailure"] = self._failure_diagnostic(exc)
+                    self._persist()
+                    client = self._new_client(self._options(record, params))
             self._check_context_cancel(command_task, record)
             total = usage.get("totalTokens") if isinstance(usage, dict) else None
             if not isinstance(total, int) or isinstance(total, bool) or total < 0:
@@ -1969,7 +2008,120 @@ class ClaudeBackend:
             return self._client_factory(options)
         from claude_agent_sdk import ClaudeSDKClient
 
-        return ClaudeSDKClient(options)
+        backend = self
+        stderr_counts: dict[str, int] = {"lines": 0, "chars": 0}
+        previous_stderr = options.stderr
+
+        def observe_stderr(line: str) -> None:
+            # Fixed vocabulary only: no arbitrary output or authentication data.
+            stderr_counts["lines"] += 1
+            stderr_counts["chars"] += len(line)
+            lower = line.lower()
+            for key, needles in {
+                "oauth": ("oauth", "invalid_grant"),
+                "refresh": ("refresh",),
+                "auth_error": ("authenticationerror", "authentication failed", "unauthorized"),
+                "rate_limit": ("rate limit", "rate_limit", "429"),
+                "timeout": ("timed out", "timeout"),
+                "lock": ("lock",),
+                "network": ("econnreset", "econnrefused", "enotfound", "etimedout", "fetch failed"),
+                "resource": ("enospc", "emfile", "enfile", "out of memory"),
+                "permission": ("eacces", "eperm", "permission denied"),
+            }.items():
+                if any(needle in lower for needle in needles):
+                    stderr_counts[key] = stderr_counts.get(key, 0) + 1
+            if previous_stderr is not None:
+                previous_stderr(line)
+
+        options.stderr = observe_stderr
+
+        class ObservedClient(ClaudeSDKClient):
+            async def disconnect(self) -> None:
+                # SDK connect() tears its Query down before re-raising an
+                # initialize error. Retain counters before that cleanup;
+                # never messages, request data, environment or credentials.
+                if getattr(self, "_query", None) is not None:
+                    self._bello_control_snapshot = backend._control_channel_diagnostic(self)
+                await super().disconnect()
+
+        client = ObservedClient(options)
+        client._bello_stderr_counts = stderr_counts
+        return client
+
+    @staticmethod
+    def _control_channel_diagnostic(client: Any) -> dict[str, Any]:
+        """Bounded, content-free counters; diagnostics cannot affect control."""
+        try:
+            query = getattr(client, "_query", None)
+            if query is None:
+                previous = getattr(client, "_bello_control_snapshot", None)
+                return dict(previous) if isinstance(previous, dict) else {"available": False}
+            out: dict[str, Any] = {"available": True}
+            counters = getattr(client, "_bello_stderr_counts", None)
+            if isinstance(counters, dict):
+                out["stderr_categories"] = dict(counters)
+            for source, key in (("_closed", "closed"), ("_initialized", "initialized")):
+                value = getattr(query, source, None)
+                if isinstance(value, bool):
+                    out[key] = value
+            for source, key in (("pending_control_responses", "pending_controls"),
+                                ("_inflight_requests", "inflight_incoming_controls")):
+                value = getattr(query, source, None)
+                if isinstance(value, dict):
+                    out[key] = len(value)
+            receiver = getattr(query, "_message_receive", None)
+            if receiver is not None:
+                stats = receiver.statistics()
+                for key in ("current_buffer_used", "max_buffer_size", "tasks_waiting_send", "tasks_waiting_receive"):
+                    value = getattr(stats, key, None)
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        out[key] = value
+            reader = getattr(query, "_read_task", None)
+            if reader is not None:
+                out["reader_done"] = bool(reader.done())
+            process = getattr(getattr(client, "_transport", None), "_process", None)
+            if process is not None:
+                out["process_exited"] = process.returncode is not None
+                if isinstance(process.returncode, int):
+                    out["process_exit_code"] = process.returncode
+                pid = getattr(process, "pid", None)
+                if isinstance(pid, int) and not isinstance(pid, bool):
+                    out["child_process"] = ClaudeBackend._child_process_diagnostic(pid)
+            result = getattr(query, "_last_error_result", None)
+            out["error_result_seen"] = isinstance(result, dict)
+            if isinstance(result, dict) and isinstance(result.get("api_error_status"), int):
+                out["api_error_status"] = result["api_error_status"]
+            return out
+        except Exception:
+            return {"available": False, "snapshot_failed": True}
+
+    @staticmethod
+    def _child_process_diagnostic(pid: int) -> dict[str, Any]:
+        """Linux numeric state only; no cmdline, environ, memory or fd content."""
+        result: dict[str, Any] = {"pid": pid}
+        root = Path("/proc") / str(pid)
+        try:
+            data = (root / "stat").read_text()
+            fields = data[data.rfind(")") + 2:].split()
+            result.update(state=fields[0], ppid=int(fields[1]),
+                          user_ticks=int(fields[11]), system_ticks=int(fields[12]),
+                          threads=int(fields[17]), start_ticks=int(fields[19]),
+                          virtual_bytes=int(fields[20]), rss_pages=int(fields[21]))
+            channel = (root / "wchan").read_text().strip()
+            if re.fullmatch(r"[a-zA-Z0-9_]+", channel):
+                result["wait_channel"] = channel
+            result["fd_count"] = sum(1 for _ in (root / "fd").iterdir())
+            result["stdio_kinds"] = {}
+            for n in (0, 1, 2):
+                target = os.readlink(root / "fd" / str(n))
+                result["stdio_kinds"][str(n)] = (
+                    "pipe" if target.startswith("pipe:") else
+                    "socket" if target.startswith("socket:") else
+                    "regular_or_device"
+                )
+        except (OSError, ValueError, IndexError) as error:
+            result["unavailable_type"] = type(error).__name__
+        return result
 
     async def _validate_mcp_boundary(self, client: Any, *, allow_absent_bello: bool = False) -> None:
         status = await client.get_mcp_status()
@@ -2447,6 +2599,54 @@ class ClaudeBackend:
     def _reject(command: _Command, error: BaseException) -> None:
         if not command.future.done():
             command.future.set_exception(error)
+
+    @staticmethod
+    def _failure_diagnostic(error: BaseException) -> dict[str, Any]:
+        known = {
+            "Exception", "ExceptionGroup", "BaseExceptionGroup", "RuntimeError",
+            "ValueError", "TypeError", "KeyError", "IndexError", "AttributeError",
+            "AssertionError", "OSError", "TimeoutError", "ConnectionError",
+            "BrokenPipeError", "CancelledError", "EndOfStream", "BrokenResourceError",
+            "ClosedResourceError", "CLIConnectionError", "ProcessError", "ResultError",
+            "CLINotFoundError", "CLIJSONDecodeError", "MessageParseError", "AppServerError",
+        }
+        modules = {"supervisor", "claude_agent_sdk", "anyio", "asyncio", "contextlib", "mcp"}
+        nodes: list[dict[str, Any]] = []
+        pending = [(error, None, "root")]
+        seen: set[int] = set()
+        while pending and len(nodes) < 8:
+            current, parent, relation = pending.pop(0)
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            name = type(current).__name__
+            node: dict[str, Any] = {"type": name if name in known else "OtherException",
+                                    "parent": parent, "relation": relation}
+            for field in ("exit_code", "errno", "api_error_status"):
+                value = getattr(current, field, None)
+                if type(value) is int:
+                    node[field] = value
+            frames = []
+            tb = current.__traceback__
+            while tb is not None:
+                module = tb.tb_frame.f_globals.get("__name__", "")
+                if isinstance(module, str) and module.split(".")[0] in modules:
+                    # Module/function names are installed source identifiers;
+                    # omit arbitrary filenames and all frame-local data.
+                    function = tb.tb_frame.f_code.co_name
+                    if all(part.isidentifier() for part in module.split(".")) and function.isidentifier():
+                        frames.append({"module": module, "function": function, "line": tb.tb_lineno})
+                tb = tb.tb_next
+            node["frames"] = frames[-8:]
+            index = len(nodes)
+            nodes.append(node)
+            if isinstance(current, BaseExceptionGroup):
+                pending.extend((child, index, "group") for child in current.exceptions[:8])
+            if current.__cause__ is not None:
+                pending.append((current.__cause__, index, "cause"))
+            elif current.__context__ is not None and not current.__suppress_context__:
+                pending.append((current.__context__, index, "context"))
+        return {"version": 1, "exceptions": nodes, "truncated": bool(pending)}
 
     @staticmethod
     def _safe_failure(error: BaseException) -> str:
