@@ -252,7 +252,7 @@ def test_wheel_data_layout_is_checked_without_importing_product(tmp_path):
     wheel = tmp_path / "neutral.whl"
     payload = b"# neutral installer fixture\n"
     with ZipFile(wheel, "w") as archive:
-        archive.writestr("bello-0.8.0.data/platlib/supervisor/runtime/native_codex_install.py", payload)
+        archive.writestr("bello-0.8.1.data/platlib/supervisor/runtime/native_codex_install.py", payload)
     assert verify.wheel_payload(wheel) == {"supervisor/runtime/native_codex_install.py": hashlib.sha256(payload).hexdigest()}
 
 

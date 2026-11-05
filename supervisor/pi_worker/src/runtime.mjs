@@ -338,7 +338,7 @@ export class PiWorkerRuntime {
 
   initializeResult() {
     return {
-      serverInfo: { name: "bello-pi-worker", version: "0.8.0", piSdkVersion: this.sdk.version },
+      serverInfo: { name: "bello-pi-worker", version: "0.8.1", piSdkVersion: this.sdk.version },
       protocolVersion: 1,
       capabilities: {
         multiplex: true,

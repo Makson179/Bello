@@ -751,12 +751,13 @@ class ConfigInspectionTests(unittest.TestCase):
             "max_completion_returns_before_adversary": 0, "max_completion_returns_after_adversary": 0}),
             ("unlimited", "unlimited"))
 
-    def test_version_target_recognizes_080_development(self):
-        self.assertEqual(INSPECTOR.TARGET_VERSION, "0.8.0")
-        for value in ("0.8.0", "0.8.0.dev0", "0.8.0.dev12"):
+    def test_version_target_recognizes_081_development(self):
+        self.assertEqual(INSPECTOR.TARGET_VERSION, "0.8.1")
+        for value in ("0.8.1", "0.8.1.dev0", "0.8.1.dev12"):
             self.assertEqual(INSPECTOR._version_compatibility(value), "verified")
-        # The 0.8 schema adds `goal` and defaults Smart Execution on: older installs need an update.
-        for value in ("0.5.2", "0.7.0", "0.7.1", "0.7.2"):
+        # The 0.8 schema adds `goal` and defaults Smart Execution on; 0.8.1 adds the Goal checkpoint,
+        # the Goal runtime switch and absolute context retention: older installs need an update.
+        for value in ("0.5.2", "0.7.0", "0.7.1", "0.7.2", "0.8.0"):
             self.assertEqual(INSPECTOR._version_compatibility(value), "update_required")
         self.assertEqual(INSPECTOR._version_compatibility("garbage"), "unverified")
 

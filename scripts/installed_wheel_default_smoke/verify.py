@@ -244,7 +244,7 @@ def run(args) -> dict:
         package = importlib.import_module("supervisor")
         package_parent = Path(package.__file__).resolve(strict=True).parent.parent
         require(package_parent.is_relative_to(Path(sys.prefix).resolve()), "Package is not in active venv")
-        require(importlib.metadata.version("Bello") == "0.8.0", "Wrong installed Bello version")
+        require(importlib.metadata.version("Bello") == "0.8.1", "Wrong installed Bello version")
         for name, checksum in expected.items():
             path = package_parent / name
             require(path.is_file() and digest(path) == checksum, "Installed package bytes differ from wheel")
@@ -258,7 +258,7 @@ def run(args) -> dict:
         spec_values = {name: getattr(spec, name) for name in ("url", "archive_sha256", "manifest_sha256")}
         require(spec_values == ledger["bundle"], "Final wheel default pins differ from release ledger")
         require(not runtime.exists(), "Runtime cache is not fresh")
-        report.update(version="0.8.0", python=sys.version, platform=platform.platform(),
+        report.update(version="0.8.1", python=sys.version, platform=platform.platform(),
                       package_parent=str(package_parent), package_files_verified=len(expected), bundle=spec_values)
         requests = []
         def audit(event, values):
