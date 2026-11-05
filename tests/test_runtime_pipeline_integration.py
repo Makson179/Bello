@@ -291,9 +291,14 @@ def _supported_node() -> Path:
 
 def _pytest_command(windows_python: Path | None = None) -> str:
     if windows_python is not None:
+        # pytest 9.2 stats its -c file; Windows Server 2022's AppContainer
+        # denies a stat of the NUL device that os.devnull names. Use an empty
+        # config inside the staged toolchain, which the sandbox can read.
+        isolated = windows_python.parent / "pytest-isolated.ini"
+        isolated.write_text("[pytest]\n", encoding="utf-8")
         return subprocess.list2cmdline([
             str(windows_python), "-I", "-m", "pytest", "-q", "-p", "no:cacheprovider",
-            "-c", os.devnull, "--rootdir=.", "--confcutdir=.",
+            "-c", str(isolated), "--rootdir=.", "--confcutdir=.",
             "test_solution.py",
         ])
     executable = shutil.which("pytest")
