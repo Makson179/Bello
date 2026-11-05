@@ -141,6 +141,18 @@ class _AsyncDelivery:
 CLI_STDERR_LOG = "claude-cli-stderr.log"
 
 
+def _observe_outcome(future: asyncio.Future[Any]) -> None:
+    """Mark a command outcome observed once it settles.
+
+    A command can be rejected after its requester stopped waiting (stop()
+    never awaits its own stop command; a cancelled request leaves its future
+    queued). Awaiters still receive the exception; this only keeps shutdown
+    from logging "Future exception was never retrieved".
+    """
+    if not future.cancelled():
+        future.exception()
+
+
 class ClaudeCliError(AppServerError):
     """Claude Code CLI output carried in full: never truncated or redacted."""
 
@@ -256,6 +268,7 @@ class ClaudeBackend:
             if owner.task.done():
                 continue
             future = asyncio.get_running_loop().create_future()
+            future.add_done_callback(_observe_outcome)
             await owner.queue.put(_Command("stop", {"threadId": thread_id}, future))
         for thread_id, owner in owners:
             if owner.task.done():
@@ -517,6 +530,7 @@ class ClaudeBackend:
             await self._ensure_owner(record)
             owner = self._owners[thread_id]
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        future.add_done_callback(_observe_outcome)
         await owner.queue.put(_Command(kind, params, future))
         return await future
 

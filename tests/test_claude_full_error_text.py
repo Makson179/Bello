@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from claude_agent_sdk._errors import ProcessError
 
-from supervisor.appserver import AppServerMessage
+from supervisor.appserver import AppServerError, AppServerMessage
 from supervisor.runtime.claude import CLI_STDERR_LOG, ClaudeBackend, ClaudeCliError
 from supervisor.runtime_errors import bounded_provider_error
 from supervisor.schemas import BelloStatus
@@ -119,3 +119,39 @@ async def test_auth_status_failure_carries_the_complete_cli_output(tmp_path):
     assert "Claude Code CLI stderr:\n" in text and "auth" in text.split("Claude Code CLI stderr:\n", 1)[1]
     assert raised.value.bello_full_text is True
     assert "auth" in (tmp_path / CLI_STDERR_LOG).read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_rejected_commands_nobody_awaits_are_not_reported_as_unretrieved(tmp_path):
+    import asyncio
+    import gc
+
+    from supervisor.runtime.claude import _Command, _Owner
+
+    loop = asyncio.get_running_loop()
+    reports = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: reports.append(context.get("message", "")))
+    try:
+        runtime = backend(tmp_path, FakeFactory(complete_after_queries=None), [])
+        await start_thread(runtime, tmp_path)
+        queue: asyncio.Queue = asyncio.Queue()
+        blocker = asyncio.Event()
+        runtime._owners["thread-1"] = _Owner(queue, asyncio.create_task(blocker.wait()))
+        # A requester that gave up, and stop()'s own never-awaited command.
+        waiting = asyncio.create_task(runtime._send_owner("thread-1", "interrupt", {}))
+        await asyncio.sleep(0)
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        stopping = asyncio.create_task(runtime.stop())
+        await asyncio.sleep(0)
+        while not queue.empty():
+            runtime._reject(queue.get_nowait(), AppServerError("Claude Code session owner is closed"))
+        blocker.set()
+        await stopping
+        del waiting, stopping
+        gc.collect()
+        await asyncio.sleep(0)
+        assert not [message for message in reports if "never retrieved" in message]
+    finally:
+        loop.set_exception_handler(previous)
