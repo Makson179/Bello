@@ -37,6 +37,7 @@ from jsonschema.exceptions import SchemaError, ValidationError
 
 from supervisor.appserver import AppServerError, AppServerTimeoutError
 from supervisor.process_fence import create_subprocess_exec
+from supervisor.runtime.context_policy import context_policies_match
 from supervisor.runtime.models import validate_effort
 from supervisor.runtime.claude_async import BATCH_GUIDANCE, BATCH_TOOL_NAME, ClaudeAsyncBatches
 from supervisor.runtime.claude_cli import OfficialCli, resolve_official_cli, sdk_bundled_cli
@@ -390,7 +391,9 @@ class ClaudeBackend:
         self._assert_state_persistence_known()
         await self._ensure_initialized()
         record = self._record(params.get("threadId"))
-        if "noNeedForContext" in params and claude_context.context_policy(params["noNeedForContext"]) != record.get("noNeedForContext", claude_context.context_policy(None)):
+        if "noNeedForContext" in params and not context_policies_match(
+                record.get("noNeedForContext", claude_context.context_policy(None)),
+                claude_context.context_policy(params["noNeedForContext"])):
             raise AppServerError("resuming a Claude Code thread cannot change noNeedForContext")
         if "asyncTools" in params and params["asyncTools"] != record.get("asyncTools", False):
             raise AppServerError("resuming a Claude Code thread cannot change asyncTools")
@@ -420,6 +423,10 @@ class ClaudeBackend:
     async def _turn_start(self, params: dict[str, Any]) -> dict[str, Any]:
         self._assert_state_persistence_known()
         record = self._record(params.get("threadId"))
+        if "noNeedForContext" in params and not context_policies_match(
+                record.get("noNeedForContext", claude_context.context_policy(None)),
+                claude_context.context_policy(params["noNeedForContext"])):
+            raise AppServerError("a Claude Code turn cannot change noNeedForContext")
         if record.get("closed"):
             raise AppServerError("cannot start a turn on an archived Claude Code thread")
         if record.get("activeTurnId"):

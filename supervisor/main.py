@@ -178,7 +178,15 @@ class BelloClickGroup(click.Group):
     "no_need_for_context_threshold_tokens",
     type=click.IntRange(min=1),
     default=None,
-    help="Positive input-token threshold at which No Need For Context summarizes (default: 200000).",
+    help="Positive input-token threshold at which No Need For Context summarizes (default: 244800).",
+)
+@click.option(
+    "--context-retain-tokens",
+    "no_need_for_context_retain_tokens",
+    type=click.IntRange(min=1),
+    default=None,
+    help=("Soft recent-context target in tokens (default: 24800); whole turns and tool-call groups can "
+          "exceed it. Mutually exclusive with --context-retain-percent."),
 )
 @click.option(
     "--context-retain-percent",
@@ -187,7 +195,8 @@ class BelloClickGroup(click.Group):
     default=None,
     help=(
         "Soft recent-context target as a percentage of the threshold, greater than 0 and at most 50 "
-        "(default: 10); whole turns and tool-call groups can exceed it."
+        "(legacy percentage mode); whole turns and tool-call groups can exceed it. "
+        "Mutually exclusive with --context-retain-tokens."
     ),
 )
 @click.option(
@@ -271,6 +280,7 @@ def cli(
     no_need_for_context_enabled: bool | None,
     no_need_for_context_threshold_tokens: int | None,
     no_need_for_context_retain_percent: float | None,
+    no_need_for_context_retain_tokens: int | None,
     log_distiller_enabled: bool | None,
     distiller_model_path: Path | None,
     completion_review: bool | None,
@@ -281,6 +291,8 @@ def cli(
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
+    if no_need_for_context_retain_tokens is not None and no_need_for_context_retain_percent is not None:
+        raise click.UsageError("--context-retain-tokens and --context-retain-percent are mutually exclusive")
     from supervisor.process_fence import configure_worker
     from supervisor.watchdog import PERMIT_ENV, WORKER_ENV, watch_cli
     configure_worker()
@@ -334,6 +346,7 @@ def cli(
             no_need_for_context_enabled=no_need_for_context_enabled,
             no_need_for_context_threshold_tokens=no_need_for_context_threshold_tokens,
             no_need_for_context_retain_percent=no_need_for_context_retain_percent,
+            no_need_for_context_retain_tokens=no_need_for_context_retain_tokens,
             log_distiller_enabled=log_distiller_enabled,
             distiller_model_path=distiller_model_path,
             completion_review=completion_review,
@@ -712,7 +725,10 @@ def config_command() -> None:
     click.echo(f"no-need-for-context: {str(config.no_need_for_context.enabled).lower()}")
     if config.no_need_for_context.enabled:
         click.echo(f"context-threshold-tokens: {config.no_need_for_context.threshold_tokens}")
-        click.echo(f"context-retain-percent: {config.no_need_for_context.retain_percent}")
+        if config.no_need_for_context.retain_tokens is not None:
+            click.echo(f"context-retain-tokens: {config.no_need_for_context.retain_tokens}")
+        else:
+            click.echo(f"context-retain-percent: {config.no_need_for_context.retain_percent}")
     if config.effective_runtime_enabled:
         click.echo(f"runtime-mod: {config.runtime_mod}")
         click.echo(f"runtime-intelligence: {config.runtime_intelligence}")
@@ -936,6 +952,7 @@ def _resolve_run_settings(
     no_need_for_context_enabled: bool | None = None,
     no_need_for_context_threshold_tokens: int | None = None,
     no_need_for_context_retain_percent: float | None = None,
+    no_need_for_context_retain_tokens: int | None = None,
     log_distiller_enabled: bool | None = None,
     distiller_model_path: Path | None = None,
     completion_review: bool | None = None,
@@ -992,14 +1009,20 @@ def _resolve_run_settings(
         enabled=project_config.log_distiller.enabled if log_distiller_enabled is None else log_distiller_enabled,
         model_path=project_config.log_distiller.model_path if distiller_model_path is None else str(distiller_model_path),
     )
+    if no_need_for_context_retain_percent is not None and no_need_for_context_retain_tokens is not None:
+        raise ProjectConfigError("--context-retain-tokens and --context-retain-percent are mutually exclusive")
+    context_retention = {}
+    if no_need_for_context_retain_tokens is not None:
+        context_retention = {"retain_tokens": no_need_for_context_retain_tokens, "retain_percent": None}
+    elif no_need_for_context_retain_percent is not None:
+        context_retention = {"retain_percent": no_need_for_context_retain_percent, "retain_tokens": None}
     selected_context = replace(
         project_config.no_need_for_context,
         enabled=(project_config.no_need_for_context.enabled if no_need_for_context_enabled is None
                  else no_need_for_context_enabled),
         threshold_tokens=(project_config.no_need_for_context.threshold_tokens
                           if no_need_for_context_threshold_tokens is None else no_need_for_context_threshold_tokens),
-        retain_percent=(project_config.no_need_for_context.retain_percent
-                        if no_need_for_context_retain_percent is None else no_need_for_context_retain_percent),
+        **context_retention,
     )
     _validate_model_intelligence("coder", selected_coder_model, selected_coder_intelligence)
     if project_config.revision_coder_enabled and (selected_completion_review or selected_adversary):

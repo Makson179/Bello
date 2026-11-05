@@ -303,9 +303,22 @@ def _replace_config_field(
         return _editor.replace(config, log_distiller=_editor.replace(config.log_distiller, enabled=bool(value)))
     if field == "distiller_model_path":
         return _editor.replace(config, log_distiller=_editor.replace(config.log_distiller, model_path=value))
-    if field in {"no_need_for_context_enabled", "no_need_for_context_threshold_tokens", "no_need_for_context_retain_percent"}:
+    if field == "no_need_for_context_retention_mode":
+        current_mode = "tokens" if config.no_need_for_context.retain_tokens is not None else "percentage"
+        if value == current_mode:
+            return config
+        retention = ({"retain_tokens": 24800, "retain_percent": None} if value == "tokens"
+                     else {"retain_percent": 10, "retain_tokens": None})
+        return _editor.replace(config, no_need_for_context=_editor.replace(config.no_need_for_context, **retention))
+    if field in {"no_need_for_context_enabled", "no_need_for_context_threshold_tokens",
+                 "no_need_for_context_retain_percent", "no_need_for_context_retain_tokens"}:
         setting = field.removeprefix("no_need_for_context_")
-        return _editor.replace(config, no_need_for_context=_editor.replace(config.no_need_for_context, **{setting: value}))
+        update = {setting: value}
+        if setting == "retain_tokens":
+            update["retain_percent"] = None
+        elif setting == "retain_percent":
+            update["retain_tokens"] = None
+        return _editor.replace(config, no_need_for_context=_editor.replace(config.no_need_for_context, **update))
     multi_agent_parts = _editor._multi_agent_editor_field_parts(field)
     if multi_agent_parts is not None:
         config_field, setting_field = multi_agent_parts

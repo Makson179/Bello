@@ -24,6 +24,7 @@ from jsonschema import ValidationError
 from supervisor.appserver import (AppServerClient, AppServerError, AppServerMessage,
     AppServerTimeoutError, _private_owned_directory, _codex_home_from_environment)
 from supervisor.runtime.journal import RuntimeJournal
+from supervisor.runtime.context_policy import context_policies_match
 from supervisor.runtime.codex_permissions import native_permission_params, validate_windows_native_scope
 from supervisor.runtime.codex_toolchains import native_toolchain_read_paths
 from supervisor.filesystem_safety import is_link_or_reparse, remove_path_tree
@@ -49,6 +50,12 @@ _CONTEXT_COMPACTION_UNSUPPORTED = (
     "the published Smart Execution helper does not include it. No engine or API fallback was used "
     "and no model turn was started. Turn No Need For Context off (--no-no-need-for-context, or "
     "no_need_for_context.enabled in `bello config`), or point BELLO_CODEX_BINARY at a rebuilt helper."
+)
+_CONTEXT_RETAIN_TOKENS_UNSUPPORTED = (
+    "Absolute No Need For Context retention requires a native Codex build with "
+    "bello_context_retain_tokens support. This helper cannot preserve the requested absolute tail; "
+    "No engine or API fallback was used and no model turn was started. Point BELLO_CODEX_BINARY "
+    "at a rebuilt helper, or keep an explicit legacy retain_percent policy."
 )
 
 
@@ -106,6 +113,7 @@ class CodexBackend:
         self._async_tools_verified = False
         self._async_tools_checked = False
         self._context_compaction_verified = False
+        self._context_retain_tokens_verified = False
         self._native_command = None
         self._runtime_read_paths: tuple[Path, ...] = ()
         self._private_read_roots = tuple(Path(path).absolute() for path in private_read_roots)
@@ -283,8 +291,9 @@ class CodexBackend:
             raise AppServerError("unsupported native Codex service tier")
         if params.get("distillerEnabled"):
             await self._validate_selection()
-        if params.get("noNeedForContext", {}).get("enabled"):
-            await self._validate_context_compaction(timeout)
+        context_policy = params.get("noNeedForContext", {})
+        if context_policy.get("enabled"):
+            await self._validate_context_compaction(timeout, require_retain_tokens="retainPercent" not in context_policy)
         if params.get("asyncTools"):
             await self._validate_async_tools(timeout)
         elif not self._async_tools_checked:
@@ -312,6 +321,8 @@ class CodexBackend:
             response = await self._client.request("experimentalFeature/list", params, timeout=timeout)
             if any(f.get("name") == "bello_context_compaction" for f in response.get("data", []) if isinstance(f, dict)):
                 self._context_compaction_verified = True
+            if any(f.get("name") == "bello_context_retain_tokens" for f in response.get("data", []) if isinstance(f, dict)):
+                self._context_retain_tokens_verified = True
             if any(feature.get("name") == "bello_async_tools" for feature in response.get("data", [])
                    if isinstance(feature, dict)):
                 self._async_tools_verified = True
@@ -324,8 +335,10 @@ class CodexBackend:
         self._async_tools_checked = True
         raise AppServerError(_ASYNC_TOOLS_UNSUPPORTED)
 
-    async def _validate_context_compaction(self, timeout: float) -> None:
-        if self._context_compaction_verified:
+    async def _validate_context_compaction(self, timeout: float, *, require_retain_tokens: bool = False) -> None:
+        # Compatibility discovery only: older helpers silently ignore unknown
+        # config fields. Never turn an absolute target into their 10% fallback.
+        if self._context_compaction_verified and (not require_retain_tokens or self._context_retain_tokens_verified):
             return
         cursor, seen = None, set()
         while True:
@@ -335,12 +348,17 @@ class CodexBackend:
             response = await self._client.request("experimentalFeature/list", request, timeout=timeout)
             if any(f.get("name") == "bello_context_compaction" for f in response.get("data", []) if isinstance(f, dict)):
                 self._context_compaction_verified = True
+            if any(f.get("name") == "bello_context_retain_tokens" for f in response.get("data", []) if isinstance(f, dict)):
+                self._context_retain_tokens_verified = True
+            if self._context_compaction_verified and (not require_retain_tokens or self._context_retain_tokens_verified):
                 return
             cursor = response.get("nextCursor")
             if not cursor or cursor in seen:
                 break
             seen.add(cursor)
-        raise AppServerError(_CONTEXT_COMPACTION_UNSUPPORTED)
+        if not self._context_compaction_verified:
+            raise AppServerError(_CONTEXT_COMPACTION_UNSUPPORTED)
+        raise AppServerError(_CONTEXT_RETAIN_TOKENS_UNSUPPORTED)
 
     async def _validate_selection(self) -> None:
         if self._bridge is None:
@@ -426,14 +444,22 @@ class CodexBackend:
         private_read_roots: tuple[Path, ...] = ()
         context_policy = params.get("noNeedForContext", {})
         context_enabled = context_policy.get("enabled", False)
+        if "retainTokens" in context_policy and "retainPercent" in context_policy:
+            raise AppServerError("noNeedForContext must select retainTokens or retainPercent, not both")
         if context_enabled:
             # Context compaction is a conversation-history policy only: it adds
             # no sandbox, readable-root, network or approval restriction.
             from supervisor.project_config import NoNeedForContextConfig
-            NoNeedForContextConfig(enabled=context_enabled, threshold_tokens=context_policy.get("thresholdTokens", 200000),
-                                   retain_percent=context_policy.get("retainPercent", 10))
+            if ("retainTokens" in context_policy and context_policy["retainTokens"] is None
+                    or "retainPercent" in context_policy and context_policy["retainPercent"] is None):
+                raise AppServerError("noNeedForContext retention target must be a number")
+            selected_context = NoNeedForContextConfig(
+                enabled=context_enabled, threshold_tokens=context_policy.get("thresholdTokens", 244800),
+                retain_percent=context_policy.get("retainPercent"), retain_tokens=context_policy.get("retainTokens"))
             if not self._context_compaction_verified:
                 raise AppServerError("native context compaction requested without verified capability")
+            if selected_context.retain_tokens is not None and not self._context_retain_tokens_verified:
+                raise AppServerError(_CONTEXT_RETAIN_TOKENS_UNSUPPORTED)
         if root_read:
             # Host-derived directories only. Never create a missing deny path:
             # the native deny resolver would turn it into a directory.
@@ -481,13 +507,17 @@ class CodexBackend:
             config["features"].pop("bello_context_compaction", None)
         config.pop("features.bello_context_compaction", None)
         config.pop("bello_context_retain_percent", None)
+        config.pop("bello_context_retain_tokens", None)
         if self._context_compaction_verified:
             config["features.bello_context_compaction"] = context_enabled
         if context_enabled:
-            config.update(model_auto_compact_token_limit=context_policy.get("thresholdTokens", 200000),
+            config.update(model_auto_compact_token_limit=selected_context.threshold_tokens,
                           model_auto_compact_token_limit_scope="total",
-                          model_post_turn_compact_threshold_percent=0,
-                          bello_context_retain_percent=context_policy.get("retainPercent", 10))
+                          model_post_turn_compact_threshold_percent=0)
+            if selected_context.retain_tokens is not None:
+                config["bello_context_retain_tokens"] = selected_context.retain_tokens
+            else:
+                config["bello_context_retain_percent"] = selected_context.retain_percent
         if params.get("asyncTools") and not self._async_tools_verified:
             raise AppServerError("native Async tools requested without verified capability")
         if isinstance(config.get("features"), dict):
@@ -683,6 +713,11 @@ class CodexBackend:
     async def _resume(self, record: dict[str, Any], params: dict[str, Any], timeout: float) -> dict[str, Any]:
         combined = {**record["params"], **params}
         self._validate_context_override(record, params)
+        if "noNeedForContext" in record["params"]:
+            # A compatible OFF override must not migrate inactive saved knobs.
+            combined["noNeedForContext"] = deepcopy(record["params"]["noNeedForContext"])
+        else:
+            combined.pop("noNeedForContext", None)
         if bool(combined.get("asyncTools", False)) != bool(record["params"].get("asyncTools", False)):
             raise AppServerError("native resume cannot change Async tools mode; start a new run")
         if _model(combined["model"]) != record["model"] or str(Path(combined["cwd"]).resolve()) != str(Path(record["cwd"]).resolve()):
@@ -746,7 +781,7 @@ class CodexBackend:
     def _validate_context_override(record: dict[str, Any], params: dict[str, Any]) -> None:
         from supervisor.project_config import NoNeedForContextConfig
         saved = record["params"].get("noNeedForContext", NoNeedForContextConfig().to_backend_data())
-        if "noNeedForContext" in params and params["noNeedForContext"] != saved:
+        if "noNeedForContext" in params and not context_policies_match(saved, params["noNeedForContext"]):
             raise AppServerError("native resume/turn cannot change context compaction policy; start a new run")
 
     def _bind_turn(self, record: dict[str, Any], native: str, host: str) -> None:

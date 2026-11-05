@@ -725,6 +725,27 @@ test("a 100000-token threshold and a 15000-token tail are exactly representable 
   assert.equal(selected.thresholdTokens * selected.retainPercent / 100, 15000);
 });
 
+test("the default absolute Pi tail keeps 24800 tokens rather than ten percent of 244800", () => {
+  const sizes = [1, 1000, 320, 24480];
+  const messages = sizes.map((size, index) => index === 0
+    ? { role: "user", content: "x".repeat(size * 4) }
+    : { role: "assistant", content: [{ type: "text", text: "x".repeat(size * 4) }] });
+  const context = { contextEntries: messages.map((message, index) => ({
+    sourceEntry: { id: String(index), type: "message" }, messages: [message],
+  })) };
+  const absolute = normalizeContextPolicy({ enabled: true });
+  assert.equal(absolute.thresholdTokens, 244800);
+  assert.equal(absolute.retainTokens, 24800);
+  const plan = planContextCompaction(context, absolute);
+  assert.equal(plan.retainedTokens, 24800);
+  assert.equal(plan.retainedEntryId, "2");
+  const legacy = planContextCompaction(context, normalizeContextPolicy({
+    enabled: true, thresholdTokens: 244800, retainPercent: 10,
+  }));
+  assert.equal(legacy.retainedTokens, 24480);
+  assert.equal(legacy.retainedEntryId, "3");
+});
+
 test("the input budget leaves exactly the output reserve plus the 4096-token safety margin", () => {
   const selected = { enabled: true, thresholdTokens: 1000, retainPercent: 10 };
   for (const [contextWindow, maxTokens] of [[32768, 4096], [16000, 2000], [1000000, 16384], [200000, 64000]]) {
@@ -1113,5 +1134,28 @@ test("worker persists context policy, forwards it and rejects resume drift befor
   await assert.rejects(runtime.dispatch("thread/resume", { threadId: "policy-thread", noNeedForContext: { ...policy, retainPercent: 20 } }), /cannot change noNeedForContext/);
   await assert.rejects(runtime.dispatch("thread/start", { ...params, threadId: "bad", noNeedForContext: { ...policy, retainPercent: 51 } }), /retainPercent/);
   assert.equal(runtime.threads.has("bad"), false);
-  assert.deepEqual(normalizeContextPolicy(undefined), { enabled: false, thresholdTokens: 200000, retainPercent: 10 });
+  assert.deepEqual(normalizeContextPolicy(undefined), { enabled: false, thresholdTokens: 244800, retainTokens: 24800 });
+});
+
+test("worker resumes old disabled defaults without migrating them and still rejects enabling", async (t) => {
+  const layout = temporaryLayout(t);
+  const sdk = createFakeSdk();
+  const runtime = new PiWorkerRuntime({ sdk, emit: async () => {}, hostCalls: { call: async () => ({}) } });
+  t.after(() => runtime.close());
+  await runtime.dispatch("initialize", { stateDir: layout.stateDir, agentDir: layout.agentDir });
+  const legacy = { enabled: false, thresholdTokens: 200000, retainPercent: 10 };
+  const current = { enabled: false, thresholdTokens: 244800, retainTokens: 24800 };
+  const threadId = "old-off-policy";
+  await runtime.dispatch("thread/start", { threadId, cwd: layout.workspace, provider: "openai-codex",
+    model: "gpt-test", tools: [], noNeedForContext: legacy });
+  await runtime.dispatch("thread/resume", { threadId, noNeedForContext: current });
+  const record = runtime.getRecord(threadId);
+  assert.deepEqual(record.meta.noNeedForContext, legacy);
+  for (const method of ["thread/resume", "turn/start"]) {
+    await assert.rejects(runtime.dispatch(method, { threadId, turnId: "wrong", input: "fixture",
+      noNeedForContext: { ...current, enabled: true } }), /cannot change noNeedForContext/);
+  }
+  await runtime.dispatch("turn/start", { threadId, turnId: "off-turn", input: "fixture", noNeedForContext: current });
+  await waitFor(() => !record.active);
+  assert.deepEqual(record.meta.noNeedForContext, legacy);
 });

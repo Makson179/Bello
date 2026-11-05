@@ -200,15 +200,19 @@ class BelloConfig(BaseModel):
     # Smart Execution defaults on; a saved explicit false is preserved.
     async_tools: bool = True
     no_need_for_context: dict[str, Any] = Field(
-        default_factory=lambda: {"enabled": False, "threshold_tokens": 200000, "retain_percent": 10}
+        default_factory=lambda: {"enabled": False, "threshold_tokens": 244800, "retain_tokens": 24800}
     )
 
     @field_validator("no_need_for_context", mode="before")
     @classmethod
     def validate_no_need_for_context(cls, value: Any) -> dict[str, Any]:
         from supervisor.project_config import NoNeedForContextConfig, ProjectConfigError
-        if not isinstance(value, dict) or set(value) - {"enabled", "threshold_tokens", "retain_percent"}:
-            raise ValueError("no_need_for_context must contain only enabled, threshold_tokens and retain_percent")
+        if not isinstance(value, dict) or set(value) - {"enabled", "threshold_tokens", "retain_percent", "retain_tokens"}:
+            raise ValueError("no_need_for_context must contain only enabled, threshold_tokens and one retention setting")
+        if "retain_tokens" in value and ("retain_percent" in value or value["retain_tokens"] is None):
+            raise ValueError("no_need_for_context must select only one valid retention setting")
+        if "retain_percent" in value and value["retain_percent"] is None:
+            raise ValueError("no_need_for_context.retain_percent must be a finite number greater than 0 and at most 50")
         try:
             return NoNeedForContextConfig(**value).to_json_data()
         except ProjectConfigError as exc:

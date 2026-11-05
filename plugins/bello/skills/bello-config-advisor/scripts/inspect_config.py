@@ -177,12 +177,15 @@ def _normalize(payload: dict[str, Any], *, config_exists: bool) -> dict[str, Any
         if isinstance(raw_distiller, dict) else copy.deepcopy(raw_distiller)
     )
     raw_context = payload.get("no_need_for_context", {})
-    no_need_for_context = (
-        {"enabled": raw_context.get("enabled", False),
-         "threshold_tokens": raw_context.get("threshold_tokens", 200000),
-         "retain_percent": raw_context.get("retain_percent", 10)}
-        if isinstance(raw_context, dict) else copy.deepcopy(raw_context)
-    )
+    if isinstance(raw_context, dict):
+        # Preserve both explicit keys if invalid input supplied them, so source
+        # validation can report the ambiguity instead of silently choosing one.
+        retention = {key: raw_context[key] for key in ("retain_tokens", "retain_percent") if key in raw_context}
+        no_need_for_context = {"enabled": raw_context.get("enabled", False),
+                               "threshold_tokens": raw_context.get("threshold_tokens", 244800),
+                               **(retention or {"retain_tokens": 24800})}
+    else:
+        no_need_for_context = copy.deepcopy(raw_context)
 
     return {
         "review_limit_format": "explicit",
@@ -330,16 +333,21 @@ def _source_config_errors(payload: dict[str, Any], current: dict[str, Any], *, c
     distiller = current["log_distiller"]
     context = current["no_need_for_context"]
     raw_context = payload.get("no_need_for_context", {})
-    if not isinstance(raw_context, dict) or set(raw_context) - {"enabled", "threshold_tokens", "retain_percent"}:
-        errors.append("no_need_for_context must contain only enabled, threshold_tokens and retain_percent")
+    if not isinstance(raw_context, dict) or set(raw_context) - {"enabled", "threshold_tokens", "retain_percent", "retain_tokens"}:
+        errors.append("no_need_for_context must contain only enabled, threshold_tokens and one retention setting")
     if isinstance(context, dict):
         if type(context["enabled"]) is not bool:
             errors.append("no_need_for_context.enabled must be boolean")
         if not _is_int(context["threshold_tokens"]) or context["threshold_tokens"] <= 0:
             errors.append("no_need_for_context.threshold_tokens must be a positive integer")
-        percent = context["retain_percent"]
-        if type(percent) not in (int, float) or not 0 < percent <= 50 or not math.isfinite(percent):
-            errors.append("no_need_for_context.retain_percent must be a finite number greater than 0 and at most 50")
+        if "retain_tokens" in context and "retain_percent" in context:
+            errors.append("no_need_for_context must select only one of retain_tokens and retain_percent")
+        if "retain_tokens" in context and (not _is_int(context["retain_tokens"]) or context["retain_tokens"] <= 0):
+            errors.append("no_need_for_context.retain_tokens must be a positive integer")
+        if "retain_percent" in context:
+            percent = context["retain_percent"]
+            if type(percent) not in (int, float) or not 0 < percent <= 50 or not math.isfinite(percent):
+                errors.append("no_need_for_context.retain_percent must be a finite number greater than 0 and at most 50")
     raw_distiller = payload.get("log_distiller", {})
     if not isinstance(raw_distiller, dict) or set(raw_distiller) - {"enabled", "model_path"}:
         errors.append("log_distiller must contain only enabled and model_path")

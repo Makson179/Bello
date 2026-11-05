@@ -51,7 +51,19 @@ CONTEXT_SOURCE_MARKERS = {
         "const SUMMARY_TIMEOUT: Duration = Duration::from_secs(500);",
         "tokio::time::timeout(SUMMARY_TIMEOUT, attempts)",
         "summary.chars().count() > BELLO_SUMMARY_MAX_CHARS",
-        "bello_input_budget(hard_limit)",
+        # Estimates still select the soft tail and reject a non-reducing
+        # summary; they must not admit/refuse requests as a capacity oracle.
+        "bello_context_threshold(&turn.config, &turn.model_info())?",
+        "bello_context_retain_tokens(&turn.config, threshold)",
+        "sess.send_token_count_event(&turn).await;",
+        "sess.ensure_bello_context_persistence().await?",
+        "CompactionPhase::PostTurn",
+        "Ok(summary) if approx_token_count(&summary) as i64 >= previous_size",
+        "CodexErrorDetails::Interrupted",
+        "CodexErrorDetails::TurnAborted",
+        "CodexErrorDetails::SessionBudgetExceeded",
+        "Err(error) => last_error = error",
+        "if !current.annotated_items().starts_with(&original)",
     ),
     "codex-rs/core/src/session/context_window.rs": (
         # 16,000-character prompt target, 48,000-character limit and the input
@@ -60,21 +72,73 @@ CONTEXT_SOURCE_MARKERS = {
         "pub(crate) const BELLO_SUMMARY_MAX_CHARS: usize = 48_000;",
         "pub(crate) const BELLO_CONTEXT_SAFETY_MARGIN: i64 = 4_096;",
         "pub(crate) fn bello_input_budget(",
+        "unwrap_or(244_800)",
+        "pub(crate) fn bello_context_retain_tokens(",
+        "pub(crate) fn bello_context_tokens(info: Option<TokenUsageInfo>) -> i64",
+        "info.last_token_usage.input_tokens.max(0)",
+        ".saturating_add(info.last_token_usage.output_tokens.max(0))",
+        "pub(crate) fn bello_compacted_token_info(",
+        "info.last_token_usage = TokenUsage::default();",
+        "bello_context_tokens(sess.token_usage_info().await)",
     ),
     "codex-rs/core/src/session/mod.rs": (
         "async fn replace_compacted_history_from_snapshot(",
         "current.starts_with(expected)",
         "items.extend_from_slice(&current[expected.len()..])",
+        "state.bello_context_persistence_uncertain = true;",
+        "live.flush().await?",
+        "state.commit_auto_compact_window(metadata.window_number, metadata.window_ids)",
+        "pub(crate) fn bello_checkpoint_complete(items: &[RolloutItem]) -> bool",
+        "fn last_bello_token_info_from_rollout(items: &[RolloutItem]) -> Option<TokenUsageInfo>",
+        "context_window::bello_compacted_token_info(state.token_info())",
+        "state.set_token_info(Some(compacted_token_info));",
+        "Self::last_bello_token_info_from_rollout(items)",
+        "current.total_token_usage = record.thread_token_usage.clone();",
+        "checkpoint.latest_token_usage_record.as_ref()",
+        "pub(crate) async fn update_bello_summary_token_usage_info(",
+        "preserve_context_measurement: bool",
+        "preserved_info.last_token_usage = previous;",
+    ),
+    "codex-rs/core/src/session/turn.rs": (
+        "super::context_window::bello_context_tokens(sess.token_usage_info().await)",
     ),
     "codex-rs/core/src/compact.rs": (
         'bello_compact.rs', "codex_features::Feature::BelloContextCompaction",
         "return bello::run(",
+        "sess.update_bello_summary_token_usage_info(turn_context, token_usage.as_ref()).await?;",
     ),
     "codex-rs/features/src/lib.rs": (
         'key: "bello_context_compaction",\n        stage: Stage::UnderDevelopment,\n        default_enabled: false,',
+        'key: "bello_context_retain_tokens",\n        stage: Stage::UnderDevelopment,\n        default_enabled: false,',
     ),
     "codex-rs/config/src/config_toml.rs": (
         "pub bello_context_retain_percent: Option<f64>",
+        "pub bello_context_retain_tokens: Option<i64>",
+    ),
+    "codex-rs/core/src/config/mod.rs": (
+        "cfg.bello_context_retain_percent.is_none().then_some(24_800)",
+        "bello_context_retain_tokens and bello_context_retain_percent are mutually exclusive",
+    ),
+}
+
+# These are the removed native history-estimate admission gates, not the static
+# validation of a configured threshold against reported model capacity. Keep
+# this rejection contract separate from positive markers so an old helper
+# cannot satisfy preparation merely by retaining the surviving safety checks.
+CONTEXT_FORBIDDEN_SOURCE_MARKERS = {
+    "codex-rs/core/src/bello_compact.rs": (
+        "bello_input_budget",
+        "summarization input exceeds safe model budget",
+        "protected context fills model capacity",
+        "cannot verify replacement context size",
+        "protected prefix and whole recent rounds exceed safe model budget",
+        "projected.estimate_token_count",
+        "accounting_is_stale",
+        "estimate_token_count(",
+        "sess.recompute_token_usage(&turn).await",
+    ),
+    "codex-rs/core/src/session/mod.rs": (
+        "late results exceed safe replacement budget",
     ),
 }
 
@@ -103,6 +167,8 @@ def verify_context_source(source: Path) -> None:
         contents = path.read_text(encoding="utf-8")
         if any(marker not in contents for marker in markers):
             raise ValueError("Candidate context source contract is incomplete")
+        if any(marker in contents for marker in CONTEXT_FORBIDDEN_SOURCE_MARKERS.get(name, ())):
+            raise ValueError("Candidate context source contains a removed estimate admission gate")
 
 
 def identity(root: Path = ROOT) -> dict:

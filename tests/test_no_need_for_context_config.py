@@ -26,6 +26,9 @@ from supervisor.state import StateStore
     {"retain_percent": 0}, {"retain_percent": -1}, {"retain_percent": 50.1},
     {"retain_percent": float("nan")}, {"retain_percent": float("inf")},
     {"retain_percent": 10 ** 400},
+    {"retain_tokens": True}, {"retain_tokens": "24800"}, {"retain_tokens": 0},
+    {"retain_tokens": -1}, {"retain_tokens": 24800.0},
+    {"retain_tokens": 24800, "retain_percent": 10},
 ])
 def test_context_config_strict_validation(value):
     with pytest.raises(ProjectConfigError, match="no_need_for_context"):
@@ -34,7 +37,9 @@ def test_context_config_strict_validation(value):
         BelloConfig(project_root="/project", no_need_for_context=value)
 
 
-@pytest.mark.parametrize("value", [None, [], {"thresholdTokens": 1000}, {"unknown": True}])
+@pytest.mark.parametrize("value", [None, [], {"thresholdTokens": 1000}, {"unknown": True},
+                                  {"retain_tokens": None}, {"retain_percent": None},
+                                  {"retain_tokens": 24800, "retain_percent": None}])
 def test_context_config_rejects_invalid_saved_shape(tmp_path, value):
     path = project_config_path(tmp_path)
     path.parent.mkdir(parents=True)
@@ -48,7 +53,7 @@ def test_context_config_legacy_defaults_and_round_trip(tmp_path):
     path.parent.mkdir(parents=True)
     path.write_text("{}")
     old = load_project_config(tmp_path, create=False)
-    assert old.no_need_for_context == NoNeedForContextConfig(False, 200000, 10)
+    assert old.no_need_for_context == NoNeedForContextConfig(False, 244800, retain_tokens=24800)
     config = replace(old, no_need_for_context=NoNeedForContextConfig(True, 100000, 12.5))
     save_project_config(tmp_path, config)
     assert load_project_config(tmp_path, create=False).no_need_for_context == config.no_need_for_context
@@ -69,10 +74,10 @@ def test_context_sparse_defaults_and_explicit_legacy_threshold_are_preserved(tmp
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps({"no_need_for_context": {"enabled": enabled}}))
     sparse = load_project_config(tmp_path, create=False)
-    assert sparse.no_need_for_context == NoNeedForContextConfig(enabled, 200000, 10)
+    assert sparse.no_need_for_context == NoNeedForContextConfig(enabled, 244800, retain_tokens=24800)
     assert context_policy({"enabled": enabled}) == sparse.no_need_for_context.to_backend_data()
     assert BelloConfig(project_root=str(tmp_path), task_path="TASK.md", no_need_for_context={"enabled": enabled}).no_need_for_context == {
-        "enabled": enabled, "threshold_tokens": 200000, "retain_percent": 10}
+        "enabled": enabled, "threshold_tokens": 244800, "retain_tokens": 24800}
 
     explicit = {"enabled": enabled, "threshold_tokens": 249000, "retain_percent": 10}
     path.write_text(json.dumps({"no_need_for_context": explicit}))
@@ -93,6 +98,99 @@ def test_context_run_override_preserves_saved_config():
                                      no_need_for_context_retain_percent=20)
     assert settings.no_need_for_context == NoNeedForContextConfig(False, 50000, 20)
     assert config.no_need_for_context == NoNeedForContextConfig(True, 100000, 12.5)
+
+
+def test_context_absolute_defaults_and_round_trip(tmp_path):
+    default = NoNeedForContextConfig()
+    assert default.retain_percent is None
+    assert default.retain_tokens == 24800  # Not 10% of 244800 (24480).
+    assert default.to_json_data() == {"enabled": False, "threshold_tokens": 244800, "retain_tokens": 24800}
+    assert default.to_backend_data() == {"enabled": False, "thresholdTokens": 244800, "retainTokens": 24800}
+    absolute = NoNeedForContextConfig(True, 120000, retain_tokens=18000)
+    config = ProjectConfig(no_need_for_context=absolute)
+    save_project_config(tmp_path, config)
+    assert load_project_config(tmp_path, create=False).no_need_for_context == absolute
+    assert StateStore(tmp_path).get_bello_config().no_need_for_context == absolute.to_json_data()
+
+
+def test_context_run_overrides_switch_modes_and_threshold_only_preserves_mode():
+    legacy = ProjectConfig(no_need_for_context=NoNeedForContextConfig(True, 100000, 12.5))
+    tokens = _resolve_run_settings(project_config=legacy, no_need_for_context_retain_tokens=24800).no_need_for_context
+    assert tokens == NoNeedForContextConfig(True, 100000, retain_tokens=24800)
+    absolute = ProjectConfig(no_need_for_context=tokens)
+    percent = _resolve_run_settings(project_config=absolute, no_need_for_context_retain_percent=20).no_need_for_context
+    assert percent == NoNeedForContextConfig(True, 100000, 20)
+    changed = _resolve_run_settings(project_config=absolute, no_need_for_context_threshold_tokens=244800).no_need_for_context
+    assert changed == NoNeedForContextConfig(True, 244800, retain_tokens=24800)
+    with pytest.raises(ProjectConfigError, match="mutually exclusive"):
+        _resolve_run_settings(project_config=absolute, no_need_for_context_retain_tokens=24800,
+                              no_need_for_context_retain_percent=10)
+
+
+def test_context_cli_absolute_tokens_and_mutually_exclusive_flags(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("supervisor.main._startup_update_gate", lambda: None)
+    captured = []
+
+    async def fake_run(settings):
+        captured.append(settings)
+        return 0
+
+    monkeypatch.setattr("supervisor.main._run_bello", fake_run)
+    monkeypatch.setattr("supervisor.main._run_async_cleanly", asyncio.run)
+    result = CliRunner().invoke(cli, ["--no-need-for-context", "--context-retain-tokens", "24800"])
+    assert result.exit_code == 0, result.output
+    assert captured[0].no_need_for_context == NoNeedForContextConfig(True, 244800, retain_tokens=24800)
+    result = CliRunner().invoke(cli, ["--context-retain-tokens", "24800", "--context-retain-percent", "10"])
+    assert result.exit_code != 0
+    assert "mutually exclusive" in result.output
+    assert len(captured) == 1
+
+
+def test_context_cli_conflicting_modes_rejected_before_startup_or_config_creation(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+
+    def forbidden_startup():
+        pytest.fail("conflicting retention modes must be rejected before startup")
+
+    monkeypatch.setattr("supervisor.main._startup_update_gate", forbidden_startup)
+    result = CliRunner().invoke(cli, ["--context-retain-tokens", "24800", "--context-retain-percent", "10"])
+    assert result.exit_code == 2
+    assert "mutually exclusive" in result.output
+    assert not project_config_path(tmp_path).exists()
+
+
+def test_context_editor_switch_to_tokens_and_positive_integer_validation():
+    config = ProjectConfig(no_need_for_context=NoNeedForContextConfig(True, 100000, 12.5))
+    parameters = parameter_defs(config)
+    index = [p.key for p in parameters].index("no_need_for_context_retention_mode")
+    config, _, _ = select_current(config, EditorState(parameter_index=index, expanded_index=index, option_index=0))
+    assert config.no_need_for_context == NoNeedForContextConfig(True, 100000, retain_tokens=24800)
+    parameters = parameter_defs(config)
+    index = [p.key for p in parameters].index("no_need_for_context_retain_tokens")
+    for raw in ("0", "-1", "1.5", "nan", "true"):
+        unchanged, state, _ = select_current(config, EditorState(parameter_index=index, editing=True,
+                                                               edit_kind="positive_int", edit_value=raw))
+        assert unchanged == config and state.edit_error
+
+
+@pytest.mark.parametrize("context,option", [
+    (NoNeedForContextConfig(True, 100000, 20), 1),
+    (NoNeedForContextConfig(True, 100000, retain_tokens=12345), 0),
+])
+def test_context_editor_reselect_current_mode_preserves_custom_target(context, option):
+    config = ProjectConfig(no_need_for_context=context)
+    index = [p.key for p in parameter_defs(config)].index("no_need_for_context_retention_mode")
+    unchanged, _, _ = select_current(config, EditorState(parameter_index=index, expanded_index=index,
+                                                       option_index=option))
+    assert unchanged == config
+
+
+def test_context_schema_rejects_null_or_ambiguous_retention_modes():
+    for value in ({"retain_tokens": None}, {"retain_percent": None},
+                  {"retain_tokens": 24800, "retain_percent": None}):
+        with pytest.raises(ValidationError, match="no_need_for_context"):
+            BelloConfig(project_root="/project", no_need_for_context=value)
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -119,6 +217,7 @@ def test_context_cli_switch_and_parameters(monkeypatch, tmp_path, enabled):
     ("--context-threshold-tokens", "0"), ("--context-threshold-tokens", "1.5"),
     ("--context-retain-percent", "0"), ("--context-retain-percent", "51"),
     ("--context-retain-percent", "nan"), ("--context-retain-percent", "inf"),
+    ("--context-retain-tokens", "0"), ("--context-retain-tokens", "1.5"),
 ])
 def test_context_cli_rejects_invalid_numbers(monkeypatch, tmp_path, flag, value):
     monkeypatch.chdir(tmp_path)
@@ -136,12 +235,17 @@ def test_context_editor_controls_and_validation():
     config, _, _ = select_current(original, EditorState(parameter_index=toggle, expanded_index=toggle, option_index=0))
     assert config.no_need_for_context.enabled
     assert not config.runtime_enabled
-    for field, raw, expected in (("threshold_tokens", "100000", 100000), ("retain_percent", "12.5", 12.5)):
+    for field, raw, expected in (("threshold_tokens", "100000", 100000), ("retain_tokens", "22000", 22000)):
         parameters = parameter_defs(config)
         index = [p.key for p in parameters].index(f"no_need_for_context_{field}")
         config, edit, _ = select_current(config, EditorState(parameter_index=index))
         config, _, _ = select_current(config, replace(edit, edit_value=raw))
         assert getattr(config.no_need_for_context, field) == expected
+    parameters = parameter_defs(config)
+    mode_index = [p.key for p in parameters].index("no_need_for_context_retention_mode")
+    config, _, _ = select_current(config, EditorState(parameter_index=mode_index, expanded_index=mode_index, option_index=1))
+    assert config.no_need_for_context.retain_percent == 10
+    assert config.no_need_for_context.retain_tokens is None
     parameters = parameter_defs(config)
     index = [p.key for p in parameters].index("no_need_for_context_retain_percent")
     assert "Recent-tail target" in parameters[index].help_text
@@ -162,9 +266,9 @@ def test_controller_reads_saved_context_and_explicit_override(tmp_path):
 
 
 def test_context_is_off_by_default_everywhere():
-    assert ProjectConfig().no_need_for_context == NoNeedForContextConfig(False, 200000, 10)
+    assert ProjectConfig().no_need_for_context == NoNeedForContextConfig(False, 244800, retain_tokens=24800)
     assert BelloConfig(project_root="/project", task_path="TASK.md").no_need_for_context == {
-        "enabled": False, "threshold_tokens": 200000, "retain_percent": 10}
+        "enabled": False, "threshold_tokens": 244800, "retain_tokens": 24800}
     assert _resolve_run_settings(project_config=ProjectConfig()).no_need_for_context.enabled is False
 
 
@@ -186,11 +290,11 @@ def test_context_wording_is_engine_neutral_in_cli_and_editor():
         "no_need_for_context_enabled", "no_need_for_context_threshold_tokens", "no_need_for_context_retain_percent")]
     assert "Pi, Claude subscription and native Codex" in texts[0]
     assert "default: off" in texts[0] and "runtime excluded" in texts[0]
-    assert "default: 200000" in texts[1]
+    assert "default: 244800" in texts[1]
     assert "Soft" in texts[2] and "at most 50" in texts[2]
     parameters = {p.key: p for p in parameter_defs(ProjectConfig(no_need_for_context=NoNeedForContextConfig(True, 1000, 5)))}
     context_rows = [p for key, p in parameters.items() if key.startswith("no_need_for_context")]
-    assert [p.label for p in context_rows] == ["no-need-for-context", "context-threshold-tokens", "context-retain-percent"]
+    assert [p.label for p in context_rows] == ["no-need-for-context", "context-threshold-tokens", "context-retention-mode", "context-retain-percent"]
     visible = [options[name].help for name in options if name.startswith("no_need_for_context")]
     visible += [p.label for p in context_rows] + [p.help_text for p in context_rows]
     engines = "Pi, Claude subscription and native Codex"

@@ -33,8 +33,8 @@ from typing import Any
 from supervisor.appserver import AppServerError
 
 
-DEFAULT_THRESHOLD = 200_000
-DEFAULT_RETAIN_PERCENT = 10.0
+DEFAULT_THRESHOLD = 244_800
+DEFAULT_RETAIN_TOKENS = 24_800
 CONTINUE_PROMPT = (
     "Continue the active Bello request from the completed tool results. "
     "Do not repeat completed actions. Finish when the request is satisfied."
@@ -253,19 +253,27 @@ def _count(value: Any, limit: int = 1_000_000) -> int | None:
 def context_policy(value: Any) -> dict[str, Any]:
     if value is None:
         return {"enabled": False, "thresholdTokens": DEFAULT_THRESHOLD,
-                "retainPercent": DEFAULT_RETAIN_PERCENT}
-    if not isinstance(value, dict) or set(value) - {"enabled", "thresholdTokens", "retainPercent"}:
+                "retainTokens": DEFAULT_RETAIN_TOKENS}
+    if not isinstance(value, dict) or set(value) - {"enabled", "thresholdTokens", "retainPercent", "retainTokens"}:
         raise AppServerError("noNeedForContext must be a context policy object")
     enabled = value.get("enabled", False)
     threshold = value.get("thresholdTokens", DEFAULT_THRESHOLD)
-    retain = value.get("retainPercent", DEFAULT_RETAIN_PERCENT)
     if not isinstance(enabled, bool):
         raise AppServerError("noNeedForContext.enabled must be boolean")
     if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 1:
         raise AppServerError("noNeedForContext.thresholdTokens must be a positive integer")
-    if not isinstance(retain, (int, float)) or isinstance(retain, bool) or not 0 < retain <= 50 or not math.isfinite(retain):
-        raise AppServerError("noNeedForContext.retainPercent must be greater than 0 and at most 50")
-    return {"enabled": enabled, "thresholdTokens": threshold, "retainPercent": float(retain)}
+    if "retainTokens" in value and "retainPercent" in value:
+        raise AppServerError("noNeedForContext must select retainTokens or retainPercent, not both")
+    policy = {"enabled": enabled, "thresholdTokens": threshold}
+    if "retainPercent" in value:
+        retain = value["retainPercent"]
+        if not isinstance(retain, (int, float)) or isinstance(retain, bool) or not 0 < retain <= 50 or not math.isfinite(retain):
+            raise AppServerError("noNeedForContext.retainPercent must be greater than 0 and at most 50")
+        return {**policy, "retainPercent": float(retain)}
+    retain = value.get("retainTokens", DEFAULT_RETAIN_TOKENS)
+    if not isinstance(retain, int) or isinstance(retain, bool) or retain < 1:
+        raise AppServerError("noNeedForContext.retainTokens must be a positive integer")
+    return {**policy, "retainTokens": retain}
 
 
 def encoded(value: Any) -> str:
@@ -420,7 +428,8 @@ def partition_rounds(state: dict[str, Any], policy: dict[str, Any]) -> tuple[lis
     rounds = state["rounds"]
     if len(rounds) < 2:
         return [], deepcopy(rounds)
-    target = policy["thresholdTokens"] * policy["retainPercent"] / 100
+    target = (policy["retainTokens"] if "retainTokens" in policy
+              else policy["thresholdTokens"] * policy["retainPercent"] / 100)
     retained_size = 0
     start = len(rounds)
     while start > 1 and (start == len(rounds) or retained_size < target):

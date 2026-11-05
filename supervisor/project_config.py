@@ -126,31 +126,45 @@ class ProjectConfigError(RuntimeError):
 @dataclass(frozen=True)
 class NoNeedForContextConfig:
     enabled: bool = False
-    threshold_tokens: int = 200000
-    retain_percent: float = 10
+    threshold_tokens: int = 244800
+    # Keep the third positional argument compatible with older callers.
+    retain_percent: float | None = None
+    retain_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if type(self.enabled) is not bool:
             raise ProjectConfigError("no_need_for_context.enabled must be a boolean")
         if type(self.threshold_tokens) is not int or self.threshold_tokens <= 0:
             raise ProjectConfigError("no_need_for_context.threshold_tokens must be a positive integer")
-        if (type(self.retain_percent) not in (int, float)
+        if self.retain_percent is not None and self.retain_tokens is not None:
+            raise ProjectConfigError("no_need_for_context must select only one of retain_tokens and retain_percent")
+        if self.retain_percent is None and self.retain_tokens is None:
+            object.__setattr__(self, "retain_tokens", 24800)
+        if self.retain_tokens is not None and (type(self.retain_tokens) is not int or self.retain_tokens <= 0):
+            raise ProjectConfigError("no_need_for_context.retain_tokens must be a positive integer")
+        if self.retain_percent is not None and (type(self.retain_percent) not in (int, float)
                 or not 0 < self.retain_percent <= 50
                 or not math.isfinite(self.retain_percent)):
             raise ProjectConfigError("no_need_for_context.retain_percent must be a finite number greater than 0 and at most 50")
 
     def to_json_data(self) -> dict[str, Any]:
-        return {"enabled": self.enabled, "threshold_tokens": self.threshold_tokens,
-                "retain_percent": self.retain_percent}
+        retention = ({"retain_tokens": self.retain_tokens} if self.retain_tokens is not None
+                     else {"retain_percent": self.retain_percent})
+        return {"enabled": self.enabled, "threshold_tokens": self.threshold_tokens, **retention}
 
     def to_backend_data(self) -> dict[str, Any]:
-        return {"enabled": self.enabled, "thresholdTokens": self.threshold_tokens,
-                "retainPercent": self.retain_percent}
+        retention = ({"retainTokens": self.retain_tokens} if self.retain_tokens is not None
+                     else {"retainPercent": self.retain_percent})
+        return {"enabled": self.enabled, "thresholdTokens": self.threshold_tokens, **retention}
 
 
 def _no_need_for_context_config(value: Any, *, path: Path) -> NoNeedForContextConfig:
-    if not isinstance(value, dict) or set(value) - {"enabled", "threshold_tokens", "retain_percent"}:
-        raise ProjectConfigError(f"{path}: no_need_for_context must contain only enabled, threshold_tokens and retain_percent")
+    if not isinstance(value, dict) or set(value) - {"enabled", "threshold_tokens", "retain_percent", "retain_tokens"}:
+        raise ProjectConfigError(f"{path}: no_need_for_context must contain only enabled, threshold_tokens and one retention setting")
+    if "retain_tokens" in value and ("retain_percent" in value or value["retain_tokens"] is None):
+        raise ProjectConfigError(f"{path}: no_need_for_context must select only one valid retention setting")
+    if "retain_percent" in value and value["retain_percent"] is None:
+        raise ProjectConfigError(f"{path}: no_need_for_context.retain_percent must be a finite number greater than 0 and at most 50")
     try:
         return NoNeedForContextConfig(**value)
     except ProjectConfigError as exc:

@@ -19,6 +19,7 @@ from uuid import uuid4
 from supervisor.appserver import AppServerClient, AppServerError, AppServerMessage, AppServerTimeoutError
 from supervisor.approvals import ApprovalManager, normalize_approval_request
 from supervisor.runtime.cleanup import finish_cleanup
+from supervisor.runtime.context_policy import context_policies_match
 from supervisor.runtime.journal import RuntimeJournal
 from supervisor.runtime.models import engine_effort, parse_model_selection
 from supervisor.runtime.codex_permissions import validate_windows_native_scope
@@ -397,7 +398,7 @@ class RuntimeClient(AppServerClient):
             if (record.get("networkAccess", False) != (not self.runtime_enabled)
                     or record.get("distillerEnabled", False) != expected_distiller
                     or record.get("asyncTools", False) != expected_async
-                    or record.get("noNeedForContext", self._default_context_policy()) != expected_context
+                    or not context_policies_match(record.get("noNeedForContext", self._default_context_policy()), expected_context)
                     or (params.get("belloRole") is not None and params["belloRole"] != role)):
                 raise AppServerError(
                     "Saved thread uses a different runtime/distiller/async tool policy; start a fresh run "
@@ -632,7 +633,7 @@ class RuntimeClient(AppServerClient):
 
     def _validate_scope_overrides(self, record: dict[str, Any], params: dict[str, Any]) -> None:
         if ("noNeedForContext" in params and
-                params["noNeedForContext"] != record.get("noNeedForContext", self._default_context_policy())):
+                not context_policies_match(record.get("noNeedForContext", self._default_context_policy()), params["noNeedForContext"])):
             raise AppServerError("a resumed thread cannot change its context compaction policy")
         if ("windowsNativeRootRead" in params and
                 (type(params["windowsNativeRootRead"]) is not bool or

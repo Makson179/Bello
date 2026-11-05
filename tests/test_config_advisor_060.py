@@ -136,6 +136,25 @@ class CatalogTests(unittest.TestCase):
 
 
 class AdvisorValidationTests(unittest.TestCase):
+    def test_absolute_context_retention_roundtrip_and_invalid_modes(self):
+        from supervisor.project_config import _config_from_payload
+        candidate = config()
+        candidate["no_need_for_context"] = {"enabled": True, "threshold_tokens": 244800, "retain_tokens": 24800}
+        self.assertEqual(validate(candidate), [])
+        expected = candidate["no_need_for_context"]
+        self.assertEqual(INSPECTOR._normalize(candidate, config_exists=True)["no_need_for_context"], expected)
+        self.assertEqual(_config_from_payload(candidate, path=Path("synthetic.json")).no_need_for_context.to_json_data(), expected)
+        for retention in ({"retain_tokens": True}, {"retain_tokens": None}, {"retain_tokens": "24800"},
+                          {"retain_tokens": 0}, {"retain_tokens": -1}, {"retain_tokens": 1.5},
+                          {"retain_tokens": 24800, "retain_percent": 10}, {"retain_percent": None}):
+            with self.subTest(retention=retention):
+                bad = copy.deepcopy(candidate)
+                bad["no_need_for_context"] = {"enabled": True, **retention}
+                self.assertTrue(any("no_need_for_context" in error for error in validate(bad)))
+                current = INSPECTOR._normalize(bad, config_exists=True)
+                self.assertTrue(any("no_need_for_context" in error for error in
+                                    INSPECTOR._source_config_errors(bad, current, config_exists=True)))
+
     def test_context_opt_in_roundtrip_and_strict_validation(self):
         candidate = config()
         candidate["no_need_for_context"] = {"enabled": True, "threshold_tokens": 100000, "retain_percent": 12.5}
@@ -164,7 +183,7 @@ class AdvisorValidationTests(unittest.TestCase):
         self.assertIs(current["async_tools"], True)
         self.assertIs(current["goal"], False)
         self.assertIs(current["windows_native_root_read"], False)
-        self.assertEqual(current["no_need_for_context"], {"enabled": False, "threshold_tokens": 200000, "retain_percent": 10})
+        self.assertEqual(current["no_need_for_context"], {"enabled": False, "threshold_tokens": 244800, "retain_tokens": 24800})
 
     def test_context_sparse_defaults_and_explicit_legacy_threshold_match_project_config(self):
         from supervisor.project_config import _config_from_payload
@@ -176,7 +195,7 @@ class AdvisorValidationTests(unittest.TestCase):
                     if threshold is not None:
                         candidate["no_need_for_context"]["threshold_tokens"] = threshold
                     self.assertEqual(validate(candidate), [])
-                    expected = {"enabled": enabled, "threshold_tokens": threshold or 200000, "retain_percent": 10}
+                    expected = {"enabled": enabled, "threshold_tokens": threshold or 244800, "retain_tokens": 24800}
                     self.assertEqual(INSPECTOR._normalize(candidate, config_exists=True)["no_need_for_context"], expected)
                     self.assertEqual(_config_from_payload(candidate, path=Path("synthetic.json")).no_need_for_context.to_json_data(), expected)
 

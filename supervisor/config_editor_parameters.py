@@ -358,8 +358,20 @@ def _parameter_defs(
         *((_editor.EditorParameter(
             "no_need_for_context_threshold_tokens", "context-threshold-tokens",
             str(config.no_need_for_context.threshold_tokens), (), edit_kind="positive_int",
-            help_text="Positive input-token threshold for compaction. The backend also checks the model's context limit.",
+            help_text="Positive input-token threshold for compaction (default: 244800).",
         ), _editor.EditorParameter(
+            "no_need_for_context_retention_mode", "context-retention-mode",
+            "tokens" if config.no_need_for_context.retain_tokens is not None else "percentage",
+            (_editor.EditorOption("tokens", "no_need_for_context_retention_mode", "tokens"),
+             _editor.EditorOption("percentage", "no_need_for_context_retention_mode", "percentage")),
+            help_text="Choose an absolute recent-tail token target (default) or preserve a legacy percentage target.",
+        ), _editor.EditorParameter(
+            "no_need_for_context_retain_tokens", "context-retain-tokens",
+            str(config.no_need_for_context.retain_tokens), (), edit_kind="positive_int",
+            help_text=("Recent-tail target in tokens (default: 24800). "
+                       "The original task and instructions are retained separately. "
+                       "Whole turns and tool pairs may make the recent tail larger than this target."),
+        ) if config.no_need_for_context.retain_tokens is not None else _editor.EditorParameter(
             "no_need_for_context_retain_percent", "context-retain-percent",
             str(config.no_need_for_context.retain_percent), (), edit_kind="retain_percent",
             help_text=("Recent-tail target as a percentage of the token threshold, greater than 0 and at most 50. "
@@ -725,6 +737,8 @@ def _option_matches_current(config: ProjectConfig, parameter: EditorParameter, o
         return config.log_distiller.enabled == option.value
     if option.field == "no_need_for_context_enabled":
         return config.no_need_for_context.enabled == option.value
+    if option.field == "no_need_for_context_retention_mode":
+        return ("tokens" if config.no_need_for_context.retain_tokens is not None else "percentage") == option.value
     multi_agent_parts = _editor._multi_agent_editor_field_parts(option.field)
     if multi_agent_parts is not None:
         config_field, setting_field = multi_agent_parts

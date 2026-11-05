@@ -329,12 +329,15 @@ diff --git a/codex-rs/config/src/config_toml.rs b/codex-rs/config/src/config_tom
 index 3e5cc07e6ca62ffa13e2a104a5f815a0d4fa40f0..ce5b528612e73e870d4d5f7cbe48fd25ff6554c3 100644
 --- a/codex-rs/config/src/config_toml.rs
 +++ b/codex-rs/config/src/config_toml.rs
-@@ -180,6 +180,9 @@ pub struct ConfigToml {
+@@ -180,6 +180,12 @@ pub struct ConfigToml {
      /// Token usage threshold triggering auto-compaction of conversation history.
      pub model_auto_compact_token_limit: Option<i64>,
  
 +    /// Soft recent-history target for Bello's context compaction, as a percent of its threshold.
 +    pub bello_context_retain_percent: Option<f64>,
++
++    /// Absolute soft recent-history target. Mutually exclusive with the legacy percentage.
++    pub bello_context_retain_tokens: Option<i64>,
 +
      /// Controls whether the auto-compaction limit applies to the full context or
      /// only to tokens after the carried prefix in the current compaction window.
@@ -363,7 +366,7 @@ diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
 index fb42dd5390f2f773861effc67615333abb704ff4..60c392d6ea365e0fff01e46ad6725f3ab0647427 100644
 --- a/codex-rs/core/config.schema.json
 +++ b/codex-rs/core/config.schema.json
-@@ -767,6 +767,15 @@
+@@ -767,6 +767,18 @@
              "bedrock_setup_wizard": {
                "type": "boolean"
              },
@@ -373,13 +376,16 @@ index fb42dd5390f2f773861effc67615333abb704ff4..60c392d6ea365e0fff01e46ad6725f3a
 +            "bello_context_compaction": {
 +              "type": "boolean"
 +            },
++            "bello_context_retain_tokens": {
++              "type": "boolean"
++            },
 +            "bello_native_selection": {
 +              "type": "boolean"
 +            },
              "browser_annotation_api": {
                "type": "boolean"
              },
-@@ -6710,6 +6719,11 @@
+@@ -6710,6 +6722,16 @@
        "minimum": 0.0,
        "type": "integer"
      },
@@ -388,10 +394,15 @@ index fb42dd5390f2f773861effc67615333abb704ff4..60c392d6ea365e0fff01e46ad6725f3a
 +      "format": "double",
 +      "type": "number"
 +    },
++    "bello_context_retain_tokens": {
++      "description": "Absolute soft recent-history target; mutually exclusive with bello_context_retain_percent.",
++      "format": "int64",
++      "type": "integer"
++    },
      "browser_use": {
        "$ref": "#/definitions/BrowserUseConfigToml"
      },
-@@ -6863,6 +6877,15 @@
+@@ -6863,6 +6885,18 @@
          "bedrock_setup_wizard": {
            "type": "boolean"
          },
@@ -399,6 +410,9 @@ index fb42dd5390f2f773861effc67615333abb704ff4..60c392d6ea365e0fff01e46ad6725f3a
 +          "type": "boolean"
 +        },
 +        "bello_context_compaction": {
++          "type": "boolean"
++        },
++        "bello_context_retain_tokens": {
 +          "type": "boolean"
 +        },
 +        "bello_native_selection": {
@@ -412,7 +426,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..b284196a6afa56c9c5e796816b128cb536c19ed4
 --- /dev/null
 +++ b/codex-rs/core/src/bello_compact.rs
-@@ -0,0 +1,813 @@
+@@ -0,0 +1,766 @@
 +//! Transactional, tool-free compaction of completed model rounds. The retained
 +//! tail is a soft target: complete tool pairs and pending operations take priority.
 +use super::*;
@@ -420,8 +434,8 @@ index 0000000000000000000000000000000000000000..b284196a6afa56c9c5e796816b128cb5
 +use crate::context_manager::is_user_turn_boundary;
 +use crate::session::context_window::BELLO_SUMMARY_MAX_CHARS;
 +use crate::session::context_window::BELLO_SUMMARY_TARGET_CHARS;
++use crate::session::context_window::bello_context_retain_tokens;
 +use crate::session::context_window::bello_context_threshold;
-+use crate::session::context_window::bello_input_budget;
 +use crate::tools::native_async::AsyncTools;
 +use std::collections::HashMap;
 +use std::time::Duration;
@@ -610,13 +624,6 @@ index 0000000000000000000000000000000000000000..b284196a6afa56c9c5e796816b128cb5
 +        )
 +}
 +
-+/// Reported usage can lag a checkpoint after a cold resume. A history whose own
-+/// estimate is under half the threshold needs no summary, however large the
-+/// restored usage figure still claims it is.
-+fn accounting_is_stale(estimated: Option<i64>, threshold: i64) -> bool {
-+    estimated.is_some_and(|tokens| tokens.saturating_mul(2) < threshold)
-+}
-+
 +fn call_key(item: &ResponseItem) -> Option<(bool, &str)> {
 +    match item {
 +        ResponseItem::FunctionCall { call_id, .. }
@@ -778,38 +785,20 @@ index 0000000000000000000000000000000000000000..b284196a6afa56c9c5e796816b128cb5
 +) -> CodexResult<String> {
 +    sess.ensure_bello_context_persistence().await?;
 +    let threshold = bello_context_threshold(&turn.config, &turn.model_info())?;
-+    let target =
-+        ((threshold as f64) * turn.config.bello_context_retain_percent / 100.0).ceil() as i64;
++    let target = bello_context_retain_tokens(&turn.config, threshold);
 +    let before = sess.clone_history().await;
-+    if accounting_is_stale(before.estimate_token_count(&turn), threshold) {
-+        // Never pay to compact a history that is plainly far below the threshold.
-+        return Ok(String::new());
-+    }
 +    let original = before.annotated_items().to_vec();
 +    let pending = AsyncTools::for_turn(&turn).pending_call_ids().await;
 +    let selected = plan(&original, target.max(1), &pending)?;
-+    let hard_limit = turn.model_context_window().ok_or_else(|| {
-+        CodexErr::Stream("no-need-for-context: model context capacity is unknown".into())
-+    })?;
-+    // Every request here leaves the summary output reserve plus a safety margin free.
-+    let budget = bello_input_budget(hard_limit);
 +    if !original
 +        .iter()
 +        .enumerate()
 +        .any(|(index, item)| !selected.keep[index] && model_item(&item.item))
 +    {
-+        if before
-+            .estimate_token_count(&turn)
-+            .is_some_and(|tokens| tokens < budget)
-+        {
-+            // The tail is a target, not permission to split a large round. Wait
-+            // until older completed rounds exist; do not repeatedly pay just
-+            // to summarize the same previous handoff with no new retired round.
-+            return Ok(String::new());
-+        }
-+        return Err(CodexErr::Stream(
-+            "no-need-for-context: protected context fills model capacity; original retained".into(),
-+        ));
++        // A whole protected round cannot be split. Nothing can be retired yet,
++        // so wait for another boundary instead of treating an estimate as an
++        // authoritative provider capacity error.
++        return Ok(String::new());
 +    }
 +    let mut middle = before.clone();
 +    middle.replace_annotated(
@@ -828,17 +817,9 @@ index 0000000000000000000000000000000000000000..b284196a6afa56c9c5e796816b128cb5
 +        &[directive.into()],
 +        turn.model_info().truncation_policy.into(),
 +    );
-+    // Even the summarizer must fit with its output reserve and safety margin. Do
-+    // not silently truncate a too-large region or ask the provider to accept an overflow.
-+    if !middle
-+        .estimate_token_count(&turn)
-+        .is_some_and(|tokens| tokens < budget)
-+    {
-+        return Err(CodexErr::Stream(
-+            "no-need-for-context: summarization input exceeds safe model budget; original retained"
-+                .into(),
-+        ));
-+    }
++    // Approximate history accounting (especially opaque reasoning) is not a
++    // request admission gate. Submit the selected history unchanged; a real
++    // provider error still follows the existing original-history error path.
 +    // Plain text: no output schema, so no JSON, envelope or heading is demanded.
 +    let prompt = Prompt {
 +        input: middle.for_prompt(&turn.model_info().input_modalities),
@@ -946,16 +927,6 @@ index 0000000000000000000000000000000000000000..b284196a6afa56c9c5e796816b128cb5
 +            .filter(|(index, _)| selected.keep[*index])
 +            .map(|(_, entry)| entry.clone()),
 +    );
-+    let mut projected = current.clone();
-+    let mut with_late_items = replacement.clone();
-+    with_late_items.extend_from_slice(&current.annotated_items()[original.len()..]);
-+    projected.replace_annotated(with_late_items);
-+    let projected_tokens = projected.estimate_token_count(&turn).ok_or_else(|| {
-+        CodexErr::Stream("no-need-for-context: cannot verify replacement context size".into())
-+    })?;
-+    if projected_tokens >= budget {
-+        return Err(CodexErr::Stream("no-need-for-context: protected prefix and whole recent rounds exceed safe model budget; original retained".into()));
-+    }
 +    // Original prefix already carries the instructions. Keep the existing world
 +    // state baseline so subsequent requests do not reinject/duplicate that prefix.
 +    let baseline = before
@@ -982,10 +953,12 @@ index 0000000000000000000000000000000000000000..b284196a6afa56c9c5e796816b128cb5
 +            reviewer_compaction_hash: None,
 +        },
 +        original,
-+        (&turn, budget),
 +    )
 +    .await?;
-+    sess.recompute_token_usage(&turn).await;
++    // The durable checkpoint reset the active-context measurement. The summary
++    // request's usage is billing, not the replacement context's size; wait for
++    // the next ordinary provider response instead of re-estimating ciphertext.
++    sess.send_token_count_event(&turn).await;
 +    sess.emit_turn_item_completed(&turn, item).await;
 +    Ok(summary)
 +}
@@ -1139,12 +1112,6 @@ index 0000000000000000000000000000000000000000..b284196a6afa56c9c5e796816b128cb5
 +        assert_eq!(SUMMARY_TIMEOUT, Duration::from_secs(500));
 +    }
 +    #[test]
-+    fn bello_context_stale_usage_after_resume_is_not_a_reason_to_compact_again() {
-+        assert!(accounting_is_stale(Some(40_000), 100_000));
-+        assert!(!accounting_is_stale(Some(50_000), 100_000));
-+        assert!(!accounting_is_stale(None, 100_000));
-+    }
-+    #[test]
 +    fn bello_context_summarizer_tool_use_is_unusable() {
 +        let call: ResponseItem = serde_json::from_value(
 +            json!({"type":"function_call","name":"exec","call_id":"c","arguments":"{}"}),
@@ -1269,10 +1236,17 @@ index 39919cfef601752cfa2ebf0699e404d7c3f540d0..f35d7e8f451a15603f90be4072cb4402
              }) => {
                  sess.record_observed_response_completed(
                      turn_context,
-@@ -827,6 +843,16 @@ async fn drain_to_completed(
+@@ -827,6 +843,21 @@ async fn drain_to_completed(
                  .await;
-                 sess.update_token_usage_info(turn_context, token_usage.as_ref())
-                     .await?;
+-                sess.update_token_usage_info(turn_context, token_usage.as_ref())
+-                    .await?;
++                if turn_context.config.features.enabled(codex_features::Feature::BelloContextCompaction) {
++                    // This response describes a selected summary input, not the
++                    // coder's still-live original history, even if validation fails.
++                    sess.update_bello_summary_token_usage_info(turn_context, token_usage.as_ref()).await?;
++                } else {
++                    sess.update_token_usage_info(turn_context, token_usage.as_ref()).await?;
++                }
 +                if turn_context
 +                    .config
 +                    .features
@@ -1290,17 +1264,20 @@ diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
 index fe062799547c5bb1eb4dbab866ff58a6c4586d72..5a663018a356006c93cac5b8a25b24f22fe242c9 100644
 --- a/codex-rs/core/src/config/mod.rs
 +++ b/codex-rs/core/src/config/mod.rs
-@@ -639,6 +639,9 @@ pub struct Config {
+@@ -639,6 +639,12 @@ pub struct Config {
      /// Token usage threshold triggering auto-compaction of conversation history.
      pub model_auto_compact_token_limit: Option<i64>,
  
 +    /// Soft recent-history target; whole model rounds may exceed this percentage.
 +    pub bello_context_retain_percent: f64,
 +
++    /// Absolute soft target, default 24,800; None preserves an explicit legacy percentage.
++    pub bello_context_retain_tokens: Option<i64>,
++
      /// Controls whether `model_auto_compact_token_limit` applies to the full
      /// active context or only tokens after the carried compaction-window prefix.
      pub model_auto_compact_token_limit_scope: AutoCompactTokenLimitScope,
-@@ -3245,6 +3248,10 @@ impl Config {
+@@ -3245,6 +3251,18 @@ impl Config {
      ) -> std::io::Result<Self> {
          // Keep the large config-construction future off small test thread stacks.
          Box::pin(async move {
@@ -1308,14 +1285,24 @@ index fe062799547c5bb1eb4dbab866ff58a6c4586d72..5a663018a356006c93cac5b8a25b24f2
 +            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
 +                "bello_context_retain_percent must be finite and in (0, 50]"));
 +        }
++        if cfg.bello_context_retain_tokens.is_some_and(|tokens| tokens <= 0) {
++            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
++                "bello_context_retain_tokens must be positive"));
++        }
++        if cfg.bello_context_retain_tokens.is_some() && cfg.bello_context_retain_percent.is_some() {
++            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
++                "bello_context_retain_tokens and bello_context_retain_percent are mutually exclusive"));
++        }
          if cfg.experimental_thread_store_endpoint.is_some() {
              return Err(std::io::Error::new(
                  std::io::ErrorKind::InvalidInput,
-@@ -4290,6 +4297,7 @@ impl Config {
+@@ -4290,6 +4308,9 @@ impl Config {
              review_model,
              model_context_window: cfg.model_context_window,
              model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
 +            bello_context_retain_percent: cfg.bello_context_retain_percent.unwrap_or(10.0),
++            bello_context_retain_tokens: cfg.bello_context_retain_tokens.or_else(||
++                cfg.bello_context_retain_percent.is_none().then_some(24_800)),
              model_auto_compact_token_limit_scope: cfg
                  .model_auto_compact_token_limit_scope
                  .unwrap_or_default(),
@@ -1324,7 +1311,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..d9fedd25498445cad52d521313a4471124c23e55
 --- /dev/null
 +++ b/codex-rs/core/src/session/bello_context_tests.rs
-@@ -0,0 +1,442 @@
+@@ -0,0 +1,547 @@
 +//! Fault-injection checks for Bello's checkpoint persistence boundary.
 +//! These tests never start a provider request or an external process.
 +
@@ -1539,7 +1526,6 @@ index 0000000000000000000000000000000000000000..d9fedd25498445cad52d521313a44711
 +            None,
 +            metadata,
 +            expected,
-+            (turn, 100_000),
 +        )
 +        .await
 +}
@@ -1767,11 +1753,117 @@ index 0000000000000000000000000000000000000000..d9fedd25498445cad52d521313a44711
 +    assert!(cold.state.lock().await.bello_context_persistence_uncertain);
 +    assert!(cold.ensure_bello_context_persistence().await.is_err());
 +}
++
++#[tokio::test]
++async fn bello_context_checkpoint_resets_measurement_but_preserves_billing_on_resume() {
++    let (session, turn, _store, _rx) = fixture().await;
++    let measured = TokenUsage {
++        input_tokens: 244_000, output_tokens: 2_000, total_tokens: 246_000,
++        ..Default::default()
++    };
++    let billing_record = {
++        let mut state = session.state.lock().await;
++        state.set_token_info(Some(TokenUsageInfo {
++            total_token_usage: measured.clone(),
++            last_token_usage: measured.clone(),
++            model_context_window: Some(272_000),
++        }));
++        state.record_token_usage(session.thread_id(), &turn.sub_id, session.session_id(),
++            turn.sub_id.clone(), "summary-response".into(), &measured)
++    };
++    let original = session.clone_history().await.annotated_items().to_vec();
++    replace(&session, &turn, original, metadata(&session).await).await.unwrap();
++    let info = session.token_usage_info().await.unwrap();
++    assert_eq!(info.last_token_usage, TokenUsage::default());
++    assert_eq!(info.total_token_usage, measured);
++    assert_eq!(session.state.lock().await.latest_token_usage_record, Some(billing_record));
++    let mut persisted = session.live_thread().unwrap().load_history(false).await.unwrap().items;
++    assert!(Session::bello_checkpoint_complete(&persisted));
++    let restored = Session::last_bello_token_info_from_rollout(&persisted).unwrap();
++    assert_eq!(restored, info);
++    // Legacy checkpoints may lack the reset event: the checkpoint boundary is
++    // sufficient to invalidate the summarizer's old input measurement.
++    let checkpoint_index = persisted.iter().rposition(|item| matches!(item, RolloutItem::Compacted(_))).unwrap();
++    let mut legacy = vec![RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
++        info: Some(TokenUsageInfo { total_token_usage: measured.clone(), last_token_usage: measured.clone(), model_context_window: Some(272_000) }),
++        rate_limits: None,
++    }))];
++    legacy.extend_from_slice(&persisted[..checkpoint_index + 1]);
++    assert_eq!(Session::last_bello_token_info_from_rollout(&legacy).unwrap().last_token_usage, TokenUsage::default());
++    // Paginated history can start at the newest legacy checkpoint: no older
++    // TokenCount or standalone provider record is available to seed totals.
++    let RolloutItem::Compacted(mut pruned_checkpoint) = persisted[checkpoint_index].clone() else {
++        unreachable!()
++    };
++    assert!(pruned_checkpoint.latest_token_usage_record.is_some());
++    let companions = pruned_checkpoint.replacement_history.as_mut().unwrap()[0]
++        .metadata.as_mut().unwrap().bello_checkpoint_companions.as_mut().unwrap();
++    companions.retain(|item| !matches!(serde_json::from_value::<RolloutItem>(item.clone()),
++        Ok(RolloutItem::EventMsg(EventMsg::TokenCount(_)))));
++    let legacy_companions = companions.iter().map(|item|
++        serde_json::from_value::<RolloutItem>(item.clone()).unwrap()).collect::<Vec<_>>();
++    let mut pruned_legacy = vec![RolloutItem::Compacted(pruned_checkpoint)];
++    pruned_legacy.extend(legacy_companions);
++    assert!(Session::bello_checkpoint_complete(&pruned_legacy));
++    assert!(Session::last_token_info_from_rollout(&pruned_legacy).is_none());
++    let restored = Session::last_bello_token_info_from_rollout(&pruned_legacy).unwrap();
++    assert_eq!(restored.last_token_usage, TokenUsage::default());
++    assert_eq!(restored.total_token_usage, measured);
++    // A raw record updates billing but cannot classify a summary versus an
++    // ordinary response. A later TokenCount establishes the measured boundary.
++    let later = TokenUsage { input_tokens: 40_000, output_tokens: 500, total_tokens: 40_500, ..Default::default() };
++    let record = session.state.lock().await.record_token_usage(session.thread_id(), &turn.sub_id,
++        session.session_id(), turn.sub_id.clone(), "ordinary-response".into(), &later);
++    persisted.push(RolloutItem::TokenUsageRecord(record.clone()));
++    let restored = Session::last_bello_token_info_from_rollout(&persisted).unwrap();
++    assert_eq!(restored.last_token_usage, TokenUsage::default());
++    assert_eq!(restored.total_token_usage, record.thread_token_usage);
++    // Non-NNC resume keeps the stock last-TokenCount behavior.
++    assert_eq!(Session::last_token_info_from_rollout(&persisted).unwrap().last_token_usage, TokenUsage::default());
++    persisted.push(RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
++        info: Some(TokenUsageInfo { total_token_usage: record.thread_token_usage, last_token_usage: later.clone(), model_context_window: Some(272_000) }),
++        rate_limits: None,
++    })));
++    assert_eq!(Session::last_bello_token_info_from_rollout(&persisted).unwrap().last_token_usage, later);
++}
++
++#[tokio::test]
++async fn bello_context_failed_summary_bills_usage_without_replacing_active_measurement() {
++    let (session, turn, _store, _rx) = fixture().await;
++    let original = session.clone_history().await.annotated_items().to_vec();
++    let coder = TokenUsage { input_tokens: 244_000, output_tokens: 1_000, total_tokens: 245_000, ..Default::default() };
++    let summary = TokenUsage { input_tokens: 200_000, output_tokens: 500, total_tokens: 200_500, ..Default::default() };
++    session.record_observed_response_completed(&turn, "coder-before-summary", Some(&coder), None).await;
++    session.update_token_usage_info(&turn, Some(&coder)).await.unwrap();
++    session.record_observed_response_completed(&turn, "unusable-summary", Some(&summary), None).await;
++    let before_count = session.live_thread().unwrap().load_history(false).await.unwrap().items;
++    let mut expected_total = coder.clone();
++    expected_total.add_assign(&summary);
++    // Crash gap: the raw summary record survives, but its selected input must
++    // never replace the prior coder context measurement on cold replay.
++    let replayed = Session::last_bello_token_info_from_rollout(&before_count).unwrap();
++    assert_eq!(replayed.last_token_usage, coder);
++    assert_eq!(replayed.total_token_usage, expected_total);
++    let only_raw = before_count.iter().rev().find(|item|
++        matches!(item, RolloutItem::TokenUsageRecord(_))).unwrap().clone();
++    let replayed = Session::last_bello_token_info_from_rollout(&[only_raw]).unwrap();
++    assert_eq!(replayed.last_token_usage, TokenUsage::default());
++    assert_eq!(replayed.total_token_usage, expected_total);
++    session.update_bello_summary_token_usage_info(&turn, Some(&summary)).await.unwrap();
++    // An unusable summary has not committed any history replacement.
++    assert_eq!(session.clone_history().await.annotated_items(), original.as_slice());
++    let info = session.token_usage_info().await.unwrap();
++    assert_eq!(info.last_token_usage, coder);
++    assert_eq!(info.total_token_usage, expected_total);
++    let persisted = session.live_thread().unwrap().load_history(false).await.unwrap().items;
++    let replayed = Session::last_bello_token_info_from_rollout(&persisted).unwrap();
++    assert_eq!(replayed, info);
++}
 diff --git a/codex-rs/core/src/session/context_window.rs b/codex-rs/core/src/session/context_window.rs
 index edddb25461928a970e42f9b3d16ad8e102ee6233..610a67a3b50a3bdabdd11f4dfeee12e6f3a2f20a 100644
 --- a/codex-rs/core/src/session/context_window.rs
 +++ b/codex-rs/core/src/session/context_window.rs
-@@ -1,9 +1,55 @@
+@@ -1,9 +1,87 @@
  use super::session::Session;
  use super::turn_context::TurnContext;
  use crate::config::Config;
@@ -1780,6 +1872,8 @@ index edddb25461928a970e42f9b3d16ad8e102ee6233..610a67a3b50a3bdabdd11f4dfeee12e6
 +use codex_protocol::error::CodexErr;
 +use codex_protocol::error::Result as CodexResult;
  use codex_protocol::openai_models::ModelInfo;
++use codex_protocol::protocol::TokenUsage;
++use codex_protocol::protocol::TokenUsageInfo;
  
 +/// The summary prompt asks for plain text of at most about this many characters.
 +pub(crate) const BELLO_SUMMARY_TARGET_CHARS: usize = 16_000;
@@ -1802,7 +1896,7 @@ index edddb25461928a970e42f9b3d16ad8e102ee6233..610a67a3b50a3bdabdd11f4dfeee12e6
 +/// ordinary 90%-window auto-compaction policy. Reject incompatible settings
 +/// explicitly rather than silently lowering the threshold or retained tail.
 +pub(crate) fn bello_context_threshold(config: &Config, model: &ModelInfo) -> CodexResult<i64> {
-+    let threshold = config.model_auto_compact_token_limit.unwrap_or(249_000);
++    let threshold = config.model_auto_compact_token_limit.unwrap_or(244_800);
 +    if threshold <= 0 {
 +        return Err(CodexErr::Stream(format!(
 +            "no-need-for-context: configured threshold {threshold} must be positive"
@@ -1824,18 +1918,53 @@ index edddb25461928a970e42f9b3d16ad8e102ee6233..610a67a3b50a3bdabdd11f4dfeee12e6
 +    Ok(threshold)
 +}
 +
++/// The absolute soft tail is independent of the trigger. Old explicit percent
++/// configurations keep their original meaning rather than being migrated silently.
++pub(crate) fn bello_context_retain_tokens(config: &Config, threshold: i64) -> i64 {
++    config.bello_context_retain_tokens.unwrap_or_else(|| {
++        ((threshold as f64) * config.bello_context_retain_percent / 100.0).ceil() as i64
++    })
++}
++
++/// Use the latest measured ordinary response, not cumulative billing or a
++/// byte estimate of historical encrypted reasoning. Newly appended local/tool
++/// data is reflected by the next provider response, as with Unreal checkpoints.
++pub(crate) fn bello_context_tokens(info: Option<TokenUsageInfo>) -> i64 {
++    info.map_or(0, |info| {
++        info.last_token_usage.input_tokens.max(0)
++            .saturating_add(info.last_token_usage.output_tokens.max(0))
++    })
++}
++
++/// Summary usage describes its old input, not the new active context. Persist
++/// this reset alongside the checkpoint while preserving cumulative usage.
++pub(crate) fn bello_compacted_token_info(info: Option<TokenUsageInfo>) -> TokenUsageInfo {
++    let mut info = info.unwrap_or(TokenUsageInfo {
++        total_token_usage: TokenUsage::default(),
++        last_token_usage: TokenUsage::default(),
++        model_context_window: None,
++    });
++    info.last_token_usage = TokenUsage::default();
++    info
++}
++
  #[derive(Debug)]
  pub(crate) struct ContextWindowTokenStatus {
      // Full active context usage, independent of the configured auto-compact scope.
-@@ -56,22 +102,24 @@ async fn context_window_token_status_with_config(
+@@ -56,22 +134,28 @@ async fn context_window_token_status_with_config(
      model_info: &ModelInfo,
  ) -> ContextWindowTokenStatus {
-     let active_context_tokens = sess.get_total_token_usage().await;
+-    let active_context_tokens = sess.get_total_token_usage().await;
 +    let bello_enabled = config.features.enabled(Feature::BelloContextCompaction);
++    let active_context_tokens = if bello_enabled {
++        bello_context_tokens(sess.token_usage_info().await)
++    } else {
++        sess.get_total_token_usage().await
++    };
 +    let auto_compact_limit = if bello_enabled {
 +        // Validated before inference and before summarizing. Do not apply the
 +        // model's generic auto-compaction cap to this opt-in policy.
-+        Some(config.model_auto_compact_token_limit.unwrap_or(249_000))
++        Some(config.model_auto_compact_token_limit.unwrap_or(244_800))
 +    } else {
 +        model_info.auto_compact_token_limit()
 +    };
@@ -1860,7 +1989,7 @@ index edddb25461928a970e42f9b3d16ad8e102ee6233..610a67a3b50a3bdabdd11f4dfeee12e6
                  (
                      active_context_tokens.saturating_sub(baseline),
                      scope_limit,
-@@ -95,10 +143,14 @@ async fn context_window_token_status_with_config(
+@@ -95,10 +179,14 @@ async fn context_window_token_status_with_config(
      .min();
  
      // Only reserve the fallback buffer when there is a fallback prompt to use it.
@@ -1879,7 +2008,7 @@ index edddb25461928a970e42f9b3d16ad8e102ee6233..610a67a3b50a3bdabdd11f4dfeee12e6
      let buffered_auto_compact_limit = auto_compact_scope_limit
          .map(|limit| limit.saturating_add(auto_compact_fallback_buffer_tokens));
  
-@@ -111,10 +163,11 @@ async fn context_window_token_status_with_config(
+@@ -111,10 +199,11 @@ async fn context_window_token_status_with_config(
      let post_turn_percent = config.model_post_turn_compact_threshold_percent;
      let turn_end_compaction_threshold_reached = post_turn_percent > 0
          && (token_limit_reached
@@ -1895,7 +2024,7 @@ index edddb25461928a970e42f9b3d16ad8e102ee6233..610a67a3b50a3bdabdd11f4dfeee12e6
  
      ContextWindowTokenStatus {
          active_context_tokens,
-@@ -128,3 +181,138 @@ async fn context_window_token_status_with_config(
+@@ -128,3 +217,215 @@ async fn context_window_token_status_with_config(
          turn_end_compaction_threshold_reached,
      }
  }
@@ -1919,6 +2048,7 @@ index edddb25461928a970e42f9b3d16ad8e102ee6233..610a67a3b50a3bdabdd11f4dfeee12e6
 +        config.model_auto_compact_token_limit_scope = AutoCompactTokenLimitScope::Total;
 +        config.model_post_turn_compact_threshold_percent = 1;
 +        config.bello_context_retain_percent = 8.064516129032258;
++        config.bello_context_retain_tokens = None;
 +        let mut model = turn.model_info().as_ref().clone();
 +        model.context_window = Some(272_000);
 +        model.effective_context_window_percent = 95;
@@ -1927,7 +2057,7 @@ index edddb25461928a970e42f9b3d16ad8e102ee6233..610a67a3b50a3bdabdd11f4dfeee12e6
 +        let threshold = bello_context_threshold(&config, &model).unwrap();
 +        assert_eq!(threshold, 248_000);
 +        assert_eq!(
-+            ((threshold as f64) * config.bello_context_retain_percent / 100.0).ceil() as i64,
++            bello_context_retain_tokens(&config, threshold),
 +            20_000
 +        );
 +        for tokens in [244_800, 247_999, 248_000] {
@@ -1938,6 +2068,8 @@ index edddb25461928a970e42f9b3d16ad8e102ee6233..610a67a3b50a3bdabdd11f4dfeee12e6
 +                .set_token_info(Some(TokenUsageInfo {
 +                    total_token_usage: TokenUsage::default(),
 +                    last_token_usage: TokenUsage {
++                        input_tokens: tokens - 1_000,
++                        output_tokens: 1_000,
 +                        total_tokens: tokens,
 +                        ..Default::default()
 +                    },
@@ -1966,7 +2098,7 @@ index edddb25461928a970e42f9b3d16ad8e102ee6233..610a67a3b50a3bdabdd11f4dfeee12e6
 +        let threshold = bello_context_threshold(&config, &model).unwrap();
 +        assert_eq!(threshold, 100_000);
 +        assert_eq!(
-+            ((threshold as f64) * config.bello_context_retain_percent / 100.0).ceil() as i64,
++            bello_context_retain_tokens(&config, threshold),
 +            15_000
 +        );
 +    }
@@ -2011,15 +2143,89 @@ index edddb25461928a970e42f9b3d16ad8e102ee6233..610a67a3b50a3bdabdd11f4dfeee12e6
 +        let mut config = turn.config.as_ref().clone();
 +        config.model_auto_compact_token_limit = None;
 +        let mut model = turn.model_info().as_ref().clone();
-+        model.context_window = Some(257_096);
++        model.context_window = Some(252_896);
 +        model.effective_context_window_percent = 100;
-+        assert_eq!(bello_context_threshold(&config, &model).unwrap(), 249_000);
-+        model.context_window = Some(257_095);
++        assert_eq!(bello_context_threshold(&config, &model).unwrap(), 244_800);
++        assert_eq!(bello_context_retain_tokens(&config, 244_800), 24_800);
++        model.context_window = Some(252_895);
 +        assert!(bello_context_threshold(&config, &model).is_err());
 +        // The default also fits the common 272k-token window at 95% usable capacity.
 +        model.context_window = Some(272_000);
 +        model.effective_context_window_percent = 95;
-+        assert_eq!(bello_context_threshold(&config, &model).unwrap(), 249_000);
++        assert_eq!(bello_context_threshold(&config, &model).unwrap(), 244_800);
++    }
++
++    #[tokio::test]
++    async fn bello_context_absolute_tail_does_not_follow_a_custom_trigger() {
++        let (_, turn) = make_session_and_context().await;
++        let mut config = turn.config.as_ref().clone();
++        assert_eq!(bello_context_retain_tokens(&config, 200_000), 24_800);
++        config.bello_context_retain_tokens = Some(20_000);
++        assert_eq!(bello_context_retain_tokens(&config, 244_800), 20_000);
++        config.bello_context_retain_tokens = None;
++        config.bello_context_retain_percent = 20.0;
++        assert_eq!(bello_context_retain_tokens(&config, 100_000), 20_000);
++    }
++
++    #[test]
++    fn bello_context_uses_only_the_last_measured_input_and_output() {
++        let info = TokenUsageInfo {
++            total_token_usage: TokenUsage { total_tokens: 9_000_000, ..Default::default() },
++            last_token_usage: TokenUsage {
++                input_tokens: 200_000,
++                output_tokens: 1_000,
++                reasoning_output_tokens: 700,
++                total_tokens: 999_999,
++                ..Default::default()
++            },
++            model_context_window: Some(272_000),
++        };
++        assert_eq!(bello_context_tokens(Some(info.clone())), 201_000);
++        let reset = bello_compacted_token_info(Some(info.clone()));
++        assert_eq!(reset.total_token_usage, info.total_token_usage);
++        assert_eq!(reset.model_context_window, info.model_context_window);
++        assert_eq!(bello_context_tokens(Some(reset)), 0);
++        assert_eq!(bello_context_tokens(None), 0);
++    }
++
++    #[tokio::test]
++    async fn bello_context_trigger_ignores_ciphertext_and_unmeasured_local_appends() {
++        let (session, turn) = make_session_and_context().await;
++        let mut config = turn.config.as_ref().clone();
++        config.features.enable(Feature::BelloContextCompaction).unwrap();
++        config.model_auto_compact_token_limit = Some(244_800);
++        let opaque = serde_json::from_value::<codex_protocol::models::ResponseItem>(serde_json::json!({
++            "type": "reasoning", "id": "opaque-large", "summary": [],
++            "encrypted_content": "x".repeat(2_000_000)
++        })).unwrap();
++        let local = serde_json::from_value::<codex_protocol::models::ResponseItem>(serde_json::json!({
++            "type": "message", "role": "user",
++            "content": [{"type": "input_text", "text": "new tool data".repeat(10_000)}]
++        })).unwrap();
++        {
++            let mut state = session.state.lock().await;
++            state.history.record_items([&opaque, &local], turn.model_info().truncation_policy.into());
++            state.set_token_info(Some(TokenUsageInfo {
++                total_token_usage: TokenUsage { total_tokens: 9_000_000, ..Default::default() },
++                last_token_usage: TokenUsage {
++                    input_tokens: 208_516, output_tokens: 1_745, total_tokens: 210_261,
++                    ..Default::default()
++                },
++                model_context_window: Some(272_000),
++            }));
++        }
++        assert!(session.get_total_token_usage().await > 244_800);
++        let status = context_window_token_status_with_config(&session, &config, &turn.model_info()).await;
++        assert_eq!(status.active_context_tokens, 210_261);
++        assert!(!status.token_limit_reached);
++        {
++            let mut state = session.state.lock().await;
++            state.update_token_info_from_usage(&TokenUsage {
++                input_tokens: 244_000, output_tokens: 900, total_tokens: 244_900,
++                ..Default::default()
++            }, Some(272_000));
++        }
++        assert!(context_window_token_status_with_config(&session, &config, &turn.model_info()).await.token_limit_reached);
 +    }
 +
 +    #[test]
@@ -2276,6 +2482,22 @@ index 9caf797d45be597230009d244a2a880d87a8be61..dea44b2ca0c0f818f5a139214c6ddbb3
  mod rollout_reconstruction_tests;
  
  use crate::exec_policy::ExecPolicyUpdateError;
+@@ -1633,6 +1635,6 @@ impl Session {
+                 // Seed usage info from the recorded rollout so UIs can show token counts
+                 // immediately on resume/fork.
+-                if let Some(info) = Self::last_token_info_from_rollout(&rollout_items) {
++                if let Some(info) = self.restored_token_info(&rollout_items) {
+                     let mut state = self.state.lock().await;
+                     state.set_token_info(Some(info));
+                 }
+@@ -1661,6 +1663,6 @@ impl Session {
+                 // Seed usage info from the recorded rollout so UIs can show token counts
+                 // immediately on resume/fork.
+-                if let Some(info) = Self::last_token_info_from_rollout(&rollout_items) {
++                if let Some(info) = self.restored_token_info(&rollout_items) {
+                     let mut state = self.state.lock().await;
+                     state.set_token_info(Some(info));
+                 }
 @@ -1736,6 +1738,12 @@ impl Session {
          turn_context: &Arc<TurnContext>,
          rollout_items: &[RolloutItem],
@@ -2289,7 +2511,63 @@ index 9caf797d45be597230009d244a2a880d87a8be61..dea44b2ca0c0f818f5a139214c6ddbb3
          let rollout_reconstruction::RolloutReconstruction {
              mut history,
              retained_context,
-@@ -3516,7 +3524,7 @@ impl Session {
+@@ -1864,3 +1872,55 @@ impl Session {
++    fn restored_token_info(&self, items: &[RolloutItem]) -> Option<TokenUsageInfo> {
++        if self.enabled(Feature::BelloContextCompaction) {
++            Self::last_bello_token_info_from_rollout(items)
++        } else {
++            Self::last_token_info_from_rollout(items)
++        }
++    }
++
++    /// A checkpoint invalidates the old request's context-size measurement,
++    /// including legacy checkpoints written just before their UI usage reset.
++    /// Later TokenCount events establish a new measured boundary. Raw provider
++    /// records update billing totals only, never active-context size.
++    fn last_bello_token_info_from_rollout(items: &[RolloutItem]) -> Option<TokenUsageInfo> {
++        let mut info = None;
++        for item in items {
++            match item {
++                RolloutItem::EventMsg(EventMsg::TokenCount(event)) => {
++                    if event.info.is_some() {
++                        info = event.info.clone();
++                    }
++                }
++                RolloutItem::TokenUsageRecord(record) => {
++                    // A raw record can be a summarizer or an ordinary response.
++                    // Only a subsequent TokenCount binds an active measurement;
++                    // a crash between record and count must not install summary input.
++                    let current = info.get_or_insert_with(|| TokenUsageInfo {
++                        total_token_usage: TokenUsage::default(),
++                        last_token_usage: TokenUsage::default(),
++                        model_context_window: None,
++                    });
++                    current.total_token_usage = record.thread_token_usage.clone();
++                }
++                RolloutItem::Compacted(checkpoint)
++                    if checkpoint.replacement_history.as_ref()
++                        .and_then(|history| history.first())
++                        .and_then(|first| first.metadata.as_ref())
++                        .is_some_and(|metadata| metadata.bello_checkpoint_companions.is_some()) =>
++                {
++                    let mut reset = context_window::bello_compacted_token_info(info);
++                    if let Some(record) = checkpoint.latest_token_usage_record.as_ref() {
++                        // A paginated replay may omit every earlier TokenCount.
++                        // The checkpoint's record still carries full billing totals.
++                        reset.total_token_usage = record.thread_token_usage.clone();
++                    }
++                    info = Some(reset);
++                }
++                _ => {}
++            }
++        }
++        info
++    }
++
+     fn last_token_usage_record_from_rollout(
+         rollout_items: &[RolloutItem],
+     ) -> Option<TokenUsageRecord> {
+@@ -3516,7 +3576,7 @@ impl Session {
              .iter()
              .map(|envelope| envelope.item.clone())
              .collect::<Vec<_>>();
@@ -2298,7 +2576,7 @@ index 9caf797d45be597230009d244a2a880d87a8be61..dea44b2ca0c0f818f5a139214c6ddbb3
              let mut state = self.state.lock().await;
              state
                  .current_time_reminder
-@@ -3557,7 +3565,9 @@ impl Session {
+@@ -3557,7 +3617,9 @@ impl Session {
              state
                  .history
                  .record_annotated_items(&mut items, model_info.truncation_policy.into());
@@ -2309,7 +2587,7 @@ index 9caf797d45be597230009d244a2a880d87a8be61..dea44b2ca0c0f818f5a139214c6ddbb3
          for image in image_preparations {
              self.services
                  .analytics_events_client
-@@ -3575,6 +3585,7 @@ impl Session {
+@@ -3575,6 +3637,7 @@ impl Session {
                  .executed_tool_calls
                  .mark_mcp_attribution_persisted(revision);
          }
@@ -2317,7 +2595,7 @@ index 9caf797d45be597230009d244a2a880d87a8be61..dea44b2ca0c0f818f5a139214c6ddbb3
          if turn_context.config.memories.disable_on_external_context
              && let Some(item) = response_items
                  .iter()
-@@ -3890,14 +3901,16 @@ impl Session {
+@@ -3890,14 +3953,16 @@ impl Session {
          for mut recording in pending {
              let _ = recording.changed().await;
          }
@@ -2336,7 +2614,7 @@ index 9caf797d45be597230009d244a2a880d87a8be61..dea44b2ca0c0f818f5a139214c6ddbb3
          self.persist_rollout_items(&[
              RolloutItem::InterAgentCommunicationMetadata {
                  trigger_turn: communication.trigger_turn,
-@@ -3905,6 +3918,7 @@ impl Session {
+@@ -3905,6 +3970,7 @@ impl Session {
              RolloutItem::ResponseItem(response_item),
          ])
          .await;
@@ -2344,7 +2622,7 @@ index 9caf797d45be597230009d244a2a880d87a8be61..dea44b2ca0c0f818f5a139214c6ddbb3
          drop(boundary);
          self.send_raw_response_items(turn_context, items).await;
      }
-@@ -3982,11 +3996,52 @@ impl Session {
+@@ -3982,11 +4048,48 @@ impl Session {
  
      pub(crate) async fn replace_compacted_history(
          &self,
@@ -2360,7 +2638,6 @@ index 9caf797d45be597230009d244a2a880d87a8be61..dea44b2ca0c0f818f5a139214c6ddbb3
 +            world_state_baseline,
 +            metadata,
 +            None,
-+            None,
 +        )
 +        .await
 +        .expect("unconditional history replacement cannot fail its snapshot check");
@@ -2373,7 +2650,6 @@ index 9caf797d45be597230009d244a2a880d87a8be61..dea44b2ca0c0f818f5a139214c6ddbb3
 +        world_state_baseline: Option<WorldStateSnapshot>,
 +        metadata: CompactedHistoryMetadata,
 +        expected: Vec<ResponseItemEnvelope>,
-+        budget: (&TurnContext, i64),
 +    ) -> CodexResult<()> {
 +        self.replace_compacted_history_inner(
 +            items,
@@ -2381,7 +2657,6 @@ index 9caf797d45be597230009d244a2a880d87a8be61..dea44b2ca0c0f818f5a139214c6ddbb3
 +            world_state_baseline,
 +            metadata,
 +            Some(expected),
-+            Some(budget),
 +        )
 +        .await
 +    }
@@ -2393,12 +2668,11 @@ index 9caf797d45be597230009d244a2a880d87a8be61..dea44b2ca0c0f818f5a139214c6ddbb3
 +        world_state_baseline: Option<WorldStateSnapshot>,
 +        metadata: CompactedHistoryMetadata,
 +        expected: Option<Vec<ResponseItemEnvelope>>,
-+        budget: Option<(&TurnContext, i64)>,
 +    ) -> CodexResult<()> {
          for envelope in &mut items {
              Self::assign_missing_response_item_id(&mut envelope.item);
          }
-@@ -4014,11 +4069,39 @@ impl Session {
+@@ -4014,11 +4117,29 @@ impl Session {
          // Wait for accepted updates to finish persisting, then keep later updates from
          // overtaking the current settings snapshot while its checkpoint is written.
          let _settings_guard = thread_settings::acquire_persistence_lock(self).await;
@@ -2425,20 +2699,10 @@ index 9caf797d45be597230009d244a2a880d87a8be61..dea44b2ca0c0f818f5a139214c6ddbb3
 +                }
 +                items.extend_from_slice(&current[expected.len()..]);
 +            }
-+            if let Some((turn, limit)) = budget {
-+                let mut projected = state.history.clone();
-+                projected.replace_annotated(items.clone());
-+                if !projected
-+                    .estimate_token_count(turn)
-+                    .is_some_and(|tokens| tokens < limit)
-+                {
-+                    return Err(CodexErr::Stream("no-need-for-context: late results exceed safe replacement budget; original retained".into()));
-+                }
-+            }
              let snapshot = world_state_baseline.or_else(|| {
                  let previous = state.history.world_state_checkpoint()?;
                  let mut retained = serde_json::Map::new();
-@@ -4048,6 +4131,143 @@ impl Session {
+@@ -4048,6 +4169,153 @@ impl Session {
                      .cloned(),
              );
              let replacement_history = items.clone();
@@ -2470,6 +2734,15 @@ index 9caf797d45be597230009d244a2a880d87a8be61..dea44b2ca0c0f818f5a139214c6ddbb3
 +                    companions.push(RolloutItem::TurnContext(reference.clone()));
 +                }
 +                companions.push(RolloutItem::EventMsg(settings));
++                // Reset the context measurement atomically with its replacement.
++                // Cumulative billing still includes the summarizer response; its
++                // input must not masquerade as the new retained context's size.
++                let compacted_token_info =
++                    context_window::bello_compacted_token_info(state.token_info());
++                companions.push(RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
++                    info: Some(compacted_token_info.clone()),
++                    rate_limits: state.latest_rate_limits.clone(),
++                })));
 +                if let Some(first) = items.first_mut() {
 +                    first
 +                        .metadata
@@ -2570,6 +2843,7 @@ index 9caf797d45be597230009d244a2a880d87a8be61..dea44b2ca0c0f818f5a139214c6ddbb3
 +                    state.history.set_world_state_baseline(snapshot);
 +                }
 +                state.reasoning_effort_pin = ReasoningEffortPin::Compacted;
++                state.set_token_info(Some(compacted_token_info));
 +                state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
 +                state.bello_context_persistence_uncertain = false;
 +                if let Some(revision) = mcp_revision {
@@ -2582,7 +2856,7 @@ index 9caf797d45be597230009d244a2a880d87a8be61..dea44b2ca0c0f818f5a139214c6ddbb3
              state.replace_annotated_history(
                  items,
                  reference_context_item.clone(),
-@@ -4106,6 +4326,7 @@ impl Session {
+@@ -4106,6 +4374,7 @@ impl Session {
              let mut state = self.state.lock().await;
              state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
          }
@@ -2590,7 +2864,7 @@ index 9caf797d45be597230009d244a2a880d87a8be61..dea44b2ca0c0f818f5a139214c6ddbb3
      }
  
      pub fn enabled(&self, feature: Feature) -> bool {
-@@ -4487,6 +4708,45 @@ impl Session {
+@@ -4487,6 +4756,45 @@ impl Session {
          state.advance_auto_compact_window()
      }
  
@@ -2636,11 +2910,74 @@ index 9caf797d45be597230009d244a2a880d87a8be61..dea44b2ca0c0f818f5a139214c6ddbb3
      pub(crate) async fn request_new_context_window(&self) {
          let mut state = self.state.lock().await;
          state.request_new_context_window();
+@@ -4667,3 +4975,17 @@ impl Session {
++    /// A summary response is billed normally but does not measure the coder's
++    /// still-active history. Preserve that measurement even on summary failure.
++    pub(crate) async fn update_bello_summary_token_usage_info(
++        &self,
++        turn_context: &TurnContext,
++        token_usage: Option<&TokenUsage>,
++    ) -> CodexResult<()> {
++        let result = self.record_token_usage_info_inner(
++            turn_context, &turn_context.initial_settings, token_usage, true,
++        ).await;
++        self.send_token_count_event(turn_context).await;
++        result
++    }
++
+     pub(crate) async fn record_observed_response_completed(
+         &self,
+         turn_context: &TurnContext,
+@@ -4701,21 +5023,42 @@ impl Session {
+     pub(crate) async fn record_token_usage_info(
+         &self,
+         turn_context: &TurnContext,
+         settings: &ResolvedStepSettings,
+         token_usage: Option<&TokenUsage>,
+     ) -> CodexResult<()> {
++        self.record_token_usage_info_inner(turn_context, settings, token_usage, false).await
++    }
++
++    async fn record_token_usage_info_inner(
++        &self,
++        turn_context: &TurnContext,
++        settings: &ResolvedStepSettings,
++        token_usage: Option<&TokenUsage>,
++        preserve_context_measurement: bool,
++    ) -> CodexResult<()> {
+         if let Some(token_usage) = token_usage {
+             let token_info = {
+                 let mut state = self.state.lock().await;
++                let previous_measurement = preserve_context_measurement.then(||
++                    state.token_info().map(|info| info.last_token_usage).unwrap_or_default());
+                 state
+                     .update_token_info_from_usage(token_usage, turn_context.model_context_window());
+-                if matches!(
++                // Contributors still observe the actual response usage. Restore
++                // live context accounting before any await, so cancellation or
++                // failed validation cannot install the summary input as history size.
++                let observed_info = state.token_info();
++                if let Some(previous) = previous_measurement {
++                    if let Some(mut preserved_info) = observed_info.clone() {
++                        preserved_info.last_token_usage = previous;
++                        state.set_token_info(Some(preserved_info));
++                    }
++                } else if matches!(
+                     turn_context.config.model_auto_compact_token_limit_scope,
+                     AutoCompactTokenLimitScope::BodyAfterPrefix
+                 ) {
+                     state.ensure_auto_compact_window_server_prefill_from_usage(token_usage);
+                 }
+-                state.token_info()
++                observed_info
+             };
+             let turn_state = self
+                 .input_queue
 diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
 index 4496c9b940d1278f9c70a2eba8d85ed2b1593ee6..60e8828ba9bf111c8dc0f532901783f1216acc0e 100644
 --- a/codex-rs/core/src/session/tests.rs
 +++ b/codex-rs/core/src/session/tests.rs
-@@ -5966,6 +5966,145 @@ async fn settings_checkpoint_waits_for_accepted_settings_persistence() {
+@@ -5966,6 +5966,152 @@ async fn settings_checkpoint_waits_for_accepted_settings_persistence() {
  }
  
  #[tokio::test]
@@ -2672,7 +3009,6 @@ index 4496c9b940d1278f9c70a2eba8d85ed2b1593ee6..60e8828ba9bf111c8dc0f532901783f1
 +                reviewer_compaction_hash: None,
 +            },
 +            original.clone(),
-+            (&turn, 100_000),
 +        )
 +        .await
 +        .unwrap();
@@ -2698,7 +3034,6 @@ index 4496c9b940d1278f9c70a2eba8d85ed2b1593ee6..60e8828ba9bf111c8dc0f532901783f1
 +                reviewer_compaction_hash: None,
 +            },
 +            original,
-+            (&turn, 100_000),
 +        )
 +        .await;
 +    assert!(failed.is_err());
@@ -2707,16 +3042,27 @@ index 4496c9b940d1278f9c70a2eba8d85ed2b1593ee6..60e8828ba9bf111c8dc0f532901783f1
 +        current.annotated_items()
 +    );
 +    let (window_number, window_ids) = session.preview_auto_compact_window().await;
-+    let oversized = session
++    // Opaque reasoning can dwarf the actual provider accounting. An estimate
++    // must not veto an otherwise valid, atomic history replacement.
++    let opaque: ResponseItem = serde_json::from_value(serde_json::json!({
++        "type": "reasoning", "id": "opaque-large", "summary": [],
++        "encrypted_content": "x".repeat(2_000_000)
++    })).unwrap();
++    let replacement = vec![
++        ResponseItemEnvelope::new(user_message("summary with retained opaque reasoning")),
++        ResponseItemEnvelope::new(opaque),
++    ];
++    let mut estimated = current.clone();
++    estimated.replace_annotated(replacement.clone());
++    assert!(estimated.estimate_token_count(&turn).unwrap() > 250_304);
++    session
 +        .replace_compacted_history_from_snapshot(
-+            vec![ResponseItemEnvelope::new(user_message(
-+                "oversized replacement",
-+            ))],
++            replacement.clone(),
 +            None,
 +            None,
 +            CompactedHistoryMetadata {
 +                input_goal_ids: Default::default(),
-+                message: "invalid budget".into(),
++                message: "valid replacement despite approximate size".into(),
 +                window_number,
 +                window_ids,
 +                compaction_response_id: None,
@@ -2724,19 +3070,18 @@ index 4496c9b940d1278f9c70a2eba8d85ed2b1593ee6..60e8828ba9bf111c8dc0f532901783f1
 +                reviewer_compaction_hash: None,
 +            },
 +            current.annotated_items().to_vec(),
-+            (&turn, 1),
 +        )
-+        .await;
-+    assert!(oversized.is_err());
++        .await
++        .unwrap();
 +    assert_eq!(
 +        session.clone_history().await.annotated_items(),
-+        current.annotated_items()
++        replacement.as_slice()
 +    );
 +}
 +
 +#[tokio::test]
 +async fn bello_context_failed_persistence_keeps_original_history() {
-+    let (mut session, turn) = make_session_and_context().await;
++    let (mut session, _turn) = make_session_and_context().await;
 +    attach_thread_persistence(&mut session).await;
 +    session
 +        .replace_history(vec![user_message("original task")], None)
@@ -2763,7 +3108,6 @@ index 4496c9b940d1278f9c70a2eba8d85ed2b1593ee6..60e8828ba9bf111c8dc0f532901783f1
 +                reviewer_compaction_hash: None,
 +            },
 +            original.clone(),
-+            (&turn, 100_000),
 +        )
 +        .await;
 +    assert!(
@@ -2786,7 +3130,7 @@ index 4496c9b940d1278f9c70a2eba8d85ed2b1593ee6..60e8828ba9bf111c8dc0f532901783f1
  async fn mcp_attribution_checkpoints_cover_batch_prefixes_compaction_and_restore() {
      let (mut session, turn_context) = make_session_and_context().await;
      session.services.executed_tool_calls =
-@@ -12957,6 +13096,7 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
+@@ -12957,6 +13103,7 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
          internal_chat_message_metadata_passthrough: None,
      };
      let mut ctx = HandleOutputCtx {
@@ -2858,7 +3202,15 @@ index f13e98ccb08a26e97fffc0b8fcfeeb8fa8a0bf5a..c6459c9e3ac7151d8a3654960a52bee8
      maybe_run_previous_model_inline_compact(sess, turn_context, client_session, cancellation_token)
          .await?;
      let token_status =
-@@ -1431,10 +1459,21 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1428,13 +1456,28 @@ async fn maybe_run_previous_model_inline_compact(
+-    let active_context_tokens = sess.get_total_token_usage().await;
++    let active_context_tokens = if turn_context.config.features.enabled(Feature::BelloContextCompaction) {
++        super::context_window::bello_context_tokens(sess.token_usage_info().await)
++    } else {
++        sess.get_total_token_usage().await
++    };
+     let previous_model_limit_reached = match turn_context
+         .config
          .model_auto_compact_token_limit_scope
      {
          AutoCompactTokenLimitScope::Total => {
@@ -2884,7 +3236,7 @@ index f13e98ccb08a26e97fffc0b8fcfeeb8fa8a0bf5a..c6459c9e3ac7151d8a3654960a52bee8
              active_context_tokens > new_auto_compact_limit
                  || active_context_tokens >= new_context_window
          }
-@@ -1490,6 +1529,20 @@ async fn run_auto_compact(
+@@ -1490,6 +1533,20 @@ async fn run_auto_compact(
          conversation.id = %sess.thread_id,
          turn.id = %turn_context.sub_id,
      );
@@ -2905,7 +3257,7 @@ index f13e98ccb08a26e97fffc0b8fcfeeb8fa8a0bf5a..c6459c9e3ac7151d8a3654960a52bee8
      if turn_context.config.features.enabled(Feature::TokenBudget) {
          // Compaction is the reset request, so force a new context window
          // instead of consuming a pending `new_context` tool request.
-@@ -2538,7 +2591,19 @@ async fn try_run_sampling_request(
+@@ -2538,7 +2595,19 @@ async fn try_run_sampling_request(
      prompt: &Prompt,
      cancellation_token: CancellationToken,
  ) -> CodexResult<SamplingRequestResult> {
@@ -2925,7 +3277,7 @@ index f13e98ccb08a26e97fffc0b8fcfeeb8fa8a0bf5a..c6459c9e3ac7151d8a3654960a52bee8
      feedback_tags!(
          model = step_context.settings.model_info.slug.clone(),
          approval_policy = turn_context.approval_policy(),
-@@ -2620,7 +2685,7 @@ async fn try_run_sampling_request(
+@@ -2620,7 +2689,7 @@ async fn try_run_sampling_request(
          !sess.services.extensions.turn_item_contributors().is_empty();
      let mut active_item_is_streaming_to_client = false;
      let receiving_span = trace_span!("receiving_stream");
@@ -2934,7 +3286,7 @@ index f13e98ccb08a26e97fffc0b8fcfeeb8fa8a0bf5a..c6459c9e3ac7151d8a3654960a52bee8
          let handle_responses = trace_span!(
              parent: &receiving_span,
              "handle_responses",
-@@ -2751,6 +2816,7 @@ async fn try_run_sampling_request(
+@@ -2751,6 +2820,7 @@ async fn try_run_sampling_request(
                  }
  
                  let mut ctx = HandleOutputCtx {
@@ -2942,7 +3294,7 @@ index f13e98ccb08a26e97fffc0b8fcfeeb8fa8a0bf5a..c6459c9e3ac7151d8a3654960a52bee8
                      sess: sess.clone(),
                      step_context: Arc::clone(&step_context),
                      turn_store: Arc::clone(&turn_store),
-@@ -3175,6 +3241,42 @@ async fn try_run_sampling_request(
+@@ -3175,6 +3245,42 @@ async fn try_run_sampling_request(
          drain_in_flight(&mut in_flight, sess.clone(), &step_context).await?;
      }
  
@@ -6569,7 +6921,7 @@ diff --git a/codex-rs/features/src/lib.rs b/codex-rs/features/src/lib.rs
 index 4ff27c25d874dda6b8c666d927b445fd48c293ea..a622b0809b472bd4ad3a215352289e08bf548114 100644
 --- a/codex-rs/features/src/lib.rs
 +++ b/codex-rs/features/src/lib.rs
-@@ -118,6 +118,12 @@ pub enum Feature {
+@@ -118,6 +118,15 @@ pub enum Feature {
      DaemonAutoStart,
  
      // Experimental
@@ -6579,10 +6931,13 @@ index 4ff27c25d874dda6b8c666d927b445fd48c293ea..a622b0809b472bd4ad3a215352289e08
 +    BelloAsyncTools,
 +    /// Preserve a recent native tail while summarizing older completed model rounds.
 +    BelloContextCompaction,
++    /// Advertise absolute soft-tail configuration and measured NNC usage checkpoints.
++    /// Compatibility marker only; this flag does not gate runtime inference.
++    BelloContextRetainTokens,
      /// Send per-content-entry classifications in internal Responses metadata.
      ContentItemKinds,
      /// Record model-attempted tool calls in internal Responses metadata.
-@@ -1089,6 +1095,24 @@ pub const FEATURES: &[FeatureSpec] = &[
+@@ -1089,6 +1098,30 @@ pub const FEATURES: &[FeatureSpec] = &[
          default_enabled: false,
      },
      FeatureSpec {
@@ -6600,6 +6955,12 @@ index 4ff27c25d874dda6b8c666d927b445fd48c293ea..a622b0809b472bd4ad3a215352289e08
 +    FeatureSpec {
 +        id: Feature::BelloContextCompaction,
 +        key: "bello_context_compaction",
++        stage: Stage::UnderDevelopment,
++        default_enabled: false,
++    },
++    FeatureSpec {
++        id: Feature::BelloContextRetainTokens,
++        key: "bello_context_retain_tokens",
 +        stage: Stage::UnderDevelopment,
 +        default_enabled: false,
 +    },

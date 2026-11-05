@@ -259,16 +259,21 @@ def validate(
         if type(config.get(field, OPTIONAL_BOOLEAN_DEFAULTS[field])) is not bool:
             errors.append(f"{field}: expected boolean")
     context = config.get("no_need_for_context", {})
-    if not isinstance(context, dict) or set(context) - {"enabled", "threshold_tokens", "retain_percent"}:
-        errors.append("no_need_for_context: expected only enabled, threshold_tokens and retain_percent")
+    if not isinstance(context, dict) or set(context) - {"enabled", "threshold_tokens", "retain_percent", "retain_tokens"}:
+        errors.append("no_need_for_context: expected only enabled, threshold_tokens and one retention setting")
     else:
         if type(context.get("enabled", False)) is not bool:
             errors.append("no_need_for_context.enabled: expected boolean")
-        if not _is_int(context.get("threshold_tokens", 200000), minimum=1):
+        if not _is_int(context.get("threshold_tokens", 244800), minimum=1):
             errors.append("no_need_for_context.threshold_tokens: expected a positive integer")
-        percent = context.get("retain_percent", 10)
-        if type(percent) not in (int, float) or not 0 < percent <= 50 or not math.isfinite(percent):
-            errors.append("no_need_for_context.retain_percent: expected a finite number greater than 0 and at most 50")
+        if "retain_tokens" in context and "retain_percent" in context:
+            errors.append("no_need_for_context: select only one of retain_tokens and retain_percent")
+        if "retain_tokens" in context and not _is_int(context["retain_tokens"], minimum=1):
+            errors.append("no_need_for_context.retain_tokens: expected a positive integer")
+        if "retain_percent" in context:
+            percent = context["retain_percent"]
+            if type(percent) not in (int, float) or not 0 < percent <= 50 or not math.isfinite(percent):
+                errors.append("no_need_for_context.retain_percent: expected a finite number greater than 0 and at most 50")
 
     if config.get("review_limit_format") != "explicit":
         errors.append("review_limit_format: must be 'explicit'")
