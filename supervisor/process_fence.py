@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from os import path as _path
 import secrets
 import signal
 import subprocess
@@ -383,6 +384,37 @@ def _terminate_windows_job(job: Any, *, timeout: float = 10.0) -> bool:
     return False
 
 
+def _windows_direct_interpreter(
+    command: list[str],
+    env: dict[str, str],
+    *,
+    windows: bool | None = None,
+    executable: str | None = None,
+    base_executable: str | None = None,
+) -> tuple[list[str], dict[str, str]]:
+    """Start a Windows venv worker as the real interpreter (issue #41).
+
+    A Windows venv's ``python.exe`` is a redirector that starts the base
+    interpreter as a child process, so ``Popen(...).pid`` is not the PID the
+    worker reports in its hello and the guardian rejects it. Starting the base
+    interpreter directly with ``__PYVENV_LAUNCHER__`` naming the venv
+    interpreter, exactly as the redirector does, gives the same venv
+    interpreter in one process; CPython consumes that variable at startup.
+    """
+    windows = os.name == "nt" if windows is None else windows
+    executable = sys.executable if executable is None else executable
+    base = getattr(sys, "_base_executable", None) if base_executable is None else base_executable
+    if not windows or not command or not executable or not base:
+        return command, env
+
+    def same(left: str, right: str) -> bool:
+        return _path.normcase(_path.abspath(left)) == _path.normcase(_path.abspath(right))
+
+    if not same(command[0], executable) or same(base, executable) or not _path.isfile(base):
+        return command, env
+    return [base, *command[1:]], dict(env, __PYVENV_LAUNCHER__=command[0])
+
+
 def guardian_main() -> int:
     """Separate process: contains workers, allocates groups and witnesses exit."""
     address = tuple(json.loads(os.environ.pop("BELLO_GUARDIAN_ADDRESS")))
@@ -469,6 +501,7 @@ def guardian_main() -> int:
             # CREATE_SUSPENDED is a Win32 flag, not a public subprocess export
             # on supported CPython versions. Assign the Job before any worker
             # code runs, regardless of whether Python exposes that constant.
+            command, worker_env = _windows_direct_interpreter(command, worker_env)
             worker = subprocess.Popen(command, env=worker_env,
                                       creationflags=getattr(subprocess, "CREATE_SUSPENDED", 0x00000004))
             job = _WindowsKillJob.create(worker.pid)
