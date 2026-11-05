@@ -751,28 +751,28 @@ def test_linux_x64_bundle_pins_verified_native_artifact():
     assert {machine for system, machine in install.BUNDLES if system == "Linux"} == {"x86_64"}
     assert install.BUNDLES[("Linux", "x86_64")] == install.NativeBundle(
         url=("https://github.com/Makson179/Bello/releases/download/"
-             "native-codex-0.161.0-nnc-se-20261019/"
+             "native-codex-0.161.0-nnc-tokens-20261105/"
              "bello-native-codex-0.161.0-x86_64-unknown-linux-gnu.tar.gz"),
-        archive_sha256="dace587b72401effc572d5702d670da95fee08f79f808c5ae01e02a6032e513a",
-        manifest_sha256="73bb2613cd29a2a799713c7098c8a28fd2923fe3f705a50faf56389329ddd77b",
+        archive_sha256="1c706edf20af1e975065003bb429b16711f1e1286e996ec03df474fe6e465851",
+        manifest_sha256="9e0a0254ccf614b2ec7b23d3a2f037a277195f5d2240aa3fcf44bb85994bf512",
     )
 
 
 @pytest.mark.parametrize("key,filename,archive_sha,manifest_sha", [
     (("Linux", "x86_64"), "x86_64-unknown-linux-gnu",
-     "dace587b72401effc572d5702d670da95fee08f79f808c5ae01e02a6032e513a",
-     "73bb2613cd29a2a799713c7098c8a28fd2923fe3f705a50faf56389329ddd77b"),
+     "1c706edf20af1e975065003bb429b16711f1e1286e996ec03df474fe6e465851",
+     "9e0a0254ccf614b2ec7b23d3a2f037a277195f5d2240aa3fcf44bb85994bf512"),
     (("Darwin", "arm64"), "aarch64-apple-darwin",
-     "111cfe5cd8ccb7451bc439d0e61f1c0b47ab9ecbec955c0207c23eef401ecc85",
-     "91d82250f699f7483f9c91b0a4d661ef544f5e23851bddf8f336a9227ae9aae6"),
+     "70fedf5fa329cf7324c3558636e3656c920ff22be8e8ba4dae2e42b9742ed866",
+     "0b4eac66a6aeefafa09bbad4f70c5526a34fd61c7b0efe69b359d631c6d23f7c"),
     (("Windows", "x86_64"), "x86_64-pc-windows-msvc",
-     "135f8e721f5393ecafa0a4febd28659c0e8f2ceb5649a1028351c28b87cc2f12",
-     "22e290e3adbe4b5be631885427b443c101109809daabf9859987911821cbdc36"),
+     "534b9f262e2ad845ba7f89f649dca5205ff8d0959263c182df3fe02371050605",
+     "6b318671a684bc12b429215f9dffdd9e799d51a685a95c9ccdbcf804f4ee44ca"),
 ])
 def test_async_bundle_pins_qualified_complete_artifact(key, filename, archive_sha, manifest_sha):
     assert install.ASYNC_BUNDLES[key] == install.NativeBundle(
         url=("https://github.com/Makson179/Bello/releases/download/"
-             "native-codex-0.161.0-nnc-se-20261019/"
+             "native-codex-0.161.0-nnc-tokens-20261105/"
              f"bello-native-codex-0.161.0-{filename}.tar.gz"),
         archive_sha256=archive_sha, manifest_sha256=manifest_sha,
     )
@@ -788,10 +788,10 @@ def test_windows_x64_bundle_pins_verified_native_artifact():
     assert {machine for system, machine in install.BUNDLES if system == "Windows"} == {"x86_64"}
     assert install.BUNDLES[("Windows", "x86_64")] == install.NativeBundle(
         url=("https://github.com/Makson179/Bello/releases/download/"
-             "native-codex-0.161.0-nnc-se-20261019/"
+             "native-codex-0.161.0-nnc-tokens-20261105/"
              "bello-native-codex-0.161.0-x86_64-pc-windows-msvc.tar.gz"),
-        archive_sha256="135f8e721f5393ecafa0a4febd28659c0e8f2ceb5649a1028351c28b87cc2f12",
-        manifest_sha256="22e290e3adbe4b5be631885427b443c101109809daabf9859987911821cbdc36",
+        archive_sha256="534b9f262e2ad845ba7f89f649dca5205ff8d0959263c182df3fe02371050605",
+        manifest_sha256="6b318671a684bc12b429215f9dffdd9e799d51a685a95c9ccdbcf804f4ee44ca",
     )
 
 
@@ -873,7 +873,7 @@ def test_published_selection_and_async_pins_are_intact_and_not_disabled():
     for key in platforms:
         assert install.ASYNC_BUNDLES[key] == install.BUNDLES[key]
         assert install.ASYNC_BUNDLES[key].url.startswith(
-            "https://github.com/Makson179/Bello/releases/download/native-codex-0.161.0-nnc-se-20261019/")
+            "https://github.com/Makson179/Bello/releases/download/native-codex-0.161.0-nnc-tokens-20261105/")
 
 
 @pytest.mark.parametrize("distiller", [False, True])
