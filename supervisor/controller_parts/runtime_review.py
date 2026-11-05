@@ -1095,9 +1095,10 @@ class RuntimeReview:
                         # terminal skip so a retained trigger cannot strand the queue forever.
                         self.ports._ack_runtime_trigger_batch(runtime_trigger_batch)
                     return
-            if not completion_review and GOAL_PROGRESS_REVIEW_SUMMARY in summary and failure_kind != "auth":
-                # The periodic Goal progress review is optional: a failure skips
-                # this observation instead of ending the run. Its cadence slot is
+            if not completion_review and GOAL_PROGRESS_REVIEW_SUMMARY in summary:
+                # The periodic Goal progress review is optional: any failure skips
+                # this observation instead of ending the run (a lost login then
+                # stops the run at the next required check). Its cadence slot is
                 # already consumed, so it cannot become a retry loop.
                 self.ports.store.append_text_locked(
                     compat.PROGRESS, f"- Optional Goal progress review failed with {failure_kind}; skipped.\n")
