@@ -273,3 +273,46 @@ async def test_report_retains_a_failed_case_without_raw_transcripts(tmp_path, mo
     assert [item["case"] for item in result["results"]] == [
         "on", "off", "empty", "truncated", "refused", "oversized", "legacy", "pending"]
     assert list(output.iterdir()) == [output / "report.json"]
+
+
+@pytest.mark.asyncio
+async def test_absolute_tail_is_the_default_proof_mode_and_legacy_keeps_percentage(tmp_path, monkeypatch):
+    calls = {}
+
+    async def fake_case(binary, output, **kwargs):
+        calls[output.name] = kwargs
+        return {"case": output.name, "passed": True}
+
+    monkeypatch.setattr(proof, "verify_case", fake_case)
+    binary = tmp_path / "helper"
+    binary.write_bytes(b"fixture identity only")
+    report = await proof.verify(binary, tmp_path / "context")
+    assert report["passed"] is True and len(calls) == 8
+    assert calls["legacy"] == {"legacy_envelope": True, "retention": "percent"}
+    assert all("retention" not in kwargs for name, kwargs in calls.items() if name != "legacy")
+
+
+@pytest.mark.asyncio
+async def test_helper_without_absolute_tail_capability_fails_before_any_thread(tmp_path, monkeypatch):
+    server = SimpleNamespace(server_port=1234, serve_forever=Mock(), shutdown=Mock(), server_close=Mock())
+    worker = SimpleNamespace(start=Mock(), join=Mock())
+    methods = []
+
+    async def request(method, params):
+        methods.append(method)
+        return {"data": [{"name": "bello_context_compaction"}, {"name": "bello_async_tools"}]}
+
+    session = SimpleNamespace(start=AsyncMock(), close=AsyncMock(), request=request)
+    monkeypatch.setattr(proof, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(proof, "ThreadingHTTPServer", Mock(return_value=server))
+    monkeypatch.setattr(proof, "threading", SimpleNamespace(Thread=Mock(return_value=worker), Event=proof.threading.Event))
+    monkeypatch.setattr(proof, "ReceiptSession", Mock(return_value=session))
+    binary = tmp_path / "not-executed"
+    binary.write_bytes(b"fixture identity only")
+
+    report = await proof.verify(binary, tmp_path / "context", cases=["on"])
+
+    result = report["results"][0]
+    assert report["passed"] is False and result["passed"] is False
+    assert result["failure"] == {"stage": "startup", "type": "ValueError"}
+    assert result["retention"] == "tokens" and methods == ["experimentalFeature/list"]

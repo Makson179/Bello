@@ -193,7 +193,8 @@ async def capabilities(command: list[str], home: Path, output: Path) -> dict:
             seen.add(cursor)
         else:
             raise ValueError("Too many feature pages")
-        require({"bello_async_tools", "bello_context_compaction"}.issubset(names), "Required native capabilities missing")
+        require({"bello_async_tools", "bello_context_compaction", "bello_context_retain_tokens"}.issubset(names),
+                "Required native capabilities missing")
         result.update(passed=True, features=sorted(names))
     finally:
         if process is not None:

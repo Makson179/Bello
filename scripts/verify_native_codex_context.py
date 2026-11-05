@@ -288,7 +288,8 @@ def evaluate(provider, *, enabled, failure, status, resumed, archive_present, ex
     return checks
 
 
-async def verify_case(binary, output, *, enabled=True, failure=None, pending=False, legacy_envelope=False):
+async def verify_case(binary, output, *, enabled=True, failure=None, pending=False, legacy_envelope=False,
+                      retention="tokens"):
     output.mkdir(parents=True, exist_ok=False)
     home, workspace = output / "private-native-home", output / "work"
     home.mkdir(); workspace.mkdir()
@@ -319,7 +320,11 @@ async def verify_case(binary, output, *, enabled=True, failure=None, pending=Fal
             "features.code_mode": False, "features.code_mode_only": False, "features.shell_zsh_fork": False,
             "model_reasoning_effort": "high", "model_post_turn_compact_threshold_percent": 0}}
     if enabled:
-        params["config"].update(model_auto_compact_token_limit=THRESHOLD, bello_context_retain_percent=10)
+        # 0.8.1 defaults to an absolute recent tail; the legacy case keeps the
+        # percentage mode. Both select the same 1,200-token target here.
+        retain = ({"bello_context_retain_tokens": THRESHOLD // 10} if retention == "tokens"
+                  else {"bello_context_retain_percent": 10})
+        params["config"].update(model_auto_compact_token_limit=THRESHOLD, **retain)
     try:
         if os.name == "nt":
             await provision_windows_sandbox(binary, home, env, output)
@@ -327,7 +332,8 @@ async def verify_case(binary, output, *, enabled=True, failure=None, pending=Fal
             params["config"].update(permissions.pop("config")); params.update(permissions); params.pop("sandbox")
         await session.start()
         features = await session.request("experimentalFeature/list", {"limit": 200})
-        if "bello_context_compaction" not in {item.get("name") for item in features.get("data", [])}:
+        names = {item.get("name") for item in features.get("data", [])}
+        if not {"bello_context_compaction", "bello_context_retain_tokens"} <= names:
             raise ValueError("Missing context capability")
         reply = await session.request("thread/start", params)
         thread_id = reply["thread"]["id"]
@@ -371,7 +377,7 @@ async def verify_case(binary, output, *, enabled=True, failure=None, pending=Fal
                       archive_present=archive_present, execution_counts=execution_counts)
     result = {"case": output.name, "passed": error is None and not provider.errors and not provider.rejected and all(checks.values()),
         "enabled": enabled, "summary_failure": failure, "pending_async": pending,
-        "legacy_envelope": legacy_envelope, "checks": checks,
+        "legacy_envelope": legacy_envelope, "retention": retention if enabled else None, "checks": checks,
         "failure": error, "windows_setup_failure": setup_failure,
         "regular_requests": len(provider.regular), "summary_requests": len(provider.summaries),
         "turn_status": status, "resumed": resumed,
@@ -390,7 +396,7 @@ async def verify(binary, output, *, cases=None):
     output.mkdir(parents=True, exist_ok=False)
     definitions = {"on": {}, "off": {"enabled": False}, "empty": {"failure": "empty"},
                    "truncated": {"failure": "truncated"}, "refused": {"failure": "refused"},
-                   "oversized": {"failure": "oversized"}, "legacy": {"legacy_envelope": True},
+                   "oversized": {"failure": "oversized"}, "legacy": {"legacy_envelope": True, "retention": "percent"},
                    "pending": {"pending": True}}
     selected = list(definitions) if cases is None else cases
     results = []
