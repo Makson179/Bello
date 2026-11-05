@@ -45,7 +45,8 @@ async def test_initialize_timeout_bounded_and_same_session(tmp_path, failures, s
         if failures==2:
             assert len(factory.clients)==2 and record['contextState']['generation']==0
         saved=(instance.state_dir/'threads.json').read_text()
-        assert 'secret-timeout-body' not in saved and 'secret-control-error' not in saved
+        # The complete error chain is kept (owner decision: no redaction).
+        assert 'secret-timeout-body' in saved and 'secret-control-error' in saved
     finally:
         await instance.stop()
 

@@ -25,36 +25,48 @@ AUTH = {
 }
 
 
-def test_failure_diagnostic_redacts_content_and_preserves_cause():
-    secret = "TOKEN-secret-prompt-reasoning-not-to-be-logged"
+def test_failure_diagnostic_keeps_the_complete_text_and_cause():
+    # Owner decision: Claude Code error text is never truncated or redacted.
+    secret = "TOKEN-secret-shown-in-full"
     try:
         try:
             raise KeyError(secret)
         except KeyError as cause:
             raise RuntimeError(secret) from cause
     except RuntimeError as error:
-        diagnostic = ClaudeBackend._failure_diagnostic(error)
-    encoded = json.dumps(diagnostic)
-    assert secret not in encoded
+        diagnostic = ClaudeBackend._failure_diagnostic(error, cli_stderr=["cli: " + secret, "second line"])
     assert [n["type"] for n in diagnostic["exceptions"]] == ["RuntimeError", "KeyError"]
     assert diagnostic["exceptions"][1]["relation"] == "cause"
+    assert diagnostic["exceptions"][0]["message"] == secret
+    assert secret in diagnostic["traceback"] and "KeyError" in diagnostic["traceback"]
+    assert diagnostic["cliStderr"] == f"cli: {secret}\nsecond line"
+    assert any(frame["function"] == "test_failure_diagnostic_keeps_the_complete_text_and_cause"
+               for frame in diagnostic["exceptions"][0]["frames"])
 
 
-def test_failure_diagnostic_bounded_group_and_numeric_exit():
+def test_failure_diagnostic_keeps_every_group_member_and_cli_exit():
     from claude_agent_sdk._errors import ProcessError
-    error = ExceptionGroup("private text", [ProcessError("secret", exit_code=1), *[ValueError("secret") for _ in range(20)]])
+    error = ExceptionGroup("group text", [ProcessError("cli failed", exit_code=1, stderr="cli stderr text"),
+                                          *[ValueError(f"member {index}") for index in range(20)]])
     diagnostic = ClaudeBackend._failure_diagnostic(error)
-    assert len(diagnostic["exceptions"]) <= 8
+    assert len(diagnostic["exceptions"]) == 22 and "truncated" not in diagnostic
     assert diagnostic["exceptions"][1]["exit_code"] == 1
-    assert diagnostic["truncated"]
-    assert "secret" not in json.dumps(diagnostic)
-    assert "private text" not in json.dumps(diagnostic)
+    assert diagnostic["exceptions"][1]["stderr"] == "cli stderr text"
+    encoded = json.dumps(diagnostic)
+    assert "group text" in encoded and "member 19" in encoded
 
 
-def test_failure_diagnostic_unknown_exception_name_is_redacted():
-    error = type("SECRET_CLASS_NAME", (Exception,), {})("secret")
-    assert ClaudeBackend._failure_diagnostic(error)["exceptions"][0]["type"] == "OtherException"
-    assert ClaudeBackend._safe_failure(error) == "Claude Code turn failed before a result was received"
+def test_failure_text_names_any_exception_and_appends_cli_stderr():
+    error = type("CustomClaudeFailure", (Exception,), {})("detail")
+    assert ClaudeBackend._failure_text(error) == "Claude Code turn failed: CustomClaudeFailure: detail"
+    assert ClaudeBackend._failure_text(error, ["first", "token=abc123"]) == (
+        "Claude Code turn failed: CustomClaudeFailure: detail\nClaude Code CLI stderr:\nfirst\ntoken=abc123")
+    assert ClaudeBackend._failure_text(AppServerError("bello text")) == "bello text"
+    long_text = "x" * 20000
+    assert ClaudeBackend._failure_text(RuntimeError(long_text)).endswith(long_text)
+    group = ExceptionGroup("outer", [ValueError("inner one"), OSError("inner two")])
+    text = ClaudeBackend._failure_text(group)
+    assert "inner one" in text and "inner two" in text
 
 
 @pytest.mark.asyncio
@@ -80,8 +92,11 @@ async def test_receive_failure_diagnostic_is_durable_without_replay(tmp_path):
         completed = next(e["params"]["turn"] for e in events if e["method"] == "turn/completed")
         assert completed["status"] == "failed"
         assert completed["failureDiagnostic"]["exceptions"][0]["type"] == "RuntimeError"
+        assert completed["failureDiagnostic"]["exceptions"][0]["message"] == "secret-error-body"
+        assert completed["error"] == {"message": "Claude Code turn failed: RuntimeError: secret-error-body",
+                                      "belloFullText": True}
         persisted = (tmp_path / "claude-state" / "threads.json").read_text()
-        assert "failureDiagnostic" in persisted and "secret-error-body" not in persisted
+        assert "failureDiagnostic" in persisted and "secret-error-body" in persisted
         assert len(factory.clients) == 1 and len(factory.clients[0].queries) == 1
     finally:
         await runtime.stop()

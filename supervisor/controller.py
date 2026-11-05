@@ -1898,6 +1898,9 @@ class BelloController:
                 # length-limited answer after a completion return.
                 self._clear_persisted_coder_turn(thread_id, turn_id)
                 detail = bounded_provider_error({"error": turn.get("error")}).get("error", {})
+                if detail.get("belloFullText") is True and isinstance(detail.get("message"), str):
+                    # Claude Code's complete error text, readable as written.
+                    detail = detail["message"]
                 await self.fail_provider(f"coder execution failed: {detail or 'provider returned a failed turn'}")
                 return
             if self.coder and isinstance(turn_id, str):

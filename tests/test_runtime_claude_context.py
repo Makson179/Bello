@@ -106,7 +106,8 @@ async def test_context_usage_timeout_reconnect_is_bounded_no_query_replay(tmp_pa
             assert factory.probes == 2 and len(factory.clients) == 2
             assert instance._record("thread-1")["claudeSessionId"] == original
             assert instance._record("thread-1")["contextState"]["generation"] == 0
-        assert "private-timeout" not in (instance.state_dir / "threads.json").read_text()
+        # The complete error text is kept (owner decision: no redaction).
+        assert "private-timeout" in (instance.state_dir / "threads.json").read_text()
     finally:
         await instance.stop()
 
