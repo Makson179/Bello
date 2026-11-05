@@ -804,9 +804,11 @@ def _mac_invocation(
     )
     env = _clean_environment(str(scratch / "home"), str(scratch / "tmp"), paths)
     # Seatbelt denies the unlisted (usually absent) /etc/gitconfig with EPERM,
-    # not ENOENT, and git treats that as fatal for every command. As in the
-    # Linux sandbox, which does not mount it, commands get no system config.
+    # not ENOENT, and git treats that as fatal for every command (and warns for
+    # /etc/gitattributes). As in the Linux sandbox, which mounts neither file,
+    # commands get no system git config or attributes.
     env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_ATTR_NOSYSTEM"] = "1"
     if policy.temp_root is not None:
         env.update({key: str(policy.temp_root) for key in ("TMPDIR", "TMP", "TEMP", "CLAUDE_CODE_TMPDIR")})
     return _Invocation(tuple(argv), env, cwd, "sandbox-exec")
