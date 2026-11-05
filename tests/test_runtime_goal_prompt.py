@@ -43,7 +43,9 @@ def sections(**updates):
 
 
 def raw_section(start, end):
-    raw = PROMPTS.read_bytes()
+    # The pinned hashes are of the repository's LF text; a Windows checkout may
+    # convert prompts.toml to CRLF.
+    raw = PROMPTS.read_bytes().replace(b"\r\n", b"\n")
     return raw[raw.index(start):raw.index(end)]
 
 

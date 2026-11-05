@@ -347,6 +347,17 @@ def _has_native_posix_backend() -> bool:
     not _has_native_posix_backend() and os.environ.get("BELLO_REQUIRE_NATIVE_SANDBOX") != "1",
     reason="requires a native POSIX sandbox backend",
 )
+def _echo_dispatches_on_name(tmp_path: Path) -> bool:
+    probe = tmp_path / "renamed-echo-probe"
+    shutil.copyfile("/bin/echo", probe)
+    probe.chmod(0o755)
+    try:
+        output = subprocess.run([str(probe), "PROBE"], capture_output=True, text=True, timeout=10).stdout
+    finally:
+        probe.unlink(missing_ok=True)
+    return output.strip() != "PROBE"
+
+
 async def test_real_coder_runtime_executes_dependencies_without_writes_or_private_reads(
     dependency_snapshot, tmp_path: Path, request: pytest.FixtureRequest,
 ) -> None:
@@ -368,8 +379,11 @@ async def test_real_coder_runtime_executes_dependencies_without_writes_or_privat
     else:
         shutil.copyfile("/bin/echo", oracle)
         executable_target = ".venv/programbench-oracle"
+    # A multicall coreutils (uutils on Ubuntu 26.04, busybox) dispatches on
+    # the invoked name, so a renamed copy of echo must be run as "echo".
+    link = "echo" if sys.platform != "darwin" and _echo_dispatches_on_name(tmp_path) else "executable"
     oracle.chmod(0o111)
-    (snapshot.snapshot_root / "executable").symlink_to(executable_target)
+    (snapshot.snapshot_root / link).symlink_to(executable_target)
     client = RuntimeClient(cwd=project, state_dir=tmp_path / "native-state", backends={"codex": _Backend()})
     coder = _coder(client, project, task, snapshot)
     sequence = 0
@@ -398,7 +412,7 @@ async def test_real_coder_runtime_executes_dependencies_without_writes_or_privat
         for name, arguments, expected in (
             ("read_file", {"path": ".venv/public.txt"}, "PUBLIC_DEPENDENCY"),
             ("exec_command", {"command": "/bin/cat .venv/public.txt"}, "PUBLIC_DEPENDENCY"),
-            ("exec_command", {"command": "./executable ORACLE_EXECUTED"}, "ORACLE_EXECUTED"),
+            ("exec_command", {"command": f"./{link} ORACLE_EXECUTED"}, "ORACLE_EXECUTED"),
         ):
             result = await call(name, arguments)
             assert not result["isError"], result
