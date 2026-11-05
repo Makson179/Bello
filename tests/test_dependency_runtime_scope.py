@@ -347,15 +347,25 @@ def _has_native_posix_backend() -> bool:
     not _has_native_posix_backend() and os.environ.get("BELLO_REQUIRE_NATIVE_SANDBOX") != "1",
     reason="requires a native POSIX sandbox backend",
 )
-def _echo_dispatches_on_name(tmp_path: Path) -> bool:
-    probe = tmp_path / "renamed-echo-probe"
-    shutil.copyfile("/bin/echo", probe)
-    probe.chmod(0o755)
-    try:
-        output = subprocess.run([str(probe), "PROBE"], capture_output=True, text=True, timeout=10).stdout
-    finally:
-        probe.unlink(missing_ok=True)
-    return output.strip() != "PROBE"
+def _execute_only_oracle(tmp_path: Path) -> tuple[str, str]:
+    """A standalone executable whose renamed copy prints the marker, and its arguments.
+
+    Multicall coreutils (uutils on Ubuntu 26.04, busybox) pick the utility
+    from the executable's own name, so a renamed copy of echo stops being
+    echo there; a standalone shell still works.
+    """
+    for source, arguments in (("/bin/echo", "ORACLE_EXECUTED"), ("/bin/sh", "-c 'echo ORACLE_EXECUTED'")):
+        probe = tmp_path / "renamed-oracle-probe"
+        shutil.copyfile(source, probe)
+        probe.chmod(0o755)
+        try:
+            output = subprocess.run([str(probe), *shlex.split(arguments)], capture_output=True, text=True,
+                                    timeout=10).stdout
+        finally:
+            probe.unlink(missing_ok=True)
+        if output.strip() == "ORACLE_EXECUTED":
+            return source, arguments
+    pytest.skip("no standalone executable can serve as the execute-only oracle")
 
 
 async def test_real_coder_runtime_executes_dependencies_without_writes_or_private_reads(
@@ -376,14 +386,13 @@ async def test_real_coder_runtime_executes_dependencies_without_writes_or_privat
         script.chmod(0o755)
         oracle.write_bytes(b"EXECUTE_ONLY_PERMISSION_FIXTURE")
         executable_target = ".venv/public-tool"
+        arguments = "ORACLE_EXECUTED"
     else:
-        shutil.copyfile("/bin/echo", oracle)
+        source, arguments = _execute_only_oracle(tmp_path)
+        shutil.copyfile(source, oracle)
         executable_target = ".venv/programbench-oracle"
-    # A multicall coreutils (uutils on Ubuntu 26.04, busybox) dispatches on
-    # the invoked name, so a renamed copy of echo must be run as "echo".
-    link = "echo" if sys.platform != "darwin" and _echo_dispatches_on_name(tmp_path) else "executable"
     oracle.chmod(0o111)
-    (snapshot.snapshot_root / link).symlink_to(executable_target)
+    (snapshot.snapshot_root / "executable").symlink_to(executable_target)
     client = RuntimeClient(cwd=project, state_dir=tmp_path / "native-state", backends={"codex": _Backend()})
     coder = _coder(client, project, task, snapshot)
     sequence = 0
@@ -412,7 +421,7 @@ async def test_real_coder_runtime_executes_dependencies_without_writes_or_privat
         for name, arguments, expected in (
             ("read_file", {"path": ".venv/public.txt"}, "PUBLIC_DEPENDENCY"),
             ("exec_command", {"command": "/bin/cat .venv/public.txt"}, "PUBLIC_DEPENDENCY"),
-            ("exec_command", {"command": f"./{link} ORACLE_EXECUTED"}, "ORACLE_EXECUTED"),
+            ("exec_command", {"command": f"./executable {arguments}"}, "ORACLE_EXECUTED"),
         ):
             result = await call(name, arguments)
             assert not result["isError"], result
