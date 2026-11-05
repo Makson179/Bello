@@ -49,7 +49,26 @@ def _system_command(raw: str, names: set[str], *, workspace: Path | None = None)
     # Neither a workspace executable nor an arbitrary host PATH shim gets a
     # claim to the semantics of cat/shasum. Keep this POSIX-only and literal.
     system_bins = {Path("/bin"), Path("/usr/bin")}
-    return lexical.parent in system_bins and canonical.parent in system_bins
+    if lexical.parent not in system_bins:
+        return False
+    # Ubuntu 26.04's uutils coreutils link /usr/bin/cat to a multicall binary
+    # under /usr/lib; an administrator-installed target is still the system's.
+    return canonical.parent in system_bins or _root_controlled(canonical)
+
+
+def _root_controlled(path: Path) -> bool:
+    """True when the file and every ancestor directory are owned by root and
+    writable by neither group nor others, so no unprivileged user placed it."""
+    if os.name != "posix":
+        return False
+    try:
+        for part in (path, *path.parents):
+            info = part.lstat()
+            if info.st_uid != 0 or info.st_mode & 0o022:
+                return False
+    except OSError:
+        return False
+    return True
 
 
 def _literal_parts(command: str) -> list[tuple[str, str | None]] | None:

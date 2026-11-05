@@ -128,3 +128,30 @@ def test_unqualified_reader_rejects_workspace_path_even_without_current_shadow(t
 def test_unqualified_system_reader_accepts_only_absolute_host_path(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
     assert reads._system_command("cat", reads._READERS, workspace=tmp_path)
+
+
+def _linked_reader(monkeypatch, target, *, root_controlled):
+    # Ubuntu 26.04 (uutils): /usr/bin/cat is a link to a multicall binary.
+    monkeypatch.setattr(reads.shutil, "which", lambda command: "/usr/bin/cat")
+    original_resolve = Path.resolve
+    monkeypatch.setattr(Path, "resolve", lambda self, strict=False: Path(target)
+                        if str(self) == "/usr/bin/cat" else original_resolve(self, strict=strict))
+    monkeypatch.setattr(reads, "_root_controlled", lambda path: root_controlled and path == Path(target))
+
+
+def test_system_reader_linked_to_a_root_controlled_multicall_binary_is_accepted(monkeypatch):
+    _linked_reader(monkeypatch, "/usr/lib/cargo/bin/coreutils/cat", root_controlled=True)
+    assert reads._system_command("/usr/bin/cat", reads._READERS)
+
+
+def test_system_reader_linked_outside_root_control_is_rejected(monkeypatch):
+    _linked_reader(monkeypatch, "/home/user/bin/cat", root_controlled=False)
+    assert not reads._system_command("/usr/bin/cat", reads._READERS)
+
+
+def test_root_control_requires_root_owned_unwritable_ancestors(tmp_path):
+    owned = tmp_path / "reader"
+    owned.write_text("not a system file\n")
+    assert reads._root_controlled(Path("/bin/sh").resolve()) is True
+    # A user file (and anything below world-writable /tmp) never qualifies.
+    assert reads._root_controlled(owned) is False
