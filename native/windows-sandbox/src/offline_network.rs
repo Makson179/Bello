@@ -427,6 +427,61 @@ fn layout_objects(engine: &Engine) -> Result<LayoutObjects> {
     };
     Ok((provider, sublayer))
 }
+unsafe fn has_layout_data(blob: &FWP_BYTE_BLOB) -> bool {
+    matches!(blob_bytes(blob, LAYOUT_DATA.len()), Ok(bytes) if bytes == LAYOUT_DATA)
+}
+/// Every provider/sublayer field that differs from the fixed policy (issue
+/// #42). Reports field names, plus the bounded flags and weight scalars; WFP
+/// display strings and provider data are compared, never echoed.
+unsafe fn layout_mismatches(p: &FWPM_PROVIDER0, s: &FWPM_SUBLAYER0) -> Vec<String> {
+    let mut found = Vec::new();
+    if !eq_guid(&p.providerKey, &PROVIDER_KEY) {
+        found.push("provider.providerKey".to_string());
+    }
+    if p.flags != FWPM_PROVIDER_FLAG_PERSISTENT {
+        found.push(format!(
+            "provider.flags={:#x} (expected {FWPM_PROVIDER_FLAG_PERSISTENT:#x})",
+            p.flags
+        ));
+    }
+    if !string_equals(p.displayData.name, PROVIDER_NAME) {
+        found.push("provider.displayData.name".to_string());
+    }
+    if !p.displayData.description.is_null() {
+        found.push("provider.displayData.description".to_string());
+    }
+    if !string_equals(p.serviceName, SERVICE_NAME) {
+        found.push("provider.serviceName".to_string());
+    }
+    if !has_layout_data(&p.providerData) {
+        found.push("provider.providerData".to_string());
+    }
+    if !eq_guid(&s.subLayerKey, &SUBLAYER_KEY) {
+        found.push("sublayer.subLayerKey".to_string());
+    }
+    if s.flags != FWPM_SUBLAYER_FLAG_PERSISTENT {
+        found.push(format!(
+            "sublayer.flags={:#x} (expected {FWPM_SUBLAYER_FLAG_PERSISTENT:#x})",
+            s.flags
+        ));
+    }
+    if s.providerKey.is_null() || !eq_guid(&*s.providerKey, &PROVIDER_KEY) {
+        found.push("sublayer.providerKey".to_string());
+    }
+    if s.weight != u16::MAX {
+        found.push(format!("sublayer.weight={} (expected {})", s.weight, u16::MAX));
+    }
+    if !string_equals(s.displayData.name, SUBLAYER_NAME) {
+        found.push("sublayer.displayData.name".to_string());
+    }
+    if !s.displayData.description.is_null() {
+        found.push("sublayer.displayData.description".to_string());
+    }
+    if !has_layout_data(&s.providerData) {
+        found.push("sublayer.providerData".to_string());
+    }
+    found
+}
 fn validate_layout_in(engine: &Engine) -> Result<()> {
     let (provider, sublayer) = layout_objects(engine)?;
     let provider =
@@ -435,24 +490,12 @@ fn validate_layout_in(engine: &Engine) -> Result<()> {
         sublayer.ok_or_else(|| anyhow!("Bello offline WFP sublayer is not installed"))?;
     let p = unsafe { &*provider.0 };
     let s = unsafe { &*sublayer.0 };
-    let valid = unsafe {
-        eq_guid(&p.providerKey, &PROVIDER_KEY)
-            && p.flags == FWPM_PROVIDER_FLAG_PERSISTENT
-            && string_equals(p.displayData.name, PROVIDER_NAME)
-            && p.displayData.description.is_null()
-            && string_equals(p.serviceName, SERVICE_NAME)
-            && blob_bytes(&p.providerData, LAYOUT_DATA.len())? == LAYOUT_DATA
-            && eq_guid(&s.subLayerKey, &SUBLAYER_KEY)
-            && s.flags == FWPM_SUBLAYER_FLAG_PERSISTENT
-            && !s.providerKey.is_null()
-            && eq_guid(&*s.providerKey, &PROVIDER_KEY)
-            && s.weight == u16::MAX
-            && string_equals(s.displayData.name, SUBLAYER_NAME)
-            && s.displayData.description.is_null()
-            && blob_bytes(&s.providerData, LAYOUT_DATA.len())? == LAYOUT_DATA
-    };
-    if !valid {
-        bail!("existing offline WFP layout differs from the fixed policy; refusing repair");
+    let mismatches = unsafe { layout_mismatches(p, s) };
+    if !mismatches.is_empty() {
+        bail!(
+            "existing offline WFP layout differs from the fixed policy ({}); refusing repair",
+            mismatches.join(", ")
+        );
     }
     validate_security(engine, &PROVIDER_KEY, FwpmProviderGetSecurityInfoByKey0)?;
     validate_security(engine, &SUBLAYER_KEY, FwpmSubLayerGetSecurityInfoByKey0)
@@ -827,6 +870,41 @@ pub fn remove_layout() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn layout_mismatches_name_each_differing_field() {
+        let mut provider_name = wide(PROVIDER_NAME);
+        let mut service = wide(SERVICE_NAME);
+        let mut sublayer_name = wide(SUBLAYER_NAME);
+        let mut owner = PROVIDER_KEY;
+        let mut provider: FWPM_PROVIDER0 = unsafe { mem::zeroed() };
+        provider.providerKey = PROVIDER_KEY;
+        provider.displayData.name = provider_name.as_mut_ptr();
+        provider.flags = FWPM_PROVIDER_FLAG_PERSISTENT;
+        provider.providerData = data_blob(LAYOUT_DATA);
+        provider.serviceName = service.as_mut_ptr();
+        let mut sublayer: FWPM_SUBLAYER0 = unsafe { mem::zeroed() };
+        sublayer.subLayerKey = SUBLAYER_KEY;
+        sublayer.displayData.name = sublayer_name.as_mut_ptr();
+        sublayer.flags = FWPM_SUBLAYER_FLAG_PERSISTENT;
+        sublayer.providerKey = &mut owner;
+        sublayer.providerData = data_blob(LAYOUT_DATA);
+        sublayer.weight = u16::MAX;
+        assert!(unsafe { layout_mismatches(&provider, &sublayer) }.is_empty());
+        provider.flags = 0;
+        sublayer.weight = u16::MAX - 1;
+        sublayer.providerKey = ptr::null_mut();
+        let other = b"foreign layout data";
+        sublayer.providerData = data_blob(other);
+        assert_eq!(
+            unsafe { layout_mismatches(&provider, &sublayer) },
+            vec![
+                format!("provider.flags=0x0 (expected {FWPM_PROVIDER_FLAG_PERSISTENT:#x})"),
+                "sublayer.providerKey".to_string(),
+                format!("sublayer.weight={} (expected {})", u16::MAX - 1, u16::MAX),
+                "sublayer.providerData".to_string(),
+            ]
+        );
+    }
     #[test]
     fn uuids_are_canonical_distinct_and_nonzero() {
         let one = new_id().unwrap();
