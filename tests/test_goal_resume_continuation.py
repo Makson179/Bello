@@ -132,3 +132,21 @@ async def test_non_goal_resume_keeps_the_idle_review(tmp_path, monkeypatch):
     assert controller.coder.starts == []
     await _idle_until(controller, clock, CONTROLLER_IDLE_GUARD_STALL_SECONDS + 120)
     assert reviewer.completion_packets
+
+
+@pytest.mark.asyncio
+async def test_goal_resume_of_a_fresh_restart_generation_sends_its_restart_kickoff(tmp_path, monkeypatch):
+    # A pause during a restart's kickoff leaves a new thread without its first
+    # prompt; the generic Goal continuation would lack the task and handoff.
+    from supervisor.prompts.supervisor import build_restart_prompt
+
+    controller, store, _, clock = _paused_run(tmp_path, monkeypatch, goal=True)
+    controller.coder.task_read_path = tmp_path / "TASK.md"
+    controller.coder.plan_path = None
+    await _command(controller, "/pause")
+    await _interrupted_turn_completes(controller)
+    controller._generation_has_coder_turn = False
+    await _command(controller, "/resume")
+    assert controller.coder.starts == [build_restart_prompt(tmp_path / "TASK.md", plan_path=None, goal=True)]
+    assert "HANDOFF" in controller.coder.starts[0] and "BELLO_READY_FOR_REVIEW" in controller.coder.starts[0]
+

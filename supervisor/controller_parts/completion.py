@@ -286,11 +286,18 @@ class Completion:
             self.state._goal_auto_next_pending = None
             return True
 
-        delivered, _ = await self.ports._deliver_coder_message(
-            "Continue toward the original Goal. Check any pending work or external results "
-            "and choose your next step. Submit for review only when you actually judge the work ready.",
-            before_send=claim,
-        )
+        message = ("Continue toward the original Goal. Check any pending work or external results "
+                   "and choose your next step. Submit for review only when you actually judge the work ready.")
+        coder = self.ports.coder
+        if not getattr(self.ports, "_generation_has_coder_turn", True):
+            # A fresh restart generation whose kickoff a pause superseded has not
+            # seen its first prompt: send that Goal restart kickoff (task path,
+            # handoff and readiness protocol), as start_restart_turn would.
+            from supervisor.prompts.supervisor import build_restart_prompt
+            task = getattr(coder, "task_read_path", None)
+            message = (build_restart_prompt(task, plan_path=getattr(coder, "plan_path", None), goal=True)
+                       if task is not None else compat.POST_RESTART_CONTINUE_NUDGE)
+        delivered, _ = await self.ports._deliver_coder_message(message, before_send=claim)
         if delivered:
             self.ports._append_event(compat.AppEventSource.SUPERVISOR,
                 "goal/auto_next", reason="successful coder turn continued without a readiness marker")
