@@ -29,6 +29,8 @@ def test_release_versions_are_consistent():
     claude = (ROOT / "supervisor/runtime/claude.py").read_text()
     assert claude.count(f'"CLAUDE_AGENT_SDK_CLIENT_APP": "bello/{version}"') == 2
     assert f'version="{version}"' in claude
+    appserver = (ROOT / "supervisor/appserver.py").read_text()
+    assert f'"clientInfo": {{"name": "bello", "title": "Bello", "version": "{version}"}}' in appserver
     assert f'version: "{version}"' in (ROOT / "supervisor/pi_worker/src/runtime.mjs").read_text()
     advisor = ROOT / "plugins/bello/skills/bello-config-advisor"
     assert f'TARGET_VERSION = "{version}"' in (advisor / "scripts/inspect_config.py").read_text()
