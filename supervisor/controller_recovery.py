@@ -213,20 +213,22 @@ def _planned_codex_command(config: BelloConfig) -> tuple[list[str], Path | None]
     from supervisor.runtime.native_codex_install import ASYNC_BUNDLES, BUNDLES, _platform_key
     binary = os.environ.get("BELLO_CODEX_BINARY")
     manifest = os.environ.get("BELLO_CODEX_SELECTION_MANIFEST")
-    if config.async_tools:
+    # Like RuntimeClient: No Need For Context selects the async helper too.
+    native_async = config.async_tools or bool(config.no_need_for_context.get("enabled", False))
+    if native_async:
         binary, manifest = (binary or "").strip(), (manifest or "").strip()
-    if config.async_tools or config.log_distiller.get("enabled", False):
+    if native_async or config.log_distiller.get("enabled", False):
         if binary or manifest:
             return ([binary or "codex", "app-server", "--listen", "stdio://"],
                     Path(manifest).expanduser().absolute() if manifest else None)
         key = _platform_key()
-        bundle = (ASYNC_BUNDLES if config.async_tools else BUNDLES).get(key)
+        bundle = (ASYNC_BUNDLES if native_async else BUNDLES).get(key)
         if bundle is not None:
             base = Path(os.environ.get("BELLO_RUNTIME_DIR", str(Path.home() / ".bello/runtime"))).expanduser().absolute()
             directory = base / "native-codex" / bundle.archive_sha256
             executable = directory / "bin" / ("codex.exe" if key[0] == "Windows" else "codex")
             return [str(executable), "app-server", "--listen", "stdio://"], directory / "selection-manifest.json"
-        if not config.async_tools:
+        if not native_async:
             raise RecoveryBlocked("native engine selection is unsupported for recovery")
     # The non-installer backend strips only the optional manifest, not binary.
     manifest = (os.environ.get("BELLO_CODEX_SELECTION_MANIFEST") or "").strip()

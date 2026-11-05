@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from supervisor.controller_recovery import DurableRun, RecoveryBlocked, _engine_identity
+from supervisor.controller_recovery import DurableRun, RecoveryBlocked, _engine_identity, _planned_codex_command
 from tests.test_runtime_preflight import controller_for
 
 
@@ -113,3 +113,46 @@ async def test_fresh_run_has_no_recorded_launchers_to_bind(tmp_path, monkeypatch
     await controller._runtime_preflight()
     controller.client._engine.assert_not_awaited()
     assert "sandbox" in events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_tools, distiller, nnc", [
+    (False, False, True), (True, False, False), (False, True, False), (False, True, True), (False, False, False),
+])
+async def test_restore_plan_names_the_codex_launcher_the_live_client_starts(
+    tmp_path, monkeypatch, async_tools, distiller, nnc,
+):
+    # No Need For Context alone selects the managed async helper; the restore
+    # plan used to expect the host codex instead, so such runs never recovered.
+    from supervisor.runtime import codex as codex_module, native_codex_install as install
+    from supervisor.runtime.client import RuntimeClient
+
+    monkeypatch.delenv("BELLO_CODEX_BINARY", raising=False)
+    monkeypatch.delenv("BELLO_CODEX_SELECTION_MANIFEST", raising=False)
+    monkeypatch.setenv("BELLO_RUNTIME_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setattr(install, "_platform_key", lambda: ("Linux", "x86_64"))
+
+    def installed(bundle, *, system):  # the installer's result, without a download
+        directory = tmp_path / "runtime" / "native-codex" / bundle.archive_sha256
+        return [str(directory / "bin" / "codex"), "app-server", "--listen", "stdio://"], directory / "selection-manifest.json"
+
+    started = {}
+
+    class Backend:
+        def __init__(self, **options):
+            started.update(options)
+
+        async def request(self, method, params):
+            return {}
+
+    monkeypatch.setattr(install, "_ensure_native_bundle", installed)
+    monkeypatch.setattr(codex_module, "CodexBackend", Backend)
+    client = RuntimeClient(cwd=tmp_path)
+    client.configure_run(async_tools=async_tools, no_need_for_context={"enabled": nnc})
+    if distiller:
+        client._distiller = object()
+    await client._engine("codex")
+    live = (started["command"] or ["codex", "app-server", "--listen", "stdio://"], started["selection_manifest"])
+    config = SimpleNamespace(async_tools=async_tools, log_distiller={"enabled": distiller},
+                             no_need_for_context={"enabled": nnc})
+    assert _planned_codex_command(config) == live
