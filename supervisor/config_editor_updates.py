@@ -21,7 +21,7 @@ from supervisor.config_editor_types import (
     InlineEditKind,
 )
 from supervisor.config_validation import ModelCatalog
-from supervisor.project_config import ProjectConfig
+from supervisor.project_config import ProjectConfig, ProjectConfigError
 
 
 def move_down(state: EditorState, parameters: tuple[EditorParameter, ...]) -> EditorState:
@@ -244,7 +244,10 @@ def _commit_inline_edit(
     if state.edit_kind == "positive_int":
         if not raw.isdecimal() or int(raw) < 1:
             return config, _editor.replace(state, edit_error="enter a positive integer")
-        updated = _editor._replace_config_field(config, parameter.key, int(raw))
+        try:
+            updated = _editor._replace_config_field(config, parameter.key, int(raw))
+        except ProjectConfigError as exc:
+            return config, _editor.replace(state, edit_error=str(exc))
         return updated, _editor.advance_after_selection(state, len(parameters))
     if state.edit_kind == "review_limit":
         if raw.lower() == _editor.UNLIMITED_REVIEW_LIMIT:
@@ -309,7 +312,9 @@ def _replace_config_field(
         current_mode = "tokens" if config.no_need_for_context.retain_tokens is not None else "percentage"
         if value == current_mode:
             return config
-        retention = ({"retain_tokens": 24800, "retain_percent": None} if value == "tokens"
+        # The default absolute tail, capped at half the threshold to stay valid.
+        tail = min(24800, max(1, config.no_need_for_context.threshold_tokens // 2))
+        retention = ({"retain_tokens": tail, "retain_percent": None} if value == "tokens"
                      else {"retain_percent": 10, "retain_tokens": None})
         return _editor.replace(config, no_need_for_context=_editor.replace(config.no_need_for_context, **retention))
     if field in {"no_need_for_context_enabled", "no_need_for_context_threshold_tokens",

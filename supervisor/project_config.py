@@ -144,6 +144,13 @@ class NoNeedForContextConfig:
             object.__setattr__(self, "retain_tokens", 24800)
         if self.retain_tokens is not None and (type(self.retain_tokens) is not int or self.retain_tokens <= 0):
             raise ProjectConfigError("no_need_for_context.retain_tokens must be a positive integer")
+        if self.retain_tokens is not None and self.retain_tokens * 2 > self.threshold_tokens:
+            # Like retain_percent's 50% cap: a compaction must be able to
+            # retire at least half of the threshold, or it never reduces.
+            raise ProjectConfigError(
+                f"no_need_for_context.retain_tokens ({self.retain_tokens}) must be at most half of threshold_tokens "
+                f"({self.threshold_tokens}); set a smaller retain_tokens (--context-retain-tokens) "
+                "or a larger threshold_tokens")
         if self.retain_percent is not None and (type(self.retain_percent) not in (int, float)
                 or not 0 < self.retain_percent <= 50
                 or not math.isfinite(self.retain_percent)):

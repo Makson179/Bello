@@ -156,6 +156,29 @@ class AdvisorValidationTests(unittest.TestCase):
                 self.assertTrue(any("no_need_for_context" in error for error in
                                     INSPECTOR._source_config_errors(bad, current, config_exists=True)))
 
+    def test_absolute_tail_is_at_most_half_the_threshold_like_project_config(self):
+        from supervisor.project_config import ProjectConfigError, _config_from_payload
+        for context, valid in (({"enabled": True, "threshold_tokens": 49600}, True),
+                               ({"enabled": True, "threshold_tokens": 20000}, False),
+                               ({"enabled": True, "threshold_tokens": 1000, "retain_tokens": 501}, False),
+                               ({"enabled": True, "threshold_tokens": 1000, "retain_tokens": 500}, True),
+                               ({"enabled": True, "threshold_tokens": 20000, "retain_percent": 10}, True)):
+            with self.subTest(context=context):
+                candidate = config()
+                candidate["no_need_for_context"] = context
+                errors = validate(candidate)
+                current = INSPECTOR._normalize(candidate, config_exists=True)
+                source_errors = INSPECTOR._source_config_errors(candidate, current, config_exists=True)
+                if valid:
+                    self.assertEqual(errors, [])
+                    self.assertFalse(any("no_need_for_context" in error for error in source_errors))
+                    _config_from_payload(candidate, path=Path("synthetic.json"))
+                else:
+                    self.assertTrue(any("at most half of threshold_tokens" in error for error in errors))
+                    self.assertTrue(any("at most half of threshold_tokens" in error for error in source_errors))
+                    with self.assertRaises(ProjectConfigError):
+                        _config_from_payload(candidate, path=Path("synthetic.json"))
+
     def test_context_opt_in_roundtrip_and_strict_validation(self):
         candidate = config()
         candidate["no_need_for_context"] = {"enabled": True, "threshold_tokens": 100000, "retain_percent": 12.5}

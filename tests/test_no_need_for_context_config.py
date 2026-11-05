@@ -174,6 +174,52 @@ def test_context_editor_switch_to_tokens_and_positive_integer_validation():
         assert unchanged == config and state.edit_error
 
 
+
+def test_context_absolute_tail_is_at_most_half_the_threshold():
+    # The 24,800 default needs a threshold of at least 49,600. A lowered
+    # threshold used to keep it, so a compaction could never reduce context.
+    assert NoNeedForContextConfig(True, 49600).retain_tokens == 24800
+    assert NoNeedForContextConfig(True, 1000, retain_tokens=500).retain_tokens == 500
+    assert NoNeedForContextConfig(True, 20000, 10).retain_percent == 10
+    for value in ({"threshold_tokens": 49599}, {"threshold_tokens": 1000, "retain_tokens": 501}):
+        with pytest.raises(ProjectConfigError, match="at most half of threshold_tokens"):
+            NoNeedForContextConfig(True, **value)
+        with pytest.raises(ValidationError, match="at most half of threshold_tokens"):
+            BelloConfig(project_root="/project", no_need_for_context={"enabled": True, **value})
+    with pytest.raises(ProjectConfigError, match="--context-retain-tokens"):
+        _resolve_run_settings(project_config=ProjectConfig(), no_need_for_context_enabled=True,
+                              no_need_for_context_threshold_tokens=20000)
+    lowered = _resolve_run_settings(project_config=ProjectConfig(), no_need_for_context_enabled=True,
+                                    no_need_for_context_threshold_tokens=20000,
+                                    no_need_for_context_retain_tokens=4000).no_need_for_context
+    assert lowered == NoNeedForContextConfig(True, 20000, retain_tokens=4000)
+
+
+def test_context_cli_rejects_a_lowered_threshold_with_the_default_tail(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("supervisor.main._startup_update_gate", lambda: None)
+
+    async def forbidden_run(settings):
+        pytest.fail("an invalid context policy must not start a run")
+
+    monkeypatch.setattr("supervisor.main._run_bello", forbidden_run)
+    result = CliRunner().invoke(cli, ["--no-need-for-context", "--context-threshold-tokens", "20000"])
+    assert result.exit_code != 0
+    assert "at most half of threshold_tokens" in result.output
+
+
+def test_context_editor_keeps_the_absolute_tail_valid():
+    config = ProjectConfig(no_need_for_context=NoNeedForContextConfig(True, 100000, retain_tokens=24800))
+    index = [p.key for p in parameter_defs(config)].index("no_need_for_context_threshold_tokens")
+    unchanged, state, _ = select_current(config, EditorState(parameter_index=index, editing=True,
+                                                           edit_kind="positive_int", edit_value="20000"))
+    assert unchanged == config and "at most half of threshold_tokens" in state.edit_error
+    percent = ProjectConfig(no_need_for_context=NoNeedForContextConfig(True, 20000, 10))
+    index = [p.key for p in parameter_defs(percent)].index("no_need_for_context_retention_mode")
+    switched, _, _ = select_current(percent, EditorState(parameter_index=index, expanded_index=index,
+                                                        option_index=0))
+    assert switched.no_need_for_context == NoNeedForContextConfig(True, 20000, retain_tokens=10000)
+
 @pytest.mark.parametrize("context,option", [
     (NoNeedForContextConfig(True, 100000, 20), 1),
     (NoNeedForContextConfig(True, 100000, retain_tokens=12345), 0),

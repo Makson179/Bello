@@ -275,6 +275,10 @@ def validate(
             errors.append("no_need_for_context: select only one of retain_tokens and retain_percent")
         if "retain_tokens" in context and not _is_int(context["retain_tokens"], minimum=1):
             errors.append("no_need_for_context.retain_tokens: expected a positive integer")
+        tail = context.get("retain_tokens", None if "retain_percent" in context else 24800)
+        threshold = context.get("threshold_tokens", 244800)
+        if _is_int(tail, minimum=1) and _is_int(threshold, minimum=1) and tail * 2 > threshold:
+            errors.append("no_need_for_context.retain_tokens: expected at most half of threshold_tokens")
         if "retain_percent" in context:
             percent = context["retain_percent"]
             if type(percent) not in (int, float) or not 0 < percent <= 50 or not math.isfinite(percent):

@@ -347,6 +347,9 @@ def _source_config_errors(payload: dict[str, Any], current: dict[str, Any], *, c
             errors.append("no_need_for_context must select only one of retain_tokens and retain_percent")
         if "retain_tokens" in context and (not _is_int(context["retain_tokens"]) or context["retain_tokens"] <= 0):
             errors.append("no_need_for_context.retain_tokens must be a positive integer")
+        elif ("retain_tokens" in context and _is_int(context["threshold_tokens"])
+              and context["retain_tokens"] * 2 > context["threshold_tokens"]):
+            errors.append("no_need_for_context.retain_tokens must be at most half of threshold_tokens")
         if "retain_percent" in context:
             percent = context["retain_percent"]
             if type(percent) not in (int, float) or not 0 < percent <= 50 or not math.isfinite(percent):
