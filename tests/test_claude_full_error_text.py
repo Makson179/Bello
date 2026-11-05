@@ -12,6 +12,7 @@ import sys
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from claude_agent_sdk import AssistantMessage, TextBlock
 from claude_agent_sdk._errors import ProcessError
 
 from supervisor.appserver import AppServerError, AppServerMessage
@@ -19,7 +20,9 @@ from supervisor.runtime.claude import CLI_STDERR_LOG, ClaudeBackend, ClaudeCliEr
 from supervisor.runtime_errors import bounded_provider_error
 from supervisor.schemas import BelloStatus
 from tests.support.controller import _runtime_controller
-from tests.test_runtime_claude import FakeClient, FakeFactory, backend, start_thread, wait_completed
+from tests.test_runtime_claude import (
+    FakeClient, FakeFactory, backend, result_message, start_thread, wait_completed,
+)
 
 LONG_STDERR = "Claude Code: OAuth token has expired; refresh_token=abc123 Authorization: Bearer xyz " + "z" * 6000
 
@@ -73,6 +76,68 @@ async def test_cli_stderr_reaches_the_turn_error_diagnostic_and_log_in_full(tmp_
     finally:
         await runtime.stop()
 
+
+
+class _ErrorResultFactory(FakeFactory):
+    """The CLI ends the turn with an error result instead of raising."""
+
+    def __init__(self, result):
+        super().__init__(complete_after_queries=None)
+        self.result = result
+
+    def __call__(self, options):
+        factory = self
+
+        class Client(FakeClient):
+            async def query(self, prompt):
+                await super().query(prompt)
+                self.options.stderr(RESULT_STDERR)
+                await self.messages.put(AssistantMessage(content=[TextBlock(text="working")], model="sonnet"))
+                await self.messages.put(factory.result)
+
+        client = Client(self, options)
+        self.clients.append(client)
+        return client
+
+
+RESULT_STDERR = "CLI: request failed with 529; Authorization: Bearer xyz"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["api_error", "cli_errors"])
+async def test_an_error_result_reports_the_cli_text_and_stderr_in_full(tmp_path, case):
+    # API failures arrive as subtype "success" with the prose in result; the
+    # CLI's own terminal errors arrive in errors[]. Neither raises in the SDK.
+    events = []
+    result = result_message(result="API Error: 529 {\"type\":\"overloaded_error\"} token=abc123"
+                            if case == "api_error" else None, is_error=True)
+    if case == "api_error":
+        result.api_error_status = 529
+    else:
+        result.subtype = "error_during_execution"
+        result.errors = ["Tool permission stream closed before response", "second CLI error"]
+    runtime = backend(tmp_path, _ErrorResultFactory(result), events)
+    try:
+        await start_thread(runtime, tmp_path)
+        await runtime.request("turn/start", {"threadId": "thread-1", "turnId": "failed-turn",
+                                             "input": [{"type": "text", "text": "work"}]})
+        turn = (await wait_completed(events))["params"]["turn"]
+    finally:
+        await runtime.stop()
+    assert turn["status"] == "failed" and turn["error"]["belloFullText"] is True
+    message, diagnostic = turn["error"]["message"], turn["failureDiagnostic"]
+    assert message.endswith("\nClaude Code CLI stderr:\n" + RESULT_STDERR)
+    assert diagnostic["version"] == 2 and diagnostic["cliStderr"] == RESULT_STDERR
+    if case == "api_error":
+        assert message.startswith("Claude Code returned an error result (subtype=success, terminal_reason=completed, "
+                                  "api_error_status=529, num_turns=1):\nAPI Error: 529 ")
+        assert "token=abc123" in message
+        assert diagnostic["errorResult"]["api_error_status"] == 529
+        assert diagnostic["errorResult"]["result"] == result.result
+    else:
+        assert message.startswith("Claude Code returned an error result (subtype=error_during_execution, ")
+        assert "\nTool permission stream closed before response\nsecond CLI error\n" in message
+        assert diagnostic["errorResult"]["errors"] == result.errors
 
 def test_provider_errors_flagged_full_text_stay_whole_and_others_stay_bounded():
     message = "token=abc123 " + "x" * 9000

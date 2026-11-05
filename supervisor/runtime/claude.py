@@ -1604,7 +1604,11 @@ class ClaudeBackend:
         elif not self._turn(record, turn_id)["items"] and isinstance(message.result, str) and message.result:
             await self._append_agent_item(record, turn_id, message.result)
         if status == "failed" and error is None:
-            error = "Claude Code reported that the turn failed"
+            # The CLI's own error result and stderr, untruncated and unredacted
+            # (owner decision), like the exception path in _drive_turn.
+            stderr = self._cli_stderr_lines(record["id"])
+            error, diagnostic = self._error_result_failure(message, stderr)
+            self._turn(record, turn_id)["failureDiagnostic"] = diagnostic
         await self._complete_turn(
             record, turn_id, status, usage, error,
             output_schema_failure=output_schema_failure,
@@ -2761,6 +2765,31 @@ class ClaudeBackend:
         if cli_stderr:
             text += "\nClaude Code CLI stderr:\n" + "\n".join(cli_stderr)
         return text
+
+    @staticmethod
+    def _error_result_failure(message: ResultMessage, cli_stderr: list[str]) -> tuple[str, dict[str, Any]]:
+        """The complete text and diagnostic of an error result the CLI returned.
+
+        The CLI reports API failures (``subtype: "success"``, ``result: "API
+        Error: ..."``) and its own terminal errors (``errors[]``) this way; the
+        SDK raises nothing for them. Everything is kept whole, by owner decision.
+        """
+        errors = [str(item) for item in message.errors or [] if str(item)]
+        result = message.result if isinstance(message.result, str) else ""
+        facts = {name: value for name in ("subtype", "terminal_reason", "stop_reason", "api_error_status", "num_turns")
+                 if (value := getattr(message, name, None)) not in (None, "")}
+        text = "Claude Code returned an error result"
+        if facts:
+            text += " (" + ", ".join(f"{name}={value}" for name, value in facts.items()) + ")"
+        details = [*errors, *([result] if result.strip() and result.strip() not in errors else [])]
+        if details:
+            text += ":\n" + "\n".join(details)
+        if cli_stderr:
+            text += "\nClaude Code CLI stderr:\n" + "\n".join(cli_stderr)
+        diagnostic: dict[str, Any] = {"version": 2, "errorResult": {**facts, "errors": errors, "result": result}}
+        if cli_stderr:
+            diagnostic["cliStderr"] = "\n".join(cli_stderr)
+        return text, diagnostic
 
     @staticmethod
     def _valid_uuid(value: Any) -> bool:
