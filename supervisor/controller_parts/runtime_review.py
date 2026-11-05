@@ -1481,6 +1481,7 @@ class RuntimeReview:
         apply_restart_metadata = decision.decision != compat.SupervisorDecisionKind.RESTART or restart_candidate
 
         intervention: tuple[str, str] | None = None
+        advisory_delivered = False
         lifecycle_changed_on_delivery = [False]
 
         def before_send() -> bool:
@@ -1511,6 +1512,7 @@ class RuntimeReview:
                     return lifecycle_changed_on_delivery[0]
                 delivered_at = compat.time.monotonic()
                 policy.mark_delivered(now=delivered_at, evidence_key=decision.advisory_key)
+                advisory_delivered = True
                 self.ports._append_event(compat.AppEventSource.SUPERVISOR,
                     "runtime/goal_advisory", reason="nonbinding progress observation delivered")
         if decision.decision == compat.SupervisorDecisionKind.INTERVENE and decision.message_to_coder and self.ports.coder:
@@ -1565,7 +1567,12 @@ class RuntimeReview:
             self.ports.store.write_text_locked(compat.HANDOFF, "")
         if decision.display_message and apply_restart_metadata:
             self.ports.tui.render("SUPERVISOR", decision.display_message)
-        if intervention is not None or (decision.decision == compat.SupervisorDecisionKind.RESTART and restart_candidate) or decision.decision == compat.SupervisorDecisionKind.PAUSE:
+        # A delivered advisory also starts or steers a coder turn: a readiness
+        # review queued behind this check would otherwise judge (and could
+        # accept) a workspace the coder is still changing.
+        if (intervention is not None or advisory_delivered
+                or (decision.decision == compat.SupervisorDecisionKind.RESTART and restart_candidate)
+                or decision.decision == compat.SupervisorDecisionKind.PAUSE):
             self.state._runtime_decision_invalidated_completion = True
         self.ports._record_supervisor_decision_metric(use_case="runtime", decision=decision.decision.value)
         self.ports.store.update_bello_config(
