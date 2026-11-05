@@ -117,6 +117,9 @@ async def test_cancel_between_preparations_prevents_query_and_reconnect(tmp_path
         await instance.request('turn/start',{'threadId':'thread-1','turnId':'t','input':[{'type':'text','text':'work'}]})
         assert (await wait_completed(events))['params']['turn']['status']=='interrupted'
         assert len(factory.clients)==1 and factory.main_queries==0
+        # No orphaned queue reader may swallow the owner's next command; stop()
+        # would otherwise wait out its 10-second owner timeout.
+        await asyncio.wait_for(instance.stop(),timeout=5)
     finally: await instance.stop()
 
 

@@ -775,7 +775,12 @@ class ClaudeBackend:
             return stop_owner
         except _ContextCancelled as exc:
             self._resolve(exc.command, {})
-            command_task = None
+            # A cancellation found in the queue can leave this turn's own
+            # queue.get() pending. Keep it for the cleanup below, which cancels
+            # it or returns a raced command; dropping it would let an orphaned
+            # getter swallow the owner's next command (stop, turn/start).
+            if command_task is not None and command_task.done():
+                command_task = None
             stop_owner = exc.command.kind == "stop"
             await self._complete_turn(record, turn_id, "interrupted", self._async_usage.get(async_key, {}), "Turn interrupted")
             return stop_owner
