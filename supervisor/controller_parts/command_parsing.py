@@ -1418,6 +1418,20 @@ def _test_count_summary(output: str) -> tuple[int | None, int | None]:
     ]
     if node_failures:
         failed = max(failed or 0, *node_failures)
+    # Runner verdicts that the shell status can hide (`... ; echo exit=$?`,
+    # `... | tail`): unittest's "FAILED (failures=1, errors=2)", pytest's
+    # errors on its timing summary line and Go's FAIL lines. Only ever a failure.
+    for verdict in compat.re.finditer(r"(?m)^failed \(([^)]*)\)[ \t]*$", lowered):
+        counts = [int(value) for value in compat.re.findall(r"\b(?:failures|errors)=(\d+)", verdict.group(1))]
+        failed = (failed or 0) + (sum(counts) or 1)
+    for line in lowered.splitlines():
+        if compat.re.search(r"\bin\s+\d+(?:\.\d+)?s\b", line):
+            errors = sum(int(value) for value in compat.re.findall(r"\b(\d+)\s+errors?\b", line))
+            if errors:
+                failed = (failed or 0) + errors
+    go_failures = len(compat.re.findall(r"(?m)^[ \t]*--- fail:", lowered))
+    if go_failures or compat.re.search(r"(?m)^fail(?:[ \t]|$)", lowered):
+        failed = max(failed or 0, go_failures or 1)
     if passed is not None and failed is None:
         failed = 0
     return passed, failed

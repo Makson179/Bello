@@ -149,6 +149,37 @@ def test_test_runs_with_descriptor_duplication_are_behavioral_evidence(
 
 
 @pytest.mark.parametrize(
+    "command, stdout, outcome",
+    [
+        ("python3 -m unittest discover -s tests -t . 2>&1; echo exit=$?",
+         "F..\n" + "-" * 70 + "\nRan 3 tests in 0.001s\n\nFAILED (failures=1)\nexit=1\n", "failed"),
+        ("python3 -m unittest discover -s tests -t .; echo exit=$?",
+         "F..\n" + "-" * 70 + "\nRan 3 tests in 0.001s\n\nFAILED (failures=1)\nexit=1\n", "failed"),
+        ("python3 -m unittest discover -s tests -t . | tail -5",
+         "E..\n" + "-" * 70 + "\nRan 3 tests in 0.001s\n\nFAILED (errors=2, skipped=1)\n", "failed"),
+        ("python3 -m pytest -q 2>&1 | tail -5", "...\n4 passed, 1 error in 0.02s\n", "failed"),
+        ("go test ./... 2>&1 | tail -3", "--- FAIL: TestMean (0.00s)\nFAIL\nFAIL\texample.com/stats\t0.01s\n", "failed"),
+        ("python3 -m pytest -q 2>&1 | tail -5", "...\n5 passed, 0 errors in 0.02s\n", "passed"),
+        ("go test ./... 2>&1 | tail -3", "ok  \texample.com/stats\t0.01s\n", "passed"),
+    ],
+)
+def test_runner_verdict_beats_a_shell_status_hidden_by_a_trailing_command(
+    posix_command_semantics: None, command: str, stdout: str, outcome: str,
+) -> None:
+    # `; echo exit=$?` and `| tail` make the shell report 0 even when tests fail.
+    validation = _validation_from_action(
+        TriggeringAction(
+            kind="commandExecution", command=command, exit_code=0,
+            status="completed", summary="command completed",
+        ),
+        sequence=7, item={"stdout": stdout},
+    )
+    assert validation is not None and validation.type == "behavioral"
+    assert validation.trusted_validation_outcome == outcome
+    assert validation.passed is (outcome == "passed")
+
+
+@pytest.mark.parametrize(
     "command",
     ["python3 -m pytest -q &>out.log", "python3 -m pytest -q >&out.log", "python3 -m pytest -q & echo started"],
 )
