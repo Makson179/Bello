@@ -194,10 +194,11 @@ class BelloConfig(BaseModel):
     max_adversary_runs: int = 1
     completion_review_enabled: bool = True
     runtime_enabled: bool = True
-    # Opt-in Goal mode (see ProjectConfig.goal). Runtime supervision and completion
-    # review are mandatory while it is on; nothing else is implied.
+    # Opt-in Goal mode (see ProjectConfig.goal). Completion review is mandatory while
+    # it is on; goal_runtime (default on) decides runtime supervision. Nothing else is implied.
     goal: bool = Field(default=False, strict=True)
     goal_adversary_after_returns: int = Field(default=0, strict=True, ge=0)
+    goal_runtime: bool = Field(default=True, strict=True)
     # Smart Execution defaults on; a saved explicit false is preserved.
     async_tools: bool = True
     no_need_for_context: dict[str, Any] = Field(

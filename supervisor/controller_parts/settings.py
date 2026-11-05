@@ -51,6 +51,7 @@ class SettingsPort(CoordinatorPort):
         '_generate_schema_hash_async',
         '_goal_enabled',
         '_goal_adversary_after_returns',
+        '_goal_runtime',
         '_log_distiller_config',
         '_multi_agent_config',
         '_persist_model_config',
@@ -86,6 +87,7 @@ class SettingsPort(CoordinatorPort):
         'finalize',
         'goal',
         'goal_adversary_after_returns',
+        'goal_runtime',
         'log_distiller',
         'model',
         'overwrite_state',
@@ -193,15 +195,28 @@ class Settings:
         except Exception:
             return 0
 
-    def _runtime_enabled(self) -> bool:
-        # Runtime supervision is mandatory while Goal is on: neither a saved
-        # false nor a one-run override can disable it.
-        if self.ports._goal_enabled():
+    def _goal_runtime(self) -> bool:
+        """Goal's own runtime switch (default on); inert unless Goal is enabled."""
+        override = getattr(self.ports, "goal_runtime", None)
+        if override is not None:
+            return bool(override)
+        config = getattr(self.ports, "project_config", None)
+        if config is not None:
+            return bool(getattr(config, "goal_runtime", True))
+        try:
+            return bool(self.ports.store.get_bello_config().goal_runtime)
+        except Exception:
             return True
+
+    def _runtime_enabled(self) -> bool:
+        # While Goal is on, only Goal's own runtime switch decides: neither a
+        # saved runtime_enabled nor a one-run --runtime/--no-runtime applies.
+        if self.ports._goal_enabled():
+            return self.ports._goal_runtime()
         return self.ports._runtime_choice()
 
     def _runtime_choice(self) -> bool:
-        """The run's runtime switch before Goal forces supervision on.
+        """The run's runtime switch before Goal applies its own goal_runtime.
 
         Persisted run state records this choice, so a Goal run never rewrites a
         saved runtime preference; every reader applies Goal first.
@@ -305,6 +320,7 @@ class Settings:
             task=compat._workspace_display_path(self.ports.project_root, str(self.ports.task_path)),
             goal=self.ports._goal_enabled(),
             goal_adversary_after_returns=self.ports._goal_adversary_after_returns(),
+            goal_runtime=self.ports._goal_runtime(),
             coder_mod=self.ports._coder_model() or compat.DEFAULT_MODEL,
             runtime_mod=self.ports._runtime_model() or compat.DEFAULT_MODEL,
             completion_mod=self.ports._completion_model() or compat.DEFAULT_MODEL,
@@ -347,6 +363,8 @@ class Settings:
         goal_checkpoint_summary = ""
         if self.ports._goal_enabled() and (checkpoint := self.ports._goal_adversary_after_returns()):
             goal_checkpoint_summary = f"goal-adversary-after-returns={checkpoint} "
+        if self.ports._goal_enabled() and not self.ports._goal_runtime():
+            goal_checkpoint_summary += "goal-runtime=false "
         return (
             f"settings: {'goal=true ' if self.ports._goal_enabled() else ''}"
             f"{goal_checkpoint_summary}"

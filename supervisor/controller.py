@@ -711,6 +711,7 @@ class BelloController:
     _async_tools_enabled = service_method('settings', Settings._async_tools_enabled)
     _goal_enabled = service_method('settings', Settings._goal_enabled)
     _goal_adversary_after_returns = service_method('settings', Settings._goal_adversary_after_returns)
+    _goal_runtime = service_method('settings', Settings._goal_runtime)
     _no_need_for_context_config = service_method('settings', Settings._no_need_for_context_config)
     _log_distiller_config = service_method('settings', Settings._log_distiller_config)
     _windows_native_root_read_enabled = service_method('settings', Settings._windows_native_root_read_enabled)
@@ -954,6 +955,7 @@ class BelloController:
         log_distiller: LogDistillerConfig | None = None,
         goal: bool | None = None,
         goal_adversary_after_returns: int | None = None,
+        goal_runtime: bool | None = None,
         declared_grading_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
         project_config: ProjectConfig | None = None,
         recovery_enabled: bool = True,
@@ -1011,9 +1013,10 @@ class BelloController:
         self.no_need_for_context = no_need_for_context
         self.log_distiller = log_distiller
         # Goal override for this run (None = the saved project/run config decides). While
-        # Goal is on, runtime supervision and completion review are mandatory.
+        # Goal is on, completion review is mandatory and goal_runtime decides runtime supervision.
         self.goal = goal
         self.goal_adversary_after_returns = goal_adversary_after_returns
+        self.goal_runtime = goal_runtime
         self.project_config = project_config
         self.event_queue: asyncio.Queue[ControllerEvent] = asyncio.Queue()
         self.client = client or RuntimeClient(
@@ -1318,11 +1321,12 @@ class BelloController:
             max_completion_returns_after_adversary=project_config.completion_returns_after_adversary,
             completion_review_enabled=project_config.completion_review,
             cheap_runtime=self._runtime_enabled() and project_config.cheap_runtime,
-            # Goal forces runtime on at every point of use; keep the saved choice.
+            # Goal applies goal_runtime at every point of use; keep the saved choice.
             runtime_enabled=self._runtime_choice(),
             goal=self._goal_enabled(),
             async_tools=self._async_tools_enabled(),
             goal_adversary_after_returns=self._goal_adversary_after_returns(),
+            goal_runtime=self._goal_runtime(),
             no_need_for_context=self._no_need_for_context_config().to_json_data(),
             windows_native_root_read=self._windows_native_root_read_enabled(),
             log_distiller=self._log_distiller_config().to_json_data(),
@@ -1451,10 +1455,11 @@ class BelloController:
                     "max_completion_returns_after_adversary": project_config.completion_returns_after_adversary,
                     "completion_review_enabled": project_config.completion_review,
                     "cheap_runtime": self._runtime_enabled() and project_config.cheap_runtime,
-                    # Goal forces runtime on at every point of use; keep the saved choice.
+                    # Goal applies goal_runtime at every point of use; keep the saved choice.
                     "runtime_enabled": self._runtime_choice(),
                     "goal": self._goal_enabled(),
                     "goal_adversary_after_returns": self._goal_adversary_after_returns(),
+                    "goal_runtime": self._goal_runtime(),
                     "async_tools": self._async_tools_enabled(),
                     "no_need_for_context": self._no_need_for_context_config().to_json_data(),
                     "windows_native_root_read": self._windows_native_root_read_enabled(),

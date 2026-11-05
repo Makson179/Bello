@@ -115,7 +115,7 @@ def adversary_active(config: ProjectConfig) -> bool:
 def project_profiles(config: ProjectConfig) -> tuple[ProfileUse, ...]:
     """Active profiles of a saved configuration, as a run would check them."""
     adversary = adversary_active(config)
-    # Goal makes completion review and runtime supervision mandatory.
+    # Goal makes completion review mandatory; goal_runtime decides its runtime supervision.
     completion_review = config.effective_completion_review
     review = completion_review or adversary
     policies: list[tuple[str, MultiAgentConfig]] = [("multi_agent", config.multi_agent)]

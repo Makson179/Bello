@@ -51,7 +51,8 @@ def policy():
 
 
 def config():
-    result = dict(review_limit_format="explicit", task="TASK.md", goal=False, goal_adversary_after_returns=0, speed="usual",
+    result = dict(review_limit_format="explicit", task="TASK.md", goal=False, goal_adversary_after_returns=0,
+                  goal_runtime=True, speed="usual",
                   revision_coder_enabled=False, runtime_enabled=True, cheap_runtime=False,
                   async_tools=False, windows_native_root_read=False,
                   no_need_for_context={"enabled": False, "threshold_tokens": 249000, "retain_percent": 10},

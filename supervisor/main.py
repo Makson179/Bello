@@ -146,10 +146,11 @@ class BelloClickGroup(click.Group):
     "--goal/--no-goal",
     default=None,
     help=(
-        "Keep working toward the original task until its completion review accepts it. While on, runtime "
-        "supervision and completion review are mandatory (--no-runtime and --completion-review false are "
-        "ignored) and completion returns are unlimited. Smart Execution, the revision coder, context "
-        "compaction and the log distiller keep their own settings."
+        "Keep working toward the original task until its completion review accepts it. While on, completion "
+        "review is mandatory (--completion-review false is ignored), runtime supervision follows "
+        "--goal-runtime/--no-goal-runtime instead of --runtime/--no-runtime (on by default), and completion "
+        "returns are unlimited. Smart Execution, the revision coder, context compaction and the log distiller "
+        "keep their own settings."
     ),
 )
 @click.option(
@@ -163,10 +164,22 @@ class BelloClickGroup(click.Group):
     ),
 )
 @click.option(
+    "--goal-runtime/--no-goal-runtime",
+    "goal_runtime",
+    default=None,
+    help=(
+        "Enable or disable runtime supervision for Goal runs (on unless a saved goal_runtime=false says "
+        "otherwise). Off makes no runtime, cheap-triage or Goal progress review model calls and, as with "
+        "--no-runtime, enables network inside the filesystem sandbox with no outside-sandbox escalation. Like "
+        "the other switches it is recorded for later runs; it has no effect while Goal is off."
+    ),
+)
+@click.option(
     "--runtime/--no-runtime",
     "runtime_enabled",
     default=None,
-    help="Enable or disable runtime supervision for this run (mandatory while --goal is on).",
+    help=("Enable or disable runtime supervision for this run (ignored while --goal is on; use "
+          "--goal-runtime/--no-goal-runtime there)."),
 )
 @click.option(
     "--async-tools/--no-async-tools",
@@ -286,6 +299,7 @@ def cli(
     clean: bool | None,
     goal: bool | None,
     goal_adversary_after_returns: int | None,
+    goal_runtime: bool | None,
     runtime_enabled: bool | None,
     async_tools: bool | None,
     no_need_for_context_enabled: bool | None,
@@ -353,6 +367,7 @@ def cli(
             clean=clean,
             goal=goal,
             goal_adversary_after_returns=goal_adversary_after_returns,
+            goal_runtime=goal_runtime,
             runtime_enabled=runtime_enabled,
             async_tools=async_tools,
             no_need_for_context_enabled=no_need_for_context_enabled,
@@ -730,9 +745,13 @@ def config_command() -> None:
     if config.revision_coder_enabled:
         click.echo(f"revision-coder-mod: {config.revision_coder_mod}")
         click.echo(f"revision-coder-intelligence: {config.revision_coder_intelligence}")
-    # While Goal is on, runtime supervision and completion review are mandatory.
+    # While Goal is on, completion review is mandatory and goal_runtime decides runtime supervision.
     required = " (required by goal)" if config.goal else ""
-    click.echo(f"runtime: {str(config.effective_runtime_enabled).lower()}{required if not config.runtime_enabled else ''}")
+    if config.goal:
+        click.echo(f"goal-runtime: {str(config.goal_runtime).lower()}")
+    runtime_note = (required if config.goal_runtime and not config.runtime_enabled else
+                    " (goal-runtime off)" if not config.goal_runtime else "") if config.goal else ""
+    click.echo(f"runtime: {str(config.effective_runtime_enabled).lower()}{runtime_note}")
     click.echo(f"async-tools: {str(config.async_tools).lower()}")
     click.echo(f"no-need-for-context: {str(config.no_need_for_context.enabled).lower()}")
     if config.no_need_for_context.enabled:
@@ -895,7 +914,8 @@ async def _run_bello(settings: RunSettings) -> int:
         clean_workspace=settings.clean,
         goal=settings.goal,
         goal_adversary_after_returns=settings.goal_adversary_after_returns,
-        # Goal is passed separately and forces runtime on inside the controller.
+        goal_runtime=settings.goal_runtime,
+        # Goal is passed separately; the controller applies goal_runtime itself.
         runtime_enabled=settings.runtime_enabled if settings.runtime_choice is None else settings.runtime_choice,
         async_tools=settings.async_tools,
         no_need_for_context=settings.no_need_for_context,
@@ -934,8 +954,11 @@ class RunSettings:
     adversary_runs: int
     goal: bool = False
     goal_adversary_after_returns: int = 0
+    # Goal's own runtime switch; inert unless goal is true.
+    goal_runtime: bool = True
+    # Effective runtime supervision for this run (Goal applies goal_runtime).
     runtime_enabled: bool = True
-    # Runtime switch before Goal forces supervision on (None: same as runtime_enabled).
+    # Runtime switch before Goal applies goal_runtime (None: same as runtime_enabled).
     runtime_choice: bool | None = None
     async_tools: bool = True
     no_need_for_context: NoNeedForContextConfig = field(default_factory=NoNeedForContextConfig)
@@ -966,6 +989,7 @@ def _resolve_run_settings(
     clean: bool | None = None,
     goal: bool | None = None,
     goal_adversary_after_returns: int | None = None,
+    goal_runtime: bool | None = None,
     runtime_enabled: bool | None = None,
     async_tools: bool | None = None,
     no_need_for_context_enabled: bool | None = None,
@@ -1005,6 +1029,9 @@ def _resolve_run_settings(
     if (not isinstance(selected_goal_checkpoint, int) or isinstance(selected_goal_checkpoint, bool)
             or selected_goal_checkpoint < 0):
         raise RuntimeError("goal_adversary_after_returns must be a non-negative integer")
+    selected_goal_runtime = project_config.goal_runtime if goal_runtime is None else goal_runtime
+    if not isinstance(selected_goal_runtime, bool):
+        raise RuntimeError("goal_runtime must be true or false")
     selected_runtime_enabled = project_config.runtime_enabled if runtime_enabled is None else runtime_enabled
     # The run's own switch. The controller applies Goal itself and records this
     # choice, so a Goal run never rewrites the saved runtime preference.
@@ -1012,17 +1039,28 @@ def _resolve_run_settings(
     selected_completion_review = project_config.completion_review if completion_review is None else completion_review
     goal_notices: list[str] = []
     if selected_goal:
-        # Goal makes runtime supervision and completion review mandatory. Smart Execution is
-        # deliberately not touched: it keeps its own default and any explicit choice.
-        if not selected_runtime_enabled:
+        # Goal makes completion review mandatory and its own goal_runtime switch decides runtime
+        # supervision (default on). Smart Execution is deliberately not touched: it keeps its own
+        # default and any explicit choice.
+        if selected_goal_runtime and not selected_runtime_enabled:
             goal_notices.append(
                 "Goal mode requires runtime supervision; "
                 + ("ignoring --no-runtime." if runtime_enabled is False
                    else "the saved runtime=false is overridden for this run.")
             )
+        if not selected_goal_runtime and runtime_enabled is True:
+            goal_notices.append("Goal runtime supervision is off (goal_runtime=false); ignoring --runtime.")
+        elif not selected_goal_runtime and goal_runtime is None:
+            # A dormant saved choice (possibly recorded by a non-Goal run) must not
+            # silently reduce a Goal run's protection.
+            goal_notices.append(
+                "Goal runs without runtime supervision (saved goal_runtime=false): network is enabled inside "
+                "the filesystem sandbox and outside-sandbox escalation is unavailable; --goal-runtime turns it "
+                "on for this run."
+            )
         if completion_review is False:
             goal_notices.append("Goal mode requires completion review; ignoring --completion-review false.")
-        selected_runtime_enabled = True
+        selected_runtime_enabled = selected_goal_runtime
         selected_completion_review = True
     selected_adversary = (
         adversary if adversary is not None
@@ -1080,6 +1118,7 @@ def _resolve_run_settings(
         clean=project_config.clean if clean is None else clean,
         goal=selected_goal,
         goal_adversary_after_returns=selected_goal_checkpoint,
+        goal_runtime=selected_goal_runtime,
         goal_notices=tuple(goal_notices),
         runtime_enabled=selected_runtime_enabled,
         runtime_choice=runtime_choice,

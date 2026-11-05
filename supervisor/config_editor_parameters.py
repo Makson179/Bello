@@ -20,6 +20,7 @@ from supervisor.project_config import (
 
 GOAL_UNLIMITED_VALUE = "Unlimited (goal)"
 GOAL_FORCED_VALUE = "true (goal)"
+GOAL_RUNTIME_OFF_VALUE = "false (goal-runtime)"
 MODEL_FAMILY_ASTRA_LABEL = "GPT-6 Astra"
 
 
@@ -131,7 +132,8 @@ def _parameter_defs(
 ) -> tuple[EditorParameter, ...]:
     from supervisor import config_editor as _editor
 
-    # Goal makes runtime supervision and completion review mandatory, whatever was saved.
+    # Goal makes completion review mandatory and goal_runtime decides runtime supervision,
+    # whatever runtime_enabled saved.
     runtime_enabled = config.effective_runtime_enabled
     completion_review = config.effective_completion_review
     coder_parameters = _editor._role_parameters(
@@ -332,10 +334,23 @@ def _parameter_defs(
             _editor._format_bool(config.goal),
             (_editor.EditorOption("true", "goal", True), _editor.EditorOption("false", "goal", False)),
             help_text=("Keep working toward the original task until the completion review accepts it. Runtime "
-                       "supervision and completion review become mandatory and completion returns unlimited. "
-                       "Smart Execution, the revision coder, context compaction and the log distiller keep "
-                       "their own settings. Off by default."),
+                       "supervision (unless goal-runtime is false) and completion review become mandatory and "
+                       "completion returns unlimited. Smart Execution, the revision coder, context compaction "
+                       "and the log distiller keep their own settings. Off by default."),
         ),
+        *((_editor.EditorParameter(
+            "goal_runtime",
+            "goal-runtime",
+            _editor._format_bool(config.goal_runtime) + ("" if config.goal else " (inactive)"),
+            (_editor.EditorOption("true", "goal_runtime", True), _editor.EditorOption("false", "goal_runtime", False)),
+            help_text=(
+                "Runtime supervision in goal mode (default true). false runs goal without runtime, cheap-triage "
+                "or goal progress review model calls; completion review, the goal checkpoint and automatic "
+                "continuation still apply. Like runtime off, it reduces safety: network is enabled inside the "
+                "filesystem sandbox, with no runtime review or outside-sandbox escalation. Inactive unless goal "
+                "is enabled. Choose before starting a fresh run."
+            ),
+        ),) if config.goal or not config.goal_runtime else ()),
         *((_editor.EditorParameter(
             "goal_adversary_after_returns",
             "goal-adversary-after-returns",
@@ -412,12 +427,14 @@ def _parameter_defs(
         _editor.EditorParameter(
             "runtime_enabled",
             "runtime",
-            GOAL_FORCED_VALUE if config.goal else _editor._format_bool(config.runtime_enabled),
+            (GOAL_FORCED_VALUE if config.goal_runtime else GOAL_RUNTIME_OFF_VALUE) if config.goal
+            else _editor._format_bool(config.runtime_enabled),
             () if config.goal else (
                 _editor.EditorOption("true", "runtime_enabled", True), _editor.EditorOption("false", "runtime_enabled", False)
             ),
             help_text=(
-                "Runtime supervision is always on in goal mode, whatever was saved here. Turn goal off to change it."
+                "In goal mode, goal-runtime decides runtime supervision, whatever was saved here. Turn goal off "
+                "to change this value."
             ) if config.goal else (
                 "Run runtime supervision and its optional cheap triage. Off reduces safety: network is enabled "
                 "inside the filesystem sandbox, with no runtime review or outside-sandbox escalation."

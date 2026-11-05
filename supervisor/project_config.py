@@ -88,6 +88,7 @@ RUNTIME_SYNC_FIELDS = (
     "task",
     "goal",
     "goal_adversary_after_returns",
+    "goal_runtime",
     "coder_mod",
     "revision_coder_enabled",
     "revision_coder_mod",
@@ -212,6 +213,9 @@ class ProjectConfig:
     # 0 preserves unlimited Goal completion review before the first adversary.
     # A positive checkpoint is dormant unless Goal and adversary are enabled.
     goal_adversary_after_returns: int = 0
+    # Runtime supervision while Goal is on. False runs Goal with runtime off (the
+    # same execution policy as runtime_enabled=false); ignored without Goal.
+    goal_runtime: bool = True
     coder_mod: str = DEFAULT_MODEL
     revision_coder_enabled: bool = False
     revision_coder_mod: str = DEFAULT_MODEL
@@ -256,8 +260,8 @@ class ProjectConfig:
 
     @property
     def effective_runtime_enabled(self) -> bool:
-        """Runtime supervision is mandatory while Goal is on, whatever was saved."""
-        return self.goal or self.runtime_enabled
+        """While Goal is on, goal_runtime decides, whatever runtime_enabled saved."""
+        return self.goal_runtime if self.goal else self.runtime_enabled
 
     @property
     def effective_completion_review(self) -> bool:
@@ -274,6 +278,7 @@ class ProjectConfig:
             "task": self.task,
             "goal": self.goal,
             "goal_adversary_after_returns": self.goal_adversary_after_returns,
+            "goal_runtime": self.goal_runtime,
             "coder_mod": self.coder_mod,
             "revision_coder_enabled": self.revision_coder_enabled,
             "revision_coder_mod": self.revision_coder_mod,
@@ -476,6 +481,7 @@ def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfi
             "goal_adversary_after_returns",
             path=path,
         ),
+        goal_runtime=_bool(payload.get("goal_runtime", default.goal_runtime), "goal_runtime", path=path),
         coder_mod=coder_mod,
         revision_coder_enabled=_bool(
             payload.get("revision_coder_enabled", default.revision_coder_enabled),
@@ -798,6 +804,8 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
         updates["goal"] = config.goal
     if "goal_adversary_after_returns" in selected:
         updates["goal_adversary_after_returns"] = config.goal_adversary_after_returns
+    if "goal_runtime" in selected:
+        updates["goal_runtime"] = config.goal_runtime
     if "task" in selected:
         updates["task"] = config.task
         updates["task_path"] = config.task or ""
@@ -846,7 +854,7 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
         updates["no_need_for_context"] = config.no_need_for_context.to_json_data()
     if "windows_native_root_read" in selected:
         updates["windows_native_root_read"] = config.windows_native_root_read
-    if selected.intersection({"cheap_runtime", "runtime_enabled", "goal"}):
+    if selected.intersection({"cheap_runtime", "runtime_enabled", "goal", "goal_runtime"}):
         updates["cheap_runtime"] = config.effective_cheap_runtime
     if "log_distiller" in selected:
         updates["log_distiller"] = config.log_distiller.to_json_data()

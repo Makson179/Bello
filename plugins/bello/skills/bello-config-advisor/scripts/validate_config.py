@@ -49,10 +49,11 @@ REQUIRED_KEYS = {
     "adversary_multi_agent",
 }
 # Older complete recommendations omit these opt-ins. Match ProjectConfig's
-# defaults (async_tools=true, windows_native_root_read=false, goal=false) without
-# accepting arbitrary new keys or coercing strings.
-OPTIONAL_BOOLEAN_KEYS = {"async_tools", "windows_native_root_read", "goal"}
-OPTIONAL_BOOLEAN_DEFAULTS = {"async_tools": True, "windows_native_root_read": False, "goal": False}
+# defaults (async_tools=true, windows_native_root_read=false, goal=false,
+# goal_runtime=true) without accepting arbitrary new keys or coercing strings.
+OPTIONAL_BOOLEAN_KEYS = {"async_tools", "windows_native_root_read", "goal", "goal_runtime"}
+OPTIONAL_BOOLEAN_DEFAULTS = {"async_tools": True, "windows_native_root_read": False, "goal": False,
+                             "goal_runtime": True}
 OPTIONAL_OBJECT_KEYS = {"no_need_for_context"}
 OPTIONAL_INTEGER_KEYS = {"goal_adversary_after_returns"}
 
@@ -290,9 +291,16 @@ def validate(
     runtime = config.get("runtime_enabled") is True
     review = config.get("completion_review") is True
     goal = config.get("goal", False) is True
-    if goal and not (runtime and review):
+    goal_runtime = config.get("goal_runtime", True) is not False
+    if goal and goal_runtime and not (runtime and review):
         # Goal makes both mandatory; a recommendation must say so explicitly.
         errors.append("goal: requires runtime_enabled=true and completion_review=true")
+    if goal and not goal_runtime:
+        if not review:
+            errors.append("goal: requires completion_review=true")
+        # Goal's own switch turns runtime off; runtime_enabled stays the dormant
+        # non-Goal preference, so applying the setup never rewrites it.
+        runtime = False
     adversary_enabled = config.get("adversary") is True
     active_roles = {"coder"}
     if runtime:
@@ -306,7 +314,8 @@ def validate(
     for role in ("coder", "revision_coder", "runtime", "completion", "adversary"):
         _validate_role(config, role, errors, catalog=entries, active=role in active_roles)
     if not runtime and config.get("cheap_runtime") is True:
-        errors.append("cheap_runtime: must be false when runtime_enabled=false")
+        errors.append("cheap_runtime: must be false when goal_runtime=false" if goal and not goal_runtime
+                      else "cheap_runtime: must be false when runtime_enabled=false")
     if runtime and config.get("cheap_runtime") is True:
         try:
             identity = qualified_model(triage_model, allow_legacy=True)

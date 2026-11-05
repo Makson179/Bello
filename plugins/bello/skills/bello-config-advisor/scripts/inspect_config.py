@@ -192,6 +192,7 @@ def _normalize(payload: dict[str, Any], *, config_exists: bool) -> dict[str, Any
         "task": _optional_nonempty_string(_first(payload, ("task", "task_path"), None, skip_none=True)),
         "goal": payload.get("goal", False),
         "goal_adversary_after_returns": payload.get("goal_adversary_after_returns", 0),
+        "goal_runtime": payload.get("goal_runtime", True),
         "coder_mod": coder_model,
         "revision_coder_enabled": payload.get("revision_coder_enabled", False),
         "revision_coder_mod": revision_coder_model,
@@ -319,6 +320,7 @@ def _source_config_errors(payload: dict[str, Any], current: dict[str, Any], *, c
         errors.append("fast must be boolean")
     for field in (
         "goal",
+        "goal_runtime",
         "revision_coder_enabled",
         "runtime_enabled",
         "async_tools",
