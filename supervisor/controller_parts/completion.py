@@ -234,9 +234,7 @@ class Completion:
             )
             return
         if goal:
-            cfg = self.ports.store.get_bello_config()
-            coder = self.ports.coder
-            self.state._goal_auto_next_pending = (cfg.generation, cfg.coder_thread_id, id(coder), object())
+            self._arm_goal_auto_next()
             await self.ports._resume_goal_auto_next()
             return
         if not self.ports._runtime_enabled():
@@ -249,6 +247,11 @@ class Completion:
             await self.ports._handle_no_marker_idle()
             return
         self.ports._schedule_supervisor_check("Coder turn completed", triggering_item_id=item_id)
+
+    def _arm_goal_auto_next(self) -> None:
+        """Arm one Goal continuation for the current coder lifecycle."""
+        cfg = self.ports.store.get_bello_config()
+        self.state._goal_auto_next_pending = (cfg.generation, cfg.coder_thread_id, id(self.ports.coder), object())
 
     async def _resume_goal_auto_next(self) -> bool:
         """Consume one successful-turn continuation under the delivery lock.

@@ -810,6 +810,7 @@ class BelloController:
     no_marker_idle_nudge_count = OwnedField('completion', 'no_marker_idle_nudge_count')
     provider_failure_recovery_counts = OwnedField('completion', 'provider_failure_recovery_counts')
     _handle_coder_turn_completed = service_method('completion', Completion._handle_coder_turn_completed)
+    _arm_goal_auto_next = service_method('completion', Completion._arm_goal_auto_next)
     _resume_goal_auto_next = service_method('completion', Completion._resume_goal_auto_next)
     _continue_after_readiness_marker = service_method('completion', Completion._continue_after_readiness_marker)
     _done_without_fresh_behavioral_validation = service_method('completion', Completion._done_without_fresh_behavioral_validation)
@@ -1553,6 +1554,12 @@ class BelloController:
             self.paused = False
             self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"status": BelloStatus.RUNNING}))
             self.tui.status("resumed")
+            if self._goal_enabled() and self.coder is not None:
+                # The pause interrupted the coder or cancelled a review, so no
+                # successful turn will continue Goal work. The delivery claim
+                # still refuses an active turn, approvals and live subagents.
+                self._arm_goal_auto_next()
+                await self._resume_goal_auto_next()
             return
         if text == "/restart":
             await self.restart("user requested supervised restart")

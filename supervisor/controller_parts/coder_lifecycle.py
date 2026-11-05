@@ -75,6 +75,7 @@ class CoderLifecyclePort(CoordinatorPort):
         '_handle_coder_turn_completed',
         '_handle_no_marker_idle',
         '_resume_goal_auto_next',
+        '_arm_goal_auto_next',
         '_interrupt_stale_revision_turn',
         '_last_completion_marker_sequence',
         '_last_restart_budget_signature',
@@ -412,7 +413,20 @@ class CoderLifecycle:
         if self.ports._goal_enabled():
             # Goal continuation follows completed turns immediately. Readiness,
             # rather than elapsed idle time, is the completion-review trigger.
-            self.ports._reset_no_marker_idle()
+            # Safety net: an idle coder that nothing will continue (a resumed
+            # pause, recovered transport, a runtime noop) gets one continuation
+            # message after the continuous-idle window, never a review.
+            task = getattr(self.ports, "_supervisor_task", None)
+            if (getattr(self.ports, "pending_approvals", None) or (task is not None and not task.done())
+                    or getattr(self.ports, "_supervisor_next_runtime_summary", None) is not None
+                    or getattr(self.ports, "_supervisor_next_completion_summary", None) is not None
+                    or getattr(self.ports, "_deferred_completion_check", None) is not None):
+                self.ports._reset_no_marker_idle()
+                return
+            if self.ports._no_marker_idle_ready(now=now):
+                self.ports._reset_no_marker_idle()
+                self.ports._arm_goal_auto_next()
+                await self.ports._resume_goal_auto_next()
             return
         if getattr(self.ports, "pending_approvals", None):
             self.ports._reset_no_marker_idle()

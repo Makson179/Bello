@@ -340,12 +340,19 @@ async def test_unknown_probe_retries_next_guard_tick_without_another_40_minutes(
 async def test_goal_idle_guard_never_probes_or_reviews(idle_controller):
     controller, store, reviewer, clock = idle_controller
     store.update_bello_config(lambda cfg: cfg.model_copy(update={"goal": True}))
-    controller._deliver_coder_message = AsyncMock(return_value=(True, None))
+
+    async def deliver(message, *, before_send=None, **_options):
+        return (before_send is None or before_send()), None
+
+    controller._deliver_coder_message = AsyncMock(side_effect=deliver)
     controller.client.read_execution_status.return_value = {"state": "quiescent"}
     for _ in range(3):
         await controller._handle_controller_idle_guard()
         clock[0] += 60
-    controller._deliver_coder_message.assert_not_awaited()
+    # The fixture's coder has been idle for the whole window: Goal's safety net
+    # sends one continuation message, but never probes or starts a review.
+    controller._deliver_coder_message.assert_awaited_once()
+    assert "Continue toward the original Goal" in controller._deliver_coder_message.await_args.args[0]
     controller.client.read_execution_status.assert_not_awaited()
     assert controller._supervisor_task is None and reviewer.completion_packets == []
 
