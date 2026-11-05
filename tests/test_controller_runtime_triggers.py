@@ -8,7 +8,7 @@ import pytest
 from supervisor.controller import _runtime_restart_issue, _validation_freshness_summary
 from supervisor.appserver import AppServerMessage
 from supervisor.schemas import ChangedFile, RestartHandoff, SupervisorDecision, SupervisorDecisionKind, SupervisorWakePacket, TriggeringAction, ValidationRun
-from supervisor.state import PROGRESS, RUNTIME_METRICS, RUNTIME_TRACE
+from supervisor.state import EVENTS, PROGRESS, RUNTIME_METRICS, RUNTIME_TRACE
 
 from tests.support.controller import (
     _CheapRuntimeNoopReviewer,
@@ -392,7 +392,7 @@ def test_runtime_event_issue_ignores_optional_file_change_action_metadata() -> N
     assert base_issue.key != different_issue.key
 
 
-async def test_runtime_restart_gate_counts_rejected_restart_as_steering_and_ignores_progress_update(
+async def test_runtime_restart_gate_rejected_requests_do_not_manufacture_interventions(
     tmp_path: Path,
 ) -> None:
     controller, store, _fake = _runtime_controller(tmp_path)
@@ -431,6 +431,7 @@ async def test_runtime_restart_gate_counts_rejected_restart_as_steering_and_igno
             sequence=event_sequence,
             output="AssertionError: expected 1, got 2",
         )
+        controller.validations.append(validation)
         packet = _runtime_validation_packet(validation, wake_sequence=wake_sequence)
         if sequence == 1:
             decision = SupervisorDecision(
@@ -456,16 +457,18 @@ async def test_runtime_restart_gate_counts_rejected_restart_as_steering_and_igno
             packet=packet,
         )
 
-    assert len(coder.steers) == 2
-    assert coder.steers[0] == "Inspect the failing assertion before another edit."
-    assert "rerunning the same failing validation" in coder.steers[1]
-    assert len(restarts) == 1
-    assert restarts[0][0] == "coder repeated the same failure after steering"
+    assert coder.steers == ["Inspect the failing assertion before another edit."]
+    assert restarts == []
     health = store.get_health()
-    assert health.restart_issue_interventions == 2
+    assert health.interventions == 1
+    assert health.restart_issue_interventions == 1
     assert health.last_progress_sequence == 1
     progress = store.path(PROGRESS).read_text(encoding="utf-8")
-    assert progress.count("Restart requested for the repeated validation failure.") == 1
+    assert progress.count("Recorded the first steering for this validation failure.") == 1
+    assert "Restart requested for the repeated validation failure." not in progress
+    event_types = [json.loads(line)["event_type"] for line in store.path(EVENTS).read_text(encoding="utf-8").splitlines()]
+    assert event_types.count("runtime/restart_rejected") == 2
+    assert "runtime/evidence_rejected" not in event_types
 
 
 def test_trusted_pass_clears_only_matching_runtime_restart_issue(tmp_path: Path) -> None:

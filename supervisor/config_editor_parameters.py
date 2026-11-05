@@ -212,6 +212,7 @@ def _parameter_defs(
         else ()
     )
     adversary_enabled = config.adversary and config.adversary_runs > 0
+    goal_checkpoint_active = config.goal and adversary_enabled and config.goal_adversary_after_returns > 0
     adversary_active = adversary_enabled
     adversary_parameters = (
         _editor._role_parameters(
@@ -272,10 +273,15 @@ def _parameter_defs(
             _editor.EditorParameter(
                 "completion_returns_before_adversary",
                 "max-reviews-before-adversary" if adversary_enabled else "max-reviews",
-                GOAL_UNLIMITED_VALUE if config.goal else _editor.format_review_limit(config.completion_returns_before_adversary),
+                (f"{config.goal_adversary_after_returns} (goal checkpoint)" if goal_checkpoint_active else
+                 GOAL_UNLIMITED_VALUE if config.goal else
+                 _editor.format_review_limit(config.completion_returns_before_adversary)),
                 (),
                 edit_kind=None if config.goal else "review_limit",
                 help_text=(
+                    "Goal starts the first adversary at the goal-adversary-after-returns checkpoint, or earlier "
+                    "if completion accepts. Completion returns after adversary stay unlimited."
+                ) if goal_checkpoint_active else (
                     "Goal keeps completion returns unlimited until the review accepts the work. Turn goal off to "
                     "use the saved finite limit."
                 ) if config.goal else before_adversary_help,
@@ -330,6 +336,21 @@ def _parameter_defs(
                        "Smart Execution, the revision coder, context compaction and the log distiller keep "
                        "their own settings. Off by default."),
         ),
+        *((_editor.EditorParameter(
+            "goal_adversary_after_returns",
+            "goal-adversary-after-returns",
+            str(config.goal_adversary_after_returns) + (
+                " (inactive)" if config.goal_adversary_after_returns > 0 and not goal_checkpoint_active else ""
+            ),
+            (),
+            edit_kind="non_negative_int",
+            help_text=(
+                "0 disables the checkpoint (default). A positive value starts the first adversary after that "
+                "many completion returns; an earlier accept starts it immediately. Inactive unless goal and "
+                "adversary are enabled. It never enables either switch or changes the adversary pass count. "
+                "Completion returns after adversary stay unlimited until acceptance."
+            ),
+        ),) if config.goal or config.goal_adversary_after_returns > 0 else ()),
         *coder_parameters,
         revision_coder_toggle,
         *revision_coder_parameters,

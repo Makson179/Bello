@@ -26,7 +26,31 @@ GOAL_CODER_GUIDANCE = (
     "tried, what each one observed (results and where the evidence is), and promising untried ideas. "
     "Consult it before choosing an approach and after any loss of context. Repeat an approach that "
     "failed only when something relevant has changed, and record what changed. Update it after each "
-    "meaningful experiment."
+    "meaningful experiment using incremental edits, not a whole-map rewrite. Compact only when the map "
+    "grows unwieldy: preserve history, results, and evidence in an append-only archive with attempt/version "
+    "pointers in the working map. Never erase past outcomes."
+)
+GOAL_RUNTIME_GUIDANCE = (
+    "Goal mode: GOAL_MAP.md is the coder's working memory, not proof of its claims. When "
+    "goal_progress_review is true, make a bounded progress review: read the relevant map entries and "
+    "compare them with current work and available results, keeping attempt/version identities clear. "
+    "Otherwise consult relevant map history only when the current trigger needs it, not on every wake. "
+    "Distinguish a meaningfully changed hypothesis, a relevant implementation change, or new diagnostic "
+    "evidence from repeating the same approach unchanged. A flat score alone does not establish a loop; "
+    "different hypotheses can legitimately produce the same result. If current evidence establishes "
+    "a single failed check, unfinished work, several coherent attempts, or an unchanged retest used to "
+    "confirm a baseline, those facts alone do not justify intervention or restart during Goal exploration. "
+    "Changed hypotheses and meaningful diagnostics count as progress even before measured results improve. "
+    "If current evidence establishes "
+    "actual repetition or a sustained plateau, you may return decision=noop with a brief, optional "
+    "advisory_to_coder offering up to 2-3 short strategic ideas worth considering. Ground the ideas in "
+    "the relevant attempts/versions and available evidence, not a detailed implementation plan. The "
+    "coder may ignore the ideas and continue its approach without having to justify that choice. "
+    "Never require a pivot solely because the score has plateaued. "
+    "A short supportive phrase is fine. This is not an intervention, restart reason, standing constraint, "
+    "or requirement to follow the suggestion; keep message_to_coder and persistent_decision null. "
+    "Do not launch a new evaluation merely to justify an advisory. If the map is absent or evidence is "
+    "insufficient, say so without inventing a loop or making map existence/format a new requirement."
 )
 GOAL_COMPLETION_GUIDANCE = (
     "Goal mode: verify the task's original objectives against current evidence. Return the work only "
@@ -94,6 +118,9 @@ def build_stateless_supervisor_prompt(packet: SupervisorWakePacket) -> str:
         "instructions": [_stateless_supervisor_section_text(name) for name in section_names],
         "prompt_sections": section_names,
     }
+    if getattr(packet, "goal", False) is True:
+        payload["instructions"].append(GOAL_RUNTIME_GUIDANCE)
+        payload["prompt_sections"].append("goal_runtime")
     stable_fields = (
         "task_path",
         "task_contents",
@@ -300,6 +327,8 @@ def _stateless_supervisor_section_text(name: str) -> str:
 
 
 def _include_action_review(packet: SupervisorWakePacket) -> bool:
+    if getattr(packet, "goal", False) is True and getattr(packet, "goal_progress_review", False) is True:
+        return True
     if packet.triggering_item_id is not None or packet.triggering_action is not None:
         return True
     summary = packet.current_summary.lower()

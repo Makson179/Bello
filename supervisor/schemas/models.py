@@ -197,6 +197,7 @@ class BelloConfig(BaseModel):
     # Opt-in Goal mode (see ProjectConfig.goal). Runtime supervision and completion
     # review are mandatory while it is on; nothing else is implied.
     goal: bool = Field(default=False, strict=True)
+    goal_adversary_after_returns: int = Field(default=0, strict=True, ge=0)
     # Smart Execution defaults on; a saved explicit false is preserved.
     async_tools: bool = True
     no_need_for_context: dict[str, Any] = Field(
@@ -336,6 +337,8 @@ class SupervisorDecision(BaseModel):
     execpolicy_amendment: list[str] | None = None
     reason: str = ""
     message_to_coder: str | None = None
+    advisory_to_coder: str | None = Field(default=None, max_length=1600)
+    advisory_key: str | None = Field(default=None, max_length=300)
     persistent_decision: str | None = None
     progress_update: str | None = None
     clear_handoff: bool = False
@@ -343,6 +346,14 @@ class SupervisorDecision(BaseModel):
     handoff: RestartHandoff | None = None
     wake_sequence: int | None = None
     generation: int | None = None
+
+    @model_validator(mode="after")
+    def advisory_is_nonbinding(self):
+        if self.advisory_to_coder and (self.decision != SupervisorDecisionKind.NOOP
+                or self.message_to_coder or self.persistent_decision or self.progress_update
+                or self.clear_handoff or self.handoff):
+            raise ValueError("runtime advisory must be a noop without correction or persistent metadata")
+        return self
 
 
 class ReviewedFile(BaseModel):
@@ -666,6 +677,7 @@ class InspectionRun(BaseModel):
     captured_output_truncated: bool = False
     sequence: int
     inspected_paths: list[str] = Field(default_factory=list)
+    runtime_freshness: Literal["historical", "stale", "unknown"] = "unknown"
 
     @model_validator(mode="before")
     @classmethod
@@ -705,6 +717,8 @@ class PriorIntervention(BaseModel):
     reason: str
     message_to_coder: str
     sequence: int
+    authority: Literal["runtime_observation", "legacy_unspecified"] = "legacy_unspecified"
+    status: Literal["historical_not_binding"] = "historical_not_binding"
 
 
 class CompletionReturnRecord(BaseModel):
@@ -906,6 +920,10 @@ class SupervisorWakePacket(BaseModel):
     restart_count: int
     task_path: str
     task_contents: str
+    goal: bool = False
+    goal_progress_review: bool = False
+    # Host timing only: never prompt/model output or evidence for delivery.
+    runtime_review_started_monotonic: float | None = Field(default=None, exclude=True)
     progress: str = ""
     progress_path: str | None = None
     progress_total_entries: int = 0

@@ -204,6 +204,8 @@ def _inline_initial_value(config: ProjectConfig, parameter: EditorParameter) -> 
         return config.task or ""
     if parameter.key == "adversary_runs":
         return str(config.adversary_runs if config.adversary else 0)
+    if parameter.key == "goal_adversary_after_returns":
+        return str(config.goal_adversary_after_returns)
     if parameter.key == "distiller_model_path":
         return config.log_distiller.model_path or ""
     if parameter.key == "completion_returns_before_adversary":

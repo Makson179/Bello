@@ -54,6 +54,7 @@ REQUIRED_KEYS = {
 OPTIONAL_BOOLEAN_KEYS = {"async_tools", "windows_native_root_read", "goal"}
 OPTIONAL_BOOLEAN_DEFAULTS = {"async_tools": True, "windows_native_root_read": False, "goal": False}
 OPTIONAL_OBJECT_KEYS = {"no_need_for_context"}
+OPTIONAL_INTEGER_KEYS = {"goal_adversary_after_returns"}
 
 
 def _is_int(value: Any, *, minimum: int = 0) -> bool:
@@ -250,7 +251,7 @@ def validate(
     except ValueError as exc:
         return [f"catalog: {exc}; supply a current catalog from inspect_models.py"]
     missing = REQUIRED_KEYS - config.keys()
-    extra = config.keys() - REQUIRED_KEYS - OPTIONAL_BOOLEAN_KEYS - OPTIONAL_OBJECT_KEYS
+    extra = config.keys() - REQUIRED_KEYS - OPTIONAL_BOOLEAN_KEYS - OPTIONAL_OBJECT_KEYS - OPTIONAL_INTEGER_KEYS
     if missing:
         errors.append(f"root: missing keys {sorted(missing)}")
     if extra:
@@ -258,6 +259,9 @@ def validate(
     for field in sorted(OPTIONAL_BOOLEAN_KEYS):
         if type(config.get(field, OPTIONAL_BOOLEAN_DEFAULTS[field])) is not bool:
             errors.append(f"{field}: expected boolean")
+    for field in sorted(OPTIONAL_INTEGER_KEYS):
+        if not _is_int(config.get(field, 0)):
+            errors.append(f"{field}: expected a non-negative integer")
     context = config.get("no_need_for_context", {})
     if not isinstance(context, dict) or set(context) - {"enabled", "threshold_tokens", "retain_percent", "retain_tokens"}:
         errors.append("no_need_for_context: expected only enabled, threshold_tokens and one retention setting")

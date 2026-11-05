@@ -51,7 +51,7 @@ def policy():
 
 
 def config():
-    result = dict(review_limit_format="explicit", task="TASK.md", goal=False, speed="usual",
+    result = dict(review_limit_format="explicit", task="TASK.md", goal=False, goal_adversary_after_returns=0, speed="usual",
                   revision_coder_enabled=False, runtime_enabled=True, cheap_runtime=False,
                   async_tools=False, windows_native_root_read=False,
                   no_need_for_context={"enabled": False, "threshold_tokens": 249000, "retain_percent": 10},
@@ -177,6 +177,7 @@ class AdvisorValidationTests(unittest.TestCase):
         candidate.pop("windows_native_root_read")
         candidate.pop("no_need_for_context")
         candidate.pop("goal")
+        candidate.pop("goal_adversary_after_returns")
         self.assertEqual(validate(candidate), [])
         current = INSPECTOR._normalize(candidate, config_exists=True)
         # Smart Execution is on when the key is absent, like ProjectConfig; Goal and root-read stay off.
@@ -233,6 +234,31 @@ class AdvisorValidationTests(unittest.TestCase):
             current = INSPECTOR._normalize(candidate, config_exists=True)
             self.assertIn("goal must be boolean", INSPECTOR._source_config_errors(
                 candidate, current, config_exists=True))
+
+    def test_goal_adversary_checkpoint_is_optional_strict_and_preserved(self):
+        field = "goal_adversary_after_returns"
+        self.assertEqual(INSPECTOR._normalize(config(), config_exists=True)[field], 0)
+        for value in (0, 1, 3, 12):
+            for goal in (False, True):
+                with self.subTest(value=value, goal=goal):
+                    candidate = config()
+                    candidate.update(goal=goal, **{field: value})
+                    if goal:
+                        candidate.update(max_completion_returns_before_adversary="unlimited",
+                                         max_completion_returns_after_adversary="unlimited")
+                    self.assertEqual(validate(candidate), [])
+                    current = INSPECTOR._normalize(candidate, config_exists=True)
+                    self.assertEqual(current[field], value)
+                    self.assertEqual(INSPECTOR._source_config_errors(
+                        candidate, current, config_exists=True), [])
+        for value in (True, False, -1, 1.0, "3", "unlimited", None, [], {}):
+            with self.subTest(value=value):
+                candidate = config()
+                candidate[field] = value
+                self.assertIn(f"{field}: expected a non-negative integer", validate(candidate))
+                current = INSPECTOR._normalize(candidate, config_exists=True)
+                self.assertIn(f"{field} must be a non-negative integer", INSPECTOR._source_config_errors(
+                    candidate, current, config_exists=True))
 
     def test_goal_recommendation_must_keep_runtime_and_completion_on_and_allows_unlimited(self):
         message = "goal: requires runtime_enabled=true and completion_review=true"

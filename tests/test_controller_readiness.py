@@ -235,12 +235,18 @@ async def test_former_material_limitation_phrases_are_not_terminal(tmp_path: Pat
     assert store.path(FINAL_REPORT).read_text(encoding="utf-8") == ""
 
 
-async def test_no_marker_idle_forces_completion_review_once(tmp_path: Path) -> None:
+async def test_no_marker_idle_forces_completion_review_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = [0.0]
+    monkeypatch.setattr("supervisor.controller.time.monotonic", lambda: clock[0])
     controller, store, fake = _runtime_controller(tmp_path)
+    controller.coder = _FakeSteerCoder()
     store.update_bello_config(
         lambda cfg: cfg.model_copy(update={"active_coder_turn_id": None, "last_event_sequence": 17})
     )
 
+    await controller._handle_no_marker_idle()
+    assert controller._supervisor_task is None
+    clock[0] = 2400.0
     await controller._handle_no_marker_idle()
     await controller._supervisor_task
 
@@ -332,8 +338,10 @@ async def test_no_marker_idle_nudges_coder_when_completion_review_disabled(tmp_p
 @pytest.mark.parametrize("cheap_runtime", [False, True])
 @pytest.mark.parametrize("completion_review", [False, True])
 async def test_denied_native_turn_runtime_noop_continues_idle_policy(
-    tmp_path: Path, cheap_runtime: bool, completion_review: bool,
+    tmp_path: Path, cheap_runtime: bool, completion_review: bool, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    clock = [0.0]
+    monkeypatch.setattr("supervisor.controller.time.monotonic", lambda: clock[0])
     controller, store, fake = _runtime_controller(tmp_path)
     controller.adversary_enabled = False
     store.update_bello_config(
@@ -370,6 +378,13 @@ async def test_denied_native_turn_runtime_noop_continues_idle_policy(
         async def respond(self, request_id, response):
             self.responses.append((request_id, response))
 
+        async def read_execution_status(self, thread_id, *, timeout):
+            assert thread_id == "thread"
+            assert controller.coder.active_turn_id is None
+            assert store.get_bello_config().active_coder_turn_id is None
+            assert controller.pending_approvals == {}
+            return {"state": "quiescent"}
+
     controller.coder = NativeCoder()
     controller.client = NativeClient()
     controller.approvals = ApprovalManager(tmp_path)
@@ -400,6 +415,12 @@ async def test_denied_native_turn_runtime_noop_continues_idle_policy(
     assert controller.pending_approvals == {}
     assert len(cheap.calls) == int(cheap_runtime)
     assert len(fake.runtime_packets) == int(not cheap_runtime)
+    if completion_review:
+        assert fake.completion_packets == []
+        assert "not used" not in controller.coder.messages
+        clock[0] = 2400.0
+        await controller._handle_controller_idle_guard()
+        await controller._supervisor_task
     assert len(fake.completion_packets) == int(completion_review)
     assert controller.coder.messages[-1] == ("not used" if completion_review else NO_MARKER_IDLE_NUDGE)
     assert controller.coder.active_turn_id == "resumed-turn"
@@ -738,7 +759,9 @@ async def test_done_without_fresh_validation_stale_runtime_noop_does_not_resume_
     assert fake.completion_packets == []
 
 
-async def test_controller_idle_guard_forces_completion_review_for_stalled_no_active_turn(tmp_path: Path) -> None:
+async def test_controller_idle_guard_forces_completion_review_for_stalled_no_active_turn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = [0.0]
+    monkeypatch.setattr("supervisor.controller.time.monotonic", lambda: clock[0])
     controller, store, fake = _runtime_controller(tmp_path)
 
     class FakeCoder:
@@ -765,11 +788,14 @@ async def test_controller_idle_guard_forces_completion_review_for_stalled_no_act
         )
     )
 
-    await controller._handle_controller_idle_guard(now=119.0)
+    await controller._handle_controller_idle_guard()
+    clock[0] = 2399.0
+    await controller._handle_controller_idle_guard(force=True)
 
     assert getattr(controller, "_supervisor_task", None) is None
 
-    await controller._handle_controller_idle_guard(now=121.0)
+    clock[0] = 2400.0
+    await controller._handle_controller_idle_guard()
     await controller._supervisor_task
 
     assert coder.messages == ["not used"]

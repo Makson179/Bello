@@ -191,6 +191,7 @@ def _normalize(payload: dict[str, Any], *, config_exists: bool) -> dict[str, Any
         "review_limit_format": "explicit",
         "task": _optional_nonempty_string(_first(payload, ("task", "task_path"), None, skip_none=True)),
         "goal": payload.get("goal", False),
+        "goal_adversary_after_returns": payload.get("goal_adversary_after_returns", 0),
         "coder_mod": coder_model,
         "revision_coder_enabled": payload.get("revision_coder_enabled", False),
         "revision_coder_mod": revision_coder_model,
@@ -361,6 +362,8 @@ def _source_config_errors(payload: dict[str, Any], current: dict[str, Any], *, c
             errors.append("log_distiller.model_path must be a non-empty local folder path or null")
     if not _is_int(current["max_adversary_runs"]):
         errors.append("max_adversary_runs must be a non-negative integer")
+    if not _is_int(current["goal_adversary_after_returns"]):
+        errors.append("goal_adversary_after_returns must be a non-negative integer")
     if (
         current["max_adversary_runs"] != 0
         and "adversary" in payload

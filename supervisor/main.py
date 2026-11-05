@@ -153,6 +153,16 @@ class BelloClickGroup(click.Group):
     ),
 )
 @click.option(
+    "--goal-adversary-after-returns",
+    default=None,
+    type=click.IntRange(min=0),
+    help=(
+        "In Goal mode, start the first adversary after this many completion returns; an earlier accept "
+        "starts it immediately. Requires Goal and adversary enabled. 0 disables the checkpoint "
+        "(default); omitted preserves the saved value. Completion returns after adversary stay unlimited."
+    ),
+)
+@click.option(
     "--runtime/--no-runtime",
     "runtime_enabled",
     default=None,
@@ -275,6 +285,7 @@ def cli(
     protected_paths: tuple[Path, ...],
     clean: bool | None,
     goal: bool | None,
+    goal_adversary_after_returns: int | None,
     runtime_enabled: bool | None,
     async_tools: bool | None,
     no_need_for_context_enabled: bool | None,
@@ -341,6 +352,7 @@ def cli(
             protected_paths=protected_paths,
             clean=clean,
             goal=goal,
+            goal_adversary_after_returns=goal_adversary_after_returns,
             runtime_enabled=runtime_enabled,
             async_tools=async_tools,
             no_need_for_context_enabled=no_need_for_context_enabled,
@@ -742,6 +754,10 @@ def config_command() -> None:
         click.echo(f"completion-intelligence: {config.completion_intelligence}")
         if config.goal:
             click.echo("completion-returns: unlimited (goal)")
+    if config.goal_adversary_after_returns:
+        active = config.goal and config.adversary and config.adversary_runs > 0
+        suffix = "" if active else " (inactive: requires goal and adversary)"
+        click.echo(f"goal-adversary-after-returns: {config.goal_adversary_after_returns}{suffix}")
     click.echo(f"adversary: {str(config.adversary).lower()}")
     if config.adversary:
         click.echo(f"adversary-mod: {config.adversary_mod}")
@@ -878,6 +894,7 @@ async def _run_bello(settings: RunSettings) -> int:
         declared_grading_roots=settings.protected_paths,
         clean_workspace=settings.clean,
         goal=settings.goal,
+        goal_adversary_after_returns=settings.goal_adversary_after_returns,
         # Goal is passed separately and forces runtime on inside the controller.
         runtime_enabled=settings.runtime_enabled if settings.runtime_choice is None else settings.runtime_choice,
         async_tools=settings.async_tools,
@@ -916,6 +933,7 @@ class RunSettings:
     adversary: bool
     adversary_runs: int
     goal: bool = False
+    goal_adversary_after_returns: int = 0
     runtime_enabled: bool = True
     # Runtime switch before Goal forces supervision on (None: same as runtime_enabled).
     runtime_choice: bool | None = None
@@ -947,6 +965,7 @@ def _resolve_run_settings(
     protected_paths: tuple[Path, ...] = (),
     clean: bool | None = None,
     goal: bool | None = None,
+    goal_adversary_after_returns: int | None = None,
     runtime_enabled: bool | None = None,
     async_tools: bool | None = None,
     no_need_for_context_enabled: bool | None = None,
@@ -981,6 +1000,11 @@ def _resolve_run_settings(
     selected_completion_intelligence = completion_intelligence or project_config.completion_intelligence
     selected_adversary_intelligence = adversary_intelligence or project_config.adversary_intelligence
     selected_goal = project_config.goal if goal is None else goal
+    selected_goal_checkpoint = (project_config.goal_adversary_after_returns
+                                if goal_adversary_after_returns is None else goal_adversary_after_returns)
+    if (not isinstance(selected_goal_checkpoint, int) or isinstance(selected_goal_checkpoint, bool)
+            or selected_goal_checkpoint < 0):
+        raise RuntimeError("goal_adversary_after_returns must be a non-negative integer")
     selected_runtime_enabled = project_config.runtime_enabled if runtime_enabled is None else runtime_enabled
     # The run's own switch. The controller applies Goal itself and records this
     # choice, so a Goal run never rewrites the saved runtime preference.
@@ -1055,6 +1079,7 @@ def _resolve_run_settings(
         protected_paths=selected_protected_paths,
         clean=project_config.clean if clean is None else clean,
         goal=selected_goal,
+        goal_adversary_after_returns=selected_goal_checkpoint,
         goal_notices=tuple(goal_notices),
         runtime_enabled=selected_runtime_enabled,
         runtime_choice=runtime_choice,

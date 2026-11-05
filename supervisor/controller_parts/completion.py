@@ -8,9 +8,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from supervisor.quiescence import execution_queue_clear
+
 from . import compat
 from .interfaces import CoordinatorPort
-from .defaults import NO_MARKER_IDLE_NUDGE
+from .defaults import NO_MARKER_IDLE_NUDGE, NO_MARKER_IDLE_REVIEW_SUMMARY
 
 
 @dataclass(init=False, slots=True)
@@ -24,6 +26,8 @@ class CompletionState:
     _completion_knowledge_state: dict[str, list[Any]]
     _last_completion_marker_sequence: int | None
     _no_marker_completion_review_key: str | None
+    _no_marker_idle_since: float | None
+    _no_marker_idle_identity: tuple[int, str | None, int] | None
     _pending_adversary_report: compat.AdversaryReport | None
     _readiness_event_journal: compat.deque[compat._ReadinessJournalEvent]
     adv_report_controller: compat.StatelessSupervisorAgent | None
@@ -58,6 +62,7 @@ class CompletionPort(CoordinatorPort):
         '_completion_packet_lifecycle_is_current',
         '_completion_supervisor_agent',
         '_completion_timeout_max_retries',
+        '_confirm_coder_quiescent',
         '_continue_after_readiness_marker',
         '_current_turn_action_count',
         '_deferred_completion_check',
@@ -75,10 +80,13 @@ class CompletionPort(CoordinatorPort):
         '_finalize_completion_review_disabled',
         '_generation_has_coder_turn',
         '_goal_enabled',
+        '_goal_adversary_after_returns',
         '_handle_no_marker_idle',
         '_mark_adversary_thread_done',
         '_mark_adversary_thread_started',
         '_no_message_backoff_seconds',
+        '_no_marker_idle_ready',
+        '_reset_no_marker_idle',
         '_packet_has_fresh_adversary_report',
         '_post_coder_review_enabled',
         '_queue_supervisor_check',
@@ -115,6 +123,7 @@ class CompletionPort(CoordinatorPort):
         'client',
         'coder',
         'finalize',
+        'event_queue',
         'last_coder_message',
         'pending_approvals',
         'prior_interventions',
@@ -282,14 +291,42 @@ class Completion:
         if self.ports.coder:
             await self.ports._deliver_coder_message(message)
 
-    async def _handle_no_marker_idle(self, *, subagents_refreshed: bool = False) -> None:
+    def _reset_no_marker_idle(self) -> None:
+        # Process-local monotonic time must never survive pause/recovery/restart.
+        self.state._no_marker_idle_since = None
+        self.state._no_marker_idle_identity = None
+        self.state._no_marker_completion_review_key = None
+
+    def _no_marker_idle_ready(self, *, now: float | None = None, wait: bool = True) -> bool:
         cfg = self.ports.store.get_bello_config()
-        if cfg.active_coder_turn_id:
-            return
+        coder = getattr(self.ports, "coder", None)
+        if (not self.ports._coder_lifecycle_accepts_activity(cfg) or coder is None
+                or cfg.active_coder_turn_id or getattr(coder, "active_turn_id", None)
+                or self.ports.pending_approvals or cfg.pending_server_request_ids
+                or self.ports._active_coder_subagents()):
+            self.ports._reset_no_marker_idle()
+            return False
+        current_time = compat.time.monotonic() if now is None else now
+        identity = (cfg.generation, cfg.coder_thread_id, id(coder))
+        if getattr(self.state, "_no_marker_idle_identity", None) != identity:
+            self.ports._reset_no_marker_idle()
+            self.state._no_marker_idle_identity = identity
+            self.state._no_marker_idle_since = current_time
+        since = self.state._no_marker_idle_since
+        if wait and (since is None or current_time - since < compat.CONTROLLER_IDLE_GUARD_STALL_SECONDS):
+            return False
+        # Let already-arrived activity update the lifecycle before forcing a review.
+        # Transport heartbeats do not restart the idle clock.
+        queue = getattr(self.ports, "event_queue", None)
+        return execution_queue_clear(queue)
+
+    async def _handle_no_marker_idle(self, *, subagents_refreshed: bool = False) -> None:
         if not subagents_refreshed:
             await self.ports._refresh_coder_subagents()
-        if self.ports._active_coder_subagents():
+        # Read the current lifecycle after the await, not a stale pre-refresh config.
+        if not self.ports._no_marker_idle_ready(wait=False):
             return
+        cfg = self.ports.store.get_bello_config()
         if not getattr(self.ports, "_generation_has_coder_turn", True):
             # A freshly restarted generation has produced no coder work yet: forcing a completion
             # review here would judge the previous generation's leftover state (observed killing a
@@ -303,14 +340,45 @@ class Completion:
         review_key = f"{cfg.generation}:{last_message_sequence}:{latest_validation_sequence}"
         if getattr(self.state, "_no_marker_completion_review_key", None) == review_key:
             return
-        self.state._no_marker_completion_review_key = review_key
+        if self.ports._goal_enabled():
+            # An idle Goal turn is not a submission. This also covers detached
+            # external evaluation whose submit tool has already returned: ask
+            # the coder to inspect its pending work, not a final auditor to
+            # reject an unfinished result. Native busy/unknown is never nudged.
+            if (not self.ports._no_marker_idle_ready()
+                    or not await self.ports._confirm_coder_quiescent()
+                    or not self.ports._no_marker_idle_ready()):
+                return
+            delivered, _ = await self.ports._deliver_coder_message(
+                "Continue toward the original Goal. Check any pending work or external results "
+                "and choose your next step. This is an idle continuation, not a completion review "
+                "or a new task requirement. Submit for review only when you actually judge the work ready."
+            )
+            if delivered:
+                self.state._no_marker_completion_review_key = review_key
+                self.ports._append_event(compat.AppEventSource.SUPERVISOR,
+                    "goal/idle_continue", reason="confirmed quiescent Goal resumed without completion review")
+            return
         if not self.ports._post_coder_review_enabled():
+            self.state._no_marker_completion_review_key = review_key
             # No review gate to force: nudge the coder to finish and emit the marker,
             # which is the only terminal signal in this mode.
             await self.ports._steer_for_marker(
                 "Coder is idle with no active turn and no readiness marker; completion review is disabled, nudging coder to finish.",
             )
             return
+        if not self.ports._no_marker_idle_ready():
+            return
+        if not await self.ports._confirm_coder_quiescent() or not self.ports._no_marker_idle_ready():
+            return
+        self.state._no_marker_completion_review_key = review_key
+        self.ports.store.append_raw_log({
+            "timestamp": compat.datetime.now(compat.timezone.utc).isoformat(),
+            "type": "controller_idle_guard",
+            "sequence": cfg.last_event_sequence,
+            "reason": "continuous idle window elapsed without a readiness marker",
+            "idle_threshold_seconds": compat.CONTROLLER_IDLE_GUARD_STALL_SECONDS,
+        })
         review_label = "completion_review" if self.ports._effective_completion_review() else "adversary review"
         self.ports.store.append_text_locked(
             compat.PROGRESS,
@@ -322,7 +390,7 @@ class Completion:
             reason="coder idle with no active turn and no readiness marker",
         )
         self.ports._schedule_supervisor_check(
-            f"Coder is idle with no active turn and no readiness marker. Run {review_label} on the current state.",
+            NO_MARKER_IDLE_REVIEW_SUMMARY,
             completion_review=True,
         )
 
@@ -809,6 +877,25 @@ class Completion:
             )
             return
 
+        checkpoint_mode = self.ports._goal_enabled() and self.ports._goal_adversary_after_returns() > 0
+        if checkpoint_mode:
+            # Even an early accept starts the configured adversary. This mode then
+            # obtains a post-adversary completion accept rather than reusing that
+            # earlier decision or treating a no-findings report as goal success.
+            self.state._accepted_adversary_report = report
+            self.ports.store.append_text_locked(
+                compat.PROGRESS,
+                "- Adversary report has no findings to return; awaiting Goal completion review.\n",
+            )
+            self.ports._append_event(
+                compat.AppEventSource.SUPERVISOR,
+                "adversary/report_normalized",
+                decision="review",
+                reason=normalized.reason,
+            )
+            self.ports._queue_supervisor_check("Goal completion after adversary", completion_review=True)
+            return
+
         self.ports.store.append_text_locked(
             compat.PROGRESS,
             "- adv_report_controller found no findings or observations to send to the coder; finalizing.\n",
@@ -914,10 +1001,16 @@ class Completion:
         packet: compat.SupervisorWakePacket | None = None,
     ) -> Literal["adversary", "complete"] | None:
         if self.ports._goal_enabled():
-            # Goal keeps completion returns unlimited until acceptance, both before and
-            # after the optional adversary. The configured adversary passes are unchanged:
-            # they run after a completion accept (`_should_run_adversary_before_complete`),
-            # never because a return budget ran out.
+            # By default Goal waits for an accept before the adversary. An opt-in
+            # checkpoint may advance to its first pass after N returns, at the next
+            # coder readiness (after the Nth repair), without declaring success.
+            # Completion remains unlimited after that pass and when adversary is off.
+            checkpoint = self.ports._goal_adversary_after_returns()
+            cfg = self.ports.store.get_bello_config()
+            if (checkpoint > 0 and cfg.adversary_run_count == 0
+                    and self.ports._effective_max_adversary_runs() > 0
+                    and cfg.completion_return_count >= checkpoint):
+                return "adversary"
             return None
         cfg = self.ports.store.get_bello_config()
         if self.ports._effective_max_adversary_runs() <= 0:
@@ -1072,6 +1165,11 @@ class Completion:
         terminal shape as adversary-disabled or limit-reached) instead of declaring the
         whole run infrastructure-invalid and discarding a reviewed, accepted solution.
         """
+        if self.ports._goal_enabled() and self.ports._goal_adversary_after_returns() > 0:
+            # The checkpoint mode explicitly requires the adversary followed by a
+            # completion accept. Do not certify this sequence if its tester failed.
+            await self.ports._fail_required_adversary(packet=packet, error_summary=error_summary)
+            return
         cfg = self.ports.store.get_bello_config()
         report = compat.AdversaryReport(
             status="error",

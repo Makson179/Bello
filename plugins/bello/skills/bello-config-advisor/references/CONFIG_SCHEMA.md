@@ -13,6 +13,7 @@ The inspector deliberately preserves valid dormant values such as saved review b
   "review_limit_format": "explicit",
   "task": "TASK.md",
   "goal": false,
+  "goal_adversary_after_returns": 0,
   "coder_mod": "openai-codex/gpt-5.6-luna",
   "revision_coder_enabled": false,
   "revision_coder_mod": "openai-codex/gpt-5.6-luna",
@@ -123,6 +124,8 @@ The plan must be a regular `.md` file inside the project root, distinct from the
 ## Runtime and log-distiller switches
 
 `goal` (Boolean, default false) is an opt-in that keeps the run working toward the original task until its completion review accepts it. While it is true, runtime supervision and completion review are mandatory (a saved `runtime_enabled: false` or `completion_review: false` is ignored for the run, so a Goal recommendation must set both to true) and completion-review returns are unlimited both before and after any adversary pass; the configured adversary pass count and prompt are unchanged. The completion reviewer returns work only for a concrete unmet requirement of the original task, and the coder is told to keep a `GOAL_MAP.md` of approaches tried, their results and untried ideas. Goal never changes `async_tools`, the revision coder, `no_need_for_context` or the log distiller. Do not recommend it unless the user asks for open-ended persistence toward the task's objectives; preserve an existing value during application.
+
+`goal_adversary_after_returns` (non-negative integer, default `0`; Booleans are invalid) optionally schedules the first adversary while Goal completion review is still returning work. `0` preserves the default Goal schedule. With both Goal and adversary enabled, a positive value starts the first adversary after that many completion returns; an earlier completion accept starts it immediately. After the adversary, Goal completion returns remain unlimited until acceptance. This field never enables Goal or adversary and never changes `max_adversary_runs`; it is dormant if either switch is off or no adversary passes are configured. For up to three returns, one adversary, then completion until acceptance, use `goal: true`, `adversary: true`, `max_adversary_runs: 1`, and `goal_adversary_after_returns: 3`. Keep the two ordinary completion budgets `"unlimited"` in a Goal recommendation; the checkpoint is separate. Older configs may omit the field. Preserve saved values unless the user requests a change; `--goal-adversary-after-returns N` overrides it for one run, and an explicit `0` disables it.
 
 `async_tools` (Smart Execution) defaults on for new configurations, so a config that does not name it runs with it on; a saved explicit `false` is preserved, and `--async-tools/--no-async-tools` overrides it for one run. It is independent of runtime, reviews, goal, and distillation. It enables event-driven execution of independent tools for coder/reviewer threads and their children; it does not change models, billing routes, sandbox authority, or runtime's bounded wakeups. Choose it before starting a fresh run. Native Codex requires an explicitly compatible `bello_async_tools` build; do not treat an older selection-only helper as sufficient or silently substitute an engine.
 

@@ -71,7 +71,7 @@ def _runtime_validation_restart_issue(validation: compat.ValidationRun) -> compa
     evidence = validation.captured_output or validation.summary
     normalized_evidence = " ".join(evidence.split())
     payload = {
-        "validation_id": validation.validation_id,
+        "command": compat._canonical_restart_command(validation.command),
         "exit_code": validation.exit_code,
         "shell_exit_code": validation.shell_exit_code,
         "executed_test_names": sorted(validation.executed_test_names),
@@ -81,7 +81,7 @@ def _runtime_validation_restart_issue(validation: compat.ValidationRun) -> compa
     }
     digest = compat.hashlib.sha256(compat.json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     return compat.RuntimeRestartIssue(
-        key=f"failed-validation:{validation.validation_id}:{digest}",
+        key=f"failed-validation:{digest}",
         sequence=validation.sequence,
         validation_id=validation.validation_id,
     )

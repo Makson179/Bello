@@ -31,6 +31,7 @@ DEFAULT_TRIAGE_MODEL = MODEL_GPT_5_6_LUNA
 DEFAULT_TRIAGE_EFFORT = "medium"
 
 RUNTIME_TRIAGE_MODEL_ENV = "BELLO_RUNTIME_TRIAGE_MODEL"
+RUNTIME_TRIAGE_EFFORT_ENV = "BELLO_RUNTIME_TRIAGE_EFFORT"
 RUNTIME_TRIAGE_TIMEOUT_ENV = "BELLO_RUNTIME_TRIAGE_TIMEOUT"
 DEFAULT_RUNTIME_TRIAGE_TIMEOUT_SECONDS = 25.0
 
@@ -39,14 +40,23 @@ class CheapRuntimeTriageConfig:
     enabled: bool
     model: str | None
     timeout_seconds: float = DEFAULT_RUNTIME_TRIAGE_TIMEOUT_SECONDS
+    effort: str | None = None
 
 
 def runtime_triage_config_from_env(*, enabled: bool = True) -> CheapRuntimeTriageConfig:
     # The project config owns the on/off switch; env remains available for advanced
-    # model and timeout overrides.
+    # model, effort and timeout overrides. The selected backend validates an
+    # explicit effort against its advertised model capabilities; do not alias it.
     model = _env_str(os.environ.get(RUNTIME_TRIAGE_MODEL_ENV)) or DEFAULT_TRIAGE_MODEL
+    effort = _env_str(os.environ.get(RUNTIME_TRIAGE_EFFORT_ENV)) or _default_triage_effort(model)
     timeout_seconds = _env_float(os.environ.get(RUNTIME_TRIAGE_TIMEOUT_ENV), DEFAULT_RUNTIME_TRIAGE_TIMEOUT_SECONDS)
-    return CheapRuntimeTriageConfig(enabled=enabled, model=model, timeout_seconds=timeout_seconds)
+    return CheapRuntimeTriageConfig(enabled=enabled, model=model, timeout_seconds=timeout_seconds, effort=effort)
+
+
+def _default_triage_effort(model: str | None) -> str | None:
+    return (DEFAULT_TRIAGE_EFFORT
+            if model in {DEFAULT_TRIAGE_MODEL, f"openai-codex/{DEFAULT_TRIAGE_MODEL}"}
+            else None)
 
 
 class CheapRuntimeReviewerError(RuntimeError):
@@ -388,14 +398,13 @@ class CheapRuntimeReviewer:
         workspace: Path,
         *,
         model: str | None,
+        effort: str | None = None,
         timeout_seconds: float = DEFAULT_RUNTIME_TRIAGE_TIMEOUT_SECONDS,
     ):
         self.client = client
         self.workspace = workspace.resolve()
         self.model = model
-        self.effort = (DEFAULT_TRIAGE_EFFORT
-                       if model in {DEFAULT_TRIAGE_MODEL, f"openai-codex/{DEFAULT_TRIAGE_MODEL}"}
-                       else None)
+        self.effort = effort if effort is not None else _default_triage_effort(model)
         self.timeout_seconds = timeout_seconds
 
     async def review(self, packet: SupervisorWakePacket) -> CheapRuntimeDecision:

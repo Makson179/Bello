@@ -87,6 +87,7 @@ class MultiAgentConfig:
 RUNTIME_SYNC_FIELDS = (
     "task",
     "goal",
+    "goal_adversary_after_returns",
     "coder_mod",
     "revision_coder_enabled",
     "revision_coder_mod",
@@ -208,6 +209,9 @@ class ProjectConfig:
     # the revision coder, No Need For Context and the log distiller keep their own
     # switches.
     goal: bool = False
+    # 0 preserves unlimited Goal completion review before the first adversary.
+    # A positive checkpoint is dormant unless Goal and adversary are enabled.
+    goal_adversary_after_returns: int = 0
     coder_mod: str = DEFAULT_MODEL
     revision_coder_enabled: bool = False
     revision_coder_mod: str = DEFAULT_MODEL
@@ -241,6 +245,11 @@ class ProjectConfig:
     completion_multi_agent: MultiAgentConfig = field(default_factory=MultiAgentConfig)
     adversary_multi_agent: MultiAgentConfig = field(default_factory=MultiAgentConfig)
 
+    def __post_init__(self) -> None:
+        value = self.goal_adversary_after_returns
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ProjectConfigError("goal_adversary_after_returns must be a non-negative integer")
+
     @property
     def fast(self) -> bool:
         return self.speed == "fast"
@@ -264,6 +273,7 @@ class ProjectConfig:
             REVIEW_LIMIT_FORMAT_FIELD: EXPLICIT_REVIEW_LIMIT_FORMAT,
             "task": self.task,
             "goal": self.goal,
+            "goal_adversary_after_returns": self.goal_adversary_after_returns,
             "coder_mod": self.coder_mod,
             "revision_coder_enabled": self.revision_coder_enabled,
             "revision_coder_mod": self.revision_coder_mod,
@@ -461,6 +471,11 @@ def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfi
     return ProjectConfig(
         task=_optional_string(_first_present(payload, ("task", "task_path"), default.task, skip_none=True), "task_path", path=path),
         goal=_bool(payload.get("goal", default.goal), "goal", path=path),
+        goal_adversary_after_returns=_non_negative_int(
+            payload.get("goal_adversary_after_returns", default.goal_adversary_after_returns),
+            "goal_adversary_after_returns",
+            path=path,
+        ),
         coder_mod=coder_mod,
         revision_coder_enabled=_bool(
             payload.get("revision_coder_enabled", default.revision_coder_enabled),
@@ -781,6 +796,8 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
     updates: dict[str, Any] = {}
     if "goal" in selected:
         updates["goal"] = config.goal
+    if "goal_adversary_after_returns" in selected:
+        updates["goal_adversary_after_returns"] = config.goal_adversary_after_returns
     if "task" in selected:
         updates["task"] = config.task
         updates["task_path"] = config.task or ""

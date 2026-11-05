@@ -50,6 +50,7 @@ class SettingsPort(CoordinatorPort):
         '_generate_schema_hash',
         '_generate_schema_hash_async',
         '_goal_enabled',
+        '_goal_adversary_after_returns',
         '_log_distiller_config',
         '_multi_agent_config',
         '_persist_model_config',
@@ -84,6 +85,7 @@ class SettingsPort(CoordinatorPort):
         'fast',
         'finalize',
         'goal',
+        'goal_adversary_after_returns',
         'log_distiller',
         'model',
         'overwrite_state',
@@ -177,6 +179,19 @@ class Settings:
             return bool(self.ports.store.get_bello_config().goal)
         except Exception:
             return False
+
+    def _goal_adversary_after_returns(self) -> int:
+        """Saved opt-in checkpoint; inert unless Goal and adversary are enabled."""
+        override = getattr(self.ports, "goal_adversary_after_returns", None)
+        if override is not None:
+            return override
+        config = getattr(self.ports, "project_config", None)
+        if config is not None:
+            return getattr(config, "goal_adversary_after_returns", 0)
+        try:
+            return self.ports.store.get_bello_config().goal_adversary_after_returns
+        except Exception:
+            return 0
 
     def _runtime_enabled(self) -> bool:
         # Runtime supervision is mandatory while Goal is on: neither a saved
@@ -289,6 +304,7 @@ class Settings:
         return compat.ProjectConfig(
             task=compat._workspace_display_path(self.ports.project_root, str(self.ports.task_path)),
             goal=self.ports._goal_enabled(),
+            goal_adversary_after_returns=self.ports._goal_adversary_after_returns(),
             coder_mod=self.ports._coder_model() or compat.DEFAULT_MODEL,
             runtime_mod=self.ports._runtime_model() or compat.DEFAULT_MODEL,
             completion_mod=self.ports._completion_model() or compat.DEFAULT_MODEL,
@@ -328,8 +344,12 @@ class Settings:
             revision_coder_summary = (
                 f"on({self.ports._revision_coder_model()}/{self.ports._revision_coder_intelligence()})"
             )
+        goal_checkpoint_summary = ""
+        if self.ports._goal_enabled() and (checkpoint := self.ports._goal_adversary_after_returns()):
+            goal_checkpoint_summary = f"goal-adversary-after-returns={checkpoint} "
         return (
             f"settings: {'goal=true ' if self.ports._goal_enabled() else ''}"
+            f"{goal_checkpoint_summary}"
             f"task={compat._workspace_display_path(self.ports.project_root, str(self.ports.task_path))} "
             f"coder-mod={self.ports._coder_model()} "
             f"runtime-mod={self.ports._runtime_model()} "

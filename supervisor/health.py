@@ -104,6 +104,8 @@ def record_restart_issue_intervention(
             return state
         issues = _restart_issues(state)
         existing = issues.get(issue_key)
+        if existing is not None and sequence <= existing.last_sequence:
+            return state  # Rephrasing or rereading one failure is not recurrence.
         issues[issue_key] = RestartIssueState(
             interventions=(existing.interventions + 1 if existing is not None else 1),
             last_sequence=(

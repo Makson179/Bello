@@ -10,6 +10,33 @@ from typing import Any, Literal
 
 from . import compat
 from .interfaces import CoordinatorPort
+from .defaults import NO_MARKER_IDLE_REVIEW_SUMMARY
+from supervisor.runtime_goal import GoalRuntimeProgressPolicy
+from supervisor.runtime_evidence import inspection_staleness
+
+GOAL_PROGRESS_REVIEW_SUMMARY = "Goal progress check: inspect the relevant attempt-map entries and current work."
+RUNTIME_STALENESS_NOTICE_SECONDS = 60.0
+RUNTIME_STALENESS_NOTICE = (
+    "Runtime timing note: You may have changed the code while this message was being prepared. "
+    "Check whether the observation is still relevant to your current work."
+)
+
+
+def runtime_message_at_send(message, packet, *, now, latest_change_sequence=0):
+    """Add context, never block or validate the reviewer's judgment.
+
+    Uses only a host clock and already-observed edit metadata. No filesystem
+    access, hashes, extra model call, proof requirements, or event allowlist.
+    Called at host dispatch; provider-side consumption may happen later.
+    """
+    if packet is None:
+        return message
+    started = packet.runtime_review_started_monotonic
+    long_review = started is not None and now - started >= RUNTIME_STALENESS_NOTICE_SECONDS
+    changed_during_review = latest_change_sequence > packet.latest_event_sequence
+    if long_review or changed_during_review:
+        return message + "\n\n" + RUNTIME_STALENESS_NOTICE
+    return message
 
 
 @dataclass(init=False, slots=True)
@@ -37,6 +64,10 @@ class RuntimeReviewState:
     runtime_triage_config: compat.CheapRuntimeTriageConfig
     runtime_triage_reviewer: compat.CheapRuntimeReviewer | None
     supervisor: compat.StatelessSupervisorAgent | None
+    goal_progress_policy: GoalRuntimeProgressPolicy
+    goal_meaningful_sequence: int
+    goal_progress_identity: tuple[int, str | None]
+    goal_progress_sequence_floor: int
 
 
 class RuntimeReviewPort(CoordinatorPort):
@@ -58,6 +89,7 @@ class RuntimeReviewPort(CoordinatorPort):
         '_completion_knowledge',
         '_completion_payload_window',
         '_completion_review_budget_action',
+        '_confirm_coder_quiescent',
         '_continue_after_readiness_marker',
         '_deferred_completion_check',
         '_deliver_coder_message',
@@ -77,6 +109,8 @@ class RuntimeReviewPort(CoordinatorPort):
         '_is_coder_descendant',
         '_last_completion_marker_sequence',
         '_mark_controller_activity',
+        '_no_marker_idle_ready',
+        'observed_changed_files',
         '_post_coder_review_agent',
         '_prepare_runtime_trigger_summary',
         '_queue_supervisor_check',
@@ -100,6 +134,7 @@ class RuntimeReviewPort(CoordinatorPort):
         '_runtime_noop_readiness_context_is_current',
         '_runtime_pending_trigger_actions',
         '_runtime_pending_trigger_signatures',
+        '_schedule_supervisor_check',
         '_sequence',
         '_subagent_summaries',
         '_supervisor_check_loop',
@@ -138,6 +173,7 @@ class RuntimeReviewPort(CoordinatorPort):
     })
     writes = frozenset({
         '_deferred_completion_check',
+        '_no_marker_completion_review_key',
         'completion_attempt_count',
         'provider_failure_recovery_counts',
     })
@@ -149,6 +185,64 @@ class RuntimeReview:
     def __init__(self, ports: RuntimeReviewPort) -> None:
         self.state = RuntimeReviewState()
         self.ports = ports
+
+    def _goal_progress_policy(self) -> GoalRuntimeProgressPolicy:
+        if not hasattr(self.state, "goal_progress_policy"):
+            self.state.goal_progress_policy = GoalRuntimeProgressPolicy()
+        return self.state.goal_progress_policy
+
+    def _sync_goal_progress_identity(self, *, current_work_sequence: int | None = None) -> None:
+        cfg = self.ports.store.get_bello_config()
+        identity = (cfg.generation, cfg.coder_thread_id)
+        previous = getattr(self.state, "goal_progress_identity", None)
+        if previous == identity:
+            return
+        self.state.goal_progress_identity = identity
+        if previous is None:
+            # Initial/recovered controller state gets the policy's normal first
+            # review grace; its existing current-run evidence is still useful.
+            self.state.goal_progress_sequence_floor = 0
+            return
+        self._goal_progress_policy().reset_review_cadence()
+        self.state.goal_meaningful_sequence = 0
+        floor = cfg.last_event_sequence
+        if type(current_work_sequence) is int and current_work_sequence > 0:
+            # The first new-identity action can arrive before a timer poll.
+            # Keep that actual action, but not the previous generation's ledger.
+            floor = min(floor, current_work_sequence - 1)
+        self.state.goal_progress_sequence_floor = floor
+
+    def _record_goal_work(self, sequence: int) -> None:
+        self._sync_goal_progress_identity(current_work_sequence=sequence)
+        self.state.goal_meaningful_sequence = max(sequence, getattr(self.state, "goal_meaningful_sequence", 0))
+
+    def _maybe_schedule_goal_progress_review(self) -> None:
+        self._sync_goal_progress_identity()
+        # Only coder evidence advances this clock. Reviewer wakes, counters and
+        # our own suggestions cannot create a progress/repetition loop.
+        sequences = [getattr(row, "sequence", 0) for row in
+                     [*self.ports.validations, *getattr(self.ports, "inspections", [])]]
+        sequences.append(getattr(self.ports.last_coder_message, "sequence", 0))
+        sequences.append(getattr(self.state, "goal_meaningful_sequence", 0))
+        floor = getattr(self.state, "goal_progress_sequence_floor", 0)
+        meaningful = max((v for v in sequences if type(v) is int and v > floor), default=0)
+        now = compat.time.monotonic()
+        task = getattr(self.state, "_supervisor_task", None)
+        policy = self._goal_progress_policy()
+        if not policy.maybe_due(
+            now=now, goal_enabled=self.ports._goal_enabled(),
+            runtime_enabled=self.ports._runtime_enabled(), meaningful_sequence=meaningful,
+            review_running=bool(task and not task.done()),
+            approval_pending=bool(self.ports.pending_approvals),
+            runnable=bool(self.ports.running and not self.ports.paused
+                and self.ports._coder_lifecycle_accepts_activity()
+                and getattr(self.state, "supervisor", None)),
+        ):
+            return
+        self.ports._schedule_supervisor_check(GOAL_PROGRESS_REVIEW_SUMMARY)
+        scheduled = getattr(self.state, "_supervisor_task", None)
+        if scheduled is not None and not scheduled.done():
+            policy.mark_requested(now=now, meaningful_sequence=meaningful)
 
     def _reconcile_intervention_accounting(self) -> None:
         prior = getattr(self.state, "prior_interventions", None)
@@ -764,6 +858,12 @@ class RuntimeReview:
             return
         if completion_review:
             await self.ports._refresh_coder_subagents()
+            if summary == NO_MARKER_IDLE_REVIEW_SUMMARY:
+                if (not self.ports._no_marker_idle_ready()
+                        or not await self.ports._confirm_coder_quiescent()
+                        or not self.ports._no_marker_idle_ready()):
+                    self.ports._no_marker_completion_review_key = None
+                    return
             active_subagents = self.ports._active_coder_subagents()
             if active_subagents:
                 self.ports._deferred_completion_check = compat.QueuedSupervisorCheck(
@@ -836,6 +936,15 @@ class RuntimeReview:
                 pending=runtime_trigger_batch,
             )
         latest_change_sequence = compat._latest_relevant_change_sequence(changed_files)
+        if not completion_review:
+            packet_inspections = [row.model_copy(update={"runtime_freshness": inspection_staleness(
+                row, changed_files, workspace_root=self.ports._active_workspace_root())})
+                for row in packet_inspections]
+            # Old reviewer instructions are audit history, not standing user
+            # constraints. Do not recycle their imperative text into full/cheap
+            # inputs at all; current findings must be independently established.
+            # The stored audit and authoritative task/human inputs remain intact.
+            packet_prior_interventions = []
         freshness_summary = compat._validation_freshness_summary(
             validations=packet_validations,
             changed_files=changed_files,
@@ -894,8 +1003,21 @@ class RuntimeReview:
             ),
             **completion_details,
         )
+        packet = packet.model_copy(update={
+            "goal": self.ports._goal_enabled(),
+            "goal_progress_review": (not completion_review and GOAL_PROGRESS_REVIEW_SUMMARY in summary),
+        })
         if completion_review:
             packet = self.ports._review_safe_packet_state(packet)
+            # Snapshot/diff preparation can await while the coder resumes. Only the
+            # automatic idle fallback is conditional here; explicit readiness,
+            # deliberate follow-ups and reviewer retries keep their existing path.
+            if summary == NO_MARKER_IDLE_REVIEW_SUMMARY:
+                if (not self.ports._no_marker_idle_ready()
+                        or not await self.ports._confirm_coder_quiescent()
+                        or not self.ports._no_marker_idle_ready()):
+                    self.ports._no_marker_completion_review_key = None
+                    return
         if not self.ports._coder_lifecycle_accepts_activity():
             if completion_review:
                 await self.ports._close_completion_review_session()
@@ -934,6 +1056,7 @@ class RuntimeReview:
                     getattr(self.state, "runtime_triage_reviewer", None) is not None
                     and human_message is None
                     and not packet.pending_approvals
+                    and not packet.goal_progress_review
                     and not compat._runtime_packet_requires_full_supervisor(packet)
                 ):
                     cheap = await self.ports._cheap_runtime_route(packet)
@@ -941,6 +1064,7 @@ class RuntimeReview:
                         self.ports._ack_runtime_trigger_batch(runtime_trigger_batch)
                         await self.ports._resume_idle_after_runtime_noop(packet)
                         return
+                packet = packet.model_copy(update={"runtime_review_started_monotonic": compat.time.monotonic()})
                 decision = await agent.decide(packet)
         except compat.SupervisorAgentError as exc:
             if getattr(self.ports, "_transport_error_pending", False):
@@ -1126,8 +1250,8 @@ class RuntimeReview:
     async def _resume_idle_after_runtime_noop(self, packet: compat.SupervisorWakePacket) -> bool:
         # A denied native approval can end a turn after its last action. A runtime
         # noop means no intervention is needed, not that the now-idle coder is done.
-        # Continue the existing no-marker review/nudge policy without waiting for
-        # the idle watchdog, and never revive a paused or superseded lifecycle.
+        # Start/continue the shared idle window (or immediate no-review nudge),
+        # never force an early review or revive a paused/superseded lifecycle.
         if not self.ports._runtime_noop_idle_context_is_current(packet):
             return False
         await self.ports._refresh_coder_subagents()
@@ -1289,7 +1413,8 @@ class RuntimeReview:
         issue: compat.RuntimeRestartIssue | None,
     ) -> None:
         self.state.prior_interventions.append(
-            compat.PriorIntervention(reason=reason, message_to_coder=message, sequence=sequence)
+            compat.PriorIntervention(reason=reason, message_to_coder=message, sequence=sequence,
+                authority="runtime_observation")
         )
         self.state.prior_interventions = self.state.prior_interventions[-20:]
         compat.patch_health(self.ports.store, compat.HealthDelta(generation=generation, interventions=1))
@@ -1320,6 +1445,13 @@ class RuntimeReview:
             return False
         if decision.wake_sequence is not None and decision.wake_sequence <= cfg.last_applied_supervisor_sequence:
             return False
+        human_input = packet is not None and packet.human_message is not None
+        # Preserve exact human directions. Timing notes describe runtime
+        # observations, not the continued authority of a user's instruction.
+        human_direction = bool(human_input and decision.decision in {
+                                   compat.SupervisorDecisionKind.INTERVENE,
+                                   compat.SupervisorDecisionKind.PAUSE}
+                               and decision.message_to_coder == packet.human_message.text)
         health = self.ports.store.get_health()
         issue = (
             compat._runtime_restart_issue(
@@ -1330,6 +1462,10 @@ class RuntimeReview:
             if packet is not None
             else None
         )
+        # Only a newly observed failing validation can advance defect recurrence.
+        # Wake sequence, a source read, or reviewer persistence cannot do so.
+        if issue is not None and issue.validation_id is None:
+            issue = None
         restart_candidate = False
         restart_candidate_reason: str | None = None
         if decision.decision == compat.SupervisorDecisionKind.RESTART:
@@ -1338,28 +1474,67 @@ class RuntimeReview:
                 issue_key=issue.key if issue is not None else None,
                 issue_sequence=issue.sequence if issue is not None else None,
             )
+            # Plateau, elapsed time and reviewer persistence are not independent
+            # repetitions of a defect. Keep other callers' restart policy intact.
+            restart_candidate = bool(issue is not None and restart_candidate
+                and restart_candidate_reason == "same issue repeated after two interventions")
         apply_restart_metadata = decision.decision != compat.SupervisorDecisionKind.RESTART or restart_candidate
 
         intervention: tuple[str, str] | None = None
+        lifecycle_changed_on_delivery = [False]
+
+        def before_send() -> bool:
+            current = self.ports.store.get_bello_config()
+            valid = (current.generation == cfg.generation and current.coder_thread_id == cfg.coder_thread_id)
+            lifecycle_changed_on_delivery[0] = not valid
+            return valid
+
+        def message_at_send(base_message):
+            def prepare():
+                changes = list((getattr(self.ports, "observed_changed_files", {}) or {}).values())
+                return base_message if human_direction else runtime_message_at_send(
+                    base_message, packet, now=compat.time.monotonic(),
+                    latest_change_sequence=compat._latest_relevant_change_sequence(changes) or 0,
+                )
+            return prepare
+
+        if decision.advisory_to_coder:
+            policy = self._goal_progress_policy()
+            now = compat.time.monotonic()
+            if (packet is not None and packet.goal and self.ports._goal_enabled()
+                    and policy.can_deliver(now=now, evidence_key=decision.advisory_key)):
+                message = ("Optional Goal observation (not a requirement; keep your approach if justified):\n"
+                           + decision.advisory_to_coder)
+                delivered, _ = await self.ports._deliver_coder_message(
+                    message, before_send=before_send, message_at_send=message_at_send(message))
+                if not delivered:
+                    return lifecycle_changed_on_delivery[0]
+                delivered_at = compat.time.monotonic()
+                policy.mark_delivered(now=delivered_at, evidence_key=decision.advisory_key)
+                self.ports._append_event(compat.AppEventSource.SUPERVISOR,
+                    "runtime/goal_advisory", reason="nonbinding progress observation delivered")
         if decision.decision == compat.SupervisorDecisionKind.INTERVENE and decision.message_to_coder and self.ports.coder:
             self.ports.tui.render("SUPERVISOR", f"steering coder: {decision.reason}")
-            delivered, _ = await self.ports._deliver_coder_message(decision.message_to_coder)
+            delivered, _ = await self.ports._deliver_coder_message(
+                decision.message_to_coder, before_send=before_send,
+                message_at_send=message_at_send(decision.message_to_coder))
             if not delivered:
-                return False
+                return lifecycle_changed_on_delivery[0]
             intervention = (decision.reason, decision.message_to_coder)
         elif decision.decision == compat.SupervisorDecisionKind.RESTART:
             if not restart_candidate:
-                message = decision.message_to_coder or compat._restart_rejection_steering(decision.handoff)
                 self.ports.tui.render("SUPERVISOR", f"restart rejected without health evidence: {decision.reason}")
-                if self.ports.coder:
-                    delivered, _ = await self.ports._deliver_coder_message(message)
-                    if not delivered:
-                        return False
-                intervention = (decision.reason, message)
+                # A rejected restart is not a correction and cannot manufacture
+                # the intervention count needed to approve its own next request.
+                self.ports._append_event(compat.AppEventSource.SUPERVISOR,
+                    "runtime/restart_rejected", reason="no independently repeated confirmed defect")
             else:
                 if restart_candidate_reason:
                     self.ports.tui.render("SUPERVISOR", f"restart candidate: {restart_candidate_reason}")
-                await self.ports.restart(decision.reason or "supervisor requested restart", handoff=decision.handoff)
+                await self.ports.restart(decision.reason or "supervisor requested restart",
+                    handoff=decision.handoff, before_restart=before_send)
+                if lifecycle_changed_on_delivery[0]:
+                    return True
         elif decision.decision == compat.SupervisorDecisionKind.PAUSE:
             await self.ports.pause()
 
@@ -1374,8 +1549,11 @@ class RuntimeReview:
                 generation=cfg.generation,
                 issue=issue,
             )
-        if decision.persistent_decision:
-            self.ports.store.append_text_locked(compat.DECISIONS, f"- {decision.persistent_decision}\n")
+        # Runtime's proposals stay in the decision audit, never in the durable
+        # user-constraint document. Human/task constraints are not changed here.
+        if decision.persistent_decision and human_input:
+            self.ports.store.append_text_locked(compat.DECISIONS,
+                f"- Human input (original): {packet.human_message.text}\n")
         if decision.progress_update and apply_restart_metadata:
             self.ports.store.append_text_locked(compat.PROGRESS, f"- {decision.progress_update}\n")
             if decision.decision != compat.SupervisorDecisionKind.RESTART:
@@ -1387,7 +1565,7 @@ class RuntimeReview:
             self.ports.store.write_text_locked(compat.HANDOFF, "")
         if decision.display_message and apply_restart_metadata:
             self.ports.tui.render("SUPERVISOR", decision.display_message)
-        if decision.decision != compat.SupervisorDecisionKind.NOOP:
+        if intervention is not None or (decision.decision == compat.SupervisorDecisionKind.RESTART and restart_candidate) or decision.decision == compat.SupervisorDecisionKind.PAUSE:
             self.state._runtime_decision_invalidated_completion = True
         self.ports._record_supervisor_decision_metric(use_case="runtime", decision=decision.decision.value)
         self.ports.store.update_bello_config(
@@ -1416,13 +1594,14 @@ class RuntimeReview:
         if config.model is None:
             self.ports.tui.render("SYSTEM", "cheap runtime triage disabled: no model configured")
             self.state.runtime_triage_config = compat.CheapRuntimeTriageConfig(
-                enabled=False, model=None, timeout_seconds=config.timeout_seconds
+                enabled=False, model=None, timeout_seconds=config.timeout_seconds, effort=config.effort
             )
             return
         reviewer = compat.CheapRuntimeReviewer(
             self.ports.client,
             self.ports._active_workspace_root(),
             model=config.model,
+            effort=config.effort,
             timeout_seconds=config.timeout_seconds,
         )
         try:
@@ -1433,7 +1612,7 @@ class RuntimeReview:
                 f"cheap runtime triage unavailable; full supervisor on every wake ({exc.__class__.__name__})",
             )
             self.state.runtime_triage_config = compat.CheapRuntimeTriageConfig(
-                enabled=False, model=config.model, timeout_seconds=config.timeout_seconds
+                enabled=False, model=config.model, timeout_seconds=config.timeout_seconds, effort=config.effort
             )
             return
         self.state.runtime_triage_reviewer = reviewer

@@ -24,6 +24,7 @@ from jsonschema import ValidationError
 from supervisor.appserver import (AppServerClient, AppServerError, AppServerMessage,
     AppServerTimeoutError, _private_owned_directory, _codex_home_from_environment)
 from supervisor.runtime.journal import RuntimeJournal
+from supervisor.quiescence import execution_queue_clear
 from supervisor.runtime.context_policy import context_policies_match
 from supervisor.runtime.codex_permissions import native_permission_params, validate_windows_native_scope
 from supervisor.runtime.codex_toolchains import native_toolchain_read_paths
@@ -129,6 +130,7 @@ class CodexBackend:
         self._threads = self._journal.threads()
         self._native_threads: dict[str, str] = {}
         self._native_turns: dict[tuple[str, str], str] = {}
+        self._execution_epochs: dict[str, int] = {}
         for host_id, record in self._threads.items():
             if record.get("id") != host_id or not isinstance(record.get("nativeId"), str):
                 raise AppServerError("invalid persisted native Codex identity mapping")
@@ -370,6 +372,94 @@ class CodexBackend:
                     self._native_command, manifest_path=self._selection_manifest,
                 )
                 self._selection_verified = True
+
+    async def read_execution_status(self, host_thread: str, *, timeout: float = 10) -> dict[str, Any]:
+        """Read live metadata for an owned thread, without adopting native turns.
+
+        Host turn completion alone is insufficient: native autonomous work may
+        have a successor which is deliberately not in Bello's authority map.
+        Missing/ambiguous metadata is not evidence of quiescence. Detached jobs
+        whose tools already returned are outside this protocol's visibility.
+        """
+        unknown = {"state": "unknown"}
+        record = self._threads.get(host_thread)
+        if (record is None or record.get("closed") or host_thread not in self._loaded or self._closing or self._failure
+                or not self._initialized or self._client is None):
+            return unknown
+        native_id = record.get("nativeId")
+        if not isinstance(native_id, str) or self._native_threads.get(native_id) != host_thread:
+            return unknown
+        identity = (native_id, record.get("activeTurnId"), tuple(record.get("turnIds", {}).items()))
+        client = self._client
+        epoch = self._execution_epochs.get(native_id, 0)
+        if native_id in self._pending_turns:
+            return {"state": "unknown", "activity_observed": True}
+        if not execution_queue_clear(self._queue):
+            return unknown
+        try:
+            raw = await client.request("thread/read", {
+                "threadId": native_id, "includeTurns": True,
+            }, timeout=timeout)
+        except (AppServerError, TimeoutError):
+            return unknown
+        if (self._threads.get(host_thread) is not record or record.get("closed") or host_thread not in self._loaded
+                or self._client is not client
+                or self._closing or self._failure or self._native_threads.get(native_id) != host_thread
+                or identity != (record.get("nativeId"), record.get("activeTurnId"),
+                                tuple(record.get("turnIds", {}).items()))
+                or not execution_queue_clear(self._queue)):
+            return unknown
+        if (epoch != self._execution_epochs.get(native_id, 0)
+                or native_id in self._pending_turns):
+            return {"state": "unknown", "activity_observed": True}
+        thread = raw.get("thread") if isinstance(raw, dict) else None
+        if not isinstance(thread, dict) or thread.get("id") != native_id:
+            return unknown
+        status = thread.get("status")
+        status = status.get("type") if isinstance(status, dict) else status
+        turns = thread.get("turns")
+        if (not isinstance(status, str) or status not in {"idle", "active"} or not isinstance(turns, list)
+                or any(obj.get(key) not in (None, False, "")
+                       for obj in (raw, thread) for key in ("nextCursor", "hasMore", "truncated"))):
+            return unknown
+        active = status == "active"
+        pending_tools = False
+        unowned_active = False
+        seen: set[str] = set()
+        terminal = {"completed", "failed", "interrupted"}
+        tool_types = {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall",
+                      "collabAgentToolCall"}
+        for turn in turns:
+            if not isinstance(turn, dict):
+                return unknown
+            turn_id, turn_status, items = turn.get("id"), turn.get("status"), turn.get("items")
+            if (not isinstance(turn_id, str) or not turn_id or turn_id in seen
+                    or not isinstance(turn_status, str) or turn_status not in terminal | {"inProgress"}
+                    or not isinstance(items, list)):
+                return unknown
+            seen.add(turn_id)
+            if turn_status == "inProgress":
+                active = True
+                unowned_active |= (native_id, turn_id) not in self._native_turns
+            for item in items:
+                if not isinstance(item, dict) or not isinstance(item.get("type"), str):
+                    return unknown
+                item_status = item.get("status")
+                if item_status == "inProgress":
+                    pending_tools = True
+                elif item.get("type") in tool_types and (not isinstance(item_status, str)
+                                                         or item_status not in terminal | {"declined"}):
+                    return unknown
+        if active or pending_tools:
+            return {"state": "busy", "pending_tools": pending_tools, "unowned_active_turn": unowned_active}
+        # A host-active turn absent from the returned inventory cannot be proved
+        # terminal by an idle thread flag. Nor can a truncated history containing
+        # no turn that this backend has actually dispatched.
+        mapped = record.get("turnIds", {})
+        if (not seen or not set(mapped).issubset(seen)
+                or turns[-1]["id"] not in mapped):
+            return unknown
+        return {"state": "quiescent", "pending_tools": False, "unowned_active_turn": False}
 
     async def _request(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
         if method == "initialize":
@@ -855,6 +945,15 @@ class CodexBackend:
 
     async def _receive(self, message: AppServerMessage) -> None:
         # Never await a handler/RPC from AppServerClient's sole reader task.
+        params = message.raw.get("params", {})
+        if isinstance(params, dict):
+            thread = params.get("thread")
+            native_id = params.get("threadId") or (thread.get("id") if isinstance(thread, dict) else None)
+            if isinstance(native_id, str) and native_id in self._native_threads:
+                # Includes unowned successor notifications, but gives them no
+                # host identity or tool authority. Account heartbeats are not
+                # thread activity and cannot invalidate a quiescence probe.
+                self._execution_epochs[native_id] = self._execution_epochs.get(native_id, 0) + 1
         self._queue.put_nowait(deepcopy(message.raw))
 
     async def _events(self) -> None:
