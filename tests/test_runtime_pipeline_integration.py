@@ -71,6 +71,18 @@ _PIPELINE_FAILURE_MARKERS = (
 )
 
 
+def _tool_result_text(serialized: str, call_id: str) -> str:
+    try:
+        messages = json.loads(serialized).get("messages", [])
+    except (ValueError, AttributeError):
+        return "unparsed request"
+    for message in reversed(messages if isinstance(messages, list) else []):
+        if isinstance(message, dict) and message.get("tool_call_id") == call_id:
+            content = message.get("content")
+            return content if isinstance(content, str) else json.dumps(content)
+    return "no result for " + call_id
+
+
 _PROVIDER_REJECTIONS = (
     "the fake provider received anything other than its isolated dummy key",
     "unexpected paid model route",
@@ -147,6 +159,7 @@ def _pipeline_diagnostic(controller, tui, provider, *, socket_diagnostic=None) -
             for error in list(provider.errors)[:8]
         ],
         "requests_by_role": {role: min(1000000, max(0, provider.roles[role])) for role in _PIPELINE_ROLES},
+        "rejected_pytest_results": [str(text)[-1500:] for text in getattr(provider, "rejected_pytest_results", [])[:2]],
     }
     if socket_diagnostic is not None:
         summary["socket_probe_exit_codes"] = {
@@ -618,6 +631,9 @@ class _PipelineProviderState:
         self.finished_roles: set[str] = set()
         self.schemas: dict[str, dict[str, Any]] = {}
         self.errors: list[str] = []
+        # The fixture's own sandboxed pytest results that the scripted coder
+        # rejected; generated in the disposable workspace, never task input.
+        self.rejected_pytest_results: list[str] = []
 
     def response(self, body: dict[str, Any], authorization: str | None) -> bytes:
         if authorization != f"Bearer {_DUMMY_KEY}":
@@ -719,6 +735,8 @@ class _PipelineProviderState:
                 {"command": self.pytest_command, "cwd": "app", "timeout": 60 if os.name == "nt" else 30},
             )
         if "1 passed" not in serialized:
+            with self.lock:
+                self.rejected_pytest_results.append(_tool_result_text(serialized, "call-coder-pytest")[-1500:])
             raise AssertionError("coder did not receive a passing pytest result")
         with self.lock:
             self.finished_roles.add("coder")
