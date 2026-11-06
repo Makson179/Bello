@@ -8,7 +8,7 @@ on:
   push:
     # Readiness tests the already published, pinned helper in its ModernBERT
     # workflow. A new branch cannot reuse another branch's native build cache.
-    branches: [mystery, 'codex/**', '!codex/release-0.6.0-readiness', '!codex/080-production-ready']
+    branches: [mystery, 'codex/**', '!codex/release-0.6.0-readiness', '!ci/0.8.1-rc']
     paths:
       - '.github/workflows/native-codex-windows*.yml'
       - 'scripts/native-codex-selection.patch'
@@ -45,11 +45,11 @@ concurrency:
 
 jobs:
   native-build:
-    if: github.ref != 'refs/heads/codex/080-production-ready'
+    if: github.ref != 'refs/heads/ci/0.8.1-rc'
     uses: ./.github/workflows/native-codex-windows-build.yml
 
   native-proof:
-    if: github.ref != 'refs/heads/codex/080-production-ready'
+    if: github.ref != 'refs/heads/ci/0.8.1-rc'
     needs: native-build
     runs-on: windows-2025
     timeout-minutes: 40

@@ -19,6 +19,7 @@ from uuid import uuid4
 from supervisor.appserver import AppServerClient, AppServerError, AppServerMessage, AppServerTimeoutError
 from supervisor.approvals import ApprovalManager, normalize_approval_request
 from supervisor.runtime.cleanup import finish_cleanup
+from supervisor.runtime.context_policy import context_policies_match
 from supervisor.runtime.journal import RuntimeJournal
 from supervisor.runtime.models import engine_effort, parse_model_selection
 from supervisor.runtime.codex_permissions import validate_windows_native_scope
@@ -277,6 +278,39 @@ class RuntimeClient(AppServerClient):
                          task_path=Path(record["runtimeTaskPath"]) if record.get("runtimeTaskPath") else None,
                          goal_map_path=Path(record["runtimeGoalMapPath"]) if record.get("runtimeGoalMapPath") else None)
 
+    async def read_execution_status(self, thread_id: str, *, timeout: float = 10) -> dict[str, Any]:
+        """Controller-only, read-only native quiescence check for an owned thread."""
+        unknown = {"state": "unknown"}
+        record = self._threads.get(thread_id)
+        if (not self._started or self._closing or record is None or record.get("closed")
+                or record.get("engine") != "codex"):
+            return unknown
+        backend = self._engines.get("codex")
+        read_status = getattr(backend, "read_execution_status", None)
+        if not callable(read_status):
+            return unknown
+        identity = (record.get("activeTurnId"), record.get("lastTurnId"), record.get("lastTurnStatus"))
+        if any(thread == thread_id for thread, _ in self._terminal_turns_inflight):
+            return unknown
+        host = self._host
+        if host and any(owner == thread_id and not task.done() for (owner, _), task in host._active.items()):
+            return {"state": "busy", "pending_tools": True}
+        result = await read_status(thread_id, timeout=timeout)
+        if (not self._started or self._closing or self._threads.get(thread_id) is not record
+                or record.get("closed") or record.get("engine") != "codex"
+                or self._engines.get("codex") is not backend or self._host is not host
+                or identity != (record.get("activeTurnId"), record.get("lastTurnId"), record.get("lastTurnStatus"))
+                or any(thread == thread_id for thread, _ in self._terminal_turns_inflight)):
+            return unknown
+        if host and any(owner == thread_id and not task.done() for (owner, _), task in host._active.items()):
+            return {"state": "busy", "pending_tools": True}
+        if (not isinstance(result, dict) or not isinstance(result.get("state"), str)
+                or result["state"] not in {"busy", "quiescent", "unknown"}):
+            return unknown
+        # Do not leak native identifiers or a backend's accidental text payload.
+        return {"state": result["state"], **{key: result[key] for key in
+                ("pending_tools", "unowned_active_turn", "activity_observed") if type(result.get(key)) is bool}}
+
     async def reconcile_terminal_turn(self, thread_id: str, turn_id: str,
                                       turn: dict[str, Any]) -> bool:
         """Apply a controller-verified native thread/read result without replaying work."""
@@ -397,7 +431,7 @@ class RuntimeClient(AppServerClient):
             if (record.get("networkAccess", False) != (not self.runtime_enabled)
                     or record.get("distillerEnabled", False) != expected_distiller
                     or record.get("asyncTools", False) != expected_async
-                    or record.get("noNeedForContext", self._default_context_policy()) != expected_context
+                    or not context_policies_match(record.get("noNeedForContext", self._default_context_policy()), expected_context)
                     or (params.get("belloRole") is not None and params["belloRole"] != role)):
                 raise AppServerError(
                     "Saved thread uses a different runtime/distiller/async tool policy; start a fresh run "
@@ -632,7 +666,7 @@ class RuntimeClient(AppServerClient):
 
     def _validate_scope_overrides(self, record: dict[str, Any], params: dict[str, Any]) -> None:
         if ("noNeedForContext" in params and
-                params["noNeedForContext"] != record.get("noNeedForContext", self._default_context_policy())):
+                not context_policies_match(record.get("noNeedForContext", self._default_context_policy()), params["noNeedForContext"])):
             raise AppServerError("a resumed thread cannot change its context compaction policy")
         if ("windowsNativeRootRead" in params and
                 (type(params["windowsNativeRootRead"]) is not bool or

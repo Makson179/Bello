@@ -10,9 +10,9 @@ from tests.test_native_codex_windows_workflow import _action, _block, _field, _m
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BRANCH = "codex/080-production-ready"
+BRANCH = "ci/0.8.1-rc"
 REF = f"refs/heads/{BRANCH}"
-STALE_BRANCH = "codex/072-recovery-validation"
+STALE_BRANCH = "codex/080-production-ready"
 WORKFLOW = ROOT / ".github/workflows/native-codex-candidate.yml"
 UPSTREAM = "979011409de0a60b52f179721948e65531d26144"
 

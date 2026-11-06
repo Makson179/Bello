@@ -153,7 +153,8 @@ def _bounded_info(value: Any, *, depth: int = 0, nodes: list[int] | None = None)
 
 
 def bounded_provider_error(params: Mapping[str, Any]) -> dict[str, Any]:
-    """Keep diagnostic error fields and tri-state retry information, <=16 KiB.
+    """Keep diagnostic error fields and tri-state retry information, <=16 KiB
+    except for errors flagged belloFullText (Claude Code), which stay whole.
 
     An absent ``willRetry`` stays absent; a present non-boolean becomes null.
     Only the literal booleans True and False carry provider retry semantics.
@@ -165,14 +166,19 @@ def bounded_provider_error(params: Mapping[str, Any]) -> dict[str, Any]:
     error = params.get("error")
     source = error if isinstance(error, Mapping) else {}
     details: dict[str, Any] = {}
+    # Claude Code errors carry belloFullText: the owner decided their complete
+    # text (including CLI stderr) is logged as is, never clipped or redacted.
+    full = source.get("belloFullText") is True
     message = source.get("message")
     if not isinstance(message, str):
         message = error if isinstance(error, str) else params.get("message")
     if isinstance(message, str):
-        details["message"] = _json_text(sanitize_error_text(message), 4096)
+        details["message"] = message if full else _json_text(sanitize_error_text(message), 4096)
     additional = source.get("additionalDetails")
     if isinstance(additional, str):
-        details["additionalDetails"] = _json_text(sanitize_error_text(additional), 4096)
+        details["additionalDetails"] = additional if full else _json_text(sanitize_error_text(additional), 4096)
+    if full:
+        details["belloFullText"] = True
     if "codexErrorInfo" in source:
         info = _bounded_info(source["codexErrorInfo"])
         rendered = _json(info)

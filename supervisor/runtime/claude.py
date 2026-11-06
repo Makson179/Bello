@@ -22,6 +22,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import inspect
 import json
@@ -29,6 +30,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import traceback
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -37,6 +39,7 @@ from jsonschema.exceptions import SchemaError, ValidationError
 
 from supervisor.appserver import AppServerError, AppServerTimeoutError
 from supervisor.process_fence import create_subprocess_exec
+from supervisor.runtime.context_policy import context_policies_match
 from supervisor.runtime.models import validate_effort
 from supervisor.runtime.claude_async import BATCH_GUIDANCE, BATCH_TOOL_NAME, ClaudeAsyncBatches
 from supervisor.runtime.claude_cli import OfficialCli, resolve_official_cli, sdk_bundled_cli
@@ -134,6 +137,28 @@ class _AsyncDelivery:
     content: list[dict[str, Any]]
 
 
+# The complete Claude Code CLI stderr of every session, one line per entry.
+CLI_STDERR_LOG = "claude-cli-stderr.log"
+
+
+def _observe_outcome(future: asyncio.Future[Any]) -> None:
+    """Mark a command outcome observed once it settles.
+
+    A command can be rejected after its requester stopped waiting (stop()
+    never awaits its own stop command; a cancelled request leaves its future
+    queued). Awaiters still receive the exception; this only keeps shutdown
+    from logging "Future exception was never retrieved".
+    """
+    if not future.cancelled():
+        future.exception()
+
+
+class ClaudeCliError(AppServerError):
+    """Claude Code CLI output carried in full: never truncated or redacted."""
+
+    bello_full_text = True
+
+
 class _ContextCancelled(Exception):
     def __init__(self, command: _Command):
         self.command = command
@@ -200,6 +225,8 @@ class ClaudeBackend:
         # example a stopped summary whose final result never arrived). Their
         # usage is a lower bound and is reported as such, never estimated.
         self._usage_incomplete: set[tuple[str, Any]] = set()
+        # Complete CLI stderr of each thread's current turn (see _new_client).
+        self._cli_stderr: dict[str, list[str]] = {}
         self._state_persistence_uncertain = False
         self._closing = False
         self._state_file = self.state_dir / "threads.json"
@@ -241,6 +268,7 @@ class ClaudeBackend:
             if owner.task.done():
                 continue
             future = asyncio.get_running_loop().create_future()
+            future.add_done_callback(_observe_outcome)
             await owner.queue.put(_Command("stop", {"threadId": thread_id}, future))
         for thread_id, owner in owners:
             if owner.task.done():
@@ -390,7 +418,9 @@ class ClaudeBackend:
         self._assert_state_persistence_known()
         await self._ensure_initialized()
         record = self._record(params.get("threadId"))
-        if "noNeedForContext" in params and claude_context.context_policy(params["noNeedForContext"]) != record.get("noNeedForContext", claude_context.context_policy(None)):
+        if "noNeedForContext" in params and not context_policies_match(
+                record.get("noNeedForContext", claude_context.context_policy(None)),
+                claude_context.context_policy(params["noNeedForContext"])):
             raise AppServerError("resuming a Claude Code thread cannot change noNeedForContext")
         if "asyncTools" in params and params["asyncTools"] != record.get("asyncTools", False):
             raise AppServerError("resuming a Claude Code thread cannot change asyncTools")
@@ -420,6 +450,10 @@ class ClaudeBackend:
     async def _turn_start(self, params: dict[str, Any]) -> dict[str, Any]:
         self._assert_state_persistence_known()
         record = self._record(params.get("threadId"))
+        if "noNeedForContext" in params and not context_policies_match(
+                record.get("noNeedForContext", claude_context.context_policy(None)),
+                claude_context.context_policy(params["noNeedForContext"])):
+            raise AppServerError("a Claude Code turn cannot change noNeedForContext")
         if record.get("closed"):
             raise AppServerError("cannot start a turn on an archived Claude Code thread")
         if record.get("activeTurnId"):
@@ -496,6 +530,7 @@ class ClaudeBackend:
             await self._ensure_owner(record)
             owner = self._owners[thread_id]
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        future.add_done_callback(_observe_outcome)
         await owner.queue.put(_Command(kind, params, future))
         return await future
 
@@ -542,6 +577,7 @@ class ClaudeBackend:
         record = self._record(thread_id)
         turn_id = params["turnId"]
         async_key = (thread_id, turn_id)
+        self._cli_stderr_lines(thread_id).clear()
         client = None
         receive_task: asyncio.Task[Any] | None = None
         command_task: asyncio.Task[_Command] | None = None
@@ -768,7 +804,12 @@ class ClaudeBackend:
             return stop_owner
         except _ContextCancelled as exc:
             self._resolve(exc.command, {})
-            command_task = None
+            # A cancellation found in the queue can leave this turn's own
+            # queue.get() pending. Keep it for the cleanup below, which cancels
+            # it or returns a raced command; dropping it would let an orphaned
+            # getter swallow the owner's next command (stop, turn/start).
+            if command_task is not None and command_task.done():
+                command_task = None
             stop_owner = exc.command.kind == "stop"
             await self._complete_turn(record, turn_id, "interrupted", self._async_usage.get(async_key, {}), "Turn interrupted")
             return stop_owner
@@ -778,7 +819,13 @@ class ClaudeBackend:
             raise
         except Exception as exc:
             if record.get("activeTurnId") == turn_id:
-                await self._complete_turn(record, turn_id, "failed", self._async_usage.get(async_key, {}), self._safe_failure(exc))
+                # The complete error and CLI stderr, untruncated and unredacted
+                # (an explicit owner decision), in both the diagnostic and the
+                # turn error that the controller logs.
+                stderr = self._cli_stderr_lines(thread_id)
+                self._turn(record, turn_id)["failureDiagnostic"] = self._failure_diagnostic(exc, cli_stderr=stderr)
+                await self._complete_turn(record, turn_id, "failed", self._async_usage.get(async_key, {}),
+                                          self._failure_text(exc, stderr))
             return stop_owner
         finally:
             batches = self._async_batches.pop(async_key, None)
@@ -861,14 +908,51 @@ class ClaudeBackend:
             record["claudeSessionId"] = str(uuid4())
             record["hasSession"] = False
             self._persist()
-        client = self._new_client(self._options(record, params))
+        client = self._new_client(self._options(record, params), thread_id=record["id"])
         try:
-            await self._validate_context_connection(client, record, params)
-            self._check_context_cancel(command_task, record)
             state = record.get("contextState")
-            if state is None:
-                return client, None
-            usage = await client.get_context_usage()
+            # One shared retry budget for the complete PRE-QUERY preparation,
+            # not separate nested budgets for initialize and measurement.
+            # connect() sends no prompt; account/model/MCP validation is rerun.
+            # Never retry query(), tool execution or an ambiguous stream here.
+            for attempt in range(2):
+                phase = "connection_validation"
+                try:
+                    await self._validate_context_connection(client, record, params)
+                    self._check_context_cancel(command_task, record)
+                    if state is None:
+                        return client, None
+                    phase = "context_usage"
+                    usage = await client.get_context_usage()
+                    break
+                except Exception as exc:
+                    if not (isinstance(exc, TimeoutError) or isinstance(exc.__cause__, TimeoutError)):
+                        raise
+                    record["lastContextPreparationFailure"] = {
+                        "phase": phase, "attempt": attempt + 1,
+                        "diagnostic": self._failure_diagnostic(
+                            exc, cli_stderr=self._cli_stderr_lines(record["id"])),
+                        "transport": self._control_channel_diagnostic(client),
+                    }
+                    record["contextPreparationFailures"] = [
+                        *record.get("contextPreparationFailures", [])[-3:],
+                        record["lastContextPreparationFailure"],
+                    ]
+                    self._persist()
+                    if attempt:
+                        raise
+                    self._check_context_cancel(command_task, record)
+                    # Close in the owning task. A cleanup failure must prevent
+                    # a second connection, not leave two live CLI owners.
+                    await client.disconnect()
+                    self._check_context_cancel(command_task, record)
+                    record["contextPreparationRetries"] = record.get("contextPreparationRetries", 0) + 1
+                    if phase == "context_usage":
+                        record["contextUsageProbeRetries"] = record.get("contextUsageProbeRetries", 0) + 1
+                        record["lastContextUsageProbeFailure"] = self._failure_diagnostic(
+                            exc, cli_stderr=self._cli_stderr_lines(record["id"]))
+                    self._persist()
+                    client = self._new_client(self._options(record, params), thread_id=record["id"])
             self._check_context_cancel(command_task, record)
             total = usage.get("totalTokens") if isinstance(usage, dict) else None
             if not isinstance(total, int) or isinstance(total, bool) or total < 0:
@@ -948,7 +1032,7 @@ class ClaudeBackend:
                 stage = "connect"
                 await client.disconnect()
                 original_disconnected = True
-                fresh = self._new_client(fresh_options)
+                fresh = self._new_client(fresh_options, thread_id=record["id"])
                 await self._validate_context_connection(fresh, new_record, params)
                 stage = "measure"
                 fresh_usage = await fresh.get_context_usage()
@@ -994,7 +1078,7 @@ class ClaudeBackend:
                 if fresh is not None:
                     await fresh.disconnect()
                 if original_disconnected:
-                    client = self._new_client(self._options(record, params))
+                    client = self._new_client(self._options(record, params), thread_id=record["id"])
                     await self._validate_context_connection(client, record, params)
                 category = self._checkpoint_category(error, stage)
                 schedule = claude_context.note_checkpoint_failure(state, threshold, projected)
@@ -1106,7 +1190,7 @@ class ClaudeBackend:
             nonlocal deadline_expired
             from claude_agent_sdk import ResultMessage
 
-            summarizer = self._new_client(self._summary_options(record, params))
+            summarizer = self._new_client(self._summary_options(record, params), thread_id=record["id"])
             key = (record["id"], record.get("activeTurnId"))
             # Set before the query is written, not after its await returns: a
             # cancelled or timed-out write may already have reached the CLI.
@@ -1520,7 +1604,11 @@ class ClaudeBackend:
         elif not self._turn(record, turn_id)["items"] and isinstance(message.result, str) and message.result:
             await self._append_agent_item(record, turn_id, message.result)
         if status == "failed" and error is None:
-            error = "Claude Code reported that the turn failed"
+            # The CLI's own error result and stderr, untruncated and unredacted
+            # (owner decision), like the exception path in _drive_turn.
+            stderr = self._cli_stderr_lines(record["id"])
+            error, diagnostic = self._error_result_failure(message, stderr)
+            self._turn(record, turn_id)["failureDiagnostic"] = diagnostic
         await self._complete_turn(
             record, turn_id, status, usage, error,
             output_schema_failure=output_schema_failure,
@@ -1606,7 +1694,9 @@ class ClaudeBackend:
             self._usage_incomplete.discard((record["id"], turn_id))
             turn["usageIncomplete"] = True
         if error:
-            turn["error"] = {"message": error}
+            # belloFullText: the controller logs this text whole (no clipping
+            # or redaction), as decided for Claude Code errors.
+            turn["error"] = {"message": error, "belloFullText": True}
             if output_schema_failure:
                 # Adapter-owned classification, never copied from provider text.
                 turn["error"]["belloFailureKind"] = "output_schema_validation"
@@ -1661,7 +1751,7 @@ class ClaudeBackend:
             ),
             "env": {
                 "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
-                "CLAUDE_AGENT_SDK_CLIENT_APP": "bello/0.8.0",
+                "CLAUDE_AGENT_SDK_CLIENT_APP": "bello/0.8.1",
             },
             "extra_args": {"disable-slash-commands": None, "no-chrome": None},
             "effort": params.get("effort"),
@@ -1714,7 +1804,7 @@ class ClaudeBackend:
             ),
             env={
                 "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
-                "CLAUDE_AGENT_SDK_CLIENT_APP": "bello/0.8.0",
+                "CLAUDE_AGENT_SDK_CLIENT_APP": "bello/0.8.1",
             },
             extra_args={"disable-slash-commands": None, "no-chrome": None},
         )
@@ -1832,7 +1922,7 @@ class ClaudeBackend:
         server_ref: dict[str, Any] = {}
         config = create_sdk_mcp_server(
             _MCP_SERVER,
-            version="0.8.0",
+            version="0.8.1",
             tools=self._sdk_tools(record, server_ref),
         )
         server = config["instance"]
@@ -1957,12 +2047,161 @@ class ClaudeBackend:
             },
         }
 
-    def _new_client(self, options: Any) -> Any:
+    def _cli_stderr_lines(self, thread_id: str | None) -> list[str]:
+        """The live list of one thread's CLI stderr for its current turn."""
+        if thread_id is None:
+            return []
+        buffers = self.__dict__.setdefault("_cli_stderr", {})
+        return buffers.setdefault(thread_id, [])
+
+    def _log_cli_stderr(self, thread_id: str | None, line: str) -> None:
+        """Append one complete CLI stderr line to the private backend log."""
+        state_dir = getattr(self, "state_dir", None)
+        if state_dir is None:
+            return
+        stamp = datetime.now(timezone.utc).isoformat()
+        entry = f"{stamp} thread={thread_id or '-'} {line}\n".encode("utf-8", errors="replace")
+        try:
+            path = Path(state_dir) / CLI_STDERR_LOG
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.write(descriptor, entry)
+            finally:
+                os.close(descriptor)
+        except OSError:
+            # Logging is diagnostic: a full disk must not stop the session.
+            pass
+
+    def _new_client(self, options: Any, *, thread_id: str | None = None) -> Any:
+        backend = self
+        stderr_counts: dict[str, int] = {"lines": 0, "chars": 0}
+        # The owner decided that Claude Code's own error text is always shown
+        # in full: every stderr line is kept for the turn's failure text and
+        # diagnostic and appended to CLI_STDERR_LOG, never truncated or redacted.
+        stderr_lines = self._cli_stderr_lines(thread_id)
+        previous_stderr = options.stderr
+
+        def observe_stderr(line: str) -> None:
+            stderr_lines.append(line)
+            backend._log_cli_stderr(thread_id, line)
+            stderr_counts["lines"] += 1
+            stderr_counts["chars"] += len(line)
+            lower = line.lower()
+            for key, needles in {
+                "oauth": ("oauth", "invalid_grant"),
+                "refresh": ("refresh",),
+                "auth_error": ("authenticationerror", "authentication failed", "unauthorized"),
+                "rate_limit": ("rate limit", "rate_limit", "429"),
+                "timeout": ("timed out", "timeout"),
+                "lock": ("lock",),
+                "network": ("econnreset", "econnrefused", "enotfound", "etimedout", "fetch failed"),
+                "resource": ("enospc", "emfile", "enfile", "out of memory"),
+                "permission": ("eacces", "eperm", "permission denied"),
+            }.items():
+                if any(needle in lower for needle in needles):
+                    stderr_counts[key] = stderr_counts.get(key, 0) + 1
+            if previous_stderr is not None:
+                previous_stderr(line)
+
+        options.stderr = observe_stderr
         if self._client_factory is not None:
-            return self._client_factory(options)
+            client = self._client_factory(options)
+            for name, value in (("_bello_stderr_counts", stderr_counts), ("_bello_stderr_lines", stderr_lines)):
+                try:
+                    setattr(client, name, value)
+                except AttributeError:
+                    pass
+            return client
         from claude_agent_sdk import ClaudeSDKClient
 
-        return ClaudeSDKClient(options)
+        class ObservedClient(ClaudeSDKClient):
+            async def disconnect(self) -> None:
+                # SDK connect() tears its Query down before re-raising an
+                # initialize error. Retain counters before that cleanup;
+                # never messages, request data, environment or credentials.
+                if getattr(self, "_query", None) is not None:
+                    self._bello_control_snapshot = backend._control_channel_diagnostic(self)
+                await super().disconnect()
+
+        client = ObservedClient(options)
+        client._bello_stderr_counts = stderr_counts
+        client._bello_stderr_lines = stderr_lines
+        return client
+
+    @staticmethod
+    def _control_channel_diagnostic(client: Any) -> dict[str, Any]:
+        """Bounded, content-free counters; diagnostics cannot affect control."""
+        try:
+            query = getattr(client, "_query", None)
+            if query is None:
+                previous = getattr(client, "_bello_control_snapshot", None)
+                return dict(previous) if isinstance(previous, dict) else {"available": False}
+            out: dict[str, Any] = {"available": True}
+            counters = getattr(client, "_bello_stderr_counts", None)
+            if isinstance(counters, dict):
+                out["stderr_categories"] = dict(counters)
+            for source, key in (("_closed", "closed"), ("_initialized", "initialized")):
+                value = getattr(query, source, None)
+                if isinstance(value, bool):
+                    out[key] = value
+            for source, key in (("pending_control_responses", "pending_controls"),
+                                ("_inflight_requests", "inflight_incoming_controls")):
+                value = getattr(query, source, None)
+                if isinstance(value, dict):
+                    out[key] = len(value)
+            receiver = getattr(query, "_message_receive", None)
+            if receiver is not None:
+                stats = receiver.statistics()
+                for key in ("current_buffer_used", "max_buffer_size", "tasks_waiting_send", "tasks_waiting_receive"):
+                    value = getattr(stats, key, None)
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        out[key] = value
+            reader = getattr(query, "_read_task", None)
+            if reader is not None:
+                out["reader_done"] = bool(reader.done())
+            process = getattr(getattr(client, "_transport", None), "_process", None)
+            if process is not None:
+                out["process_exited"] = process.returncode is not None
+                if isinstance(process.returncode, int):
+                    out["process_exit_code"] = process.returncode
+                pid = getattr(process, "pid", None)
+                if isinstance(pid, int) and not isinstance(pid, bool):
+                    out["child_process"] = ClaudeBackend._child_process_diagnostic(pid)
+            result = getattr(query, "_last_error_result", None)
+            out["error_result_seen"] = isinstance(result, dict)
+            if isinstance(result, dict) and isinstance(result.get("api_error_status"), int):
+                out["api_error_status"] = result["api_error_status"]
+            return out
+        except Exception:
+            return {"available": False, "snapshot_failed": True}
+
+    @staticmethod
+    def _child_process_diagnostic(pid: int) -> dict[str, Any]:
+        """Linux numeric state only; no cmdline, environ, memory or fd content."""
+        result: dict[str, Any] = {"pid": pid}
+        root = Path("/proc") / str(pid)
+        try:
+            data = (root / "stat").read_text()
+            fields = data[data.rfind(")") + 2:].split()
+            result.update(state=fields[0], ppid=int(fields[1]),
+                          user_ticks=int(fields[11]), system_ticks=int(fields[12]),
+                          threads=int(fields[17]), start_ticks=int(fields[19]),
+                          virtual_bytes=int(fields[20]), rss_pages=int(fields[21]))
+            channel = (root / "wchan").read_text().strip()
+            if re.fullmatch(r"[a-zA-Z0-9_]+", channel):
+                result["wait_channel"] = channel
+            result["fd_count"] = sum(1 for _ in (root / "fd").iterdir())
+            result["stdio_kinds"] = {}
+            for n in (0, 1, 2):
+                target = os.readlink(root / "fd" / str(n))
+                result["stdio_kinds"][str(n)] = (
+                    "pipe" if target.startswith("pipe:") else
+                    "socket" if target.startswith("socket:") else
+                    "regular_or_device"
+                )
+        except (OSError, ValueError, IndexError) as error:
+            result["unavailable_type"] = type(error).__name__
+        return result
 
     async def _validate_mcp_boundary(self, client: Any, *, allow_absent_bello: bool = False) -> None:
         status = await client.get_mcp_status()
@@ -2121,19 +2360,33 @@ class ClaudeBackend:
             env=self._environment,
         )
         try:
-            stdout, _stderr = await asyncio.wait_for(process.communicate(), 15)
+            stdout, stderr = await asyncio.wait_for(process.communicate(), 15)
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
-            raise AppServerError("official Claude Code auth status timed out")
+            raise ClaudeCliError("official Claude Code auth status timed out")
+        error_text = stderr.decode("utf-8", errors="replace").strip()
+        for line in error_text.splitlines():
+            self._log_cli_stderr(None, line)
+
+        def failure(reason: str) -> ClaudeCliError:
+            # The CLI's own output, whole: auth problems are usually explained there.
+            output = stdout.decode("utf-8", errors="replace").strip()
+            parts = [f"official Claude Code auth status {reason} (exit code {process.returncode})"]
+            if error_text:
+                parts.append("Claude Code CLI stderr:\n" + error_text)
+            if output:
+                parts.append("Claude Code CLI stdout:\n" + output)
+            return ClaudeCliError("\n".join(parts))
+
         if len(stdout) > 1024 * 1024:
-            raise AppServerError("official Claude Code auth status response was unexpectedly large")
+            raise ClaudeCliError("official Claude Code auth status response was unexpectedly large")
         try:
             data = json.loads(stdout)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise AppServerError("official Claude Code auth status returned invalid JSON") from exc
+            raise failure("returned invalid JSON") from exc
         if not isinstance(data, dict):
-            raise AppServerError("official Claude Code auth status returned invalid JSON")
+            raise failure("returned invalid JSON")
         return data
 
     @staticmethod
@@ -2442,13 +2695,101 @@ class ClaudeBackend:
             command.future.set_exception(error)
 
     @staticmethod
-    def _safe_failure(error: BaseException) -> str:
+    def _failure_diagnostic(error: BaseException, *, cli_stderr: list[str] | None = None) -> dict[str, Any]:
+        """Complete failure record: every exception's type, text and frames,
+        the full traceback and the CLI stderr. Kept whole and unredacted by
+        owner decision, so the actual cause is always visible."""
+        nodes: list[dict[str, Any]] = []
+        pending = [(error, None, "root")]
+        seen: set[int] = set()
+        while pending:
+            current, parent, relation = pending.pop(0)
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            node: dict[str, Any] = {"type": type(current).__name__, "module": type(current).__module__,
+                                    "message": str(current), "parent": parent, "relation": relation}
+            for field in ("exit_code", "errno", "api_error_status"):
+                value = getattr(current, field, None)
+                if type(value) is int:
+                    node[field] = value
+            for field in ("stderr", "terminal_reason", "subtype"):
+                value = getattr(current, field, None)
+                if isinstance(value, str):
+                    node[field] = value
+            frames = []
+            tb = current.__traceback__
+            while tb is not None:
+                frames.append({"module": tb.tb_frame.f_globals.get("__name__", ""),
+                               "function": tb.tb_frame.f_code.co_name,
+                               "file": tb.tb_frame.f_code.co_filename, "line": tb.tb_lineno})
+                tb = tb.tb_next
+            node["frames"] = frames
+            index = len(nodes)
+            nodes.append(node)
+            if isinstance(current, BaseExceptionGroup):
+                pending.extend((child, index, "group") for child in current.exceptions)
+            if current.__cause__ is not None:
+                pending.append((current.__cause__, index, "cause"))
+            elif current.__context__ is not None and not current.__suppress_context__:
+                pending.append((current.__context__, index, "context"))
+        result: dict[str, Any] = {"version": 2, "exceptions": nodes,
+                                  "traceback": "".join(traceback.format_exception(error))}
+        if cli_stderr:
+            result["cliStderr"] = "\n".join(cli_stderr)
+        return result
+
+    @staticmethod
+    def _failure_text(error: BaseException, cli_stderr: list[str] | None = None) -> str:
+        """The complete error text Bello logs for a failed Claude Code turn."""
         if isinstance(error, AppServerError):
-            return str(error)
-        name = error.__class__.__name__
-        if name in {"CLIConnectionError", "ProcessError", "CLINotFoundError", "ResultError"}:
-            return f"Claude Code turn failed ({name}); credentials and subprocess stderr were not logged"
-        return "Claude Code turn failed before a result was received"
+            text = str(error)
+        else:
+            parts: list[str] = []
+            pending: list[BaseException] = [error]
+            seen: set[int] = set()
+            while pending:
+                current = pending.pop(0)
+                if id(current) in seen:
+                    continue
+                seen.add(id(current))
+                message = str(current)
+                parts.append(f"{type(current).__name__}: {message}" if message else type(current).__name__)
+                if isinstance(current, BaseExceptionGroup):
+                    pending.extend(current.exceptions)
+                if current.__cause__ is not None:
+                    pending.append(current.__cause__)
+                elif current.__context__ is not None and not current.__suppress_context__:
+                    pending.append(current.__context__)
+            text = "Claude Code turn failed: " + "\ncaused by ".join(parts)
+        if cli_stderr:
+            text += "\nClaude Code CLI stderr:\n" + "\n".join(cli_stderr)
+        return text
+
+    @staticmethod
+    def _error_result_failure(message: ResultMessage, cli_stderr: list[str]) -> tuple[str, dict[str, Any]]:
+        """The complete text and diagnostic of an error result the CLI returned.
+
+        The CLI reports API failures (``subtype: "success"``, ``result: "API
+        Error: ..."``) and its own terminal errors (``errors[]``) this way; the
+        SDK raises nothing for them. Everything is kept whole, by owner decision.
+        """
+        errors = [str(item) for item in message.errors or [] if str(item)]
+        result = message.result if isinstance(message.result, str) else ""
+        facts = {name: value for name in ("subtype", "terminal_reason", "stop_reason", "api_error_status", "num_turns")
+                 if (value := getattr(message, name, None)) not in (None, "")}
+        text = "Claude Code returned an error result"
+        if facts:
+            text += " (" + ", ".join(f"{name}={value}" for name, value in facts.items()) + ")"
+        details = [*errors, *([result] if result.strip() and result.strip() not in errors else [])]
+        if details:
+            text += ":\n" + "\n".join(details)
+        if cli_stderr:
+            text += "\nClaude Code CLI stderr:\n" + "\n".join(cli_stderr)
+        diagnostic: dict[str, Any] = {"version": 2, "errorResult": {**facts, "errors": errors, "result": result}}
+        if cli_stderr:
+            diagnostic["cliStderr"] = "\n".join(cli_stderr)
+        return text, diagnostic
 
     @staticmethod
     def _valid_uuid(value: Any) -> bool:

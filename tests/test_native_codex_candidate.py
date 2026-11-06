@@ -205,6 +205,23 @@ def test_candidate_context_source_requires_opt_in_routing_and_snapshot_guard(tmp
         candidate.verify_context_source(tmp_path)
 
 
+@pytest.mark.parametrize("forbidden", [
+    (name, marker) for name, markers in candidate.CONTEXT_FORBIDDEN_SOURCE_MARKERS.items()
+    for marker in markers
+])
+def test_candidate_context_source_rejects_old_estimate_admission_gates(tmp_path, forbidden):
+    for name, markers in candidate.CONTEXT_SOURCE_MARKERS.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(markers) + "\n", encoding="utf-8", newline="\n")
+    candidate.verify_context_source(tmp_path)
+    name, marker = forbidden
+    path = tmp_path / name
+    path.write_text(path.read_text() + marker + "\n", encoding="utf-8", newline="\n")
+    with pytest.raises(ValueError, match="removed estimate admission gate"):
+        candidate.verify_context_source(tmp_path)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="symlink creation requires Windows privileges")
 def test_candidate_context_source_rejects_linked_source(tmp_path):
     for name, markers in candidate.CONTEXT_SOURCE_MARKERS.items():

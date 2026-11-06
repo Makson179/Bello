@@ -2,7 +2,7 @@ name: Native Codex 0.161 candidate qualification
 
 on:
   push:
-    branches: ['codex/080-production-ready']
+    branches: ['ci/0.8.1-rc']
   workflow_dispatch:
 
 permissions:
@@ -20,7 +20,7 @@ concurrency:
 # nothing is published or pinned. Editing this file changes the build identity.
 jobs:
   linux-build:
-    if: github.ref == 'refs/heads/codex/080-production-ready'
+    if: github.ref == 'refs/heads/ci/0.8.1-rc'
     runs-on: ubuntu-22.04
     timeout-minutes: 150
     outputs:
@@ -165,7 +165,7 @@ jobs:
           retention-days: 14
 
   windows-build:
-    if: github.ref == 'refs/heads/codex/080-production-ready'
+    if: github.ref == 'refs/heads/ci/0.8.1-rc'
     runs-on: windows-2025
     timeout-minutes: 240
     outputs:
@@ -305,7 +305,7 @@ jobs:
           retention-days: 14
 
   linux-proof:
-    if: github.ref == 'refs/heads/codex/080-production-ready'
+    if: github.ref == 'refs/heads/ci/0.8.1-rc'
     needs: linux-build
     runs-on: ubuntu-22.04
     timeout-minutes: 150
@@ -541,7 +541,7 @@ jobs:
           retention-days: 14
 
   windows-proof:
-    if: github.ref == 'refs/heads/codex/080-production-ready'
+    if: github.ref == 'refs/heads/ci/0.8.1-rc'
     needs: windows-build
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180

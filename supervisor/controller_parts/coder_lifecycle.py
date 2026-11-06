@@ -74,11 +74,17 @@ class CoderLifecyclePort(CoordinatorPort):
         '_handle_active_coder_guard',
         '_handle_coder_turn_completed',
         '_handle_no_marker_idle',
+        '_resume_goal_auto_next',
+        '_arm_goal_auto_next',
         '_interrupt_stale_revision_turn',
         '_last_completion_marker_sequence',
         '_last_restart_budget_signature',
         '_multi_agent_config',
         '_no_marker_completion_review_key',
+        '_no_marker_idle_ready',
+        '_no_marker_idle_identity',
+        '_no_marker_idle_since',
+        '_reset_no_marker_idle',
         '_pending_adversary_report',
         '_pending_runtime_trigger_actions',
         '_pending_runtime_trigger_signatures',
@@ -347,6 +353,8 @@ class CoderLifecycle:
         *,
         coder: compat.Any | None = None,
         force_new_turn: bool = False,
+        before_send: compat.Any | None = None,
+        message_at_send: compat.Any | None = None,
     ) -> tuple[bool, str | None]:
         async with self.ports._coder_activity_lock():
             cfg = self.ports.store.get_bello_config()
@@ -358,6 +366,13 @@ class CoderLifecycle:
                 or getattr(target, "thread_id", cfg.coder_thread_id) != cfg.coder_thread_id
             ):
                 return False, None
+            if before_send is not None and not before_send():
+                return False, None
+            # Optional formatting is evaluated after waiting for this lock, not
+            # before it. It annotates a message; it does not authorize delivery.
+            if message_at_send is not None:
+                message = message_at_send()
+            self.ports._reset_no_marker_idle()
             if force_new_turn:
                 result = await target.start_turn(message)
             else:
@@ -376,9 +391,11 @@ class CoderLifecycle:
 
     async def _handle_controller_idle_guard(self, *, now: float | None = None, force: bool = False) -> None:
         if not self.ports.running or getattr(self.ports, "paused", False) or getattr(self.ports, "_terminal_cleanup_started", False):
+            self.ports._reset_no_marker_idle()
             return
         cfg = self.ports.store.get_bello_config()
         if cfg.active_coder_turn_id:
+            self.ports._reset_no_marker_idle()
             await self.ports._handle_active_coder_guard(now=now)
             return
         coder = getattr(self.state, "coder", None)
@@ -389,28 +406,38 @@ class CoderLifecycle:
             )
             return
         if getattr(coder, "active_turn_id", None):
+            self.ports._reset_no_marker_idle()
+            return
+        if self.ports._goal_enabled() and await self.ports._resume_goal_auto_next():
+            return
+        if self.ports._goal_enabled():
+            # Goal continuation follows completed turns immediately. Readiness,
+            # rather than elapsed idle time, is the completion-review trigger.
+            # Safety net: an idle coder that nothing will continue (a resumed
+            # pause, recovered transport, a runtime noop) gets one continuation
+            # message after the continuous-idle window, never a review.
+            task = getattr(self.ports, "_supervisor_task", None)
+            if (getattr(self.ports, "pending_approvals", None) or (task is not None and not task.done())
+                    or getattr(self.ports, "_supervisor_next_runtime_summary", None) is not None
+                    or getattr(self.ports, "_supervisor_next_completion_summary", None) is not None
+                    or getattr(self.ports, "_deferred_completion_check", None) is not None):
+                self.ports._reset_no_marker_idle()
+                return
+            if self.ports._no_marker_idle_ready(now=now):
+                self.ports._reset_no_marker_idle()
+                self.ports._arm_goal_auto_next()
+                await self.ports._resume_goal_auto_next()
             return
         if getattr(self.ports, "pending_approvals", None):
+            self.ports._reset_no_marker_idle()
             return
         task = getattr(self.ports, "_supervisor_task", None)
         if task is not None and not task.done():
             return
-        current_time = compat.time.monotonic() if now is None else now
-        last_activity = getattr(self.state, "_last_controller_activity_monotonic", current_time)
-        if not force and current_time - last_activity < compat.CONTROLLER_IDLE_GUARD_STALL_SECONDS:
+        if not self.ports._no_marker_idle_ready(now=now):
             return
-        sequence = cfg.last_event_sequence
-        if getattr(self.state, "_idle_guard_fired_for_sequence", None) == sequence:
-            return
-        self.state._idle_guard_fired_for_sequence = sequence
-        self.ports.store.append_raw_log(
-            {
-                "timestamp": compat.datetime.now(compat.timezone.utc).isoformat(),
-                "type": "controller_idle_guard",
-                "sequence": sequence,
-                "reason": "running with no active coder turn, pending approval, or supervisor check",
-            }
-        )
+        # The shared completion path deduplicates only after the full idle window;
+        # latching a sequence on an earlier tick would suppress it forever.
         await self.ports._handle_no_marker_idle()
 
     def _active_coder_watch(self, cfg: compat.BelloConfig | None = None, *, now: float | None = None) -> compat._ActiveCoderWatch | None:
@@ -449,6 +476,58 @@ class CoderLifecycle:
             watch.retry_since = None
             watch.last_error = ""
             watch.reported_stall = False
+
+    async def _confirm_coder_quiescent(self) -> bool:
+        """Fence automatic idle review with a fresh read of the owned native thread.
+
+        This is not recovery/steering, and does not adopt unknown native turns.
+        A still-running owned tool is native activity; an already detached job
+        needs explicit wait metadata and cannot be inferred from command prose.
+        """
+        cfg = self.ports.store.get_bello_config()
+        coder = self.state.coder
+        if not self.ports._no_marker_idle_ready(wait=False):
+            return False
+        if compat.parse_model_selection(self.ports._active_coder_model() or compat.DEFAULT_MODEL).engine != "codex":
+            return True  # Other providers retain their existing lifecycle policy.
+        # An unrelated transport notice changes the global event sequence, not
+        # coder activity. Protect the lifecycle and continuous idle window
+        # instead; actual coder notifications reset that window before delivery.
+        identity = (cfg.generation, cfg.coder_thread_id, id(coder))
+        idle_window = (getattr(self.ports, "_no_marker_idle_identity", None),
+                       getattr(self.ports, "_no_marker_idle_since", None))
+        client = getattr(self.ports, "client", None)
+        read_status = getattr(client, "read_execution_status", None)
+        result = None
+        if callable(read_status):
+            try:
+                result = await compat.asyncio.wait_for(
+                    read_status(cfg.coder_thread_id, timeout=compat.CODER_STATUS_PROBE_TIMEOUT_SECONDS),
+                    timeout=compat.CODER_STATUS_PROBE_TIMEOUT_SECONDS,
+                )
+            except (compat.AppServerError, TimeoutError):
+                pass
+        current = self.ports.store.get_bello_config()
+        if (identity != (current.generation, current.coder_thread_id, id(self.state.coder))
+                or getattr(self.ports, "client", None) is not client):
+            self.ports._reset_no_marker_idle()
+            return False
+        if not self.ports._no_marker_idle_ready(wait=False):
+            # The predicate resets real lifecycle/activity blockers itself.
+            # A pending event alone only defers this probe until it is handled.
+            return False
+        if (isinstance(result, dict) and (result.get("state") == "busy"
+                                         or result.get("activity_observed") is True)):
+            self.ports._reset_no_marker_idle()
+            return False
+        if (idle_window != (getattr(self.ports, "_no_marker_idle_identity", None),
+                            getattr(self.ports, "_no_marker_idle_since", None))
+                or not isinstance(result, dict) or result.get("state") != "quiescent"):
+            # Unknown/failed reads are not quiescence and never permit a nudge.
+            # Retain elapsed idle time: the regular 60s guard will retry rather
+            # than impose another 40 minutes without evidence of new activity.
+            return False
+        return True
 
     async def _handle_active_coder_guard(self, *, now: float | None = None) -> None:
         current_time = compat.time.monotonic() if now is None else now
@@ -525,6 +604,7 @@ class CoderLifecycle:
             )
 
     async def handle_transport_error(self, event: compat.ControllerEvent) -> None:
+        self.ports._reset_no_marker_idle()
         message = event.error_message or str(event.error) or "app-server transport error"
         self.ports._append_event(compat.AppEventSource.APP_SERVER, "appServer/transportError", reason=message)
         if compat._is_recoverable_app_server_transport_error(message):
@@ -926,6 +1006,7 @@ class CoderLifecycle:
     async def pause(self) -> None:
         if getattr(self.ports, "_finalizing", False):
             return
+        self.ports._reset_no_marker_idle()
         self.state._restart_transition_token = None
         self.ports.paused = True
         self.ports.store.update_bello_config(lambda cfg: cfg.model_copy(update={"status": compat.BelloStatus.PAUSED}))
@@ -948,24 +1029,34 @@ class CoderLifecycle:
         await self.ports._resolve_pending_approvals("paused")
         self.ports.tui.status("paused")
 
-    async def restart(self, reason: str, *, handoff: compat.RestartHandoff | None = None) -> None:
+    async def restart(self, reason: str, *, handoff: compat.RestartHandoff | None = None,
+                      before_restart: compat.Any | None = None) -> None:
         if getattr(self.ports, "_finalizing", False):
             return
+        self.ports._reset_no_marker_idle()
         cfg = self.ports.store.get_bello_config()
         if getattr(self.ports, "paused", False) or cfg.status == compat.BelloStatus.PAUSED:
             self.ports.tui.status("paused; resume before restarting")
             return
-        if cfg.restart_count >= cfg.max_restarts:
+        if before_restart is None and cfg.restart_count >= cfg.max_restarts:
             await self.ports.finalize("restart cap reached", status=compat.BelloStatus.STUCK)
             return
         transition_token = object()
         self.state._restart_transition_token = transition_token
-        self.ports._append_event(compat.AppEventSource.SUPERVISOR, "controller/restart", reason=reason)
-        self.ports.store.update_bello_config(lambda current: current.model_copy(update={"status": compat.BelloStatus.RESTARTING}))
+        if before_restart is None:
+            self.ports._append_event(compat.AppEventSource.SUPERVISOR, "controller/restart", reason=reason)
+            self.ports.store.update_bello_config(lambda current: current.model_copy(update={"status": compat.BelloStatus.RESTARTING}))
         await self.ports._wait_for_revision_switch()
         restart_cap_reached = False
         try:
             async with self.ports._coder_activity_lock():
+                if before_restart is not None:
+                    if (self.state._restart_transition_token is not transition_token
+                            or not self.ports._coder_lifecycle_accepts_activity()
+                            or not before_restart()):
+                        return
+                    self.ports._append_event(compat.AppEventSource.SUPERVISOR, "controller/restart", reason=reason)
+                    self.ports.store.update_bello_config(lambda current: current.model_copy(update={"status": compat.BelloStatus.RESTARTING}))
                 current = self.ports.store.get_bello_config()
                 if not self.ports._restart_transition_is_current(
                     transition_token,
@@ -981,6 +1072,7 @@ class CoderLifecycle:
                         handoff=handoff,
                         previous_config=current,
                         transition_token=transition_token,
+                        before_restart=before_restart,
                     )
         finally:
             if self.state._restart_transition_token is transition_token:
@@ -995,6 +1087,7 @@ class CoderLifecycle:
         handoff: compat.RestartHandoff | None,
         previous_config: compat.BelloConfig,
         transition_token: object,
+        before_restart: compat.Any | None = None,
     ) -> None:
         supervisor_task = getattr(self.ports, "_supervisor_task", None)
         if supervisor_task is not None and supervisor_task is not compat.asyncio.current_task():
@@ -1006,6 +1099,15 @@ class CoderLifecycle:
         ):
             return
         await self.ports._close_completion_review_session()
+        if before_restart is not None and not before_restart():
+            # The reviewer close can await while native code continues. Cancel
+            # before interrupting anything; only undo our own pending state.
+            if self.ports._restart_transition_is_current(transition_token,
+                    expected_generation=previous_config.generation,
+                    expected_thread_id=previous_config.coder_thread_id):
+                self.ports.store.update_bello_config(lambda current: current.model_copy(
+                    update={"status": compat.BelloStatus.RUNNING}))
+            return
         if not self.ports._restart_transition_is_current(
             transition_token,
             expected_generation=previous_config.generation,

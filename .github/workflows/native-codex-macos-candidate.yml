@@ -2,7 +2,7 @@ name: Native Codex 0.161 macOS arm64 candidate
 
 on:
   push:
-    branches: ['codex/080-production-ready']
+    branches: ['ci/0.8.1-rc']
   workflow_dispatch:
 
 permissions:
@@ -19,7 +19,7 @@ concurrency:
 # name, never another run/artifact ID. Editing this file changes build identity.
 jobs:
   macos-build:
-    if: github.ref == 'refs/heads/codex/080-production-ready'
+    if: github.ref == 'refs/heads/ci/0.8.1-rc'
     runs-on: macos-15
     timeout-minutes: 240
     outputs:
@@ -151,7 +151,7 @@ jobs:
           retention-days: 14
 
   macos-proof:
-    if: github.ref == 'refs/heads/codex/080-production-ready'
+    if: github.ref == 'refs/heads/ci/0.8.1-rc'
     needs: macos-build
     runs-on: macos-15
     timeout-minutes: 120

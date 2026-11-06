@@ -21,7 +21,7 @@ from supervisor.config_editor_types import (
     InlineEditKind,
 )
 from supervisor.config_validation import ModelCatalog
-from supervisor.project_config import ProjectConfig
+from supervisor.project_config import ProjectConfig, ProjectConfigError
 
 
 def move_down(state: EditorState, parameters: tuple[EditorParameter, ...]) -> EditorState:
@@ -84,7 +84,11 @@ def select_current(
         updated = _editor._toggle_multi_agent_allowed(config, option.field, str(option.value))
         return updated, _editor._keep_parameter_expanded(state, parameter.key, updated, model_choices), None
     catalog = getattr(model_choices, "catalog", None)
-    updated = _editor._replace_config_field(config, option.field, option.value, catalog=catalog)
+    try:
+        updated = _editor._replace_config_field(config, option.field, option.value, catalog=catalog)
+    except ProjectConfigError as exc:
+        # An option that would make the saved settings invalid is not applied.
+        return config, _editor.replace(state, notice=str(exc)), None
     next_state = _editor._advance_after_parameter_change(state, parameters, updated, model_choices)
     notice = _editor._effort_change_notice(config, updated)
     return updated, _editor.replace(next_state, notice=notice) if notice else next_state, None
@@ -204,6 +208,8 @@ def _inline_initial_value(config: ProjectConfig, parameter: EditorParameter) -> 
         return config.task or ""
     if parameter.key == "adversary_runs":
         return str(config.adversary_runs if config.adversary else 0)
+    if parameter.key == "goal_adversary_after_returns":
+        return str(config.goal_adversary_after_returns)
     if parameter.key == "distiller_model_path":
         return config.log_distiller.model_path or ""
     if parameter.key == "completion_returns_before_adversary":
@@ -242,7 +248,10 @@ def _commit_inline_edit(
     if state.edit_kind == "positive_int":
         if not raw.isdecimal() or int(raw) < 1:
             return config, _editor.replace(state, edit_error="enter a positive integer")
-        updated = _editor._replace_config_field(config, parameter.key, int(raw))
+        try:
+            updated = _editor._replace_config_field(config, parameter.key, int(raw))
+        except ProjectConfigError as exc:
+            return config, _editor.replace(state, edit_error=str(exc))
         return updated, _editor.advance_after_selection(state, len(parameters))
     if state.edit_kind == "review_limit":
         if raw.lower() == _editor.UNLIMITED_REVIEW_LIMIT:
@@ -303,9 +312,24 @@ def _replace_config_field(
         return _editor.replace(config, log_distiller=_editor.replace(config.log_distiller, enabled=bool(value)))
     if field == "distiller_model_path":
         return _editor.replace(config, log_distiller=_editor.replace(config.log_distiller, model_path=value))
-    if field in {"no_need_for_context_enabled", "no_need_for_context_threshold_tokens", "no_need_for_context_retain_percent"}:
+    if field == "no_need_for_context_retention_mode":
+        current_mode = "tokens" if config.no_need_for_context.retain_tokens is not None else "percentage"
+        if value == current_mode:
+            return config
+        # The default absolute tail, capped at half the threshold to stay valid.
+        tail = min(24800, max(1, config.no_need_for_context.threshold_tokens // 2))
+        retention = ({"retain_tokens": tail, "retain_percent": None} if value == "tokens"
+                     else {"retain_percent": 10, "retain_tokens": None})
+        return _editor.replace(config, no_need_for_context=_editor.replace(config.no_need_for_context, **retention))
+    if field in {"no_need_for_context_enabled", "no_need_for_context_threshold_tokens",
+                 "no_need_for_context_retain_percent", "no_need_for_context_retain_tokens"}:
         setting = field.removeprefix("no_need_for_context_")
-        return _editor.replace(config, no_need_for_context=_editor.replace(config.no_need_for_context, **{setting: value}))
+        update = {setting: value}
+        if setting == "retain_tokens":
+            update["retain_percent"] = None
+        elif setting == "retain_percent":
+            update["retain_tokens"] = None
+        return _editor.replace(config, no_need_for_context=_editor.replace(config.no_need_for_context, **update))
     multi_agent_parts = _editor._multi_agent_editor_field_parts(field)
     if multi_agent_parts is not None:
         config_field, setting_field = multi_agent_parts

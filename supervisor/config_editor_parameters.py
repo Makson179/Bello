@@ -20,6 +20,7 @@ from supervisor.project_config import (
 
 GOAL_UNLIMITED_VALUE = "Unlimited (goal)"
 GOAL_FORCED_VALUE = "true (goal)"
+GOAL_RUNTIME_OFF_VALUE = "false (goal-runtime)"
 MODEL_FAMILY_ASTRA_LABEL = "GPT-6 Astra"
 
 
@@ -131,7 +132,8 @@ def _parameter_defs(
 ) -> tuple[EditorParameter, ...]:
     from supervisor import config_editor as _editor
 
-    # Goal makes runtime supervision and completion review mandatory, whatever was saved.
+    # Goal makes completion review mandatory and goal_runtime decides runtime supervision,
+    # whatever runtime_enabled saved.
     runtime_enabled = config.effective_runtime_enabled
     completion_review = config.effective_completion_review
     coder_parameters = _editor._role_parameters(
@@ -212,6 +214,7 @@ def _parameter_defs(
         else ()
     )
     adversary_enabled = config.adversary and config.adversary_runs > 0
+    goal_checkpoint_active = config.goal and adversary_enabled and config.goal_adversary_after_returns > 0
     adversary_active = adversary_enabled
     adversary_parameters = (
         _editor._role_parameters(
@@ -272,10 +275,15 @@ def _parameter_defs(
             _editor.EditorParameter(
                 "completion_returns_before_adversary",
                 "max-reviews-before-adversary" if adversary_enabled else "max-reviews",
-                GOAL_UNLIMITED_VALUE if config.goal else _editor.format_review_limit(config.completion_returns_before_adversary),
+                (f"{config.goal_adversary_after_returns} (goal checkpoint)" if goal_checkpoint_active else
+                 GOAL_UNLIMITED_VALUE if config.goal else
+                 _editor.format_review_limit(config.completion_returns_before_adversary)),
                 (),
                 edit_kind=None if config.goal else "review_limit",
                 help_text=(
+                    "Goal starts the first adversary at the goal-adversary-after-returns checkpoint, or earlier "
+                    "if completion accepts. Completion returns after adversary stay unlimited."
+                ) if goal_checkpoint_active else (
                     "Goal keeps completion returns unlimited until the review accepts the work. Turn goal off to "
                     "use the saved finite limit."
                 ) if config.goal else before_adversary_help,
@@ -326,10 +334,38 @@ def _parameter_defs(
             _editor._format_bool(config.goal),
             (_editor.EditorOption("true", "goal", True), _editor.EditorOption("false", "goal", False)),
             help_text=("Keep working toward the original task until the completion review accepts it. Runtime "
-                       "supervision and completion review become mandatory and completion returns unlimited. "
-                       "Smart Execution, the revision coder, context compaction and the log distiller keep "
-                       "their own settings. Off by default."),
+                       "supervision (unless goal-runtime is false) and completion review become mandatory and "
+                       "completion returns unlimited. Smart Execution, the revision coder, context compaction "
+                       "and the log distiller keep their own settings. Off by default."),
         ),
+        *((_editor.EditorParameter(
+            "goal_runtime",
+            "goal-runtime",
+            _editor._format_bool(config.goal_runtime) + ("" if config.goal else " (inactive)"),
+            (_editor.EditorOption("true", "goal_runtime", True), _editor.EditorOption("false", "goal_runtime", False)),
+            help_text=(
+                "Runtime supervision in goal mode (default true). false runs goal without runtime, cheap-triage "
+                "or goal progress review model calls; completion review, the goal checkpoint and automatic "
+                "continuation still apply. Like runtime off, it reduces safety: network is enabled inside the "
+                "filesystem sandbox, with no runtime review or outside-sandbox escalation. Inactive unless goal "
+                "is enabled. Choose before starting a fresh run."
+            ),
+        ),) if config.goal or not config.goal_runtime else ()),
+        *((_editor.EditorParameter(
+            "goal_adversary_after_returns",
+            "goal-adversary-after-returns",
+            str(config.goal_adversary_after_returns) + (
+                " (inactive)" if config.goal_adversary_after_returns > 0 and not goal_checkpoint_active else ""
+            ),
+            (),
+            edit_kind="non_negative_int",
+            help_text=(
+                "0 disables the checkpoint (default). A positive value starts the first adversary after that "
+                "many completion returns; an earlier accept starts it immediately. Inactive unless goal and "
+                "adversary are enabled. It never enables either switch or changes the adversary pass count. "
+                "Completion returns after adversary stay unlimited until acceptance."
+            ),
+        ),) if config.goal or config.goal_adversary_after_returns > 0 else ()),
         *coder_parameters,
         revision_coder_toggle,
         *revision_coder_parameters,
@@ -358,8 +394,20 @@ def _parameter_defs(
         *((_editor.EditorParameter(
             "no_need_for_context_threshold_tokens", "context-threshold-tokens",
             str(config.no_need_for_context.threshold_tokens), (), edit_kind="positive_int",
-            help_text="Positive input-token threshold for compaction. The backend also checks the model's context limit.",
+            help_text="Positive input-token threshold for compaction (default: 244800).",
         ), _editor.EditorParameter(
+            "no_need_for_context_retention_mode", "context-retention-mode",
+            "tokens" if config.no_need_for_context.retain_tokens is not None else "percentage",
+            (_editor.EditorOption("tokens", "no_need_for_context_retention_mode", "tokens"),
+             _editor.EditorOption("percentage", "no_need_for_context_retention_mode", "percentage")),
+            help_text="Choose an absolute recent-tail token target (default) or preserve a legacy percentage target.",
+        ), _editor.EditorParameter(
+            "no_need_for_context_retain_tokens", "context-retain-tokens",
+            str(config.no_need_for_context.retain_tokens), (), edit_kind="positive_int",
+            help_text=("Recent-tail target in tokens (default: 24800). "
+                       "The original task and instructions are retained separately. "
+                       "Whole turns and tool pairs may make the recent tail larger than this target."),
+        ) if config.no_need_for_context.retain_tokens is not None else _editor.EditorParameter(
             "no_need_for_context_retain_percent", "context-retain-percent",
             str(config.no_need_for_context.retain_percent), (), edit_kind="retain_percent",
             help_text=("Recent-tail target as a percentage of the token threshold, greater than 0 and at most 50. "
@@ -379,12 +427,14 @@ def _parameter_defs(
         _editor.EditorParameter(
             "runtime_enabled",
             "runtime",
-            GOAL_FORCED_VALUE if config.goal else _editor._format_bool(config.runtime_enabled),
+            (GOAL_FORCED_VALUE if config.goal_runtime else GOAL_RUNTIME_OFF_VALUE) if config.goal
+            else _editor._format_bool(config.runtime_enabled),
             () if config.goal else (
                 _editor.EditorOption("true", "runtime_enabled", True), _editor.EditorOption("false", "runtime_enabled", False)
             ),
             help_text=(
-                "Runtime supervision is always on in goal mode, whatever was saved here. Turn goal off to change it."
+                "In goal mode, goal-runtime decides runtime supervision, whatever was saved here. Turn goal off "
+                "to change this value."
             ) if config.goal else (
                 "Run runtime supervision and its optional cheap triage. Off reduces safety: network is enabled "
                 "inside the filesystem sandbox, with no runtime review or outside-sandbox escalation."
@@ -725,6 +775,8 @@ def _option_matches_current(config: ProjectConfig, parameter: EditorParameter, o
         return config.log_distiller.enabled == option.value
     if option.field == "no_need_for_context_enabled":
         return config.no_need_for_context.enabled == option.value
+    if option.field == "no_need_for_context_retention_mode":
+        return ("tokens" if config.no_need_for_context.retain_tokens is not None else "percentage") == option.value
     multi_agent_parts = _editor._multi_agent_editor_field_parts(option.field)
     if multi_agent_parts is not None:
         config_field, setting_field = multi_agent_parts

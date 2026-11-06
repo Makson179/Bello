@@ -15,7 +15,7 @@ import { ProtocolError } from "./protocol.mjs";
 import { AsyncToolCoordinator, lateToolMessage } from "./async-tools.mjs";
 import { piAgentDirectory } from "./agent-directory.mjs";
 import { billingRouteError } from "./billing-route.mjs";
-import { normalizeContextPolicy } from "./context-policy.mjs";
+import { contextPoliciesMatch, normalizeContextPolicy } from "./context-policy.mjs";
 
 const STATE_VERSION = 1;
 const ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/;
@@ -338,7 +338,7 @@ export class PiWorkerRuntime {
 
   initializeResult() {
     return {
-      serverInfo: { name: "bello-pi-worker", version: "0.8.0", piSdkVersion: this.sdk.version },
+      serverInfo: { name: "bello-pi-worker", version: "0.8.1", piSdkVersion: this.sdk.version },
       protocolVersion: 1,
       capabilities: {
         multiplex: true,
@@ -1013,7 +1013,7 @@ export class PiWorkerRuntime {
     // must not silently move a persisted thread into a different workspace.
     this.validateExecutionCwd(meta);
     if (params.noNeedForContext !== undefined
-        && !sameJson(normalizeContextPolicy(params.noNeedForContext), normalizeContextPolicy(meta.noNeedForContext))) {
+        && !contextPoliciesMatch(meta.noNeedForContext, params.noNeedForContext)) {
       throw new ProtocolError("thread/resume cannot change noNeedForContext", "scope_mismatch");
     }
     if (params.asyncTools !== undefined && params.asyncTools !== (meta.asyncTools === true)) {
@@ -1095,6 +1095,10 @@ export class PiWorkerRuntime {
 
   async turnStart(params) {
     const record = this.getRecord(params.threadId);
+    if (params.noNeedForContext !== undefined
+        && !contextPoliciesMatch(record.meta.noNeedForContext, params.noNeedForContext)) {
+      throw new ProtocolError("turn/start cannot change noNeedForContext", "scope_mismatch");
+    }
     if (record.meta.archived) throw new ProtocolError("cannot start a turn on an archived thread", "thread_archived");
     if (record.active) throw new ProtocolError("thread already has an active turn", "turn_active");
     this.validateExecutionCwd(record.meta);

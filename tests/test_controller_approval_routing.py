@@ -108,7 +108,9 @@ async def test_controller_approval_packet_carries_structured_context(tmp_path: P
     assert len(packet.pending_approvals) == 1
     assert packet.last_coder_message.text == "ready"
     assert packet.validations[0].passed is False
-    assert packet.prior_interventions[0].message_to_coder == "focus"
+    # Reviewer tactics remain audit history, not active approval constraints.
+    assert packet.prior_interventions == []
+    assert controller.prior_interventions[0].message_to_coder == "focus"
 
 
 async def test_supervisor_deny_reason_is_steered_to_coder(tmp_path: Path) -> None:

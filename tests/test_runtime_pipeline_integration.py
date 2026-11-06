@@ -71,6 +71,38 @@ _PIPELINE_FAILURE_MARKERS = (
 )
 
 
+def _tool_result_text(serialized: str, call_id: str) -> str:
+    try:
+        messages = json.loads(serialized).get("messages", [])
+    except (ValueError, AttributeError):
+        return "unparsed request"
+    for message in reversed(messages if isinstance(messages, list) else []):
+        if isinstance(message, dict) and message.get("tool_call_id") == call_id:
+            content = message.get("content")
+            return content if isinstance(content, str) else json.dumps(content)
+    return "no result for " + call_id
+
+
+_PROVIDER_REJECTIONS = (
+    "the fake provider received anything other than its isolated dummy key",
+    "unexpected paid model route",
+    "unexpected provider path",
+    "non-reasoning fixture received reasoning_effort",
+    "reasoning fixture did not receive the configured exact effort",
+    "could not identify the real Bello role from the request",
+    "request did not retain the JSON prompt key",
+    "coder did not receive the implementation write result",
+    "coder did not receive the test write result",
+    "coder did not receive a passing pytest result",
+    "completion review did not receive the implementation",
+    "completion review did not receive the behavioral test",
+    "adversary did not receive the submitted implementation",
+    "adversary did not receive its passing probe result",
+    "adversary report controller did not receive the task",
+    "adversary report controller did not receive the raw report",
+)
+
+
 def _pipeline_diagnostic(controller, tui, provider, *, socket_diagnostic=None) -> str:
     """Bounded structural failure evidence; never echo arbitrary controller text."""
     try:
@@ -120,7 +152,14 @@ def _pipeline_diagnostic(controller, tui, provider, *, socket_diagnostic=None) -
         "finished_role_count": len(provider.finished_roles),
         "provider_request_count": len(provider.requests),
         "provider_error_count": len(provider.errors),
+        # The fake provider's own rejection reasons as fixed fixture clauses;
+        # anything else (possibly request content) is reported as "other".
+        "provider_rejections": [
+            next((known for known in _PROVIDER_REJECTIONS if str(error).startswith(known)), "other")
+            for error in list(provider.errors)[:8]
+        ],
         "requests_by_role": {role: min(1000000, max(0, provider.roles[role])) for role in _PIPELINE_ROLES},
+        "rejected_pytest_results": [str(text)[-1500:] for text in getattr(provider, "rejected_pytest_results", [])[:2]],
     }
     if socket_diagnostic is not None:
         summary["socket_probe_exit_codes"] = {
@@ -159,6 +198,10 @@ def test_pipeline_diagnostic_reports_lock_failure_without_raw_private_content(tm
     assert result["reason"]["os_errors"] == ["[Errno 13]"]
     assert "failed to create coder workspace snapshot" in result["reason"]["markers"]
     assert result["socket_probe_exit_codes"] == {"host_control": 5}
+    assert result["provider_rejections"] == ["other"]
+    provider.errors = ["coder did not receive a passing pytest result"]
+    assert json.loads(_pipeline_diagnostic(controller, tui, provider))["provider_rejections"] == [
+        "coder did not receive a passing pytest result"]
 
 
 def test_pipeline_diagnostic_fallback_filters_tui_and_keeps_only_known_roles(tmp_path) -> None:
@@ -248,9 +291,14 @@ def _supported_node() -> Path:
 
 def _pytest_command(windows_python: Path | None = None) -> str:
     if windows_python is not None:
+        # pytest 9.2 stats its -c file; Windows Server 2022's AppContainer
+        # denies a stat of the NUL device that os.devnull names. Use an empty
+        # config inside the staged toolchain, which the sandbox can read.
+        isolated = windows_python.parent / "pytest-isolated.ini"
+        isolated.write_text("[pytest]\n", encoding="utf-8")
         return subprocess.list2cmdline([
             str(windows_python), "-I", "-m", "pytest", "-q", "-p", "no:cacheprovider",
-            "-c", os.devnull, "--rootdir=.", "--confcutdir=.",
+            "-c", str(isolated), "--rootdir=.", "--confcutdir=.",
             "test_solution.py",
         ])
     executable = shutil.which("pytest")
@@ -588,6 +636,9 @@ class _PipelineProviderState:
         self.finished_roles: set[str] = set()
         self.schemas: dict[str, dict[str, Any]] = {}
         self.errors: list[str] = []
+        # The fixture's own sandboxed pytest results that the scripted coder
+        # rejected; generated in the disposable workspace, never task input.
+        self.rejected_pytest_results: list[str] = []
 
     def response(self, body: dict[str, Any], authorization: str | None) -> bytes:
         if authorization != f"Bearer {_DUMMY_KEY}":
@@ -689,6 +740,8 @@ class _PipelineProviderState:
                 {"command": self.pytest_command, "cwd": "app", "timeout": 60 if os.name == "nt" else 30},
             )
         if "1 passed" not in serialized:
+            with self.lock:
+                self.rejected_pytest_results.append(_tool_result_text(serialized, "call-coder-pytest")[-1500:])
             raise AssertionError("coder did not receive a passing pytest result")
         with self.lock:
             self.finished_roles.add("coder")

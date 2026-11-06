@@ -18,7 +18,7 @@ def _publication_guard():
 
 def test_release_versions_are_consistent():
     version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
-    assert version == "0.8.0"
+    assert version == "0.8.1"
     for name in ("plugins/bello/.codex-plugin/plugin.json",
                  "plugins/bello/.claude-plugin/plugin.json",
                  "supervisor/pi_worker/package.json",
@@ -29,6 +29,8 @@ def test_release_versions_are_consistent():
     claude = (ROOT / "supervisor/runtime/claude.py").read_text()
     assert claude.count(f'"CLAUDE_AGENT_SDK_CLIENT_APP": "bello/{version}"') == 2
     assert f'version="{version}"' in claude
+    appserver = (ROOT / "supervisor/appserver.py").read_text()
+    assert f'"clientInfo": {{"name": "bello", "title": "Bello", "version": "{version}"}}' in appserver
     assert f'version: "{version}"' in (ROOT / "supervisor/pi_worker/src/runtime.mjs").read_text()
     advisor = ROOT / "plugins/bello/skills/bello-config-advisor"
     assert f'TARGET_VERSION = "{version}"' in (advisor / "scripts/inspect_config.py").read_text()
@@ -56,7 +58,7 @@ def test_release_publication_guards(case, monkeypatch, tmp_path):
     monkeypatch.chdir(ROOT)
     output = tmp_path / "outputs"
     for key, value in {
-        "RELEASE_TAG": "v0.8.0" if case != "wrong_tag" else "v0.7.2",
+        "RELEASE_TAG": "v0.8.1" if case != "wrong_tag" else "v0.7.2",
         "GITHUB_EVENT_NAME": "release" if case == "automatic" else "workflow_dispatch",
         "GITHUB_REF": "refs/heads/other" if case == "wrong_branch" else "refs/heads/main",
         "GITHUB_REPOSITORY": "Makson179/Bello",
@@ -77,7 +79,7 @@ def test_release_publication_guards(case, monkeypatch, tmp_path):
                 "body": "<!-- bello:github-only -->" if case == "github_only" else "Release notes",
             })
         assert args in (
-            ["git", "rev-parse", "--verify", "refs/tags/v0.8.0^{commit}"],
+            ["git", "rev-parse", "--verify", "refs/tags/v0.8.1^{commit}"],
             ["git", "rev-parse", "--verify", "HEAD^{commit}"],
             ["git", "rev-parse", "--verify", "refs/remotes/origin/main^{commit}"],
         )

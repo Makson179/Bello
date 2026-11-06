@@ -549,6 +549,8 @@ def _parameter_icon(parameter_key: str, theme: Theme) -> str:
         return {
             "task": "T",
             "goal": "G",
+            "goal_adversary_after_returns": "N",
+            "goal_runtime": "R",
             "coder_mod": "C",
             "coder_mod_variant": "V",
             "revision_coder_enabled": "R",
@@ -582,6 +584,8 @@ def _parameter_icon(parameter_key: str, theme: Theme) -> str:
     return {
         "task": "☑",
         "goal": "◎",
+        "goal_adversary_after_returns": "#",
+        "goal_runtime": "☆",
         "coder_mod": "◇",
         "coder_mod_variant": "◇",
         "revision_coder_enabled": "↪",
@@ -679,6 +683,7 @@ def _icon_style_key(parameter_key: str) -> str:
         "completion_review": "green",
         "adversary": "green",
         "adversary_runs": "cyan",
+        "goal_adversary_after_returns": "cyan",
         "completion_returns_before_adversary": "cyan",
         "completion_returns_after_adversary": "cyan",
         "clean": "red",
@@ -714,6 +719,7 @@ def _value_style_key(parameter_key: str, value: str) -> str:
         return "magenta_soft"
     if parameter_key in {
         "adversary_runs",
+        "goal_adversary_after_returns",
         "completion_returns_before_adversary",
         "completion_returns_after_adversary",
     }:

@@ -20,12 +20,14 @@ from supervisor.appserver import AppServerError
 from supervisor.project_config import NoNeedForContextConfig
 from supervisor.runtime.client import RuntimeClient
 from supervisor.runtime.codex import CodexBackend
+from supervisor.runtime.context_policy import context_policies_match
 from tests.test_runtime_client import FakeBackend, start
 from tests.test_runtime_codex_backend import FakeNative, drain, thread_params
 
 
 POLICY = NoNeedForContextConfig(enabled=True, threshold_tokens=120000, retain_percent=12.5)
 OFF = NoNeedForContextConfig()
+LEGACY_OFF = {"enabled": False, "thresholdTokens": 200000, "retainPercent": 10}
 MODELS = ("gpt-6-astra", "claude-code/claude-sonnet-4-6", "openai/gpt-6-astra", "anthropic/claude-sonnet-4-6")
 SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
 # The only native thread-config entries NNC may add or change.
@@ -127,6 +129,40 @@ async def test_saved_run_rejects_changed_global_switch_before_backend_dispatch(t
         assert not any(backend.calls for backend in resumed._engines.values())
     finally:
         await resumed.stop()
+
+
+@pytest.mark.parametrize("model", MODELS)
+@pytest.mark.parametrize("method", ["thread/resume", "turn/start"])
+async def test_saved_off_run_accepts_updated_inactive_defaults_without_migrating_policy(tmp_path, model, method):
+    client, workspace = make_client(tmp_path, enabled=False)
+    client.configure_run(no_need_for_context=NoNeedForContextConfig(False, 200000, 10), windows_native_root_read=True)
+    thread = await start(client, workspace, model)
+    assert client._threads[thread]["noNeedForContext"] == LEGACY_OFF
+    await client.stop()
+    resumed, _ = make_client(tmp_path, enabled=False)
+    try:
+        await resumed.request(method, {"threadId": thread, "input": "fixture", "noNeedForContext": OFF.to_backend_data()})
+        assert resumed._threads[thread]["noNeedForContext"] == LEGACY_OFF
+        engine = resumed._engines[resumed._threads[thread]["engine"]]
+        assert any(name == method for name, _ in engine.calls)
+        if method == "thread/resume":
+            sent = next(params for name, params in engine.calls if name == method)
+            assert sent["noNeedForContext"] == LEGACY_OFF
+    finally:
+        await resumed.stop()
+
+
+@pytest.mark.parametrize("value", [0, 1, None, "false", True])
+def test_disabled_policy_compatibility_requires_strict_false_on_both_sides(value):
+    assert not context_policies_match(LEGACY_OFF, {**OFF.to_backend_data(), "enabled": value})
+    assert not context_policies_match({**LEGACY_OFF, "enabled": value}, OFF.to_backend_data())
+
+
+def test_enabled_context_policy_still_requires_exact_values():
+    enabled = {**LEGACY_OFF, "enabled": True}
+    assert context_policies_match(enabled, enabled.copy())
+    assert not context_policies_match(enabled, {**OFF.to_backend_data(), "enabled": True})
+    assert not context_policies_match(enabled, LEGACY_OFF)
 
 
 # ---------------------------------------------------------------------------
@@ -392,18 +428,21 @@ async def test_nnc_does_not_change_which_command_runs_get_escalation_prompts(tmp
 # ---------------------------------------------------------------------------
 
 class ContextNative(FakeNative):
-    def __init__(self, *, context_supported, **options):
+    def __init__(self, *, context_supported, retain_tokens_supported=True, **options):
         super().__init__(**options)
         self.context_supported = context_supported
+        self.retain_tokens_supported = retain_tokens_supported
 
     async def request(self, method, params=None, timeout=30):
         result = await super().request(method, params, timeout)
         if method == "experimentalFeature/list" and self.context_supported:
             result["data"].append({"name": "bello_context_compaction"})
+            if self.retain_tokens_supported:
+                result["data"].append({"name": "bello_context_retain_tokens"})
         return result
 
 
-def make_native(tmp_path, monkeypatch, *, supported=True, windows=False):
+def make_native(tmp_path, monkeypatch, *, supported=True, retain_tokens_supported=True, windows=False):
     monkeypatch.setattr("supervisor.runtime.codex._IS_WINDOWS", windows)
     monkeypatch.setattr("supervisor.runtime.codex.native_toolchain_read_paths", lambda cwd: ())
     root, archive, source = tmp_path / "workspace", tmp_path / "archive", tmp_path / "source-home"
@@ -414,7 +453,7 @@ def make_native(tmp_path, monkeypatch, *, supported=True, windows=False):
 
     def factory(**options):
         options["persistent_isolated_home"].mkdir(mode=0o700, exist_ok=True)
-        client = ContextNative(context_supported=supported, **options)
+        client = ContextNative(context_supported=supported, retain_tokens_supported=retain_tokens_supported, **options)
         clients.append(client)
         return client
 
@@ -690,6 +729,7 @@ async def test_native_forwards_policy_through_start_and_resume(tmp_path, monkeyp
             assert config["model_auto_compact_token_limit_scope"] == "total"
             assert config["model_post_turn_compact_threshold_percent"] == 0
             assert config["bello_context_retain_percent"] == 12.5
+            assert "bello_context_retain_tokens" not in config
             assert "noNeedForContext" not in native
             assert native["approvalPolicy"] == "on-request"
     finally:
@@ -707,8 +747,9 @@ async def test_native_sparse_policy_default_and_explicit_legacy_threshold(tmp_pa
         await backend.request("thread/resume", {"threadId": "host-thread"})
         for method, native in clients[0].calls:
             if method in {"thread/start", "thread/resume"}:
-                assert native["config"]["model_auto_compact_token_limit"] == (threshold or 200000)
-                assert native["config"]["bello_context_retain_percent"] == 10
+                assert native["config"]["model_auto_compact_token_limit"] == (threshold or 244800)
+                assert native["config"]["bello_context_retain_tokens"] == 24800
+                assert "bello_context_retain_percent" not in native["config"]
     finally:
         await backend.stop()
 
@@ -718,12 +759,14 @@ async def test_native_on_policy_overrides_untrusted_context_config(tmp_path, mon
     try:
         await backend.request("thread/start", thread_params(root, noNeedForContext=POLICY.to_backend_data(), config={
             "features": {"bello_context_compaction": False}, "features.bello_context_compaction": False,
-            "bello_context_retain_percent": 50, "model_auto_compact_token_limit": 5,
+            "bello_context_retain_percent": 50, "bello_context_retain_tokens": 1,
+            "model_auto_compact_token_limit": 5,
             "model_post_turn_compact_threshold_percent": 90}))
         config = next(params for method, params in clients[0].calls if method == "thread/start")["config"]
         assert config["features.bello_context_compaction"] is True
         assert "bello_context_compaction" not in config.get("features", {})
         assert config["bello_context_retain_percent"] == 12.5
+        assert "bello_context_retain_tokens" not in config
         assert config["model_auto_compact_token_limit"] == 120000
         assert config["model_post_turn_compact_threshold_percent"] == 0
     finally:
@@ -750,15 +793,134 @@ async def test_native_off_has_no_compaction_side_effects_and_masks_feature_injec
     try:
         params = thread_params(root, noNeedForContext=OFF.to_backend_data(), config={
             "features": {"bello_context_compaction": True}, "features.bello_context_compaction": True,
-            "bello_context_retain_percent": 50})
+            "bello_context_retain_percent": 50, "bello_context_retain_tokens": 24800})
         await backend.request("thread/start", params)
         config = next(params for method, params in clients[0].calls if method == "thread/start")["config"]
         assert config.get("features.bello_context_compaction", False) is False
         assert "bello_context_compaction" not in config["features"]
         for key in ("model_auto_compact_token_limit", "model_auto_compact_token_limit_scope",
-                    "model_post_turn_compact_threshold_percent", "bello_context_retain_percent"):
+                    "model_post_turn_compact_threshold_percent", "bello_context_retain_percent",
+                    "bello_context_retain_tokens"):
             assert key not in config
         assert not backend._windows_scratch
         assert not any(path.name.startswith("bello-native-") for path in root.rglob("*"))
+    finally:
+        await backend.stop()
+
+
+@pytest.mark.parametrize("retain_tokens", [24800, 12345])
+async def test_native_absolute_tail_is_forwarded_without_rounding_to_a_percent(tmp_path, monkeypatch, retain_tokens):
+    backend, root, _, clients, _ = make_native(tmp_path, monkeypatch)
+    policy = {"enabled": True, "thresholdTokens": 244800, "retainTokens": retain_tokens}
+    try:
+        await backend.request("thread/start", thread_params(root, noNeedForContext=policy, config={
+            "bello_context_retain_percent": 10, "bello_context_retain_tokens": 2}))
+        await backend.request("thread/resume", {"threadId": "host-thread"})
+        for method, native in clients[0].calls:
+            if method in {"thread/start", "thread/resume"}:
+                assert native["config"]["model_auto_compact_token_limit"] == 244800
+                assert native["config"]["bello_context_retain_tokens"] == retain_tokens
+                assert "bello_context_retain_percent" not in native["config"]
+        assert backend._threads["host-thread"]["params"]["noNeedForContext"] == policy
+    finally:
+        await backend.stop()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_native_rejects_ambiguous_retention_before_native_thread_dispatch(tmp_path, monkeypatch, enabled):
+    backend, root, _, clients, _ = make_native(tmp_path, monkeypatch)
+    try:
+        with pytest.raises(AppServerError, match="not both"):
+            await backend.request("thread/start", thread_params(root, noNeedForContext={
+                "enabled": enabled, "retainPercent": 10, "retainTokens": 24800}))
+        assert not any(method == "thread/start" for method, _ in clients[0].calls)
+    finally:
+        await backend.stop()
+
+
+@pytest.mark.parametrize("policy", [{"enabled": True},
+    {"enabled": True, "thresholdTokens": 244800, "retainTokens": 24800}])
+async def test_old_native_helper_cannot_silently_ignore_an_absolute_tail(tmp_path, monkeypatch, policy):
+    backend, root, _, clients, _ = make_native(tmp_path, monkeypatch, retain_tokens_supported=False)
+    try:
+        with pytest.raises(AppServerError, match="bello_context_retain_tokens") as raised:
+            await backend.request("thread/start", thread_params(root, noNeedForContext=policy))
+        assert "No engine or API fallback was used" in str(raised.value)
+        assert not any(method in {"thread/start", "turn/start"} for method, _ in clients[0].calls)
+        # Existing explicit percentage policies do not need the new field.
+        await backend.request("thread/start", thread_params(root, noNeedForContext=POLICY.to_backend_data()))
+        native = next(value for method, value in clients[0].calls if method == "thread/start")
+        assert native["config"]["bello_context_retain_percent"] == 12.5
+        assert "bello_context_retain_tokens" not in native["config"]
+    finally:
+        await backend.stop()
+
+
+async def test_absolute_retention_support_is_rediscovered_for_a_resumed_helper(tmp_path, monkeypatch):
+    backend, root, _, _, _ = make_native(tmp_path, monkeypatch)
+    await backend.request("thread/start", thread_params(root, noNeedForContext={"enabled": True}))
+    await backend.stop()
+    clients = []
+
+    def old_helper(**options):
+        native = ContextNative(context_supported=True, retain_tokens_supported=False, **options)
+        clients.append(native)
+        return native
+
+    resumed = CodexBackend(state_dir=backend.state_dir, emit=AsyncMock(), client_factory=old_helper)
+    try:
+        with pytest.raises(AppServerError, match="bello_context_retain_tokens"):
+            await resumed.request("thread/resume", {"threadId": "host-thread"})
+        assert not any(method in {"thread/start", "thread/resume", "turn/start"}
+                       for native in clients for method, _ in native.calls)
+    finally:
+        await resumed.stop()
+
+
+async def test_native_absolute_capability_can_follow_compaction_on_another_catalog_page(tmp_path, monkeypatch):
+    backend, root, _, clients, _ = make_native(tmp_path, monkeypatch)
+    try:
+        await backend.request("initialize")
+        original = clients[0].request
+        pages = []
+
+        async def paginated(method, params=None, timeout=30):
+            if method == "experimentalFeature/list":
+                cursor = (params or {}).get("cursor")
+                pages.append(cursor)
+                if cursor is None:
+                    return {"data": [{"name": "bello_context_compaction"}], "nextCursor": "absolute"}
+                return {"data": [{"name": "bello_context_retain_tokens"}], "nextCursor": None}
+            return await original(method, params, timeout)
+
+        clients[0].request = paginated
+        await backend.request("thread/start", thread_params(root, noNeedForContext={"enabled": True}))
+        assert pages[:2] == [None, "absolute"]
+        native = next(value for method, value in clients[0].calls if method == "thread/start")
+        assert native["config"]["bello_context_retain_tokens"] == 24800
+    finally:
+        await backend.stop()
+
+
+@pytest.mark.parametrize("method", ["thread/resume", "turn/start"])
+async def test_native_off_policy_upgrade_keeps_saved_params_unchanged(tmp_path, monkeypatch, method):
+    backend, root, _, clients, _ = make_native(tmp_path, monkeypatch, retain_tokens_supported=False)
+    try:
+        await backend.request("thread/start", thread_params(root, noNeedForContext=LEGACY_OFF))
+        await backend.request(method, {"threadId": "host-thread", "turnId": "outer", "input": "fixture",
+                                       "noNeedForContext": OFF.to_backend_data()})
+        assert backend._threads["host-thread"]["params"]["noNeedForContext"] == LEGACY_OFF
+        assert any(name == method for name, _ in clients[0].calls)
+    finally:
+        await backend.stop()
+
+
+async def test_native_pre_policy_thread_does_not_gain_a_policy_on_resume(tmp_path, monkeypatch):
+    backend, root, _, _, _ = make_native(tmp_path, monkeypatch, retain_tokens_supported=False)
+    try:
+        await backend.request("thread/start", thread_params(root))
+        assert "noNeedForContext" not in backend._threads["host-thread"]["params"]
+        await backend.request("thread/resume", {"threadId": "host-thread", "noNeedForContext": OFF.to_backend_data()})
+        assert "noNeedForContext" not in backend._threads["host-thread"]["params"]
     finally:
         await backend.stop()

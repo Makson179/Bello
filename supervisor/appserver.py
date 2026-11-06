@@ -594,7 +594,7 @@ class AppServerClient:
         result = await self.request(
             "initialize",
             {
-                "clientInfo": {"name": "bello", "title": "Bello", "version": "0.5.2"},
+                "clientInfo": {"name": "bello", "title": "Bello", "version": "0.8.1"},
                 "capabilities": {"experimentalApi": True, "requestAttestation": False},
             },
             timeout=timeout,

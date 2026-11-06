@@ -57,8 +57,9 @@ def test_async_and_sync_entry_points_keep_introspection_contract() -> None:
     assert inspect.iscoroutinefunction(BelloController.restart)
     assert not inspect.iscoroutinefunction(BelloController._record_changed_files)
     assert tuple(inspect.signature(BelloController._deliver_coder_message).parameters) == (
-        "self", "message", "coder", "force_new_turn"
+        "self", "message", "coder", "force_new_turn", "before_send", "message_at_send"
     )
+    assert inspect.signature(BelloController._deliver_coder_message).parameters["message_at_send"].default is None
 
 
 def test_service_modules_import_independently_without_loading_controller() -> None:

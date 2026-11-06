@@ -17,6 +17,8 @@ from tests.support.controller import (
 
 async def test_runtime_intervention_cancels_queued_completion_review(tmp_path: Path) -> None:
     controller, _store, fake = _runtime_controller(tmp_path)
+    source = tmp_path / "parser.py"
+    source.write_text("def parse(value):\n    return None\n", encoding="utf-8")
 
     class FakeCoder:
         def __init__(self) -> None:
@@ -395,6 +397,8 @@ async def test_failed_runtime_apply_requeues_trigger_and_cancels_stale_completio
     tmp_path: Path,
 ) -> None:
     controller, _store, fake = _runtime_controller(tmp_path)
+    source = tmp_path / "parser.py"
+    source.write_text("def parse(value):\n    return None\n", encoding="utf-8")
 
     class FailingCoder:
         async def steer_or_start(self, message: str) -> str:
@@ -436,6 +440,8 @@ async def test_failed_runtime_steer_retries_same_wake_sequence_then_commits(
     tmp_path: Path,
 ) -> None:
     controller, store, fake = _runtime_controller(tmp_path)
+    source = tmp_path / "parser.py"
+    source.write_text("def parse(value):\n    return None\n", encoding="utf-8")
 
     class InitialEscalatingCheapReviewer(_CheapRuntimeNoopReviewer):
         async def review(self, packet):
@@ -558,6 +564,7 @@ async def test_runtime_pause_discards_queued_reviews_and_stops_queue_loop(tmp_pa
         return SupervisorDecision(
             decision=SupervisorDecisionKind.PAUSE,
             reason="human-only input required",
+            message_to_coder=packet.human_message.text,
             wake_sequence=packet.wake_sequence,
             generation=packet.generation,
         )

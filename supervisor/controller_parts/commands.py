@@ -32,6 +32,7 @@ class CommandsPort(CoordinatorPort):
         '_handle_completed_coder_action',
         '_pop_command_output',
         '_record_changed_files',
+        '_record_goal_work',
         '_record_runtime_trigger_trace',
         '_record_validation_progress',
         '_record_validation_runtime_state',
@@ -143,6 +144,7 @@ class Commands:
         ):
             return
         self.ports._record_changed_files(triggering_action)
+        self.ports._record_goal_work(self.ports._sequence)
         declared_grading_issue = self.ports._declared_grading_access_issue(triggering_action)
         if declared_grading_issue is not None:
             if is_subagent:

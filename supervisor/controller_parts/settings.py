@@ -42,6 +42,7 @@ class SettingsPort(CoordinatorPort):
         '_completion_multi_agent_config',
         '_completion_supervisor_agent',
         '_configure_runtime_triage',
+        '_durable_run',
         '_effective_completion_review',
         '_effective_max_adversary_runs',
         '_enabled_subagent_models_for_preflight',
@@ -50,6 +51,8 @@ class SettingsPort(CoordinatorPort):
         '_generate_schema_hash',
         '_generate_schema_hash_async',
         '_goal_enabled',
+        '_goal_adversary_after_returns',
+        '_goal_runtime',
         '_log_distiller_config',
         '_multi_agent_config',
         '_persist_model_config',
@@ -84,6 +87,8 @@ class SettingsPort(CoordinatorPort):
         'fast',
         'finalize',
         'goal',
+        'goal_adversary_after_returns',
+        'goal_runtime',
         'log_distiller',
         'model',
         'overwrite_state',
@@ -178,15 +183,41 @@ class Settings:
         except Exception:
             return False
 
-    def _runtime_enabled(self) -> bool:
-        # Runtime supervision is mandatory while Goal is on: neither a saved
-        # false nor a one-run override can disable it.
-        if self.ports._goal_enabled():
+    def _goal_adversary_after_returns(self) -> int:
+        """Saved opt-in checkpoint; inert unless Goal and adversary are enabled."""
+        override = getattr(self.ports, "goal_adversary_after_returns", None)
+        if override is not None:
+            return override
+        config = getattr(self.ports, "project_config", None)
+        if config is not None:
+            return getattr(config, "goal_adversary_after_returns", 0)
+        try:
+            return self.ports.store.get_bello_config().goal_adversary_after_returns
+        except Exception:
+            return 0
+
+    def _goal_runtime(self) -> bool:
+        """Goal's own runtime switch (default on); inert unless Goal is enabled."""
+        override = getattr(self.ports, "goal_runtime", None)
+        if override is not None:
+            return bool(override)
+        config = getattr(self.ports, "project_config", None)
+        if config is not None:
+            return bool(getattr(config, "goal_runtime", True))
+        try:
+            return bool(self.ports.store.get_bello_config().goal_runtime)
+        except Exception:
             return True
+
+    def _runtime_enabled(self) -> bool:
+        # While Goal is on, only Goal's own runtime switch decides: neither a
+        # saved runtime_enabled nor a one-run --runtime/--no-runtime applies.
+        if self.ports._goal_enabled():
+            return self.ports._goal_runtime()
         return self.ports._runtime_choice()
 
     def _runtime_choice(self) -> bool:
-        """The run's runtime switch before Goal forces supervision on.
+        """The run's runtime switch before Goal applies its own goal_runtime.
 
         Persisted run state records this choice, so a Goal run never rewrites a
         saved runtime preference; every reader applies Goal first.
@@ -289,6 +320,8 @@ class Settings:
         return compat.ProjectConfig(
             task=compat._workspace_display_path(self.ports.project_root, str(self.ports.task_path)),
             goal=self.ports._goal_enabled(),
+            goal_adversary_after_returns=self.ports._goal_adversary_after_returns(),
+            goal_runtime=self.ports._goal_runtime(),
             coder_mod=self.ports._coder_model() or compat.DEFAULT_MODEL,
             runtime_mod=self.ports._runtime_model() or compat.DEFAULT_MODEL,
             completion_mod=self.ports._completion_model() or compat.DEFAULT_MODEL,
@@ -328,8 +361,14 @@ class Settings:
             revision_coder_summary = (
                 f"on({self.ports._revision_coder_model()}/{self.ports._revision_coder_intelligence()})"
             )
+        goal_checkpoint_summary = ""
+        if self.ports._goal_enabled() and (checkpoint := self.ports._goal_adversary_after_returns()):
+            goal_checkpoint_summary = f"goal-adversary-after-returns={checkpoint} "
+        if self.ports._goal_enabled() and not self.ports._goal_runtime():
+            goal_checkpoint_summary += "goal-runtime=false "
         return (
             f"settings: {'goal=true ' if self.ports._goal_enabled() else ''}"
+            f"{goal_checkpoint_summary}"
             f"task={compat._workspace_display_path(self.ports.project_root, str(self.ports.task_path))} "
             f"coder-mod={self.ports._coder_model()} "
             f"runtime-mod={self.ports._runtime_model()} "
@@ -401,6 +440,24 @@ class Settings:
     def _adv_report_controller_agent(self) -> compat.StatelessSupervisorAgent | None:
         return getattr(self.ports, "adv_report_controller", None)
 
+    async def _verify_restored_engines(self) -> None:
+        """A restored run continues only with the exact launchers it recorded.
+
+        The checkpoint records every engine loaded so far, including ones a
+        fresh preflight loads only later (for example cheap triage). Initialize
+        each recorded launcher (a start, never a model turn or self-test) so
+        the comparison covers the exact recorded set, then require equality.
+        """
+        durable = getattr(self.ports, "_durable_run", None)
+        if durable is None:
+            return
+        load = getattr(self.ports.client, "_engine", None)
+        if callable(load):
+            for name in getattr(durable, "expected_engines", None) or {}:
+                if name != "client":
+                    await load(name)
+        durable.verify_engine_selection()
+
     async def preflight(self) -> None:
         if isinstance(self.ports.client, compat.RuntimeClient):
             await self.ports._runtime_preflight()
@@ -436,9 +493,7 @@ class Settings:
             )
         self.ports.tui.status("checking available models")
         models_response = await self.ports.client.model_list()
-        durable = getattr(self.ports, "_durable_run", None)
-        if durable is not None:
-            durable.verify_engine_selection()
+        await self._verify_restored_engines()
         self.ports._persist_model_config()
         await self.ports._ensure_selected_models_available(models_response)
         if self.ports.store.get_bello_config().status == compat.BelloStatus.PROVIDER_FAILURE:
@@ -497,9 +552,7 @@ class Settings:
                 self.ports.tui.status("checking the official Claude Code CLI (one-time verified download if needed)")
             await prepare_engines(self.ports.client.required_models)
         models = await self.ports.client.model_list()
-        durable = getattr(self.ports, "_durable_run", None)
-        if durable is not None:
-            durable.verify_engine_selection()
+        await self._verify_restored_engines()
         self.ports.store.update_bello_config(lambda cfg: cfg.model_copy(update={
             "runtime_name": "bello-codex/pi/claude-code", "runtime_protocol_version": 1,
         }))

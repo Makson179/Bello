@@ -14,7 +14,7 @@ from tests.test_native_codex_windows_workflow import _action, _block, _field, _s
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BRANCH = "codex/080-production-ready"
+BRANCH = "ci/0.8.1-rc"
 TARGETS = ("linux-x64", "windows-x64", "darwin-arm64")
 
 

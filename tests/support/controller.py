@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 import pytest
 import supervisor.controller as controller_module
 import supervisor.policy as policy_module
@@ -304,6 +306,9 @@ def _runtime_controller(tmp_path: Path) -> tuple[BelloController, StateStore, _R
     controller.project_root = tmp_path
     controller.task_path = task
     controller.store = store
+    # Idle watchdog tests explicitly model an authoritative native idle reply;
+    # production clients with no such capability must fail closed instead.
+    controller.client = SimpleNamespace(read_execution_status=AsyncMock(return_value={"state": "quiescent"}))
     controller.supervisor = fake
     controller.adv_report_controller = _FakeAdvReportController()
     controller.coder = None

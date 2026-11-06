@@ -87,6 +87,8 @@ class MultiAgentConfig:
 RUNTIME_SYNC_FIELDS = (
     "task",
     "goal",
+    "goal_adversary_after_returns",
+    "goal_runtime",
     "coder_mod",
     "revision_coder_enabled",
     "revision_coder_mod",
@@ -126,31 +128,53 @@ class ProjectConfigError(RuntimeError):
 @dataclass(frozen=True)
 class NoNeedForContextConfig:
     enabled: bool = False
-    threshold_tokens: int = 200000
-    retain_percent: float = 10
+    threshold_tokens: int = 244800
+    # Keep the third positional argument compatible with older callers.
+    retain_percent: float | None = None
+    retain_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if type(self.enabled) is not bool:
             raise ProjectConfigError("no_need_for_context.enabled must be a boolean")
         if type(self.threshold_tokens) is not int or self.threshold_tokens <= 0:
             raise ProjectConfigError("no_need_for_context.threshold_tokens must be a positive integer")
-        if (type(self.retain_percent) not in (int, float)
+        if self.retain_percent is not None and self.retain_tokens is not None:
+            raise ProjectConfigError("no_need_for_context must select only one of retain_tokens and retain_percent")
+        if self.retain_percent is None and self.retain_tokens is None:
+            object.__setattr__(self, "retain_tokens", 24800)
+        if self.retain_tokens is not None and (type(self.retain_tokens) is not int or self.retain_tokens <= 0):
+            raise ProjectConfigError("no_need_for_context.retain_tokens must be a positive integer")
+        if self.enabled and self.retain_tokens is not None and self.retain_tokens * 2 > self.threshold_tokens:
+            # Like retain_percent's 50% cap: a compaction must be able to
+            # retire at least half of the threshold, or it never reduces.
+            # A disabled policy is checked when it is enabled.
+            raise ProjectConfigError(
+                f"no_need_for_context.retain_tokens ({self.retain_tokens}) must be at most half of threshold_tokens "
+                f"({self.threshold_tokens}); set a smaller retain_tokens (saved, or --context-retain-tokens "
+                "for one run) or a larger threshold_tokens")
+        if self.retain_percent is not None and (type(self.retain_percent) not in (int, float)
                 or not 0 < self.retain_percent <= 50
                 or not math.isfinite(self.retain_percent)):
             raise ProjectConfigError("no_need_for_context.retain_percent must be a finite number greater than 0 and at most 50")
 
     def to_json_data(self) -> dict[str, Any]:
-        return {"enabled": self.enabled, "threshold_tokens": self.threshold_tokens,
-                "retain_percent": self.retain_percent}
+        retention = ({"retain_tokens": self.retain_tokens} if self.retain_tokens is not None
+                     else {"retain_percent": self.retain_percent})
+        return {"enabled": self.enabled, "threshold_tokens": self.threshold_tokens, **retention}
 
     def to_backend_data(self) -> dict[str, Any]:
-        return {"enabled": self.enabled, "thresholdTokens": self.threshold_tokens,
-                "retainPercent": self.retain_percent}
+        retention = ({"retainTokens": self.retain_tokens} if self.retain_tokens is not None
+                     else {"retainPercent": self.retain_percent})
+        return {"enabled": self.enabled, "thresholdTokens": self.threshold_tokens, **retention}
 
 
 def _no_need_for_context_config(value: Any, *, path: Path) -> NoNeedForContextConfig:
-    if not isinstance(value, dict) or set(value) - {"enabled", "threshold_tokens", "retain_percent"}:
-        raise ProjectConfigError(f"{path}: no_need_for_context must contain only enabled, threshold_tokens and retain_percent")
+    if not isinstance(value, dict) or set(value) - {"enabled", "threshold_tokens", "retain_percent", "retain_tokens"}:
+        raise ProjectConfigError(f"{path}: no_need_for_context must contain only enabled, threshold_tokens and one retention setting")
+    if "retain_tokens" in value and ("retain_percent" in value or value["retain_tokens"] is None):
+        raise ProjectConfigError(f"{path}: no_need_for_context must select only one valid retention setting")
+    if "retain_percent" in value and value["retain_percent"] is None:
+        raise ProjectConfigError(f"{path}: no_need_for_context.retain_percent must be a finite number greater than 0 and at most 50")
     try:
         return NoNeedForContextConfig(**value)
     except ProjectConfigError as exc:
@@ -194,6 +218,12 @@ class ProjectConfig:
     # the revision coder, No Need For Context and the log distiller keep their own
     # switches.
     goal: bool = False
+    # 0 preserves unlimited Goal completion review before the first adversary.
+    # A positive checkpoint is dormant unless Goal and adversary are enabled.
+    goal_adversary_after_returns: int = 0
+    # Runtime supervision while Goal is on. False runs Goal with runtime off (the
+    # same execution policy as runtime_enabled=false); ignored without Goal.
+    goal_runtime: bool = True
     coder_mod: str = DEFAULT_MODEL
     revision_coder_enabled: bool = False
     revision_coder_mod: str = DEFAULT_MODEL
@@ -227,14 +257,19 @@ class ProjectConfig:
     completion_multi_agent: MultiAgentConfig = field(default_factory=MultiAgentConfig)
     adversary_multi_agent: MultiAgentConfig = field(default_factory=MultiAgentConfig)
 
+    def __post_init__(self) -> None:
+        value = self.goal_adversary_after_returns
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ProjectConfigError("goal_adversary_after_returns must be a non-negative integer")
+
     @property
     def fast(self) -> bool:
         return self.speed == "fast"
 
     @property
     def effective_runtime_enabled(self) -> bool:
-        """Runtime supervision is mandatory while Goal is on, whatever was saved."""
-        return self.goal or self.runtime_enabled
+        """While Goal is on, goal_runtime decides, whatever runtime_enabled saved."""
+        return self.goal_runtime if self.goal else self.runtime_enabled
 
     @property
     def effective_completion_review(self) -> bool:
@@ -250,6 +285,8 @@ class ProjectConfig:
             REVIEW_LIMIT_FORMAT_FIELD: EXPLICIT_REVIEW_LIMIT_FORMAT,
             "task": self.task,
             "goal": self.goal,
+            "goal_adversary_after_returns": self.goal_adversary_after_returns,
+            "goal_runtime": self.goal_runtime,
             "coder_mod": self.coder_mod,
             "revision_coder_enabled": self.revision_coder_enabled,
             "revision_coder_mod": self.revision_coder_mod,
@@ -447,6 +484,12 @@ def _config_from_payload(payload: dict[str, Any], *, path: Path) -> ProjectConfi
     return ProjectConfig(
         task=_optional_string(_first_present(payload, ("task", "task_path"), default.task, skip_none=True), "task_path", path=path),
         goal=_bool(payload.get("goal", default.goal), "goal", path=path),
+        goal_adversary_after_returns=_non_negative_int(
+            payload.get("goal_adversary_after_returns", default.goal_adversary_after_returns),
+            "goal_adversary_after_returns",
+            path=path,
+        ),
+        goal_runtime=_bool(payload.get("goal_runtime", default.goal_runtime), "goal_runtime", path=path),
         coder_mod=coder_mod,
         revision_coder_enabled=_bool(
             payload.get("revision_coder_enabled", default.revision_coder_enabled),
@@ -767,6 +810,10 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
     updates: dict[str, Any] = {}
     if "goal" in selected:
         updates["goal"] = config.goal
+    if "goal_adversary_after_returns" in selected:
+        updates["goal_adversary_after_returns"] = config.goal_adversary_after_returns
+    if "goal_runtime" in selected:
+        updates["goal_runtime"] = config.goal_runtime
     if "task" in selected:
         updates["task"] = config.task
         updates["task_path"] = config.task or ""
@@ -815,7 +862,7 @@ def _runtime_updates_for_fields(config: ProjectConfig, fields: Iterable[str]) ->
         updates["no_need_for_context"] = config.no_need_for_context.to_json_data()
     if "windows_native_root_read" in selected:
         updates["windows_native_root_read"] = config.windows_native_root_read
-    if selected.intersection({"cheap_runtime", "runtime_enabled", "goal"}):
+    if selected.intersection({"cheap_runtime", "runtime_enabled", "goal", "goal_runtime"}):
         updates["cheap_runtime"] = config.effective_cheap_runtime
     if "log_distiller" in selected:
         updates["log_distiller"] = config.log_distiller.to_json_data()

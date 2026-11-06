@@ -71,6 +71,68 @@ async def context_thread(instance, tmp_path, policy=None):
     })
 
 
+@pytest.mark.parametrize("failures,expected_status,queries", [(1, "completed", 3), (2, "failed", 0)])
+async def test_context_usage_timeout_reconnect_is_bounded_no_query_replay(tmp_path, failures, expected_status, queries):
+    class ProbeClient(ContextClient):
+        async def get_context_usage(self):
+            self.factory.probes += 1
+            if self.factory.probes <= failures:
+                try:
+                    raise TimeoutError("private-timeout")
+                except TimeoutError as cause:
+                    raise Exception("Control request timeout: get_context_usage") from cause
+            return await super().get_context_usage()
+    class ProbeFactory(ContextFactory):
+        probes = 0
+        def __call__(self, options):
+            client = ProbeClient(self, options)
+            self.clients.append(client)
+            return client
+    factory = ProbeFactory()
+    events = []
+    instance = backend(tmp_path, factory, events)
+    try:
+        await context_thread(instance, tmp_path)
+        original = instance._record("thread-1")["claudeSessionId"]
+        await instance.request("turn/start", {"threadId":"thread-1", "turnId":"probe-test", "input":[{"type":"text", "text":"Continue work"}]})
+        done = await wait_completed(events)
+        assert done["params"]["turn"]["status"] == expected_status
+        assert factory.main_queries == queries
+        assert instance._record("thread-1")["contextUsageProbeRetries"] == 1
+        assert factory.clients[0].queries == []
+        assert factory.clients[0].disconnect_task is not None
+        assert factory.clients[0].options.session_id == factory.clients[1].options.session_id == original
+        if failures == 2:
+            assert factory.probes == 2 and len(factory.clients) == 2
+            assert instance._record("thread-1")["claudeSessionId"] == original
+            assert instance._record("thread-1")["contextState"]["generation"] == 0
+        # The complete error text is kept (owner decision: no redaction).
+        assert "private-timeout" in (instance.state_dir / "threads.json").read_text()
+    finally:
+        await instance.stop()
+
+
+async def test_context_usage_non_timeout_is_not_retried(tmp_path):
+    class RefusedClient(ContextClient):
+        async def get_context_usage(self):
+            raise ValueError("private-error")
+    class RefusedFactory(ContextFactory):
+        def __call__(self, options):
+            client = RefusedClient(self, options)
+            self.clients.append(client)
+            return client
+    factory = RefusedFactory();events=[];instance=backend(tmp_path,factory,events)
+    try:
+        await context_thread(instance,tmp_path)
+        await instance.request("turn/start", {"threadId":"thread-1", "turnId":"refused", "input":[{"type":"text", "text":"work"}]})
+        done=await wait_completed(events)
+        assert done["params"]["turn"]["status"]=="failed"
+        assert len(factory.clients)==1 and factory.main_queries==0
+        assert not instance._record("thread-1").get("contextUsageProbeRetries")
+    finally:
+        await instance.stop()
+
+
 async def test_rollover_preserves_logical_thread_and_exact_whole_round(tmp_path):
     factory = ContextFactory()
     events = []
@@ -163,12 +225,78 @@ def test_invalid_retain_percent_is_rejected(value):
         claude_context.context_policy({"enabled": True, "retainPercent": value})
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_claude_context_default_is_absolute_24800_with_244800_trigger(enabled):
+    assert claude_context.context_policy({"enabled": enabled}) == {
+        "enabled": enabled, "thresholdTokens": 244800, "retainTokens": 24800}
+    assert claude_context.context_policy(None) == {
+        "enabled": False, "thresholdTokens": 244800, "retainTokens": 24800}
+
+
+def test_claude_absolute_soft_tail_is_24800_not_24480(monkeypatch):
+    rounds = [{"size": 100000}, {"size": 320}, {"size": 24480}]
+    monkeypatch.setattr(claude_context, "estimate_tokens", lambda value: value["size"])
+    state = {"rounds": rounds}
+    absolute = claude_context.context_policy({"enabled": True})
+    older, retained = claude_context.partition_rounds(state, absolute)
+    assert older == rounds[:1] and retained == rounds[1:]
+    assert sum(item["size"] for item in retained) == 24800
+    # An explicit legacy percentage remains relative to the selected threshold.
+    percent = claude_context.context_policy({"enabled": True, "thresholdTokens": 244800, "retainPercent": 10})
+    older, retained = claude_context.partition_rounds(state, percent)
+    assert older == rounds[:2] and retained == rounds[2:]
+    assert percent == {"enabled": True, "thresholdTokens": 244800, "retainPercent": 10.0}
+
+
+@pytest.mark.parametrize("value", [None, True, 0, -1, 2.5, "24800"])
+def test_invalid_absolute_retain_tokens_is_rejected(value):
+    with pytest.raises(AppServerError, match="retainTokens"):
+        claude_context.context_policy({"enabled": True, "retainTokens": value})
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_claude_rejects_both_retention_modes(enabled):
+    with pytest.raises(AppServerError, match="not both"):
+        claude_context.context_policy({"enabled": enabled, "retainTokens": 24800, "retainPercent": 10})
+
+
 async def test_resume_cannot_change_context_policy(tmp_path):
     instance = backend(tmp_path, ContextFactory(), [])
     try:
         await context_thread(instance, tmp_path)
         with pytest.raises(AppServerError, match="cannot change noNeedForContext"):
             await instance.request("thread/resume", {"threadId": "thread-1", "noNeedForContext": {"enabled": False}})
+    finally:
+        await instance.stop()
+
+
+@pytest.mark.parametrize("method", ["thread/resume", "turn/start"])
+async def test_claude_off_default_upgrade_preserves_saved_policy(tmp_path, method):
+    factory = FakeFactory([result_message(result="done")])
+    instance = backend(tmp_path, factory, events := [])
+    legacy = {"enabled": False, "thresholdTokens": 200000, "retainPercent": 10}
+    try:
+        await context_thread(instance, tmp_path, legacy)
+        await instance.request(method, {"threadId": "thread-1", "turnId": "outer", "input": [{"type": "text", "text": "fixture"}],
+                                       "noNeedForContext": {"enabled": False, "thresholdTokens": 244800, "retainTokens": 24800}})
+        if method == "turn/start":
+            completed = await wait_completed(events)
+            assert completed["params"]["turn"]["status"] == "completed"
+        assert instance._record("thread-1")["noNeedForContext"] == legacy
+        assert "contextState" not in instance._record("thread-1")
+    finally:
+        await instance.stop()
+
+
+@pytest.mark.parametrize("method", ["thread/resume", "turn/start"])
+async def test_claude_off_policy_cannot_be_enabled_on_resume_or_turn(tmp_path, method):
+    instance = backend(tmp_path, ContextFactory(), [])
+    try:
+        await context_thread(instance, tmp_path, {"enabled": False, "thresholdTokens": 200000, "retainPercent": 10})
+        with pytest.raises(AppServerError, match="cannot change noNeedForContext"):
+            await instance.request(method, {"threadId": "thread-1", "turnId": "outer", "input": "fixture",
+                                           "noNeedForContext": {"enabled": True}})
+        assert not instance._record("thread-1")["noNeedForContext"]["enabled"]
     finally:
         await instance.stop()
 

@@ -5,7 +5,7 @@ targets upstream commit `979011409de0a60b52f179721948e65531d26144`
 (`rust-v0.161.0`). The managed selection and Smart Execution pins now select the
 same published 0.161.0 archive for each supported platform: Linux x64, Windows
 x64 and macOS Apple Silicon. The native assets use the GitHub-only release
-`native-codex-0.161.0-nnc-se-20261019`, separate from Bello package publication.
+`native-codex-0.161.0-nnc-tokens-20261105`, separate from Bello package publication.
 The existing `native-codex-selection.patch` and 0.155.1 build workflows are retained
 as historical recipes, not relabelled as 0.161.0 builds.
 
@@ -46,7 +46,7 @@ must only be added after real platform artifacts and their proofs exist.
 ## Candidate-only build and qualification
 
 The separate `native-codex-candidate.yml` workflow is limited to
-`codex/080-production-ready`. The build helper preserves a strict
+`ci/0.8.1-rc`. The build helper preserves a strict
 `native-build-receipt.json` with the exact target, source/toolchain recipe,
 normalized lockfile, licenses and every executable hash. Its `proof_status`
 remains `not-run`: reusable compiled binaries are not a passing qualification.
@@ -116,9 +116,14 @@ own estimate is far below the threshold is not summarized again just because the
 restored usage figure predates the checkpoint. No sandbox, readable-root, network or
 approval setting depends on this feature.
 
-The pinned `native-codex-0.161.0-nnc-se-20261019` helper includes this capability.
-Its archives passed platform qualification and the local-archive installed-cache
-suites described below, including all eight context-compaction cases. The
+The pinned `native-codex-0.161.0-nnc-tokens-20261105` helper, built from source
+`5b2f0182727f9d7dc89cf1c92ea5b76e4a434e0c`, includes this capability.
+Its archives passed platform qualification
+([Linux and Windows Server 2022/2025](https://github.com/Makson179/Bello/actions/runs/41964625798),
+[macOS](https://github.com/Makson179/Bello/actions/runs/41964625824)) and the
+local-archive installed-cache suites described below, including all eight
+context-compaction cases (seven for the absolute tail, one for the legacy percentage
+tail). The
 [qualified release ledger](../scripts/native-codex-0.161.0-qualified-release.json)
 binds the exact archives and their qualification provenance. Bello still checks for
 `bello_context_compaction` before any thread or turn and fails closed with a clear
@@ -151,6 +156,11 @@ qualifies its same-run build artifact, packages that exact candidate, and
 cold-installs the resulting archive. The retained receipts bind the source commit,
 workflow run and attempt, executable, qualification, archive and installed proof.
 These workflows do not publish assets or change download pins.
+The helper's proof and packaging inputs include `supervisor/appserver.py`,
+`supervisor/process_fence.py`, `supervisor/state.py`,
+`supervisor/filesystem_safety.py`, the distiller modules and the native scripts and
+patch. Changing any of them after the helper build commit invalidates the qualified
+artifacts.
 `native-codex-release-qualification.yml` is retained only for manual historical
 artifact replay, not this current release path. The versioned release packager
 verifies the complete build, aggregate guardian receipt, worker receipt,

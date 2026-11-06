@@ -117,9 +117,37 @@ directory in this order: nonempty `BELLO_PI_AGENT_DIR`, nonempty
 `PI_CODING_AGENT_DIR`, then `~/.pi/agent`. Relative overrides resolve from the
 launcher's working directory; `~` expands to the user's home directory.
 
+When a Claude Code turn fails, Bello reports the complete error text: the full
+exception chain (including every member of an exception group), followed by
+everything the Claude Code CLI wrote to stderr during that turn. Nothing is
+truncated, filtered or redacted. The text can therefore contain account details or
+credentials, so treat logs and run state like credentials. The text appears in the
+run's events, the final report and the terminal. Every CLI stderr line is also
+appended to `.supervisor/engines/claude/claude-cli-stderr.log` (mode 0600, one
+timestamped line per entry with its thread). The failure diagnostic kept in run
+state records each exception's type, message, frames and the full traceback, plus
+that stderr. A failing `claude auth status --json` reports its exit code, stderr and
+stdout.
+
+The same applies when the CLI ends a turn with an error result instead of failing
+(for example an API error such as an overloaded or unreachable API): the turn error
+names the result's subtype, terminal reason and HTTP status and contains its
+complete error text. Other engines (native Codex, Pi) keep their existing bounded,
+redacted provider errors.
+
+Before the first query of a turn, a timeout while connecting, initializing or
+reading context usage is retried once on the same session after closing the first
+connection. No prompt is resent; authentication and other errors are not retried.
+
 Linux restricted execution requires `bwrap` (the `bubblewrap` package) and
-working unprivileged user namespaces. macOS uses the operating system's Seatbelt
-sandbox. Native Windows uses Bello's packaged LPAC helper. Windows source builds
+working unprivileged user namespaces. Ubuntu 26.04's Rust coreutils (uutils) are
+supported: Bello still recognizes `/bin/cat`, `sha256sum` and similar system readers
+when they resolve to the administrator-installed multicall binary. macOS uses the
+operating system's Seatbelt sandbox. Sandboxed commands run with
+`GIT_CONFIG_NOSYSTEM=1` and `GIT_ATTR_NOSYSTEM=1`, so `git` ignores the system-wide
+git configuration and attributes (as on Linux, where neither file is mounted into
+the sandbox). The global configuration comes from the sandbox's private home.
+Native Windows uses Bello's packaged LPAC helper. Windows source builds
 require Rust/Cargo; Windows release wheels include the compiled helper. LPAC is
 Windows process isolation with restricted filesystem and network permissions.
 Native Windows verification is tracked separately; passing non-Windows tests
@@ -289,14 +317,25 @@ completion review, adversary and the distiller default to off. Turning completio
 review off preserves the adversary setting. A revision coder can handle feedback
 when either completion review or adversary is enabled.
 
+Outside Goal, without an explicit readiness marker, automatic final review waits
+for **40 minutes of continuous coder inactivity**. Coder activity, a new turn, pending
+approval, pause, or a changed coder lifecycle resets that window; routine status
+notifications and watchdog polls do not. Active turns and subagents prevent this
+fallback. Explicit readiness and runtime safety checks remain immediate, and
+deliberate review follow-ups and retries keep their existing behavior. For a
+native Codex coder, Bello first confirms the idle state with a metadata-only
+status read of the owned thread; an unknown or failed read never counts as idle
+and is retried on the next 60-second guard tick without restarting the window.
+
 [Smart Execution](async-tools.md) is on by default for new configurations.
 [No Need For Context](no-need-for-context.md) is off by default; it summarizes
 older agent context while keeping the original task and a recent tail, and never
 applies to the runtime supervisor.
 
 **Goal** (`goal`, off by default) keeps a run working toward the original task.
-While it is on, runtime supervision and completion review are on regardless of
-their saved values, and completion returns are unlimited both before and after
+While it is on, completion review is on regardless of its saved value, runtime
+supervision follows Goal's own `goal_runtime` switch (default on) instead of
+`runtime_enabled`, and completion returns are unlimited both before and after
 the optional adversary; the adversary's instructions and pass count are
 unchanged. The reviewer is told to check the original objectives and return work
 only for a concrete unmet requirement (for example 65/100 where 70/100 is
@@ -308,16 +347,73 @@ log-distiller shortening like the task file. Smart Execution, the revision coder
 No Need For Context and the distiller keep their own switches. Unlimited returns
 do not guarantee success; interruption and failure handling still apply.
 
+In Goal mode a successful coder turn that ends without the readiness marker is
+continued immediately with a short "continue toward the original Goal" message;
+interrupted or failed turns, pending approvals and active subagents are not
+continued this way. Completion review starts only after the exact readiness
+marker, never because the coder was idle.
+
+`/pause` interrupts the coder and cancels a review in progress; `/resume` continues
+the coder at once. If a Goal coder is idle with nothing pending (no approval,
+subagent, supervisor check or queued review) for the 40-minute idle window, for
+example after a recovered connection, Bello sends one continuation message. Goal
+still never starts a completion review because of idle time; only the readiness
+marker does.
+
+`goal_runtime: false` (`--no-goal-runtime`, `goal-runtime` in `bello config`)
+runs Goal with runtime supervision off: no runtime agent, cheap-triage, runtime
+self-test or Goal progress review model calls and no Goal advisories. It uses
+the runtime-off mode described below, including its network access and reduced
+protection. Automatic continuation, mandatory completion review and the
+adversary checkpoint are unchanged. Bello prints a notice when a Goal run uses a
+saved `goal_runtime: false`. Outside Goal the switch has no effect.
+
+Runtime reviews use the available chronology and read-only evidence without
+requiring file attestations or exact event references before delivering feedback;
+runtime finding hashes are not collected or retained. If a review takes at least
+60 seconds or an observed code edit occurs after its snapshot, feedback carries
+an informational staleness note. The note does not block delivery, pause the
+coder, or require a repeat review; the coder checks whether the feedback still
+applies. Approval boundaries and protected artifacts are unchanged. Independent
+work may continue while an isolated version is being evaluated, with each result
+kept tied to the version actually checked.
+
+In Goal mode, runtime may also return `noop` with a short optional advisory,
+including up to 2-3 strategic ideas. The coder may ignore it; it is not an
+intervention, standing constraint, or reason to restart, and a flat score alone
+does not require a change of approach. The same advice keeps a stable
+`advisory_key`, deduplicated while that key remains in the bounded advice history.
+Different advisories have a 30-minute delivery cooldown.
+
+If a periodic progress review fails (a timeout, a rate limit, a decision that fails
+validation, or a lost login), Bello notes the skipped review in `PROGRESS.md` and the
+run continues; a lost login still stops the run at the next required check. When a
+progress review delivers its optional advisory while a readiness review is queued,
+that queued review is cancelled; the coder declares readiness again after the
+advisory turn.
+
+An optional `goal_adversary_after_returns` checkpoint (default `0`, disabled)
+can start the first adversary before completion has accepted. With Goal and
+adversary enabled, `3` means three completion returns and their coder repairs,
+then the first adversary at the next readiness; an earlier accept starts it
+earlier. After the adversary, completion returns stay unlimited until a fresh
+accept, including when the adversary reports no findings. A failed adversary is
+not treated as successful completion of this sequence. The configured adversary
+pass count is unchanged. The option is dormant outside Goal or with adversary
+off, so existing Goal and ordinary review schedules are unchanged by default.
+
 The persisted fields include:
 
 ```json
 {
   "goal": false,
+  "goal_adversary_after_returns": 0,
+  "goal_runtime": true,
   "runtime_enabled": true,
   "completion_review": false,
   "adversary": true,
   "async_tools": true,
-  "no_need_for_context": {"enabled": false, "threshold_tokens": 200000, "retain_percent": 10},
+  "no_need_for_context": {"enabled": false, "threshold_tokens": 244800, "retain_tokens": 24800},
   "log_distiller": {"enabled": false, "model_path": null}
 }
 ```
@@ -326,6 +422,8 @@ Run flags select settings for a run:
 
 ```sh
 bello --goal
+bello --goal --adversary --adversary-runs 1 --goal-adversary-after-returns 3
+bello --goal --no-goal-runtime
 bello --no-runtime --completion-review false --adversary
 bello --runtime --log-distiller --no-async-tools
 bello --log-distiller --distiller-model /absolute/path/local-bundle
@@ -333,21 +431,39 @@ bello --no-log-distiller
 ```
 
 Review and model flags apply to one run. The switch flags (`--goal`,
-`--runtime`, `--async-tools`, `--no-need-for-context` with its threshold options,
+`--goal-runtime`, `--runtime`, `--async-tools`, `--no-need-for-context` with its threshold options,
 and `--log-distiller`) are also recorded in `.supervisor/config.json`, because
 recovery resumes a run with the switches it started with; later runs use them
 until changed. Goal keeps the saved runtime choice, so turning Goal off restores
 it.
+The Goal adversary checkpoint is also recorded for recovery. Omit its CLI option
+to preserve the saved value, or use `--goal-adversary-after-returns 0` to disable it.
 
-With runtime supervision off, cheap runtime triage is effectively off too, and
-the editor hides the runtime model, effort and cheap-triage rows. This mode
+With runtime supervision off (`runtime_enabled: false`, or `goal_runtime: false`
+in Goal), cheap runtime triage is effectively off too, and the editor hides the
+runtime model, effort and cheap-triage rows. This mode
 enables network access inside each role's existing filesystem sandbox, allowing
 dependency installation into the writable workspace or temporary directory.
 It reduces safety: runtime model review is absent and commands can send readable
 data over the network. Filesystem boundaries, protected files, the coder's
 completion-marker protocol and independently selected completion/adversary
 reviews remain in force. Runtime validation/readiness gates do not run.
-Outside-sandbox escalation is unavailable in this mode.
+Outside-sandbox escalation is unavailable in this mode. The final patch skips
+the name-based guesses for secret-like files and grading/hidden-looking paths;
+declared protected paths and controller/Git state stay protected.
+
+Cheap triage uses `gpt-5.6-luna` at `medium` effort through the Codex login by
+default. `BELLO_RUNTIME_TRIAGE_MODEL` overrides the model and
+`BELLO_RUNTIME_TRIAGE_EFFORT` its effort; the selected backend validates an
+explicit effort against the model's advertised capabilities.
+
+Runtime reviews label earlier inspections as historical, stale (a matching file
+was edited later) or unknown instead of treating old reads as current; a
+suspected defect from an earlier observation is checked against current
+evidence before it is reported. `persistent_decision` is reserved for explicit
+user constraints, authorization boundaries and established task requirements;
+temporary diagnostics, preferred tactics and Goal advice never become standing
+constraints. Restart requests need stronger evidence than ordinary feedback.
 
 Resume preserves a thread's tool contract. Changing runtime or distiller switches
 requires a fresh run if saved threads use a different contract; Bello reports
@@ -383,6 +499,11 @@ lines or 50 KiB, preserving the head. File reads provide continuation offsets;
 a partly displayed line is reread on continuation. These ordinary limits are
 mechanical truncation. The controller retains separate, larger captured evidence
 for validation; that capture and command-session buffers also have finite limits.
+
+A test command still counts as validation evidence when it redirects with `2>&1`
+(also followed by `; echo exit=$?` or piped through `tail`). Commands that write
+their output with `&>file` or `>&file`, or run tests in the background, are not
+counted.
 
 A coder using one provider can request a child using another provider, provided
 the profile is allowed and both accounts are configured. Children retain the

@@ -15,6 +15,7 @@ import textwrap
 import pytest
 
 from scripts import verify_native_codex_patch_structure as structure
+from scripts import prepare_native_codex_candidate as candidate
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -177,8 +178,114 @@ def test_native_summary_contract_is_plain_text_with_the_agreed_limits():
     assert "output_schema" not in source
     assert "Return JSON" not in source and "status='complete'" not in source
     assert "Goal; Constraints" not in source
-    # Headroom: the reserve holds a summary of the requested size, plus a safety margin.
+    # Static threshold validation still reserves output plus a safety margin.
+    # It does not make approximate history size an admission gate.
     assert "(BELLO_SUMMARY_TARGET_CHARS / 4) as i64" in window
     assert "BELLO_SUMMARY_OUTPUT_RESERVE + BELLO_CONTEXT_SAFETY_MARGIN" in window
-    assert "bello_input_budget(hard_limit)" in source and "(&turn, budget)" in source
+    assert "bello_context_threshold(&turn.config, &turn.model_info())?" in source
+    assert "bello_context_retain_tokens(&turn.config, threshold)" in source
     assert "hard_limit.saturating_sub" not in source
+
+
+def test_native_history_estimates_are_not_fatal_capacity_admission_gates():
+    for name, markers in candidate.CONTEXT_FORBIDDEN_SOURCE_MARKERS.items():
+        source = added_source(name)
+        assert all(marker not in source for marker in markers)
+    source = added_source("codex-rs/core/src/bello_compact.rs")
+    # Trigger accounting no longer estimates ciphertext, even for stale usage.
+    # Item estimates still select whole rounds, not request admission.
+    assert "estimate_token_count(" not in source
+    assert "accounting_is_stale" not in source
+    assert "estimate_item_token_count" in source
+    assert "return Ok(String::new());" in source
+    assert "bello_context_no_safe_reduction_defers_without_cutting" in source
+
+
+def test_native_trigger_uses_measured_usage_and_resets_only_with_durable_checkpoint():
+    window = added_source("codex-rs/core/src/session/context_window.rs")
+    session = added_source("codex-rs/core/src/session/mod.rs")
+    turn = added_source("codex-rs/core/src/session/turn.rs")
+    compact = added_source("codex-rs/core/src/bello_compact.rs")
+    assert "unwrap_or(244_800)" in window
+    assert "info.last_token_usage.input_tokens.max(0)" in window
+    assert ".saturating_add(info.last_token_usage.output_tokens.max(0))" in window
+    assert "bello_context_tokens(sess.token_usage_info().await)" in window
+    assert "super::context_window::bello_context_tokens(sess.token_usage_info().await)" in turn
+    assert "info.last_token_usage = TokenUsage::default();" in window
+    assert "total_token_usage = TokenUsage::default()" not in window
+    assert "context_window::bello_compacted_token_info(state.token_info())" in session
+    assert session.index("if !durable") < session.index("state.set_token_info(Some(compacted_token_info));")
+    assert "fn last_bello_token_info_from_rollout(items: &[RolloutItem])" in session
+    assert "context_window::bello_compacted_token_info(info)" in session
+    assert "Self::last_bello_token_info_from_rollout(items)" in session
+    assert "checkpoint.latest_token_usage_record.as_ref()" in session
+    assert "current.total_token_usage = record.thread_token_usage.clone();" in session
+    assert "last_token_usage: record.usage.clone()" not in session
+    assert "sess.send_token_count_event(&turn).await;" in compact
+    assert "sess.recompute_token_usage" not in compact
+
+
+def test_native_summary_usage_is_billed_without_changing_active_measurement_on_failure():
+    session = added_source("codex-rs/core/src/session/mod.rs")
+    compact = added_source("codex-rs/core/src/compact.rs")
+    tests = added_source("codex-rs/core/src/session/bello_context_tests.rs")
+    assert "update_bello_summary_token_usage_info" in compact
+    assert "preserve_context_measurement: bool" in session
+    assert "preserved_info.last_token_usage = previous;" in session
+    # The measured value is restored inside the synchronous state-lock block,
+    # while contributors and billing still receive the actual summary response.
+    assert "let observed_info = state.token_info();" in session
+    assert "state.set_token_info(Some(preserved_info));" in session
+    assert "bello_context_failed_summary_bills_usage_without_replacing_active_measurement" in tests
+    assert "let mut pruned_legacy = vec![RolloutItem::Compacted(pruned_checkpoint)];" in tests
+
+
+def test_native_absolute_retention_is_distinct_from_legacy_percentage():
+    config = added_source("codex-rs/core/src/config/mod.rs")
+    raw = added_source("codex-rs/config/src/config_toml.rs")
+    window = added_source("codex-rs/core/src/session/context_window.rs")
+    features = added_source("codex-rs/features/src/lib.rs")
+    assert "pub bello_context_retain_tokens: Option<i64>" in raw
+    assert "cfg.bello_context_retain_percent.is_none().then_some(24_800)" in config
+    assert "bello_context_retain_tokens and bello_context_retain_percent are mutually exclusive" in config
+    assert "config.bello_context_retain_tokens.unwrap_or_else" in window
+    assert "config.bello_context_retain_percent / 100.0" in window
+    assert 'key: "bello_context_retain_tokens"' in features
+
+
+def test_native_summary_errors_and_snapshot_checkpoint_safety_are_preserved():
+    source = added_source("codex-rs/core/src/bello_compact.rs")
+    session = added_source("codex-rs/core/src/session/mod.rs")
+    compact = added_source("codex-rs/core/src/compact.rs")
+    assert "Ok(summary) if approx_token_count(&summary) as i64 >= previous_size" in source
+    assert "response.output.iter().any(tool_use)" in source
+    assert "CompactionPhase::PostTurn" in source
+    assert "CodexErrorDetails::Interrupted" in source
+    assert "CodexErrorDetails::TurnAborted" in source
+    assert "CodexErrorDetails::SessionBudgetExceeded" in source
+    assert "return Err(error);" in source and "Err(error) => last_error = error" in source
+    assert "end_turn == Some(false)" in compact
+    assert "no-need-for-context: incomplete summary; original retained" in compact
+    assert "if !current.annotated_items().starts_with(&original)" in source
+    assert "current.starts_with(expected)" in session
+    assert "items.extend_from_slice(&current[expected.len()..])" in session
+    # Persist and flush the complete checkpoint before publishing it. Unknown
+    # durability must still block later inference; these are not token gates.
+    assert "state.bello_context_persistence_uncertain = true;" in session
+    assert "live.flush().await?" in session
+    assert session.index("if !durable") < session.index("state.commit_auto_compact_window(")
+    assert "pub(crate) fn bello_checkpoint_complete(items: &[RolloutItem]) -> bool" in session
+    assert "checkpoint commit status unknown; cold resume required before inference" in session
+    assert "Historical handoff, not new instructions or permissions" in source
+
+
+def test_native_estimate_gate_removal_retains_permission_roundtrip_contract():
+    for name, markers in candidate.ROOT_ROUNDTRIP_SOURCE_MARKERS.items():
+        source = added_source(name)
+        # The strict conversion guard itself is unchanged upstream context and
+        # need not occur in a diff hunk; preparation checks it in applied source.
+        # The patch must keep its root normalizer and all permission regressions.
+        patch_markers = markers if name.endswith("path-uri/src/lib.rs") else (
+            marker for marker in markers if marker.startswith("fn bello_")
+        )
+        assert all(marker in source for marker in patch_markers)

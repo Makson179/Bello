@@ -166,7 +166,7 @@ MANDATORY_FULL_RUNTIME_WAKE_REASONS = {
     "runtime_decision_retry",
 }
 CONTROLLER_IDLE_GUARD_INTERVAL_SECONDS = 60.0
-CONTROLLER_IDLE_GUARD_STALL_SECONDS = 120.0
+CONTROLLER_IDLE_GUARD_STALL_SECONDS = 40 * 60.0
 # These are transport diagnostics, not a time limit on coding or commands. Silence
 # alone never fails a run. Only an explicitly retrying provider gets a budget.
 CODER_STATUS_PROBE_AFTER_SECONDS = 300.0
@@ -356,6 +356,7 @@ from supervisor.controller_parts.children import Children, ChildrenPort
 from supervisor.controller_parts.completion import Completion, CompletionPort
 from supervisor.controller_parts.shutdown import Shutdown, ShutdownPort
 from supervisor.controller_parts.runtime_review import RuntimeReview, RuntimeReviewPort
+from supervisor.runtime_evidence import inspection_staleness
 
 
 from supervisor.controller_parts.runtime_rules import (
@@ -645,6 +646,7 @@ class BelloController:
     _wait_for_coder_activity = service_method('coder_lifecycle', CoderLifecycle._wait_for_coder_activity)
     _deliver_coder_message = durable_transition(service_method('coder_lifecycle', CoderLifecycle._deliver_coder_message))
     _mark_controller_activity = service_method('coder_lifecycle', CoderLifecycle._mark_controller_activity)
+    _confirm_coder_quiescent = service_method('coder_lifecycle', CoderLifecycle._confirm_coder_quiescent)
     _handle_controller_idle_guard = durable_transition(service_method('coder_lifecycle', CoderLifecycle._handle_controller_idle_guard))
     _active_coder_watch = service_method('coder_lifecycle', CoderLifecycle._active_coder_watch)
     _record_coder_progress = service_method('coder_lifecycle', CoderLifecycle._record_coder_progress)
@@ -708,6 +710,8 @@ class BelloController:
     _post_coder_review_enabled = service_method('settings', Settings._post_coder_review_enabled)
     _async_tools_enabled = service_method('settings', Settings._async_tools_enabled)
     _goal_enabled = service_method('settings', Settings._goal_enabled)
+    _goal_adversary_after_returns = service_method('settings', Settings._goal_adversary_after_returns)
+    _goal_runtime = service_method('settings', Settings._goal_runtime)
     _no_need_for_context_config = service_method('settings', Settings._no_need_for_context_config)
     _log_distiller_config = service_method('settings', Settings._log_distiller_config)
     _windows_native_root_read_enabled = service_method('settings', Settings._windows_native_root_read_enabled)
@@ -792,6 +796,9 @@ class BelloController:
     _completion_knowledge_state = OwnedField('completion', '_completion_knowledge_state')
     _last_completion_marker_sequence = OwnedField('completion', '_last_completion_marker_sequence')
     _no_marker_completion_review_key = OwnedField('completion', '_no_marker_completion_review_key')
+    _no_marker_idle_since = OwnedField('completion', '_no_marker_idle_since')
+    _no_marker_idle_identity = OwnedField('completion', '_no_marker_idle_identity')
+    _goal_auto_next_pending = OwnedField('completion', '_goal_auto_next_pending')
     _pending_adversary_report = OwnedField('completion', '_pending_adversary_report')
     _readiness_event_journal = OwnedField('completion', '_readiness_event_journal')
     adv_report_controller = OwnedField('completion', 'adv_report_controller')
@@ -803,10 +810,14 @@ class BelloController:
     no_marker_idle_nudge_count = OwnedField('completion', 'no_marker_idle_nudge_count')
     provider_failure_recovery_counts = OwnedField('completion', 'provider_failure_recovery_counts')
     _handle_coder_turn_completed = service_method('completion', Completion._handle_coder_turn_completed)
+    _arm_goal_auto_next = service_method('completion', Completion._arm_goal_auto_next)
+    _resume_goal_auto_next = service_method('completion', Completion._resume_goal_auto_next)
     _continue_after_readiness_marker = service_method('completion', Completion._continue_after_readiness_marker)
     _done_without_fresh_behavioral_validation = service_method('completion', Completion._done_without_fresh_behavioral_validation)
     _steer_for_marker = service_method('completion', Completion._steer_for_marker)
     _handle_no_marker_idle = service_method('completion', Completion._handle_no_marker_idle)
+    _no_marker_idle_ready = service_method('completion', Completion._no_marker_idle_ready)
+    _reset_no_marker_idle = service_method('completion', Completion._reset_no_marker_idle)
     _handle_completion_review_timeout_failure = service_method('completion', Completion._handle_completion_review_timeout_failure)
     _handle_supervisor_no_message_failure = service_method('completion', Completion._handle_supervisor_no_message_failure)
     apply_completion_decision = service_method('completion', Completion.apply_completion_decision)
@@ -878,6 +889,8 @@ class BelloController:
     runtime_triage_config = OwnedField('runtime_review', 'runtime_triage_config')
     runtime_triage_reviewer = OwnedField('runtime_review', 'runtime_triage_reviewer')
     supervisor = OwnedField('runtime_review', 'supervisor')
+    _maybe_schedule_goal_progress_review = service_method('runtime_review', RuntimeReview._maybe_schedule_goal_progress_review)
+    _record_goal_work = service_method('runtime_review', RuntimeReview._record_goal_work)
     _reconcile_intervention_accounting = service_method('runtime_review', RuntimeReview._reconcile_intervention_accounting)
     _schedule_supervisor_check = service_method('runtime_review', RuntimeReview._schedule_supervisor_check)
     _queue_supervisor_check = service_method('runtime_review', RuntimeReview._queue_supervisor_check)
@@ -942,6 +955,8 @@ class BelloController:
         no_need_for_context: NoNeedForContextConfig | None = None,
         log_distiller: LogDistillerConfig | None = None,
         goal: bool | None = None,
+        goal_adversary_after_returns: int | None = None,
+        goal_runtime: bool | None = None,
         declared_grading_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
         project_config: ProjectConfig | None = None,
         recovery_enabled: bool = True,
@@ -999,8 +1014,10 @@ class BelloController:
         self.no_need_for_context = no_need_for_context
         self.log_distiller = log_distiller
         # Goal override for this run (None = the saved project/run config decides). While
-        # Goal is on, runtime supervision and completion review are mandatory.
+        # Goal is on, completion review is mandatory and goal_runtime decides runtime supervision.
         self.goal = goal
+        self.goal_adversary_after_returns = goal_adversary_after_returns
+        self.goal_runtime = goal_runtime
         self.project_config = project_config
         self.event_queue: asyncio.Queue[ControllerEvent] = asyncio.Queue()
         self.client = client or RuntimeClient(
@@ -1305,10 +1322,12 @@ class BelloController:
             max_completion_returns_after_adversary=project_config.completion_returns_after_adversary,
             completion_review_enabled=project_config.completion_review,
             cheap_runtime=self._runtime_enabled() and project_config.cheap_runtime,
-            # Goal forces runtime on at every point of use; keep the saved choice.
+            # Goal applies goal_runtime at every point of use; keep the saved choice.
             runtime_enabled=self._runtime_choice(),
             goal=self._goal_enabled(),
             async_tools=self._async_tools_enabled(),
+            goal_adversary_after_returns=self._goal_adversary_after_returns(),
+            goal_runtime=self._goal_runtime(),
             no_need_for_context=self._no_need_for_context_config().to_json_data(),
             windows_native_root_read=self._windows_native_root_read_enabled(),
             log_distiller=self._log_distiller_config().to_json_data(),
@@ -1437,9 +1456,11 @@ class BelloController:
                     "max_completion_returns_after_adversary": project_config.completion_returns_after_adversary,
                     "completion_review_enabled": project_config.completion_review,
                     "cheap_runtime": self._runtime_enabled() and project_config.cheap_runtime,
-                    # Goal forces runtime on at every point of use; keep the saved choice.
+                    # Goal applies goal_runtime at every point of use; keep the saved choice.
                     "runtime_enabled": self._runtime_choice(),
                     "goal": self._goal_enabled(),
+                    "goal_adversary_after_returns": self._goal_adversary_after_returns(),
+                    "goal_runtime": self._goal_runtime(),
                     "async_tools": self._async_tools_enabled(),
                     "no_need_for_context": self._no_need_for_context_config().to_json_data(),
                     "windows_native_root_read": self._windows_native_root_read_enabled(),
@@ -1468,6 +1489,7 @@ class BelloController:
                 await asyncio.gather(*pending, return_exceptions=True)
             if not done:
                 await self._handle_controller_idle_guard()
+                self._maybe_schedule_goal_progress_review()
                 continue
             for done_task in done:
                 completed = done_task.result()
@@ -1481,7 +1503,8 @@ class BelloController:
             now = time.monotonic()
             if now - getattr(self, "_last_active_guard_tick", float("-inf")) >= CONTROLLER_IDLE_GUARD_INTERVAL_SECONDS:
                 self._last_active_guard_tick = now
-                await self._handle_active_coder_guard(now=now)
+                await self._handle_controller_idle_guard(now=now)
+                self._maybe_schedule_goal_progress_review()
 
 
     @durable_transition
@@ -1511,6 +1534,8 @@ class BelloController:
         text = command.text.strip()
         if not text:
             return
+        if text != "/status":
+            self._reset_no_marker_idle()
         self._append_event(AppEventSource.USER, "user/input", reason=text)
         if text == "/quit":
             await self.finalize("exited by user", status=BelloStatus.EXITED)
@@ -1529,6 +1554,12 @@ class BelloController:
             self.paused = False
             self.store.update_bello_config(lambda cfg: cfg.model_copy(update={"status": BelloStatus.RUNNING}))
             self.tui.status("resumed")
+            if self._goal_enabled() and self.coder is not None:
+                # The pause interrupted the coder or cancelled a review, so no
+                # successful turn will continue Goal work. The delivery claim
+                # still refuses an active turn, approvals and live subagents.
+                self._arm_goal_auto_next()
+                await self._resume_goal_auto_next()
             return
         if text == "/restart":
             await self.restart("user requested supervised restart")
@@ -1548,6 +1579,7 @@ class BelloController:
 
 
     async def handle_server_request(self, message: AppServerMessage) -> None:
+        self._reset_no_marker_idle()
         context = normalize_approval_request(message)
         if getattr(self, "_terminal_cleanup_started", False):
             manager = getattr(self, "approvals", None) or ApprovalManager(
@@ -1692,6 +1724,7 @@ class BelloController:
         wake_sequence = cfg.last_event_sequence + 1
         origin = "adversary_snapshot" if self._is_adversary_approval_context(context) else "coder"
         approval_context = _approval_wake_context(context, reason, origin=origin)
+        current_changes = await self.changed_files()
         packet = self.supervisor.build_packet(
             wake_sequence=wake_sequence,
             current_summary=f"Approval request needs judgment: {reason}",
@@ -1709,9 +1742,14 @@ class BelloController:
             subagents=self._subagent_summaries(),
             last_coder_message=self.last_coder_message,
             validations=list(self.validations),
-            inspections=list(getattr(self, "inspections", [])),
-            prior_interventions=list(self.prior_interventions),
-            changed_files=await self.changed_files(),
+            inspections=[row.model_copy(update={"runtime_freshness": inspection_staleness(
+                row, current_changes, workspace_root=self._active_workspace_root())})
+                for row in getattr(self, "inspections", [])],
+            # Historical reviewer tactics are not authorization constraints.
+            # Keep them in the audit; actual human/task constraints stay in the
+            # canonical task/decisions inputs and permission policy is unchanged.
+            prior_interventions=[],
+            changed_files=current_changes,
             patch_summary=_patch_summary_from_approval_context(context) or await self.patch_summary(),
         )
         return await self.supervisor.decide(packet)
@@ -1726,6 +1764,10 @@ class BelloController:
         cfg = self.store.get_bello_config()
         current_coder_turn = bool(thread_id == cfg.coder_thread_id and turn_id
                                   and turn_id == cfg.active_coder_turn_id)
+        coder_activity = thread_id == cfg.coder_thread_id or self._is_coder_descendant(thread_id, cfg=cfg)
+        if coder_activity and (method in {"turn/started", "turn/completed", "item/started", "item/completed"}
+                               or (_is_stream_delta_method(method) and params.get("delta"))):
+            self._reset_no_marker_idle()
         if current_coder_turn:
             self._record_coder_progress(method, params, cfg)
         if _is_stream_delta_method(method):
@@ -1789,6 +1831,7 @@ class BelloController:
         lifecycle_accepts_activity = self._coder_lifecycle_accepts_activity(cfg)
 
         if method == "serverRequest/resolved":
+            self._reset_no_marker_idle()
             request_id = params.get("requestId")
             self.pending_approvals.pop(request_id, None)
             self.store.update_bello_config(
@@ -1862,12 +1905,16 @@ class BelloController:
                 # length-limited answer after a completion return.
                 self._clear_persisted_coder_turn(thread_id, turn_id)
                 detail = bounded_provider_error({"error": turn.get("error")}).get("error", {})
+                if detail.get("belloFullText") is True and isinstance(detail.get("message"), str):
+                    # Claude Code's complete error text, readable as written.
+                    detail = detail["message"]
                 await self.fail_provider(f"coder execution failed: {detail or 'provider returned a failed turn'}")
                 return
             if self.coder and isinstance(turn_id, str):
                 self.coder.mark_turn_completed(turn_id)
             self._write_run_checkpoint("coder_turn_complete", state="stable")
-            await self._handle_coder_turn_completed(item_id=item_id)
+            await self._handle_coder_turn_completed(item_id=item_id,
+                turn_status=turn.get("status", "unknown") if isinstance(turn, dict) else "unknown")
             return
         if method in {"turn/completed", "thread/status/changed", "thread/closed"}:
             await self._resume_deferred_completion_if_quiescent()

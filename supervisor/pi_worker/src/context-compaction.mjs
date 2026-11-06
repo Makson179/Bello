@@ -182,7 +182,7 @@ export function planContextCompaction(context, policy, pendingCallIds = []) {
   const firstUser = entries.findIndex((entry) => entry.messages.some((message) => message.role === "user"));
   if (firstUser < 0) return undefined;
   const prefixEnd = firstUser + 1;
-  const target = Math.floor(policy.thresholdTokens * policy.retainPercent / 100);
+  const target = policy.retainTokens ?? Math.floor(policy.thresholdTokens * policy.retainPercent / 100);
   let cut = entries.length;
   let retained = 0;
   while (cut > prefixEnd && (retained < target || cut === entries.length)) {

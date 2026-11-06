@@ -8,7 +8,7 @@ from scripts import build_native_codex_macos_candidate as build
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/native-codex-macos-candidate.yml"
 TEXT = WORKFLOW.read_text(encoding="utf-8")
-BRANCH = "codex/080-production-ready"
+BRANCH = "ci/0.8.1-rc"
 
 
 def step(title):

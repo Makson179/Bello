@@ -49,11 +49,13 @@ REQUIRED_KEYS = {
     "adversary_multi_agent",
 }
 # Older complete recommendations omit these opt-ins. Match ProjectConfig's
-# defaults (async_tools=true, windows_native_root_read=false, goal=false) without
-# accepting arbitrary new keys or coercing strings.
-OPTIONAL_BOOLEAN_KEYS = {"async_tools", "windows_native_root_read", "goal"}
-OPTIONAL_BOOLEAN_DEFAULTS = {"async_tools": True, "windows_native_root_read": False, "goal": False}
+# defaults (async_tools=true, windows_native_root_read=false, goal=false,
+# goal_runtime=true) without accepting arbitrary new keys or coercing strings.
+OPTIONAL_BOOLEAN_KEYS = {"async_tools", "windows_native_root_read", "goal", "goal_runtime"}
+OPTIONAL_BOOLEAN_DEFAULTS = {"async_tools": True, "windows_native_root_read": False, "goal": False,
+                             "goal_runtime": True}
 OPTIONAL_OBJECT_KEYS = {"no_need_for_context"}
+OPTIONAL_INTEGER_KEYS = {"goal_adversary_after_returns"}
 
 
 def _is_int(value: Any, *, minimum: int = 0) -> bool:
@@ -250,7 +252,7 @@ def validate(
     except ValueError as exc:
         return [f"catalog: {exc}; supply a current catalog from inspect_models.py"]
     missing = REQUIRED_KEYS - config.keys()
-    extra = config.keys() - REQUIRED_KEYS - OPTIONAL_BOOLEAN_KEYS - OPTIONAL_OBJECT_KEYS
+    extra = config.keys() - REQUIRED_KEYS - OPTIONAL_BOOLEAN_KEYS - OPTIONAL_OBJECT_KEYS - OPTIONAL_INTEGER_KEYS
     if missing:
         errors.append(f"root: missing keys {sorted(missing)}")
     if extra:
@@ -258,17 +260,30 @@ def validate(
     for field in sorted(OPTIONAL_BOOLEAN_KEYS):
         if type(config.get(field, OPTIONAL_BOOLEAN_DEFAULTS[field])) is not bool:
             errors.append(f"{field}: expected boolean")
+    for field in sorted(OPTIONAL_INTEGER_KEYS):
+        if not _is_int(config.get(field, 0)):
+            errors.append(f"{field}: expected a non-negative integer")
     context = config.get("no_need_for_context", {})
-    if not isinstance(context, dict) or set(context) - {"enabled", "threshold_tokens", "retain_percent"}:
-        errors.append("no_need_for_context: expected only enabled, threshold_tokens and retain_percent")
+    if not isinstance(context, dict) or set(context) - {"enabled", "threshold_tokens", "retain_percent", "retain_tokens"}:
+        errors.append("no_need_for_context: expected only enabled, threshold_tokens and one retention setting")
     else:
         if type(context.get("enabled", False)) is not bool:
             errors.append("no_need_for_context.enabled: expected boolean")
-        if not _is_int(context.get("threshold_tokens", 200000), minimum=1):
+        if not _is_int(context.get("threshold_tokens", 244800), minimum=1):
             errors.append("no_need_for_context.threshold_tokens: expected a positive integer")
-        percent = context.get("retain_percent", 10)
-        if type(percent) not in (int, float) or not 0 < percent <= 50 or not math.isfinite(percent):
-            errors.append("no_need_for_context.retain_percent: expected a finite number greater than 0 and at most 50")
+        if "retain_tokens" in context and "retain_percent" in context:
+            errors.append("no_need_for_context: select only one of retain_tokens and retain_percent")
+        if "retain_tokens" in context and not _is_int(context["retain_tokens"], minimum=1):
+            errors.append("no_need_for_context.retain_tokens: expected a positive integer")
+        tail = context.get("retain_tokens", None if "retain_percent" in context else 24800)
+        threshold = context.get("threshold_tokens", 244800)
+        if (context.get("enabled") is True and _is_int(tail, minimum=1) and _is_int(threshold, minimum=1)
+                and tail * 2 > threshold):
+            errors.append("no_need_for_context.retain_tokens: expected at most half of threshold_tokens")
+        if "retain_percent" in context:
+            percent = context["retain_percent"]
+            if type(percent) not in (int, float) or not 0 < percent <= 50 or not math.isfinite(percent):
+                errors.append("no_need_for_context.retain_percent: expected a finite number greater than 0 and at most 50")
 
     if config.get("review_limit_format") != "explicit":
         errors.append("review_limit_format: must be 'explicit'")
@@ -281,9 +296,16 @@ def validate(
     runtime = config.get("runtime_enabled") is True
     review = config.get("completion_review") is True
     goal = config.get("goal", False) is True
-    if goal and not (runtime and review):
+    goal_runtime = config.get("goal_runtime", True) is not False
+    if goal and goal_runtime and not (runtime and review):
         # Goal makes both mandatory; a recommendation must say so explicitly.
         errors.append("goal: requires runtime_enabled=true and completion_review=true")
+    if goal and not goal_runtime:
+        if not review:
+            errors.append("goal: requires completion_review=true")
+        # Goal's own switch turns runtime off; runtime_enabled stays the dormant
+        # non-Goal preference, so applying the setup never rewrites it.
+        runtime = False
     adversary_enabled = config.get("adversary") is True
     active_roles = {"coder"}
     if runtime:
@@ -297,7 +319,8 @@ def validate(
     for role in ("coder", "revision_coder", "runtime", "completion", "adversary"):
         _validate_role(config, role, errors, catalog=entries, active=role in active_roles)
     if not runtime and config.get("cheap_runtime") is True:
-        errors.append("cheap_runtime: must be false when runtime_enabled=false")
+        errors.append("cheap_runtime: must be false when goal_runtime=false" if goal and not goal_runtime
+                      else "cheap_runtime: must be false when runtime_enabled=false")
     if runtime and config.get("cheap_runtime") is True:
         try:
             identity = qualified_model(triage_model, allow_legacy=True)
