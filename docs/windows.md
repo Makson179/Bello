@@ -35,6 +35,9 @@ bello runtime login openai-codex
 bello doctor
 ```
 
+Crash recovery works with pipx and other virtual-environment installs: Bello starts
+its supervised worker as the real interpreter of the environment (issue #41).
+
 Task execution does not need Administrator access or Windows Developer Mode.
 Host sandbox preparation does require an explicit administrator terminal:
 
@@ -173,6 +176,13 @@ or a service binary update is needed. Updates and removal refuse active runs
 and retained leases; finish runs first. A service crash leaves blocking rules
 in place. Uncertain leases survive until a verified Windows restart, rather
 than removing protection from a process that might still be running.
+
+If `prepare --network` refuses an existing WFP layout, the error now names each
+differing field (provider/sublayer key, flags, display name, service name, provider
+data or sublayer weight). Another product's Windows Filtering Platform sandbox can
+conflict with Bello's fixed policy; report the field list with your Windows build and
+installed sandbox products. Coexistence, rollback of a failed prepare and clearing a
+retained sandbox journal are not yet supported (issue #42, open).
 
 ### Snapshot creation reports a reparse, hardlink, or path-safety failure
 

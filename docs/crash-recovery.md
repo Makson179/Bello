@@ -53,7 +53,10 @@ mounts. Native Windows guards are reopened only after validation.
 
 The effective system-prompt file, including a custom override, and the selected
 engine executable/manifest are bound to the checkpoint. A different selection is
-rejected before starting that engine or rewriting restored state. Full-access
+rejected before starting that engine or rewriting restored state. When the restored
+run starts, Bello also starts every execution engine the checkpoint recorded (a
+launcher start, never a model turn or self-test) and requires the same launcher
+identity; a changed launcher stops recovery before any work continues. Full-access
 coder runs remain usable, but cannot automatically recover: their tools could
 modify the controller's recovery authority. Unknown script launchers that delegate
 to an unbound executable likewise remain nonrecoverable.

@@ -67,7 +67,7 @@ manifest, and the older 135-second build fail with an actionable error before a
 distilled coder turn starts. D-off does not read this manifest or run these checks.
 
 The current managed helper is the published
-`native-codex-0.161.0-nnc-se-20261019` release. Its exact download pins, payload
+`native-codex-0.161.0-nnc-tokens-20261105` release. Its exact download pins, payload
 hashes and qualification provenance are in the
 [qualified release ledger](../scripts/native-codex-0.161.0-qualified-release.json);
 see the [0.161.0 build and qualification guide](native-codex-candidate.md) for the
