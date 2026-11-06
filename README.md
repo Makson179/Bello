@@ -39,6 +39,11 @@ quality, and its mean score was 1.45% higher. Sol Ultra C+A raised the mean
 score over Raw Codex by 26.4%. The log distiller cut API-equivalent cost by 22% on
 Astra and by 14.8% on Luna.
 
+On [NetHackers](#nethack-state-of-the-art-and-bello-against-codex-goal), Bello
+in Goal mode set the state of the art for the lawful human female Valkyrie.
+Against Codex Goal on the same model, Bello's best score was 42.18% higher, it
+reached Codex Goal's final best 4.39 times sooner, and it cost 9.59% less.
+
 ## Install
 
 Python 3.11 or newer, git, and macOS, Linux with the `bubblewrap` package, or
@@ -149,24 +154,40 @@ complete setup for the priority you name. Every setting is also in
 
 For tasks with a measurable target, `bello --task TASK.md --goal` (or `goal` in
 `bello config`) keeps the run going until the completion reviewer accepts the
-original objectives. Runtime supervision and completion review are always on in
-this mode, and completion returns are unlimited before and after the optional
-adversary. The reviewer returns work only for a concrete unmet requirement, such
-as a score of 65/100 where 70/100 is required, and does not add requirements or
-block on polish. The coder keeps a short `GOAL_MAP.md` of what it tried, what
-happened and what is left to try. Goal is off by default; see
+original objectives. After each successful turn the coder continues toward the
+goal right away, and completion review starts only when the coder marks the
+work as ready. Completion review is always on in this mode, and completion
+returns are unlimited. The reviewer returns work only for a concrete unmet
+requirement, such as a score of 65/100 where 70/100 is required, and does not
+add requirements or block on polish. The coder keeps a short `GOAL_MAP.md` of
+what it tried, what happened and what is left to try.
+
+Runtime supervision is on by default in Goal mode. Every 20 minutes it checks
+progress against `GOAL_MAP.md` and can send the coder a short suggestion, at
+most once every 30 minutes, which the coder is free to ignore.
+`--no-goal-runtime` (or `goal-runtime` in `bello config`) runs Goal without
+runtime model calls; as with `--no-runtime`, this also allows network access
+inside the sandbox. `--goal-adversary-after-returns N` starts the adversary
+after N completion returns, or as soon as the reviewer accepts, and completion
+review then continues until it accepts. Goal is off by default; see
 [docs/runtime.md](./docs/runtime.md#independent-run-controls).
 
 ### No Need For Context (NNC)
 
 NNC compresses older conversation history into a summary while preserving the
-original task, instructions, and a recent tail of complete interactions. The
-compression threshold and retained-tail size are configurable.
+original task, instructions, and a recent tail of complete interactions. It
+works with Claude Code, native Codex and API providers, for the coder, the
+reviewer, the adversary and their subagents.
 
 This lets agents continue long-running tasks without carrying the entire
-conversation into every subsequent request. NNC is off by default; when enabled,
-the default threshold is 200,000 tokens with a soft recent-tail target of 20,000.
-See [configuration and backend details](./docs/no-need-for-context.md).
+conversation into every subsequent request. NNC is off by default. When it is
+on, it summarizes at 244,800 input tokens and keeps a recent tail of about
+24,800 tokens by default; both values are configurable with
+`--context-threshold-tokens` and `--context-retain-tokens` or in `bello config`.
+Whole turns and tool-call groups stay intact, so the tail can be somewhat
+larger, and the tail can be at most half the threshold.
+`--context-retain-percent` keeps the older percentage mode. See
+[configuration and backend details](./docs/no-need-for-context.md).
 
 <picture>
   <img src="./docs/assets/nnc-astra-xhigh-solar.png" alt="Astra XHigh on Solar, three attempts per setup. Raw versus NNC: observed passed-test fraction 58.88% versus 55.97%, API-equivalent cost $9.37 versus $8.13, solver time 31:20 versus 27:45. Partial evaluation included in observed pass fraction." width="100%">
@@ -180,6 +201,33 @@ API-equivalent cost, and solver time; three attempts per setup.
 
 Scores are ProgramBench completion scores unless a task has its own evaluator.
 Raw denotes the baseline without the Bello features being compared.
+
+### NetHack: state of the art, and Bello against Codex Goal
+
+[NetHackers](https://nethackers.dunnolab.ai) is a benchmark where a bot plays
+NetHack on its own. A bot's score is its mean progression over 15 public
+dungeons, measured by character level and dungeon depth.
+
+Bello in Goal mode, with Claude Opus 5.5 at `max` as the coder, set the state
+of the art for the lawful human female Valkyrie (`val-hum-law-fem`): 56.628%
+against the previous best of 56.600%.
+
+To compare Bello with Codex's own goal mode, we gave both the same task: write
+a bot from an empty directory for the dwarf Valkyrie (`val-dwa-law-fem`), with
+GPT-6 Luna at `high` as the coder and 24 hours per run. Codex Goal ran stock
+Codex 0.161 with its built-in goal mode. Bello ran the same coder in Goal mode
+with runtime supervision (Luna at `max`, cheap triage on), completion review,
+one adversary pass after three completion returns, and Smart Execution.
+
+<picture>
+  <img src="./docs/assets/nethack-codex-goal.png" alt="NetHackers val-dwa-law-fem, bot written from scratch, GPT-6 Luna High, 24 hours per run. Codex Goal versus Bello Codex Goal: best progression 2.96% versus 4.21%, API-equivalent cost $6.78 versus $6.13, time to reach 2.96% 22:19 versus 5:05." width="100%">
+</picture>
+
+Bello's best bot reached 4.21% mean progression against 2.96% for Codex Goal,
+42.18% higher. Bello reached Codex Goal's final best in 5:05 against 22:19,
+4.39 times sooner, and went on to pass 4%, which Codex Goal did not reach. The
+whole Bello run, with every supervising role, cost $6.13 in API-equivalent
+terms against $6.78 for Codex Goal, 9.59% less.
 
 ### Four models, raw and with Bello
 
