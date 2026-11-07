@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 
+import { registerOrcaRouter } from "./orcarouter.mjs";
+
 function discoveryKey(key, env = {}) {
   // Match Pi's literal/environment templates, but leave commands inert. A
   // command-backed key is configured; only execution can prove its value.
@@ -66,8 +68,15 @@ class LocalSnapshot {
 
   async read(providerId, options) {
     options?.signal?.throwIfAborted();
-    const value = Object.hasOwn(this.data, providerId) ? structuredClone(this.data[providerId]) : undefined;
-    if (this.credentials && value?.type === "api_key") value.key = discoveryKey(value.key, value.env);
+    const raw = Object.hasOwn(this.data, providerId) ? structuredClone(this.data[providerId]) : undefined;
+    // An empty command-backed key is still defined metadata, and a missing
+    // template value must not become the string "undefined".
+    const value = raw?.type === "api_key" && raw.key === "" ? { ...raw, key: "!" } : raw;
+    if (this.credentials && value?.type === "api_key") {
+      // An unresolved template is a missing credential, never the template
+      // text; returning it as a key would send "$VAR" as a bearer token.
+      value.key = discoveryKey(value.key, value.env);
+    }
     return value;
   }
 
@@ -94,6 +103,9 @@ export async function createCatalogRuntime({ agentDir }) {
       // before this candidate can become the worker's published snapshot.
       refreshOnCreate: false,
     });
+    // Local snapshots cannot write; OrcaRouter's catalog lives in the worker's
+    // execution runtime, and discovery here stays read-only and offline.
+    await registerOrcaRouter(runtime, { fetchImpl: async () => { throw new Error("local discovery is offline"); } });
     const refresh = runtime.refresh.bind(runtime);
     runtime.refresh = async (options = {}) => {
       if (options.allowNetwork === true) throw new Error("Pi catalog refresh is local only");

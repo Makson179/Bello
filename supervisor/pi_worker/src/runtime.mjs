@@ -15,6 +15,7 @@ import { ProtocolError } from "./protocol.mjs";
 import { AsyncToolCoordinator, lateToolMessage } from "./async-tools.mjs";
 import { piAgentDirectory } from "./agent-directory.mjs";
 import { billingRouteError } from "./billing-route.mjs";
+import { providerEnv } from "./orcarouter.mjs";
 import { contextPoliciesMatch, normalizeContextPolicy } from "./context-policy.mjs";
 
 const STATE_VERSION = 1;
@@ -483,6 +484,9 @@ export class PiWorkerRuntime {
 
   providerDescriptors(modelRuntime = this.modelRuntime) {
     if (typeof modelRuntime.getProviders !== "function") return [];
+    // Static keys are advertised by variable name only; the value stays in the
+    // process environment.
+    const scopedEnv = { ...process.env, ...providerEnv() };
     return modelRuntime.getProviders().map((provider) => {
       const status = typeof modelRuntime.getProviderAuthStatus === "function"
         ? modelRuntime.getProviderAuthStatus(provider.id)
@@ -490,6 +494,10 @@ export class PiWorkerRuntime {
       const loginMethods = [];
       if (provider.id !== "openai" && provider.auth?.oauth?.login) loginMethods.push("oauth");
       if (provider.auth?.apiKey?.login) loginMethods.push("api_key");
+      // A deployment key counts as configured without being resolved.
+      if (provider.id === "orcarouter" && !status.configured && scopedEnv.ORCA_API_KEY && scopedEnv.ORCA_API_KEY_ENV) {
+        return { id: provider.id, name: provider.name, configured: true, source: "environment", loginMethods };
+      }
       const routeError = billingRouteError(modelRuntime, provider.id);
       return {
         id: provider.id,

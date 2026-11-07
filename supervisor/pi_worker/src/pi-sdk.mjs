@@ -1,7 +1,8 @@
 import { join } from "node:path";
 import { installOpenRouterBackpressure } from "./openrouter-backpressure.mjs";
 import { createCatalogRuntime } from "./catalog.mjs";
-import { enforceExecutionBillingRoute } from "./billing-route.mjs";
+import { enforceExecutionBillingRoute, enforceOrcaRouterReauth } from "./billing-route.mjs";
+import { registerOrcaRouter } from "./orcarouter.mjs";
 import { assertContextFits, contextBudget, contextCompactionExtension, CONTEXT_COMPACTION_STATE_TYPE, installContextTransactionGuard, normalizeContextPolicy } from "./context-compaction.mjs";
 
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
@@ -79,6 +80,12 @@ export const realPiSdk = {
       modelsPath: join(agentDir, "models.json"),
       allowModelNetwork,
     });
+    // The named OrcaRouter provider joins the user's Pi providers here, so its
+    // catalog and Bearer-authorized requests use the standard Pi paths.
+    await registerOrcaRouter(runtime);
+    // A revoked OrcaRouter key surfaces as an explicit re-login for that exact
+    // credential; it never falls back to another key or billing route.
+    enforceOrcaRouterReauth(runtime);
     return enforceExecutionBillingRoute(runtime);
   },
 
