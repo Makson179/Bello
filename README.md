@@ -64,6 +64,11 @@ Then add the model sources you want, any one is enough:
 - API providers (OpenAI, Anthropic, OpenRouter, and other Pi providers):
   Node.js 22.19 or newer, `bello runtime install` once, then
   `bello runtime login <provider>`.
+- [OrcaRouter](https://www.orcarouter.ai) Cyber Inference (authorized, scoped
+  security work; models on
+  [OrcaRouter cyber](https://www.orcarouter.ai/cyber)): `bello runtime install`,
+  then `bello runtime login orcarouter` to connect in the browser
+  (OAuth 2.0 + PKCE) or paste a key, `--method api_key`.
 - Log distiller: `pipx install 'bello[log-distiller]' --force`. The model
   (599 MB) downloads on the first run with the distiller on. With subscription
   Codex it also downloads a compatible Codex helper on Apple Silicon,

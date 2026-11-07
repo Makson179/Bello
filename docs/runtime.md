@@ -24,6 +24,53 @@ route. They do not become API calls. Bello never changes the provider or billing
 route to work around a missing login or unavailable model. Provider-specific
 limits and billing rules still apply.
 
+### OrcaRouter Cyber Inference
+
+`orcarouter/<model>` routes to **[OrcaRouter](https://www.orcarouter.ai)**
+through Bello's own named Pi provider (`OrcaRouter Cyber Inference`), never
+through a generic "any base URL" option. Inference and model discovery use the
+OpenAI-compatible endpoint `https://api.orcarouter.ai/v1`; authorization runs
+on `https://www.orcarouter.ai`. It is intended for authorized, scoped security
+engineering work such as review, triage and defensive analysis on models the
+account is entitled to.
+
+```sh
+bello runtime login orcarouter            # Connect with OrcaRouter (OAuth 2.0 + PKCE)
+bello runtime login orcarouter --method api_key
+bello runtime models --engine pi
+```
+
+Two authentication methods are offered side by side:
+
+- **Connect with OrcaRouter** opens the browser on a loopback redirect
+  (`http://127.0.0.1:<port>/cb`, authorization code + S256 PKCE, state checked,
+  no client secret) and exchanges the code on
+  `https://www.orcarouter.ai/api/v1/auth/keys`. The exchange returns a durable,
+  revocable OrcaRouter API key (`sk-orca-...`) for the signed-in account; it is
+  stored in the existing Pi credential store and sent as the Bearer key. There
+  is no refresh grant: if the key is revoked, the next request fails and
+  `bello runtime login orcarouter` issues a new one.
+- **OrcaRouter API key** accepts a key you created in the
+  [OrcaRouter console](https://www.orcarouter.ai/console/keys).
+
+Both paths produce the same credential, so model selection, discovery and
+requests are identical. `ORCA_API_KEY` is read as the static key when no
+credential is stored. `ORCA_BASE_URL`, `ORCA_AUTH_BASE_URL` and
+`ORCA_API_BASE_URL` override the public origins (HTTPS required; the
+authorization origin's own `/auth` and `/api/v1/auth/keys` paths are used).
+
+The model list comes from `GET /v1/models?capability=chat` with the account's
+own key and keeps only text chat routes. If discovery is unavailable, Bello
+shows the verified fallback catalog: `deepseek/deepseek-v4.1-flash` (default),
+`orca/orcacyber-ultra-1.0` (OrcaCyber Ultra), `orca/orcacyber-zero-1.5`
+(OrcaCyber Zero) and `orcarouter/fusion`. A live catalog always replaces the
+fallback, and a key whose grant excludes a model gets OrcaRouter's own
+`model_access_denied` for that model. See
+[OrcaRouter cyber models](https://www.orcarouter.ai/models?tier=cyber) and
+[OrcaRouter for cyber](https://www.orcarouter.ai/cyber). A 401 on a stored
+credential is reported as needing reauthentication for that exact credential;
+Bello never falls back to another key or clears it automatically.
+
 Pi 1.0.4 also offers ChatGPT OAuth under its `openai` provider. Bello deliberately
 does not use that method for `openai/*`: these selections retain API-key billing.
 A stored OpenAI OAuth credential is reported as a route conflict, even if an API

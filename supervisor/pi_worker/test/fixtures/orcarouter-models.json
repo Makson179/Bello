@@ -1,0 +1,147 @@
+{
+  "data": [
+    {
+      "id": "openai/gpt-5.5",
+      "name": "GPT-5.5",
+      "supported_endpoint_types": [
+        "openai",
+        "openai-response"
+      ],
+      "architecture": {
+        "input_modalities": [
+          "text",
+          "image"
+        ]
+      },
+      "context_length": 400000,
+      "top_provider": {
+        "max_completion_tokens": 128000
+      }
+    },
+    {
+      "id": "orcacyber-ultra-1.0",
+      "name": "OrcaCyber Ultra",
+      "supported_endpoint_types": [
+        "openai"
+      ],
+      "architecture": {
+        "input_modalities": [
+          "text"
+        ]
+      },
+      "context_length": 200000,
+      "top_provider": {
+        "max_completion_tokens": 32000
+      }
+    },
+    {
+      "id": "orcacyber-zero-1.5",
+      "name": "OrcaCyber Zero",
+      "supported_endpoint_types": [
+        "anthropic"
+      ],
+      "architecture": {
+        "input_modalities": [
+          "text"
+        ]
+      }
+    },
+    {
+      "id": "vendor/vision-chat",
+      "name": "Vision Chat",
+      "supported_endpoint_types": [
+        "gemini"
+      ],
+      "architecture": {
+        "input_modalities": [
+          "text",
+          "image",
+          "video"
+        ]
+      }
+    },
+    {
+      "id": "vendor/embed-only",
+      "name": "Embed",
+      "supported_endpoint_types": [
+        "embedding"
+      ],
+      "architecture": {
+        "input_modalities": [
+          "text"
+        ]
+      }
+    },
+    {
+      "id": "vendor/image-gen",
+      "name": "Image Gen",
+      "supported_endpoint_types": [
+        "image-generation"
+      ],
+      "architecture": {
+        "input_modalities": [
+          "text"
+        ]
+      }
+    },
+    {
+      "id": "vendor/video-gen",
+      "name": "Video Gen",
+      "supported_endpoint_types": [
+        "openai-video"
+      ],
+      "architecture": {
+        "input_modalities": [
+          "text"
+        ]
+      }
+    },
+    {
+      "id": "vendor/reranker",
+      "name": "Rerank",
+      "supported_endpoint_types": [
+        "jina-rerank"
+      ],
+      "architecture": {
+        "input_modalities": [
+          "text"
+        ]
+      }
+    },
+    {
+      "id": "vendor/audio-only",
+      "name": "Audio",
+      "supported_endpoint_types": [
+        "openai"
+      ],
+      "architecture": {
+        "input_modalities": [
+          "audio"
+        ]
+      }
+    },
+    {
+      "id": "vendor/undeclared",
+      "name": "Undeclared"
+    },
+    {
+      "id": "vendor/vision-chat",
+      "name": "Duplicate",
+      "supported_endpoint_types": [
+        "openai"
+      ]
+    },
+    {
+      "id": "../escape",
+      "name": "Bad id",
+      "supported_endpoint_types": [
+        "openai"
+      ],
+      "architecture": {
+        "input_modalities": [
+          "text"
+        ]
+      }
+    }
+  ]
+}
